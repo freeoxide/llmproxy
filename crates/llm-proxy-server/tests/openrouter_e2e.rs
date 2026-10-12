@@ -361,6 +361,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         };
 
         AppState::new(
@@ -1106,6 +1107,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         };
         AppState::new(
             app_config,

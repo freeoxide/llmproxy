@@ -59,7 +59,7 @@ pub use provider_config::{
     ANONYMOUS_CALLER, AppConfig, AuthConfig, AuthMode, AuthStyle, ConfigValidationError, LogFormat,
     ModelId, ModelPricing, ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode,
     ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderFile,
-    ProviderRouteKind, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
+    ProviderRouteKind, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry, StorageConfig,
     load_app_config, load_provider_config, validate_provider_config,
 };
 pub use provider_registry::{

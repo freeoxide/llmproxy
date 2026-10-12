@@ -2624,6 +2624,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         };
         let providers =
             llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry");
@@ -2873,6 +2874,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         };
 
         let providers =
@@ -2944,6 +2946,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         };
 
         let providers =

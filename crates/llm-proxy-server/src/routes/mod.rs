@@ -668,6 +668,7 @@ mod auth_gate_tests {
                 mode: llm_proxy_core::AuthMode::ClientKeys,
                 clients,
             },
+            storage: None,
         };
 
         let state = crate::state::AppState::new(

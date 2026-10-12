@@ -39,3 +39,17 @@ mode = "none"
 #
 # [auth.clients]
 # laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
+
+# Usage ledger persistence. Absent (the default) disables persistence:
+# usage events go to an in-memory no-op sink and nothing is written to disk.
+#
+# [storage]
+# SQLite database file. Parent directories are created at startup.
+# path = "${HOME}/.local/state/llm-proxy/usage.db"
+# Delete ledger rows older than this age; absent keeps rows forever.
+# max_age = "30d"
+# Keep at most this many rows; the oldest rows are deleted when the cap is
+# exceeded. Absent means unlimited.
+# max_rows = 1000000
+# How often retention pruning runs. Default "1h"; must be at least "1s".
+# prune_interval = "1h"

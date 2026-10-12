@@ -71,6 +71,30 @@ pub(crate) fn load_toml_state(
     let client_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
         .with_context(|| "building client auth from [auth] config")?;
 
+    // Build the persistent event bus from `[storage]` (also before the
+    // listener binds) so an unusable ledger path is a startup error rather
+    // than a silent no-op. Absent `[storage]` keeps the NoopBus default:
+    // nothing is persisted, exactly as before the section existed.
+    let event_bus: std::sync::Arc<dyn llm_proxy_storage::EventBus> = match &app_config.storage {
+        Some(storage) => {
+            let bus = llm_proxy_storage::SqliteEventBus::open(
+                &storage.path,
+                llm_proxy_storage::RetentionPolicy {
+                    max_age: storage.max_age,
+                    max_rows: storage.max_rows,
+                    prune_every: storage.prune_interval,
+                },
+            )
+            .with_context(|| format!("opening usage ledger at {}", storage.path.display()))?;
+            info!(
+                path = %storage.path.display(),
+                "persisting usage events to the SQLite ledger"
+            );
+            std::sync::Arc::new(bus)
+        }
+        None => std::sync::Arc::new(llm_proxy_storage::NoopBus),
+    };
+
     info!(
         config = %path.display(),
         providers = registry.len(),
@@ -85,7 +109,8 @@ pub(crate) fn load_toml_state(
         build_info(),
         Some(cache_dir),
     )
-    .with_client_auth(std::sync::Arc::new(client_auth)))
+    .with_client_auth(std::sync::Arc::new(client_auth))
+    .with_event_bus(event_bus))
 }
 
 /// Check if a provider with catalog enforcement enabled has no usable models.
@@ -421,5 +446,114 @@ enforce = true
             captured.contains("log-format-probe"),
             "Plain log must still carry the emitted message, got: {captured}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // [storage] wiring into load_toml_state
+    // -----------------------------------------------------------------------
+
+    /// Write a minimal valid main config, optionally with a [storage] section.
+    fn write_main_config(
+        dir: &std::path::Path,
+        storage_section: Option<&str>,
+    ) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        let storage = storage_section.unwrap_or_default();
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+{storage}"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn load_toml_state_wires_sqlite_ledger_when_storage_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("usage.db");
+        let storage = format!(
+            "
+[storage]
+path = \"{}\"
+",
+            db_path.display()
+        );
+        let path = write_main_config(dir.path(), Some(&storage));
+
+        let state = load_toml_state(
+            &path,
+            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
+            llm_proxy_provider::ProxyClient::try_new().unwrap(),
+            None,
+        )
+        .expect("state with [storage]");
+
+        let debug = format!("{state:?}");
+        assert!(
+            debug.contains("SqliteEventBus"),
+            "[storage] must wire the SQLite ledger, got: {debug}"
+        );
+
+        // The ledger accepts and persists an event end to end: emit through
+        // the wired bus, close (drain), then the database file must exist
+        // with content (the writer checkpoints its WAL on close).
+        let event =
+            llm_proxy_storage::ProxyEvent::RequestReceived(llm_proxy_storage::RequestReceived {
+                request_id: "wiring-1".to_owned(),
+                timestamp: time::OffsetDateTime::now_utc(),
+                caller: "laptop".to_owned(),
+                provider: "prov-a".to_owned(),
+                route_kind: "messages".to_owned(),
+                client_protocol: "anthropic".to_owned(),
+                model: llm_proxy_protocol::core::ModelRef {
+                    requested: "claude-3".to_owned(),
+                    upstream: None,
+                },
+                streaming: false,
+                body_hash: "digest".to_owned(),
+            });
+        let bus = std::sync::Arc::clone(state.event_bus());
+        bus.emit(&event);
+        let closer = std::sync::Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || llm_proxy_storage::EventBus::close(&*closer))
+            .await
+            .expect("close");
+
+        let db = std::fs::read(&db_path).expect("database file exists after close");
+        assert!(
+            !db.is_empty(),
+            "database file must hold the committed schema and rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_toml_state_keeps_noop_bus_without_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_main_config(dir.path(), None);
+
+        let state = load_toml_state(
+            &path,
+            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
+            llm_proxy_provider::ProxyClient::try_new().unwrap(),
+            None,
+        )
+        .expect("state without [storage]");
+
+        let debug = format!("{state:?}");
+        assert!(
+            debug.contains("NoopBus"),
+            "absent [storage] must keep the no-op bus (today's behavior), got: {debug}"
+        );
+        // And close() on the default bus is a no-op that must not hang.
+        llm_proxy_storage::EventBus::close(state.event_bus().as_ref());
     }
 }

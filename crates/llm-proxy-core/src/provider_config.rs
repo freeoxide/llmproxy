@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +34,10 @@ pub struct AppConfig {
     /// Client authentication settings (`[auth]` section).
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Usage-ledger persistence settings (`[storage]` section). Absent keeps
+    /// the in-memory no-op event bus (nothing is persisted).
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +197,88 @@ const fn default_shutdown_timeout() -> Duration {
 
 const fn default_dedup_window() -> Duration {
     Duration::ZERO
+}
+
+// ---------------------------------------------------------------------------
+// StorageConfig
+// ---------------------------------------------------------------------------
+
+/// Default retention-pruning interval (1 hour).
+const fn default_prune_interval() -> Duration {
+    Duration::from_secs(3600)
+}
+
+/// Usage-ledger persistence configuration (`[storage]` section of
+/// `config.toml`).
+///
+/// When present, every proxied request is persisted to a SQLite ledger by the
+/// storage crate's event bus. When absent, the in-memory no-op bus is used and
+/// nothing is written to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Path to the SQLite database file. Parent directories are created on
+    /// startup.
+    pub path: PathBuf,
+    /// Delete ledger rows older than this age. Absent means rows are kept
+    /// forever. Must be positive when present.
+    #[serde(default, with = "humantime_serde")]
+    pub max_age: Option<Duration>,
+    /// Keep at most this many ledger rows; the oldest rows are deleted when
+    /// the cap is exceeded. Absent means unlimited. Must be at least 1 when
+    /// present.
+    #[serde(default)]
+    pub max_rows: Option<u64>,
+    /// How often the retention pruning pass runs. Defaults to 1 hour. Must be
+    /// at least 1 second (the pruning timer rejects a zero period).
+    #[serde(default = "default_prune_interval", with = "humantime_serde")]
+    pub prune_interval: Duration,
+}
+
+/// Validate `[storage]`.
+///
+/// Rules:
+/// - `path` must not be empty.
+/// - `max_age`, when set, must be positive: a zero age would delete every row
+///   on every pass and indicates a unit mistake rather than intent.
+/// - `max_rows`, when set, must be at least 1 (zero would keep nothing).
+/// - `prune_interval` must be at least 1 second; the pruning timer in the
+///   storage crate panics on a zero period, and a sub-second prune cadence
+///   serves no purpose.
+fn validate_storage_config(storage: &StorageConfig) -> Result<(), CoreError> {
+    if storage.path.as_os_str().is_empty() {
+        return Err(CoreError::ConfigValidation {
+            message: "storage.path must not be empty".to_owned(),
+            source: None,
+        });
+    }
+    if storage.max_age == Some(Duration::ZERO) {
+        return Err(CoreError::ConfigValidation {
+            message: "storage.max_age must be a positive duration; a zero age would \
+                      delete every ledger row on every pruning pass"
+                .to_owned(),
+            source: None,
+        });
+    }
+    if storage.max_rows == Some(0) {
+        return Err(CoreError::ConfigValidation {
+            message: "storage.max_rows must be at least 1; a cap of zero would keep \
+                      no rows at all"
+                .to_owned(),
+            source: None,
+        });
+    }
+    const MIN_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+    if storage.prune_interval < MIN_PRUNE_INTERVAL {
+        return Err(CoreError::ConfigValidation {
+            message: format!(
+                "storage.prune_interval must be at least 1 second, but is {:?}",
+                storage.prune_interval
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,6 +1531,9 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
         });
     }
     validate_auth_config(&cfg.auth, cfg.server.bind)?;
+    if let Some(storage) = cfg.storage.as_ref() {
+        validate_storage_config(storage)?;
+    }
     Ok(cfg)
 }
 
@@ -2619,5 +2708,167 @@ input = 0.0000025
             validate_provider_config(&provider, None),
             Err(ConfigValidationError::EmptyApiKey { .. })
         ));
+    }
+
+    // -- [storage] -----------------------------------------------------------
+
+    /// Minimal valid main config with a `[storage]` section appended.
+    fn write_app_config(extra_storage: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+{extra_storage}"#
+            ),
+        )
+        .unwrap();
+        (directory, path)
+    }
+
+    #[test]
+    fn storage_section_defaults_to_none_when_absent() {
+        let (_dir, path) = write_app_config("");
+        let config = load_app_config(&path).expect("valid config without [storage]");
+        assert!(
+            config.storage.is_none(),
+            "absent [storage] must keep the no-op event bus"
+        );
+    }
+
+    #[test]
+    fn storage_section_parses_and_applies_defaults() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+"#,
+        );
+        let config = load_app_config(&path).expect("valid [storage]");
+        let storage = config.storage.expect("storage present");
+        assert_eq!(storage.path, std::path::PathBuf::from("/tmp/usage.db"));
+        assert_eq!(storage.max_age, None, "absent max_age keeps rows forever");
+        assert_eq!(storage.max_rows, None, "absent max_rows is unlimited");
+        assert_eq!(
+            storage.prune_interval,
+            Duration::from_secs(3600),
+            "absent prune_interval defaults to 1h"
+        );
+    }
+
+    #[test]
+    fn storage_section_parses_full_retention() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_age = "30d"
+max_rows = 500_000
+prune_interval = "15m"
+"#,
+        );
+        let config = load_app_config(&path).expect("valid [storage]");
+        let storage = config.storage.expect("storage present");
+        assert_eq!(storage.max_age, Some(Duration::from_secs(30 * 24 * 3600)));
+        assert_eq!(storage.max_rows, Some(500_000));
+        assert_eq!(storage.prune_interval, Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn storage_zero_prune_interval_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+prune_interval = "0s"
+"#,
+        );
+        let error = load_app_config(&path).expect_err("zero prune interval rejected");
+        assert!(
+            error.to_string().contains("storage.prune_interval"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn storage_subsecond_prune_interval_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_age = "1d"
+prune_interval = "500ms"
+"#,
+        );
+        assert!(
+            load_app_config(&path).is_err(),
+            "sub-second prune interval must be rejected (timer panics on zero/near-zero)"
+        );
+    }
+
+    #[test]
+    fn storage_zero_max_age_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_age = "0s"
+"#,
+        );
+        let error = load_app_config(&path).expect_err("zero max_age rejected");
+        assert!(
+            error.to_string().contains("storage.max_age"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn storage_zero_max_rows_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_rows = 0
+"#,
+        );
+        let error = load_app_config(&path).expect_err("zero max_rows rejected");
+        assert!(
+            error.to_string().contains("storage.max_rows"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn storage_empty_path_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = ""
+"#,
+        );
+        let error = load_app_config(&path).expect_err("empty path rejected");
+        assert!(error.to_string().contains("storage.path"), "got: {error}");
+    }
+
+    #[test]
+    fn storage_unknown_field_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+db_host = "postgres.example"
+"#,
+        );
+        assert!(
+            load_app_config(&path).is_err(),
+            "deny_unknown_fields must reject unrecognized [storage] keys"
+        );
     }
 }

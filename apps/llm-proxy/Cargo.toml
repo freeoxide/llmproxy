@@ -25,6 +25,7 @@ workspace = true
 llm-proxy-server = { workspace = true }
 llm-proxy-core = { workspace = true }
 llm-proxy-provider = { path = "../../crates/llm-proxy-provider" }
+llm-proxy-storage = { path = "../../crates/llm-proxy-storage" }
 
 anyhow = { workspace = true }
 axum = { workspace = true }
@@ -43,5 +44,6 @@ vergen-gix = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1.42", features = ["yaml", "filters"] }
+llm-proxy-protocol = { path = "../../crates/llm-proxy-protocol" }
 tempfile = "3"
 toml = { workspace = true }

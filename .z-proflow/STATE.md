@@ -644,3 +644,236 @@ comment.
 
 - None this round beyond the standing cargo-shear note (binary still absent
   from this environment; no dependency changes this round).
+
+## committer — PRX-01 — fix round
+
+- Commit: `bf5c53fdaf8f084867ff4cf85741b874c97fd308` on `prx/usage-ledger`
+  (on top of 499b22a).
+- Message: "fix(server): gate client-auth failures before argon2
+  verification".
+- Staged paths (3): crates/llm-proxy-server/src/middleware.rs;
+  crates/llm-proxy-server/src/routes/mod.rs; .z-proflow/STATE.md.
+- Exactly the ask's list; git status showed nothing else area-relevant
+  (only untracked .zcode/, session tooling — left alone). The change is
+  the judge-round-1 MAJOR fix: RateLimiter::would_allow peek +
+  pre-verification flood gate in require_client_auth, doc rewrite, 5 new
+  tests.
+- Note: `git add` exited 1 with "The following paths are ignored by one of
+  your .gitignore files: .z-proflow" — but STATE.md is tracked
+  (git ls-files confirms) and check-ignore reports it not ignored; the
+  warning fired on the directory during pathspec expansion. All three
+  paths staged fully (verified: git diff --cached --stat showed all three,
+  git diff empty afterwards); no -f needed, nothing extra staged.
+- No hooks configured, so none ran; no --no-verify; no push. Gates not
+  re-run by the committer — the ask states the area is green on the full
+  workspace gate set.
+
+## judge — PRX-01 — round 2
+
+Audited commits 499b22a8209686574420023c7ee1491a87ac0ae3 and
+bf5c53fdaf8f084867ff4cf85741b874c97fd308 read-only against AGENTS.md, the
+STATE.md POLICY/TASK/project-rules, the [workspace.lints] wall plus
+clippy.toml, and the PRX-01 brief. Read the axum-code-review skill first;
+edition 2024 / axum 0.8 checklist applied where the tree supports it.
+
+### Gates run (exact commands, this round)
+
+- `cargo fmt --all --check` — exit 0, clean.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D
+  warnings` — exit 0, zero warnings.
+- `cargo test --workspace --all-features` — exit 0; 1239 passed, 0 failed
+  (summed across all `test result` lines).
+- `cargo shear` — "✓ no issues found" (cargo-shear present at
+  ~/.cargo/bin/cargo-shear).
+- Targeted: `cargo test -p llm-proxy-server auth_gate` (2 passed) and
+  `... would_allow` (3 passed) — the round-1-fix tests specifically.
+- Round-1-fix verification: require_client_auth now peeks
+  RateLimiter::would_allow (routes/mod.rs:319) BEFORE authenticate() runs
+  (mod.rs:323); `exhausted_failure_budget_gates_verification_before_argon2`
+  pins the ordering (a valid token on a drained budget gets 401; on the
+  round-1 code the probe handler would answer 200). Doc comment now matches
+  the code, including the `rate_limit_rpm = 0` no-bound caveat.
+
+### Findings
+
+1. MAJOR (defer to user) — crates/llm-proxy-server/src/routes/
+   core_pipeline.rs:452-459: `passthrough_auth = true` providers resolve
+   their upstream api_key from the inbound `Authorization: Bearer` header
+   (extract_inbound_auth, core_pipeline.rs:612-629), so under
+   `auth.mode = "client-keys"` the proxy client key is silently transmitted
+   to the operator-configured upstream as the provider credential, and
+   `validate_auth_config` (core provider_config.rs:1466) does not reject
+   the combination. Carried over from round 1 (judged defer there, unchanged
+   by bf5c53f); needs a deliberate design decision (reject at startup or
+   channel proxy auth via a distinct header) and must land by PRX-06's exit
+   gate at the latest.
+2. NIT (defer) — crates/llm-proxy-server/src/middleware.rs:396:
+   `OptionalConnectInfo` has zero users in the workspace (grep across
+   crates/ and apps/ finds only its definition; all handlers moved to
+   `RequestMeta` in 499b22a) and is dead public API on the crate surface;
+   delete it. Carried over from round 1.
+3. NIT (defer) — crates/llm-proxy-server/src/routes/mod.rs:341-343: a
+   request rejected by the pre-verification flood gate increments
+   `rate_limited` twice (mod.rs:320 at the gate, again at mod.rs:342 when
+   `is_allowed` returns false on the already-empty bucket), so the metric
+   counts 2 per gated auth-flood rejection and overstates the count.
+4. NIT (defer) — crates/llm-proxy-server/src/routes/mod.rs:362: the auth
+   layer's `ResponseFailed` passes `std::time::Instant::now()` as the start
+   instant, so `latency_ms` records ~0 and excludes the argon2 verification
+   time (tens of ms) and body drain; every other emission site (not_found
+   mod.rs:494, method_not_allowed mod.rs:549, normalize_error_responses
+   mod.rs:411) captures entry time. PRX-02 will persist this field as-is.
+5. NIT (defer) — crates/llm-proxy-core/src/provider_config.rs:178-181: the
+   `clients` field doc claims deserializing a serialized config "will
+   therefore fail on this field, which is intentional" — empirically false:
+   a scratch round-trip test (serde/toml against the real `AuthConfig`)
+   serializes to `mode = "client-keys"` only and deserializes SUCCESSFULLY
+   with an empty clients map (`#[serde(default)]` supplies it). No
+   production code serializes AuthConfig today, so this is doc accuracy
+   only, but the asserted safety net does not exist.
+
+### Also checked, no finding
+
+- Brief compliance: [auth.clients] PHC/argon2id at rest in SecretString;
+  401 envelope is the static "missing or invalid client auth token"
+  (error_response.rs:473-477), no secret echo (tests assert no-echo);
+  none+non-loopback refused inside load_app_config (provider_config.rs:
+  1485-1494) which runs in load_toml_state (app state.rs:71) before
+  bind_listener (serve.rs:62 → 103); RequestReceived.caller at storage
+  lib.rs:52 with both emit sites carrying ctx.caller (core_pipeline.rs:770,
+  1087); rate limiter keyed by key id when authenticated / IP otherwise
+  (core_pipeline.rs:269-273, loopback bypass restricted to anonymous
+  callers); state.rs maintenance note updated honestly (state.rs:50-53);
+  docs/protocol.md does not document the RequestReceived shape (its line 71
+  "caller metadata" is about CoreRequest), so the conditional doc update
+  does not apply.
+- Panic/indexing/dropped-Result scan of both diffs: every unwrap/expect
+  added is inside test modules (allowed by clippy.toml); no slicing, no
+  `let _ =` on Result/Future, no `#[allow]`, no MutexGuard across await
+  (locks in would_allow/cached_key_id/verify_uncached are scoped without
+  awaits); the two pre-existing `Regex::new(...).expect()` in
+  core_pipeline.rs predate this area.
+- Digest cache bounded at one entry per configured key id (only verified
+  tokens cached); manual Debug on ClientAuth prints key ids only; argon2
+  0.6 verified on crates.io in round 1, still the declared workspace dep.
+
+Verdict: findings — 1 major deferred (passthrough × client-keys, PRX-06
+deadline), 4 nits deferred. All workspace gates green as run above.
+
+## implementer — PRX-02 — round 1
+
+SQLite EventBus backend: the persistent per-request usage ledger, config
+under `[storage]`, retention pruning on a timer, WAL mode, NoopBus default
+preserved when `[storage]` is absent.
+
+### Changed paths
+
+- `Cargo.toml` — workspace deps: `rusqlite = { version = "0.40", features =
+  ["bundled"] }` (verified on crates.io this round: `cargo info rusqlite` →
+  0.40.2, github.com/rusqlite/rusqlite, MIT; `bundled` feature confirmed in
+  the downloaded crate manifest); tokio features += `sync` (explicit rather
+  than relying on feature unification for mpsc/watch).
+- `crates/llm-proxy-storage/Cargo.toml` — deps: rusqlite, thiserror, tokio,
+  tracing; dev-deps: rust_decimal, tempfile. `[lints] workspace = true`
+  unchanged.
+- `crates/llm-proxy-storage/src/sqlite.rs` (new) — `SqliteEventBus`:
+  one `requests` table keyed by request_id (received/completed ms
+  timestamps, provider, model_requested/upstream, route_kind,
+  client_protocol, streaming, caller, input/output/reasoning/cache-read/
+  cache-creation tokens, usage_provenance, six cost columns as exact
+  decimal TEXT (never float), stop_reason, error_kind, http_status,
+  latency_ms, body_hash digest only — tests assert no `body`/`message`
+  column exists); indexes on (received_at), (provider, received_at),
+  (caller, received_at); WAL + synchronous=NORMAL + busy_timeout 5s.
+  Writer = dedicated tokio task behind a bounded mpsc channel (capacity
+  1024, batch 256, one transaction per batch via spawn_blocking with the
+  connection moved in/out and reopened if a blocking closure panics);
+  `emit` is try_send — full channel drops + counts (`dropped_events()`),
+  never backpressures. Retention: `run_retention_pass` (pub; age via
+  COALESCE(received_at, completed_at), row cap deletes oldest-first) on a
+  `prune_every` interval timer (MissedTickBehavior::Delay; first tick
+  immediate = startup cleanup). 10 tests incl. WAL/indexes, one-row-per-
+  request upserts, COALESCE preserve, saturation drop+count (writer-free
+  channel), no-silent-loss invariant (persisted+dropped==emitted),
+  close()-flushes-queue, age+cap pruning, timer-driven prune.
+- `crates/llm-proxy-storage/src/lib.rs` — `mod sqlite` + single-path re-
+  exports (`SqliteEventBus`, `RetentionPolicy`, `StorageError`,
+  `run_retention_pass`); `EventBus::close(&self)` added with a default
+  no-op (stateless buses unchanged; bounded, spawn_blocking-wrapped at the
+  call site); crate docs updated (backend no longer "a later phase").
+- `crates/llm-proxy-core/src/provider_config.rs` — `StorageConfig`
+  (`[storage]`: path, max_age/max_rows optional humantime, prune_interval
+  default 1h) on `AppConfig` as `Option` with serde default (old configs
+  parse unchanged); `validate_storage_config` in `load_app_config`
+  (non-empty path, positive max_age, max_rows>=1, prune_interval>=1s —
+  the interval timer panics on zero); 9 new tests (defaults, full parse,
+  each rejection, unknown-field).
+- `crates/llm-proxy-core/src/lib.rs` — export `StorageConfig`.
+- `crates/llm-proxy-server/src/state.rs` — `pub fn event_bus()` accessor
+  (for the serve-path flush); test literal + `storage: None`.
+- `crates/llm-proxy-server/src/routes/mod.rs`, `routes/{core_pipeline,
+  models}.rs`, `tests/{chat_completions,core_pipeline,integration,
+  openrouter_e2e}.rs` — 21 AppConfig test literals gain `storage: None`.
+- `apps/llm-proxy/src/state.rs` — `load_toml_state` builds the SQLite bus
+  from `[storage]` (before listener bind; unusable path = startup error)
+  and wires it via `with_event_bus`; NoopBus otherwise; 2 new wiring tests
+  (bus type observable in AppState Debug; emit→close→db file holds data;
+  absent section keeps NoopBus + close is a no-op).
+- `apps/llm-proxy/src/commands/serve.rs` — after the graceful drain and
+  PID cleanup, `event_bus.close()` via spawn_blocking (ledger flush;
+  hard-deadline force-exit path deliberately does not flush — commented).
+- `apps/llm-proxy/Cargo.toml` — llm-proxy-storage dep; llm-proxy-protocol
+  dev-dep (test fixture types; not a production dep).
+- `config.toml.example` — `[storage]` section documented (path, max_age,
+  max_rows, prune_interval, absent = no persistence).
+- `Cargo.lock` — rusqlite/libsqlite3-sys bundled additions (expected).
+
+### Self-checks run (this round, exact commands)
+
+- `cargo test -p llm-proxy-storage` — 15 passed, 0 failed (10 new sqlite
+  tests; timer test re-run 3x, stable).
+- `cargo test -p llm-proxy-core storage` — 9 passed.
+- `cargo test -p llm-proxy --lib state::` — 6 passed.
+- `cargo test -p llm-proxy-server -p llm-proxy-core` — all suites ok.
+- `cargo test --workspace --all-features` — 1260 passed, 0 failed.
+- `cargo clippy --workspace --all-targets --all-features --locked --
+  -D warnings` — exit 0 (local run; the script's gate run is deciding).
+- `cargo shear` — "✓ no issues found" (cargo-shear at ~/.cargo/bin).
+- `cargo fmt --all` + `--check` — clean.
+
+### Interface notes for dependent areas
+
+- PRX-03 reads the ledger with a plain second `rusqlite::Connection` (WAL
+  readers are lock-free; busy_timeout 5s set). Schema: table `requests`,
+  timestamps are unix-epoch-ms INTEGERs (`received_at` NULL for
+  failure-only rows — use COALESCE(received_at, completed_at) as the time
+  axis, as retention does); costs are decimal TEXT (parse with
+  rust_decimal, never float); stop_reason/usage_provenance are stable
+  snake_case labels, unknown stop reasons carry `unknown:<inner>`.
+  Indexes: idx_requests_timestamp, idx_requests_provider_timestamp,
+  idx_requests_caller_timestamp (all on received_at).
+- `EventBus::close(&self)` is a new defaulted trait method — no behavior
+  change for NoopBus/RecordingBus; bounded (10s) and blocks, so wrap in
+  spawn_blocking from async code (serve.rs shows the pattern).
+- `SqliteEventBus::dropped_events()` is the drop counter PRX-03/PRX-06
+  can surface; `path()` returns the db path. `open()` requires a tokio
+  runtime (spawns the writer) and does blocking fs work at startup.
+- Config surface: `[storage] path/max_age/max_rows/prune_interval`;
+  validated in `load_app_config` (so `llm-proxy validate` catches it);
+  absent section = NoopBus exactly as before.
+- `AppState::event_bus()` is public (server crate).
+- Judge PRX-01 nit 4 stands: auth-layer ResponseFailed latency_ms records
+  ~0 (Instant::now() at emission); now persisted as-is by this ledger.
+
+### Punted
+
+- `upstream_message_id` (ResponseCompleted) and the sanitized `message`
+  (ResponseFailed) are NOT ledger columns: the brief lists exactly error
+  kind + http status for failures, and omitting message is the stricter
+  privacy posture. PRX-03 can revisit if raw-row responses need them.
+- No metrics export of `dropped_events` (no /usage surface yet — PRX-03).
+- Multi-process access to one db file is unsupported-by-design (single
+  writer task; a second llm-proxy on the same path would contend via
+  busy_timeout). Not in the brief.
+- DEFAULT_CONFIG_TOML (defaults.rs) unchanged — `[storage]` stays out of
+  the default config, matching the NoopBus-by-default contract.

@@ -92,6 +92,11 @@ pub async fn cmd_serve(
     // by process::exit), so remove_pid() runs exactly once per shutdown.
     let bind_addr = state.bind_address();
     let shutdown_deadline = state.shutdown_timeout();
+    // Hold the event bus so the usage ledger can be flushed after the server
+    // stops. The router (which owns the state) keeps its own Arc; closing is
+    // watch-signalled, not sender-drop-signalled, so those clones do not
+    // hold the writer open.
+    let event_bus = std::sync::Arc::clone(state.event_bus());
     let app = build_router(state);
 
     // `tap_io` runs on every accepted connection (audit MEDIUM-2 option A).
@@ -150,6 +155,15 @@ pub async fn cmd_serve(
 
     if let Err(e) = remove_pid() {
         tracing::warn!(error = %e, "failed to remove PID file during shutdown");
+    }
+
+    // Flush the usage ledger now that the graceful drain has finished and no
+    // new events can arrive: the writer drains its channel and exits. For
+    // the default NoopBus this is a no-op. close() blocks (bounded), so it
+    // runs on the blocking pool. (The hard-deadline branch above force-exits
+    // without flushing; queued events are lost there by design.)
+    if let Err(close_err) = tokio::task::spawn_blocking(move || event_bus.close()).await {
+        tracing::warn!(error = %close_err, "usage-ledger close task failed to join");
     }
 
     match result {

@@ -38,6 +38,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(
@@ -102,6 +103,7 @@ mod tests {
                     log_format: Default::default(),
                 },
                 auth: Default::default(),
+                storage: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -908,6 +910,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(

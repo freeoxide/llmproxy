@@ -25,7 +25,7 @@ llm-proxy-core = { path = "crates/llm-proxy-core" }
 llm-proxy-server = { path = "crates/llm-proxy-server" }
 
 # Async / runtime
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Web
@@ -58,6 +58,10 @@ tiktoken-rs = "0.6"
 
 # Money (cost/pricing) -- fixed-point, never float
 rust_decimal = "1"
+
+# Persistence (usage ledger). "bundled" compiles SQLite in-tree so no
+# system libsqlite3 is needed on deploy targets.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Observability
 tracing = "0.1"

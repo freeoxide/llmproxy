@@ -270,6 +270,14 @@ impl AppState {
         &self.model_catalogs
     }
 
+    /// Access the request/response event sink.
+    ///
+    /// Holds the bus so the serve path can [`EventBus::close`] it (flush the
+    /// usage ledger) after the HTTP server has stopped.
+    pub fn event_bus(&self) -> &Arc<dyn EventBus> {
+        &self.event_bus
+    }
+
     /// Return the bind address the server should listen on.
     pub fn bind_address(&self) -> std::net::SocketAddr {
         self.app_config.server.bind
@@ -305,6 +313,7 @@ mod tests {
                 log_format: Default::default(),
             },
             auth: Default::default(),
+            storage: None,
         }
     }
 
