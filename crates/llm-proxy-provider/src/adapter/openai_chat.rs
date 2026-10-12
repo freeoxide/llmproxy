@@ -411,6 +411,12 @@ fn push_tool_result_messages(content: &[CoreContent], messages: &mut Vec<ChatMes
 
 impl OpenAiChatAdapter {
     /// Encode a core request into an OpenAI Chat Completions request.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "field-by-field wire encode of the OpenAI Chat Completions request \
+                 shape, kept in one place so the mapping can be audited against \
+                 the API schema without jumping between helpers"
+    )]
     pub fn encode_request(
         &self,
         core: &CoreRequest,

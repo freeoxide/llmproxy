@@ -1,0 +1,11 @@
+---
+source: apps/llm-proxy/src/platform.rs
+assertion_line: 302
+expression: entry
+---
+[Desktop Entry]
+Type=Application
+Name=LLM Proxy
+Exec=/usr/bin/llm-proxy serve
+X-GNOME-Autostart-enabled=true
+Hidden=false

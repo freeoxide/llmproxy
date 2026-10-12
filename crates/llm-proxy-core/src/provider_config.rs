@@ -24,12 +24,16 @@ use crate::error::CoreError;
 
 /// Top-level TOML application configuration.
 ///
-/// Loaded from the main `config.toml`, which contains server settings only.
+/// Loaded from the main `config.toml`, which contains server and auth
+/// settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Server bind and operational settings.
     pub server: ServerConfig,
+    /// Client authentication settings (`[auth]` section).
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +139,48 @@ pub struct ServerConfig {
 
 const fn default_rate_limit_rpm() -> u32 {
     100
+}
+
+// ---------------------------------------------------------------------------
+// AuthConfig
+// ---------------------------------------------------------------------------
+
+/// Client authentication mode for proxy routes.
+///
+/// Serialized in TOML as `"none"` / `"client-keys"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthMode {
+    /// No client authentication: every request is attributed to the
+    /// `"anonymous"` caller. Only permitted while the server binds loopback;
+    /// `load_app_config` rejects a non-loopback bind in this mode.
+    #[default]
+    None,
+    /// Requests to proxy routes must present
+    /// `Authorization: Bearer <client-key>` matching a secret hashed under
+    /// `[auth.clients]`.
+    ClientKeys,
+}
+
+/// Client authentication configuration (`[auth]` section of `config.toml`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Authentication mode. Defaults to [`AuthMode::None`].
+    #[serde(default)]
+    pub mode: AuthMode,
+    /// Key id to hashed client secret, under `[auth.clients]`.
+    ///
+    /// Each value is a PHC-format password-hashing string (argon2id), never a
+    /// plaintext secret. Wrapped in [`SecretString`] so the value is redacted
+    /// in `Debug` output.
+    ///
+    /// `skip_serializing` (mirroring `ProviderConfig::api_key`) prevents the
+    /// hashes from leaking through any `Serialize` path; deserializing a
+    /// config that was serialized will therefore fail on this field, which is
+    /// intentional.
+    #[serde(default, skip_serializing)]
+    pub clients: HashMap<String, SecretString>,
 }
 
 /// Default graceful-shutdown hard deadline (30 seconds).
@@ -1398,7 +1444,74 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             source: None,
         });
     }
+    validate_auth_config(&cfg.auth, cfg.server.bind)?;
     Ok(cfg)
+}
+
+/// Reserved caller name used for unauthenticated requests under
+/// [`AuthMode::None`]; a client key id must not collide with it or event
+/// attribution becomes ambiguous.
+pub const ANONYMOUS_CALLER: &str = "anonymous";
+
+/// Validate `[auth]` against itself and against the bind address.
+///
+/// Rules:
+/// - `mode = "none"` with a non-empty `[auth.clients]` is contradictory
+///   (configured keys would be silently ignored) and is rejected.
+/// - `mode = "client-keys"` requires at least one `[auth.clients]` entry.
+/// - `mode = "none"` is only permitted on a loopback bind: a non-loopback
+///   bind with no client keys would expose the proxy to every reachable
+///   peer with no authentication, so startup refuses.
+/// - Key ids must be non-empty and must not be [`ANONYMOUS_CALLER`].
+fn validate_auth_config(auth: &AuthConfig, bind: SocketAddr) -> Result<(), CoreError> {
+    let clients_empty = auth.clients.is_empty();
+    match auth.mode {
+        AuthMode::None if !clients_empty => {
+            return Err(CoreError::ConfigValidation {
+                message: "auth.mode = \"none\" but [auth.clients] is non-empty; \
+                          set auth.mode = \"client-keys\" to enforce the configured keys"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        AuthMode::ClientKeys if clients_empty => {
+            return Err(CoreError::ConfigValidation {
+                message: "auth.mode = \"client-keys\" requires at least one entry \
+                          under [auth.clients]"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        AuthMode::None if !bind.ip().is_loopback() => {
+            return Err(CoreError::ConfigValidation {
+                message: format!(
+                    "server.bind {bind} is not loopback and no client keys are \
+                     configured; anonymous auth is only permitted on loopback binds. \
+                     Configure [auth.clients] and set auth.mode = \"client-keys\""
+                ),
+                source: None,
+            });
+        }
+        AuthMode::None | AuthMode::ClientKeys => {}
+    }
+    for key_id in auth.clients.keys() {
+        if key_id.is_empty() {
+            return Err(CoreError::ConfigValidation {
+                message: "[auth.clients] contains an empty key id".to_owned(),
+                source: None,
+            });
+        }
+        if key_id == ANONYMOUS_CALLER {
+            return Err(CoreError::ConfigValidation {
+                message: format!(
+                    "[auth.clients] key id \"{ANONYMOUS_CALLER}\" is reserved for \
+                     unattributed requests; choose a different key id"
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Load and parse a provider [`ProviderFile`] TOML file.
@@ -1650,6 +1763,183 @@ server_name = "test"
                 && error.to_string().contains("does not fit u64"),
             "got: {error}"
         );
+    }
+
+    /// Write a config file with the given `bind` and `[auth]` body into a
+    /// fresh temp dir, returning the dir (the config lives at
+    /// `config.toml` inside it). The returned guard keeps the file alive;
+    /// callers run [`load_app_config`] on it directly.
+    fn config_dir_with_auth(bind: &str, auth_body: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "{bind}"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+{auth_body}
+"#
+            ),
+        )
+        .expect("write config file");
+        directory
+    }
+
+    #[test]
+    fn auth_absent_section_defaults_to_none_on_loopback() {
+        let dir = config_dir_with_auth("127.0.0.1:3456", "");
+        let config =
+            load_app_config(dir.path().join("config.toml")).expect("default auth accepted");
+        assert_eq!(config.auth.mode, AuthMode::None);
+        assert!(config.auth.clients.is_empty());
+    }
+
+    #[test]
+    fn auth_none_on_non_loopback_bind_is_rejected() {
+        // The core safety rule of client identity: an anonymous proxy exposed
+        // past loopback must refuse to start, before any listener binds.
+        for bind in ["0.0.0.0:3456", "192.168.1.4:3456", "[::]:3456"] {
+            let dir = config_dir_with_auth(bind, "");
+            let error = load_app_config(dir.path().join("config.toml"))
+                .expect_err("non-loopback none must be rejected");
+            assert!(
+                error.to_string().contains("not loopback"),
+                "bind {bind}: got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_none_on_ipv6_loopback_bind_is_accepted() {
+        // `::1` is loopback; the loopback exemption is about the address, not
+        // the address family.
+        let dir = config_dir_with_auth("[::1]:3456", "");
+        load_app_config(dir.path().join("config.toml")).expect("ipv6 loopback accepted");
+    }
+
+    #[test]
+    fn auth_none_with_configured_clients_is_rejected() {
+        let dir = config_dir_with_auth(
+            "127.0.0.1:3456",
+            r#"
+[auth]
+mode = "none"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let error = load_app_config(dir.path().join("config.toml"))
+            .expect_err("none mode with clients is contradictory");
+        assert!(
+            error.to_string().contains("[auth.clients] is non-empty"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn auth_client_keys_without_clients_is_rejected() {
+        let dir = config_dir_with_auth(
+            "0.0.0.0:3456",
+            r#"
+[auth]
+mode = "client-keys"
+"#,
+        );
+        let error = load_app_config(dir.path().join("config.toml"))
+            .expect_err("client-keys mode needs at least one key");
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one entry under [auth.clients]"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn auth_client_keys_with_a_client_accepts_any_bind() {
+        // With at least one hashed key configured, a non-loopback bind is a
+        // legitimate deployment and must load.
+        let dir = config_dir_with_auth(
+            "0.0.0.0:3456",
+            r#"
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let config = load_app_config(dir.path().join("config.toml"))
+            .expect("client-keys on non-loopback accepted");
+        assert_eq!(config.auth.mode, AuthMode::ClientKeys);
+        assert_eq!(config.auth.clients.len(), 1);
+    }
+
+    #[test]
+    fn auth_rejects_reserved_and_empty_key_ids() {
+        let reserved_dir = config_dir_with_auth(
+            "127.0.0.1:3456",
+            r#"
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+anonymous = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let reserved = load_app_config(reserved_dir.path().join("config.toml"))
+            .expect_err("reserved key id must be rejected");
+        assert!(reserved.to_string().contains("reserved"), "got: {reserved}");
+
+        let empty_dir = config_dir_with_auth(
+            "127.0.0.1:3456",
+            r#"
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+"" = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let empty = load_app_config(empty_dir.path().join("config.toml"))
+            .expect_err("empty key id must be rejected");
+        assert!(empty.to_string().contains("empty key id"), "got: {empty}");
+    }
+
+    #[test]
+    fn auth_clients_do_not_leak_through_debug() {
+        // The hash (let alone a plaintext secret) must never surface in Debug
+        // output of the config, matching the api_key discipline.
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hashvalue"
+"#,
+        )
+        .expect("app config");
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("hashvalue"),
+            "client hash must be redacted in Debug, got: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"), "got: {debug}");
     }
 
     #[test]

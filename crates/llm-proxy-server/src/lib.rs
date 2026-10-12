@@ -17,7 +17,10 @@ pub mod shutdown;
 pub mod state;
 
 pub use catalog_service::{ModelCatalogService, write_catalog_atomic};
-pub use middleware::{RateLimiter, RequestDeduplicator, RequestId, RequestIdGenerator};
+pub use middleware::{
+    CallerId, ClientAuth, ClientAuthError, RateLimiter, RequestDeduplicator, RequestId,
+    RequestIdGenerator,
+};
 pub use shutdown::shutdown_signal;
 pub use state::{AppState, BuildInfo};
 

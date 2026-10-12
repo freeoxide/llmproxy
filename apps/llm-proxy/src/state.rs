@@ -66,6 +66,11 @@ pub(crate) fn load_toml_state(
         }
     }
 
+    // Build the client-auth state here (before the listener binds) so an
+    // invalid verifier hash is a startup error, not a runtime fail-closed.
+    let client_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
+        .with_context(|| "building client auth from [auth] config")?;
+
     info!(
         config = %path.display(),
         providers = registry.len(),
@@ -79,7 +84,8 @@ pub(crate) fn load_toml_state(
         proxy_client,
         build_info(),
         Some(cache_dir),
-    ))
+    )
+    .with_client_auth(std::sync::Arc::new(client_auth)))
 }
 
 /// Check if a provider with catalog enforcement enabled has no usable models.

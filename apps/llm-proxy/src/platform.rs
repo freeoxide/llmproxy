@@ -3,6 +3,9 @@
 //! Provides plist generation (macOS), desktop entry generation (Linux),
 //! and associated escaping utilities.
 
+// Only the macOS plist builder needs the config dir (for the log path); the
+// Linux desktop entry carries no absolute paths.
+#[cfg(target_os = "macos")]
 use crate::paths::config_dir;
 
 /// Generate a macOS launchd plist for auto-start.
@@ -139,6 +142,7 @@ mod tests {
     /// Used to build an `insta::Settings::add_filter` regex that matches the
     /// verbatim log path (which contains regex-special characters like `.`)
     /// so it can be redacted to `[log_path]` in snapshots.
+    #[cfg(target_os = "macos")]
     fn regex_escape(literal: &str) -> String {
         let mut out = String::with_capacity(literal.len());
         for ch in literal.chars() {
@@ -269,10 +273,16 @@ mod tests {
     #[test]
     fn desktop_exec_escape_shell_metacharacters() {
         let escaped = desktop_exec_escape("$HOME/`echo test`");
-        assert!(!escaped.contains('$'));
-        assert!(!escaped.contains('`'));
+        // Every metacharacter must survive in backslash-escaped form...
         assert!(escaped.contains("\\$"));
         assert!(escaped.contains("\\`"));
+        // ...and none may remain unescaped: once the escaped forms are
+        // removed, no bare '$' or '`' may be left in the output.
+        let unescaped = escaped.replace("\\$", "").replace("\\`", "");
+        assert!(
+            !unescaped.contains('$') && !unescaped.contains('`'),
+            "metacharacters must always be escaped, got: {escaped}"
+        );
     }
 
     #[cfg(target_os = "linux")]

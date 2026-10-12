@@ -215,6 +215,9 @@ pub(crate) struct RequestContext {
     pub(crate) request_id: String,
     /// Instant when the handler was entered (for latency metrics).
     pub(crate) start: Instant,
+    /// Authenticated client key id, or `"anonymous"` under the loopback
+    /// no-auth exemption. Stamped onto `RequestReceived` events.
+    pub(crate) caller: String,
     /// SHA-256 of the raw client request body, for the `RequestReceived.body_hash`
     /// correlation key. Computed in [`prepare_request`] over the raw wire bytes
     /// (where they first arrive), per the plan's locked decision, so it is shared
@@ -232,17 +235,20 @@ pub(crate) struct RequestContext {
 /// the handler can immediately produce an error response without entering the
 /// core pipeline.
 ///
-/// `request_id` is minted by the outermost `inject_request_id` layer and passed
-/// in by the handler so the id attached to the `x-request-id` header matches
-/// the id stamped on the request's tracing span (audit MEDIUM-1).
+/// `meta.request_id` is minted by the outermost `inject_request_id` layer and
+/// `meta.caller` is stamped by the client-auth middleware, so the id attached
+/// to the `x-request-id` header matches the id stamped on the request's
+/// tracing span (audit MEDIUM-1). An authenticated request is rate-limited
+/// under its key id, an anonymous one under its client IP.
 pub(crate) fn prepare_request(
     state: &AppState,
-    request_id: String,
+    meta: &crate::middleware::RequestMeta,
     headers: &HeaderMap,
-    connect_info: Option<&std::net::SocketAddr>,
     body: &[u8],
     path: &str,
 ) -> Result<RequestContext, RouteError> {
+    let caller = &meta.caller;
+    let connect_info = meta.connect_info.as_ref();
     let trust_forwarded_headers = state.trust_forwarded_headers();
     let client_ip = get_client_ip(headers, connect_info, trust_forwarded_headers);
     // Security: loopback bypass is intentional for local development and testing.
@@ -251,10 +257,21 @@ pub(crate) fn prepare_request(
     // processes on the same machine can bypass rate limiting. When
     // `trust_forwarded_headers` is true, the loopback check is disabled because
     // the peer IP may be spoofed by an intermediate reverse proxy.
-    let direct_loopback =
-        !trust_forwarded_headers && connect_info.is_some_and(|address| address.ip().is_loopback());
+    //
+    // The bypass applies only to unauthenticated callers: anonymous requests
+    // exist solely under the loopback-only `auth.mode = "none"`, so this
+    // preserves today's local behavior, while a request authenticated with a
+    // client key is always limited under its key id.
+    let direct_loopback = !trust_forwarded_headers
+        && !caller.is_authenticated()
+        && connect_info.is_some_and(|address| address.ip().is_loopback());
 
-    if !direct_loopback && !state.rate_limiter.is_allowed(&client_ip) {
+    let rate_limit_key = if caller.is_authenticated() {
+        caller.as_str().to_owned()
+    } else {
+        client_ip
+    };
+    if !direct_loopback && !state.rate_limiter.is_allowed(&rate_limit_key) {
         state.metrics.record_rate_limited();
         return Err(RouteError::RateLimited);
     }
@@ -265,8 +282,9 @@ pub(crate) fn prepare_request(
     }
 
     Ok(RequestContext {
-        request_id,
+        request_id: meta.request_id.0.clone(),
         start: Instant::now(),
+        caller: caller.as_str().to_owned(),
         body_hash: body_hash_of_bytes(body),
     })
 }
@@ -684,20 +702,43 @@ fn compute_cost(usage: &Usage, pricing: &ModelPricing) -> Cost {
     }
 }
 
+/// Resolved dispatch parameters shared by [`handle_core_once`] and
+/// [`handle_core_stream`]: which provider the URL named, which route kind is
+/// being served, and which client protocol the response must be encoded into.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CoreDispatch<'a> {
+    /// Provider name from the URL path.
+    pub(crate) provider_name: &'a str,
+    /// Route kind (`chat_completions` or `messages`).
+    pub(crate) route_kind: ProviderRouteKind,
+    /// Client protocol for the response encoding.
+    pub(crate) client_protocol: ClientProtocol,
+}
+
 /// Non-streaming core pipeline.
 ///
 /// ```text
 /// CoreRequest -> encode -> send -> decode -> client encode -> HTTP response
 /// ```
+#[expect(
+    clippy::too_many_lines,
+    reason = "the pipeline stages run in request order and each stage's \
+              metric + ResponseFailed emission sits next to the call that can \
+              fail; extracting stages would separate the failure bookkeeping \
+              from the step it belongs to"
+)]
 pub(crate) async fn handle_core_once(
     state: AppState,
     ctx: RequestContext,
-    provider_name: &str,
-    route_kind: ProviderRouteKind,
+    dispatch: CoreDispatch<'_>,
     core: CoreRequest,
-    client_protocol: ClientProtocol,
     inbound_auth: Option<SecretString>,
 ) -> Result<Response<Body>, RouteError> {
+    let CoreDispatch {
+        provider_name,
+        route_kind,
+        client_protocol,
+    } = dispatch;
     validate_provider_name_ref(provider_name)?;
 
     state.metrics.record_request(false);
@@ -726,6 +767,7 @@ pub(crate) async fn handle_core_once(
         .emit(&ProxyEvent::RequestReceived(RequestReceived {
             request_id: ctx.request_id.clone(),
             timestamp: time::OffsetDateTime::now_utc(),
+            caller: ctx.caller.clone(),
             provider: provider_name.to_owned(),
             route_kind: route_kind_str(route_kind).to_owned(),
             client_protocol: client_protocol_str(client_protocol).to_owned(),
@@ -992,15 +1034,24 @@ enum FirstByteResult {
 /// response: the spawned task sends the first event (or an error) back to
 /// the handler via a oneshot channel, and the handler decides whether to
 /// return an HTTP error or an SSE response.
+#[expect(
+    clippy::too_many_lines,
+    reason = "mirrors handle_core_once for the streaming path: stage order is \
+              the audit trail and each stage's failure bookkeeping stays next \
+              to the failing call"
+)]
 pub(crate) async fn handle_core_stream(
     state: AppState,
     ctx: RequestContext,
-    provider_name: &str,
-    route_kind: ProviderRouteKind,
+    dispatch: CoreDispatch<'_>,
     core: CoreRequest,
-    client_protocol: ClientProtocol,
     inbound_auth: Option<SecretString>,
 ) -> Result<Response<Body>, RouteError> {
+    let CoreDispatch {
+        provider_name,
+        route_kind,
+        client_protocol,
+    } = dispatch;
     validate_provider_name_ref(provider_name)?;
 
     state.metrics.record_request(true);
@@ -1033,6 +1084,7 @@ pub(crate) async fn handle_core_stream(
         .emit(&ProxyEvent::RequestReceived(RequestReceived {
             request_id: ctx.request_id.clone(),
             timestamp: time::OffsetDateTime::now_utc(),
+            caller: ctx.caller.clone(),
             provider: provider_name.to_owned(),
             route_kind: route_kind_str(route_kind).to_owned(),
             client_protocol: client_protocol_str(client_protocol).to_owned(),
@@ -1502,9 +1554,16 @@ async fn emit_encoder_finish(
 ///
 /// The `first_byte_tx` channel is used to signal the first-byte boundary:
 /// the spawned task sends either `FirstByteResult::FirstEvent` (once the
-/// first SSE event is produced) or `FirstByteResult::PreStreamError` (if
-/// the stream fails before any event). After the first event is sent, the
+/// first SSE event is produced) or `FirstByteResult::PreStreamError` (if the
+/// stream fails before any event). After the first event is sent, the
 /// channel is dropped and all subsequent errors become in-band SSE events.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one streaming state machine: the select-loop's cancellation, \
+              decode, first-byte, and disconnect transitions read as a unit; \
+              splitting the arms into helpers would scatter the state they \
+              mutate"
+)]
 fn build_sse_output_stream(
     byte_stream: std::pin::Pin<
         Box<
@@ -2564,6 +2623,7 @@ mod tests {
                 server_name: "test".to_owned(),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
         let providers =
             llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry");
@@ -2612,57 +2672,111 @@ mod tests {
     fn direct_loopback_bypasses_rate_limit() {
         let state = state_with_operational_config(1, false);
         let headers = HeaderMap::new();
-        let address = "127.0.0.1:12345".parse().unwrap();
+        let meta = test_meta(
+            crate::middleware::CallerId::anonymous(),
+            Some("127.0.0.1:12345"),
+        );
 
-        prepare_request(
-            &state,
-            "req-test".to_owned(),
-            &headers,
-            Some(&address),
-            b"one",
-            "/test",
-        )
-        .expect("request under the rate limit should be admitted");
-        prepare_request(
-            &state,
-            "req-test".to_owned(),
-            &headers,
-            Some(&address),
-            b"two",
-            "/test",
-        )
-        .expect("request under the rate limit should be admitted");
+        prepare_request(&state, &meta, &headers, b"one", "/test")
+            .expect("request under the rate limit should be admitted");
+        prepare_request(&state, &meta, &headers, b"two", "/test")
+            .expect("request under the rate limit should be admitted");
+    }
+
+    /// Build a `RequestMeta` for direct `prepare_request` calls.
+    fn test_meta(
+        caller: crate::middleware::CallerId,
+        peer: Option<&str>,
+    ) -> crate::middleware::RequestMeta {
+        crate::middleware::RequestMeta {
+            request_id: crate::middleware::RequestId("req-test".to_owned()),
+            caller,
+            connect_info: peer.map(|addr| addr.parse().unwrap()),
+        }
     }
 
     #[test]
     fn untrusted_forwarded_headers_cannot_bypass_rate_limit() {
         let state = state_with_operational_config(1, false);
-        let address = "198.51.100.10:12345".parse().unwrap();
+        let meta = test_meta(
+            crate::middleware::CallerId::anonymous(),
+            Some("198.51.100.10:12345"),
+        );
         let mut first_headers = HeaderMap::new();
         first_headers.insert("x-forwarded-for", "203.0.113.1".parse().unwrap());
         let mut second_headers = HeaderMap::new();
         second_headers.insert("x-forwarded-for", "203.0.113.2".parse().unwrap());
 
-        prepare_request(
-            &state,
-            "req-test".to_owned(),
-            &first_headers,
-            Some(&address),
-            b"one",
-            "/test",
-        )
-        .expect("request under the rate limit should be admitted");
+        prepare_request(&state, &meta, &first_headers, b"one", "/test")
+            .expect("request under the rate limit should be admitted");
         assert!(matches!(
-            prepare_request(
-                &state,
-                "req-test".to_owned(),
-                &second_headers,
-                Some(&address),
-                b"two",
-                "/test"
-            ),
+            prepare_request(&state, &meta, &second_headers, b"two", "/test"),
             Err(RouteError::RateLimited)
         ));
+    }
+
+    #[test]
+    fn authenticated_caller_is_limited_by_key_id_across_addresses() {
+        // An authenticated caller's bucket is the key id, not the peer IP: a
+        // second request carrying the same key from a different address
+        // shares the budget (1 rpm here), so it is rejected.
+        let state = state_with_operational_config(1, false);
+        let caller = crate::middleware::CallerId::authenticated("laptop");
+        let first_meta = test_meta(caller.clone(), Some("198.51.100.10:12345"));
+        let second_meta = test_meta(caller, Some("198.51.100.11:12345"));
+        let headers = HeaderMap::new();
+
+        prepare_request(&state, &first_meta, &headers, b"one", "/test")
+            .expect("first request under the rate limit should be admitted");
+        assert!(matches!(
+            prepare_request(&state, &second_meta, &headers, b"two", "/test"),
+            Err(RouteError::RateLimited)
+        ));
+    }
+
+    #[test]
+    fn authenticated_loopback_caller_is_still_rate_limited() {
+        // The loopback bypass exists for anonymous local clients (today's
+        // behavior under auth = "none"); an authenticated caller pays the
+        // limiter even from 127.0.0.1.
+        let state = state_with_operational_config(1, false);
+        let meta = test_meta(
+            crate::middleware::CallerId::authenticated("laptop"),
+            Some("127.0.0.1:12345"),
+        );
+        let headers = HeaderMap::new();
+
+        prepare_request(&state, &meta, &headers, b"one", "/test")
+            .expect("first request under the rate limit should be admitted");
+        assert!(matches!(
+            prepare_request(&state, &meta, &headers, b"two", "/test"),
+            Err(RouteError::RateLimited)
+        ));
+    }
+
+    #[test]
+    fn request_context_carries_caller_attribution() {
+        let state = state_with_operational_config(100, false);
+        let headers = HeaderMap::new();
+        let ctx = prepare_request(
+            &state,
+            &test_meta(crate::middleware::CallerId::anonymous(), None),
+            &headers,
+            b"",
+            "/test",
+        )
+        .expect("request admitted");
+        assert_eq!(ctx.caller, "anonymous");
+
+        let ctx = prepare_request(
+            &state,
+            &test_meta(crate::middleware::CallerId::authenticated("laptop"), None),
+            &headers,
+            b"",
+            "/test",
+        )
+        .expect("request admitted");
+        assert_eq!(ctx.caller, "laptop");
     }
 
     // -- map_provider_error -----------------------------------------------------
@@ -2758,6 +2872,7 @@ mod tests {
                 dedup_window: std::time::Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
 
         let providers =
@@ -2828,6 +2943,7 @@ mod tests {
                 dedup_window: std::time::Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
 
         let providers =

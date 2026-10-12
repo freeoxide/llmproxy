@@ -37,6 +37,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(
@@ -100,6 +101,7 @@ mod tests {
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
                 },
+                auth: Default::default(),
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -905,6 +907,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(

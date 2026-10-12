@@ -76,6 +76,13 @@ pub struct ResponsesStreamDecoder {
 }
 
 impl ProviderStreamDecoder for ResponsesStreamDecoder {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match arm per Responses API stream event: the wire shape \
+                 is a single translation table, and splitting the arms into \
+                 helpers would separate each event's field mapping from the \
+                 frame layout it produces"
+    )]
     fn decode_frame(&mut self, frame: &SseFrame) -> Result<Vec<CoreEvent>, ProviderError> {
         let data = frame.data.trim();
         if data.is_empty() || data == "[DONE]" {
@@ -534,6 +541,12 @@ fn push_message_text(output: &ResponsesOutput, content: &mut Vec<CoreContent>) {
 
 impl ResponsesAdapter {
     /// Encode a core request into a Responses API request.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "field-by-field wire encode of the Responses API request shape, \
+                 kept in one place so the mapping can be audited against the \
+                 API schema without jumping between helpers"
+    )]
     pub fn encode_request(
         &self,
         core: &CoreRequest,

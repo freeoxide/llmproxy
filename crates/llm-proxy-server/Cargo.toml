@@ -34,6 +34,7 @@ bytes = "1"
 futures = "0.3"
 regex = { workspace = true }
 sha2 = "0.10"
+argon2 = { workspace = true }
 toml = { workspace = true }
 time = { workspace = true }
 secrecy = { workspace = true }

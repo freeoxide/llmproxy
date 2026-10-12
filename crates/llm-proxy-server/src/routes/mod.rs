@@ -16,9 +16,10 @@ use tower_http::{
 };
 use tracing::info_span;
 
-use crate::middleware::{RequestId, RequestIdGenerator};
+use crate::middleware::{CallerId, RequestId, RequestIdGenerator, extract_bearer_token};
 use crate::state::AppState;
 use llm_proxy_storage::EventBus;
+use secrecy::ExposeSecret;
 
 mod chat;
 mod core_pipeline;
@@ -86,6 +87,10 @@ pub fn router(state: AppState) -> Router {
     // rejections produced by the timeout/body-limit layers (audit finding: layer
     // fallbacks emit no terminal event).
     let event_bus = Arc::clone(&state.event_bus);
+    // The client-auth layer needs the full AppState (auth state, rate limiter,
+    // metrics), so the state is cloned once for it before being moved into
+    // `with_state` below.
+    let state_arc = state.clone();
 
     // Span factory shared by both routers: it reads the id injected by the
     // outermost layer so every request span carries `request_id`, matching the
@@ -103,26 +108,31 @@ pub fn router(state: AppState) -> Router {
                 .layer(trace.clone()),
         );
 
-    // API routes: request-id injection, error normalisation, body limit,
-    // tracing, timeout.
+    // API routes: request-id injection, client auth, error normalisation,
+    // body limit, tracing, timeout.
     //
     // Layer order (outermost first):
     //   1. `inject_request_id` -- generates the id and stamps it into extensions
-    //      so the span (step 4) and the handler see the same id.
-    //   2. `normalize_error_responses` -- rewrites the 408 (timeout) and 413
+    //      so the span (step 5) and the handler see the same id.
+    //   2. `require_client_auth` -- under `auth.mode = "client-keys"`, rejects
+    //      requests without a valid `Authorization: Bearer <client-key>` with a
+    //      401 before any body buffering. Under `auth.mode = "none"` it stamps
+    //      the anonymous caller and passes through.
+    //   3. `normalize_error_responses` -- rewrites the 408 (timeout) and 413
     //      (body-limit) rejections emitted by layers below into protocol-shaped
     //      JSON envelopes carrying `x-request-id` (audit MEDIUM-7). It runs
     //      outside the body-limit/timeout layers so their rejections pass
     //      through it on the way out.
-    //   3. `DefaultBodyLimit` -- caps the body the JSON extractors can buffer.
-    //   4. `TraceLayer` -- opens the request span (carrying the request id).
-    //   5. `TimeoutLayer` -- cancels handler work exceeding `request_timeout`.
+    //   4. `DefaultBodyLimit` -- caps the body the JSON extractors can buffer.
+    //   5. `TraceLayer` -- opens the request span (carrying the request id).
+    //   6. `TimeoutLayer` -- cancels handler work exceeding `request_timeout`.
     //
     // Because the timeout and body-limit layers emit non-JSON, header-less
-    // rejections, step 2 normalises their final responses into the same
+    // rejections, step 3 normalises their final responses into the same
     // Anthropic/OpenAI-shaped JSON schema every handler uses.
     let api_middleware = ServiceBuilder::new()
         .layer(from_fn_with_state(id_gen, inject_request_id))
+        .layer(from_fn_with_state(state_arc, require_client_auth))
         .layer(from_fn_with_state(event_bus, normalize_error_responses))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(trace)
@@ -248,6 +258,90 @@ async fn inject_request_id(
     let id = id_gen.next_id();
     req.extensions_mut().insert(RequestId(id));
     next.run(req).await
+}
+
+/// Client-key authentication for proxy routes.
+///
+/// Under `auth.mode = "client-keys"`, a request must carry
+/// `Authorization: Bearer <client-key>` matching a configured
+/// `[auth.clients]` verifier; the matching key id is stamped into extensions
+/// as [`CallerId`] for event attribution and rate-limit keying. Anything
+/// else — missing header, unknown scheme, wrong token — gets a 401 whose
+/// body carries no secret material (the standard `Unauthorized` envelope).
+///
+/// Under `auth.mode = "none"` (loopback binds only, enforced by config
+/// validation at startup), every request is stamped
+/// [`CallerId::anonymous`] and passes through unchanged.
+///
+/// The bearer token is never logged and never echoed in the response. Failed
+/// attempts additionally consume the peer's IP rate-limit bucket: once it is
+/// empty, further failures skip the (CPU-costly) argon2 verification
+/// entirely, so a flood of garbage tokens cannot pin the blocking pool, while
+/// the response stays a uniform 401 either way. A failed attempt also emits a
+/// `ResponseFailed` so rejected requests stay attributable in the event log,
+/// mirroring the 404/405/408/413 layer-rejection pattern.
+async fn require_client_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if !state.client_auth.is_enforced() {
+        let mut req = req;
+        req.extensions_mut().insert(CallerId::anonymous());
+        return next.run(req).await;
+    }
+
+    let authenticated = match extract_bearer_token(req.headers()) {
+        Some(token) => state.client_auth.authenticate(token.expose_secret()).await,
+        None => None,
+    };
+
+    let mut req = req;
+    match authenticated {
+        Some(key_id) => {
+            tracing::debug!(caller = %key_id, "client authenticated");
+            req.extensions_mut().insert(CallerId::authenticated(key_id));
+            next.run(req).await
+        }
+        None => {
+            // Uniform rejection path: flood guard first (bounds the argon2
+            // spend of repeated failures), then event + 401 envelope.
+            let connect_info = req
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0);
+            let client_ip = crate::middleware::get_client_ip(
+                req.headers(),
+                connect_info.as_ref(),
+                state.trust_forwarded_headers(),
+            );
+            if !state.rate_limiter.is_allowed(&client_ip) {
+                state.metrics.record_rate_limited();
+            }
+            let request_id = req
+                .extensions()
+                .get::<RequestId>()
+                .cloned()
+                .unwrap_or_else(|| RequestId("unknown".to_owned()));
+            let path = req.uri().path().to_owned();
+            // Drain the body so a rejected connection is not left half-read.
+            if let Err(e) = axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await
+            {
+                tracing::trace!(error = %e, "draining body of auth-rejected request failed");
+            }
+            let error = error_response::RouteError::Unauthorized;
+            core_pipeline::emit_response_failed(
+                &state.event_bus,
+                &request_id.0,
+                None,
+                None,
+                &error,
+                std::time::Instant::now(),
+            );
+            let mut response =
+                error_response::route_error_response(protocol_for_path(&path), &error);
+            if let Ok(value) = request_id.0.parse() {
+                response.headers_mut().insert("x-request-id", value);
+            }
+            response
+        }
+    }
 }
 
 /// Build the per-request tracing span, carrying the injected request id.

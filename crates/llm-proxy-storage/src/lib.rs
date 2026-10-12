@@ -46,6 +46,10 @@ pub struct RequestReceived {
     /// When the request was received (RFC 3339).
     #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
+    /// Authenticated client key id, or `"anonymous"` when the request was
+    /// served under the loopback no-auth exemption. Key ids are operator
+    /// chosen; client secrets never appear on events.
+    pub caller: String,
     /// Provider name from the URL path.
     pub provider: String,
     /// Route kind (`"chat_completions"` or `"messages"`).
@@ -204,6 +208,7 @@ mod tests {
         RequestReceived {
             request_id: "req-1".to_owned(),
             timestamp: OffsetDateTime::now_utc(),
+            caller: "anonymous".to_owned(),
             provider: "p".to_owned(),
             route_kind: "messages".to_owned(),
             client_protocol: "anthropic".to_owned(),
@@ -275,6 +280,7 @@ mod tests {
         let event = ProxyEvent::RequestReceived(RequestReceived {
             request_id: "req-1".to_owned(),
             timestamp,
+            caller: "anonymous".to_owned(),
             provider: "p".to_owned(),
             route_kind: "messages".to_owned(),
             client_protocol: "anthropic".to_owned(),
@@ -413,6 +419,7 @@ mod tests {
         let req = ProxyEvent::RequestReceived(RequestReceived {
             request_id: SENTINEL.to_owned(),
             timestamp: OffsetDateTime::now_utc(),
+            caller: SENTINEL.to_owned(),
             provider: SENTINEL.to_owned(),
             route_kind: SENTINEL.to_owned(),
             client_protocol: SENTINEL.to_owned(),

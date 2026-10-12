@@ -360,6 +360,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
 
         AppState::new(
@@ -1104,6 +1105,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
         AppState::new(
             app_config,

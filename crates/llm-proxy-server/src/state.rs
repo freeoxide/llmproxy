@@ -6,7 +6,7 @@ use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_storage::{EventBus, NoopBus};
 
 use crate::ModelCatalogService;
-use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
+use crate::middleware::{ClientAuth, RateLimiter, RequestDeduplicator, RequestIdGenerator};
 
 /// Static information about this binary.
 #[derive(Debug, Clone)]
@@ -47,6 +47,10 @@ pub struct BuildInfo {
 ///   `ProviderAdapter` types whose `api_key` is `SecretString`; the adapter
 ///   config/target types keep a *manual* `Debug` that additionally redacts the
 ///   endpoint query string and auth-header *values* (not just the key). Safe.
+/// - `AppState` -> `client_auth` field: `ClientAuth` holds **hashed argon2id
+///   verifiers only, never plaintext client secrets**; its manual `Debug`
+///   prints the mode and key ids and never the verifier strings (a PHC hash
+///   is offline-crackable, so it is treated as sensitive). Safe.
 /// - `AppState` -> remaining fields: `BuildInfo`, `proxy_client`, `Counter`,
 ///   `Metrics`, `RateLimiter`, `RequestDeduplicator`, `RequestIdGenerator`,
 ///   `model_catalogs`, `event_bus` -- none hold secrets. Safe.
@@ -92,6 +96,13 @@ pub struct AppState {
     /// Structured request/response event sink. Defaults to [`NoopBus`]; a real
     /// persisted backend lands in a later phase.
     pub(crate) event_bus: Arc<dyn EventBus>,
+    /// Client-key authentication state: hashed argon2id verifiers plus a
+    /// digest cache. Built from `[auth]` config; construction from an invalid
+    /// auth config fails closed (enforced, nothing can authenticate) rather
+    /// than silently downgrading to no-auth, because the constructors are
+    /// infallible. `cmd_serve` surfaces invalid verifiers as a startup error
+    /// via `ClientAuth::from_config` before the state is built.
+    pub(crate) client_auth: Arc<ClientAuth>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -119,6 +130,7 @@ impl std::fmt::Debug for AppState {
             .field("request_id_gen", &self.request_id_gen)
             .field("model_catalogs", &self.model_catalogs)
             .field("event_bus", &self.event_bus)
+            .field("client_auth", &self.client_auth)
             .finish()
     }
 }
@@ -159,6 +171,22 @@ impl AppState {
         // matching the documented "0s disables deduplication" contract.
         let dedup_window_ms =
             u64::try_from(app_config.server.dedup_window.as_millis()).unwrap_or(0);
+        // Auth state from `[auth]` config. Construction is infallible, so an
+        // invalid auth config (e.g. an unparseable verifier) fails CLOSED --
+        // enforced with zero verifiers, rejecting every proxied request -- and
+        // logs the error, rather than silently downgrading to no-auth. The
+        // serve path validates the auth config first (`ClientAuth::from_config`
+        // in `load_toml_state`) and turns this into a startup error.
+        let client_auth = match ClientAuth::from_config(&app_config.auth) {
+            Ok(auth) => Arc::new(auth),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "invalid [auth] config; failing closed (all proxy requests will be rejected)"
+                );
+                Arc::new(ClientAuth::fail_closed())
+            }
+        };
         Self {
             app_config: Arc::new(app_config),
             providers: Arc::new(providers),
@@ -172,7 +200,18 @@ impl AppState {
             request_id_gen: Arc::new(RequestIdGenerator::new()),
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
+            client_auth,
         }
+    }
+
+    /// Replace the client-auth state (builder-style). Used by `cmd_serve`
+    /// (after `ClientAuth::from_config` succeeds, so an invalid verifier is a
+    /// startup error rather than a runtime fail-closed) and by tests that
+    /// exercise authenticated routing.
+    #[must_use]
+    pub fn with_client_auth(mut self, client_auth: Arc<ClientAuth>) -> Self {
+        self.client_auth = client_auth;
+        self
     }
 
     /// Replace the event bus (builder-style). Used by tests to inject a
@@ -265,6 +304,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         }
     }
 
@@ -376,6 +416,7 @@ mod tests {
             "request_id_gen",
             "model_catalogs",
             "event_bus",
+            "client_auth",
         ] {
             assert!(
                 debug_output.contains(field),
@@ -708,5 +749,74 @@ mod tests {
             make_build_info(),
         );
         assert_eq!(state.server_name(), long_name);
+    }
+
+    // -- Client auth state ------------------------------------------------------
+
+    #[test]
+    fn invalid_auth_config_fails_closed() {
+        // An unparseable verifier cannot be allowed to downgrade the server to
+        // no-auth: the state must come up enforced with zero verifiers, so
+        // every proxied request is rejected.
+        let mut cfg = make_app_config();
+        cfg.auth.mode = llm_proxy_core::AuthMode::ClientKeys;
+        cfg.auth.clients.insert(
+            "laptop".to_owned(),
+            secrecy::SecretString::from("not-a-phc-string"),
+        );
+        let state = AppState::new(
+            cfg,
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        );
+        assert!(
+            state.client_auth.is_enforced(),
+            "invalid auth config must fail closed, not open"
+        );
+        assert_eq!(state.client_auth.client_count(), 0);
+    }
+
+    #[test]
+    fn app_state_debug_does_not_leak_client_verifiers() {
+        // The client verifier hash must never surface through Debug, matching
+        // the api_key discipline. Use a real (cheap-parameter) argon2id hash
+        // so the verifier parses.
+        use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
+        let params = Params::new(8, 1, 1, None).expect("valid test params");
+        let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+        let phc = hasher
+            .hash_password_customized(
+                b"leakable-secret-tail",
+                b"0123456789abcdef",
+                Some(&argon2::ARGON2ID_IDENT),
+                None,
+                params,
+            )
+            .expect("hash token")
+            .to_string();
+
+        let mut cfg = make_app_config();
+        cfg.auth.mode = llm_proxy_core::AuthMode::ClientKeys;
+        cfg.auth
+            .clients
+            .insert("laptop".to_owned(), secrecy::SecretString::from(phc));
+        let client_auth =
+            crate::middleware::ClientAuth::from_config(&cfg.auth).expect("valid verifier");
+        let state = AppState::new(
+            cfg,
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        )
+        .with_client_auth(Arc::new(client_auth));
+        let debug = format!("{state:?}");
+        assert!(
+            !debug.contains("leakable-secret-tail"),
+            "client secret/verifier must not appear in Debug, got: {debug}"
+        );
+        assert!(debug.contains("laptop"), "key id may appear: {debug}");
     }
 }

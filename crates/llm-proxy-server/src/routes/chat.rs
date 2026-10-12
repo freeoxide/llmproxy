@@ -12,14 +12,14 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Response};
 use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::openai::ChatCompletionRequest;
 use tracing::{info, warn};
 
-use crate::middleware::{OptionalConnectInfo, RequestId};
+use crate::middleware::RequestMeta;
 use crate::state::AppState;
 
 use super::core_pipeline;
@@ -32,8 +32,7 @@ use super::error_response::{ClientProtocol, RouteError, route_error_response};
 pub(crate) async fn handle_chat_completions(
     State(state): State<AppState>,
     Path(provider): Path<String>,
-    Extension(req_id): Extension<RequestId>,
-    OptionalConnectInfo(connect_info): OptionalConnectInfo,
+    meta: RequestMeta,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response<Body> {
@@ -44,8 +43,7 @@ pub(crate) async fn handle_chat_completions(
     // blanket emit here would double-count every pipeline failure (the pipeline
     // emits AND returns Err via `?`), so the wrapper must stay emit-free
     // (audit route-responsefailed-gaps regression).
-    match handle_chat_completions_inner(state, req_id, provider, connect_info, headers, body).await
-    {
+    match handle_chat_completions_inner(state, meta, provider, headers, body).await {
         Ok(response) => response,
         Err(error) => {
             warn!(error = %error, "request failed");
@@ -63,9 +61,8 @@ pub(crate) async fn handle_chat_completions(
 /// function propagates without re-emitting. The outer wrapper renders only.
 async fn handle_chat_completions_inner(
     state: AppState,
-    req_id: RequestId,
+    meta: RequestMeta,
     provider: String,
-    connect_info: Option<std::net::SocketAddr>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response<Body>, RouteError> {
@@ -73,7 +70,7 @@ async fn handle_chat_completions_inner(
     let event_bus = Arc::clone(&state.event_bus);
     // The request id is consumed by prepare_request below; snapshot it once so
     // every early-gate emit references the same id.
-    let request_id = req_id.0.clone();
+    let request_id = meta.request_id.0.clone();
     // Every early gate emits exactly one ResponseFailed with the same
     // provider/request/start triple; bind it once instead of repeating the
     // six-argument call at each gate.
@@ -102,15 +99,8 @@ async fn handle_chat_completions_inner(
     core_pipeline::validate_json_content_type(&headers).inspect_err(&emit_failed)?;
 
     let request_path = format!("/providers/{provider}/v1/chat/completions");
-    let ctx = core_pipeline::prepare_request(
-        &state,
-        req_id.0,
-        &headers,
-        connect_info.as_ref(),
-        &body,
-        &request_path,
-    )
-    .inspect_err(&emit_failed)?;
+    let ctx = core_pipeline::prepare_request(&state, &meta, &headers, &body, &request_path)
+        .inspect_err(&emit_failed)?;
 
     // Parse the OpenAI ChatCompletionRequest via axum's `Json` helper so the
     // `JsonRejection` taxonomy (syntax vs data error) is preserved and mapped
@@ -145,28 +135,15 @@ async fn handle_chat_completions_inner(
     // Extract the inbound client auth token (used by passthrough-auth providers).
     let inbound_auth = core_pipeline::extract_inbound_auth(&headers);
 
+    let dispatch = core_pipeline::CoreDispatch {
+        provider_name: &provider,
+        route_kind: ProviderRouteKind::ChatCompletions,
+        client_protocol: ClientProtocol::OpenAiChat,
+    };
     if is_streaming {
-        core_pipeline::handle_core_stream(
-            state,
-            ctx,
-            &provider,
-            ProviderRouteKind::ChatCompletions,
-            core,
-            ClientProtocol::OpenAiChat,
-            inbound_auth,
-        )
-        .await
+        core_pipeline::handle_core_stream(state, ctx, dispatch, core, inbound_auth).await
     } else {
-        core_pipeline::handle_core_once(
-            state,
-            ctx,
-            &provider,
-            ProviderRouteKind::ChatCompletions,
-            core,
-            ClientProtocol::OpenAiChat,
-            inbound_auth,
-        )
-        .await
+        core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound_auth).await
     }
 }
 

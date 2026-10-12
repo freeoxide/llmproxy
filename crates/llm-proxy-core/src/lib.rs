@@ -56,11 +56,11 @@ pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
 pub use pid::{PidError, PidManager};
 pub use provider_config::{
-    AppConfig, AuthStyle, ConfigValidationError, LogFormat, ModelId, ModelPricing,
-    ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig,
-    ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderFile, ProviderRouteKind,
-    ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry, load_app_config,
-    load_provider_config, validate_provider_config,
+    ANONYMOUS_CALLER, AppConfig, AuthConfig, AuthMode, AuthStyle, ConfigValidationError, LogFormat,
+    ModelId, ModelPricing, ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode,
+    ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderFile,
+    ProviderRouteKind, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
+    load_app_config, load_provider_config, validate_provider_config,
 };
 pub use provider_registry::{
     ProviderAdapterTargetConfig, ProviderRegistry, ProviderRouteResolutionError,

@@ -50,6 +50,8 @@ anyhow = "1"
 
 # Secrets
 secrecy = { version = "0.10", features = ["serde"] }
+# Password hashing KDF for client-key verifiers (PHC strings)
+argon2 = "0.6"
 
 # Tokenization
 tiktoken-rs = "0.6"

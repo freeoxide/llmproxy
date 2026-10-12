@@ -20,3 +20,22 @@ trust_forwarded_headers = false
 # Window for rejecting identical path/body requests. "0ms" disables dedup.
 dedup_window = "0ms"
 server_name = "llm-proxy"
+
+# Client authentication for proxy routes.
+#
+# mode = "none" (default): no client authentication. Only permitted while
+# [server].bind is a loopback address; the server refuses to start on a
+# non-loopback bind without client keys.
+[auth]
+mode = "none"
+# mode = "client-keys": every proxy request must present
+# "Authorization: Bearer <client-key>". Named keys map key ids to argon2id
+# password hashes in PHC format -- never plaintext secrets. Generate one with
+# e.g. `printf 'my-secret' | argon2 'some-salt' -id -e`.
+# The key id (not the secret) appears in usage events and rate-limit keys.
+#
+# [auth]
+# mode = "client-keys"
+#
+# [auth.clients]
+# laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."

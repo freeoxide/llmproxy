@@ -222,6 +222,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
 
         AppState::new(
@@ -416,6 +417,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(
@@ -486,6 +488,7 @@ mod tests {
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
             },
+            auth: Default::default(),
         };
         AppState::new(
             app_config,
@@ -954,6 +957,12 @@ mod tests {
     /// streaming tool-call start/delta/stop maps to choices[].delta.tool_calls
     /// Verifies the full start/delta/stop sequence: start has id + function.name,
     /// delta has function.arguments with partial JSON, and correct index values.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end streaming scenario: the mock feed, the SSE \
+                 consumption, and the start/delta/stop assertions read as a \
+                 single narrative"
+    )]
     #[tokio::test]
     async fn streaming_tool_call_maps_to_delta_tool_calls() {
         // This test uses an Anthropic provider that returns tool call events.
@@ -2008,6 +2017,12 @@ mod tests {
     }
 
     /// Same model name routed to different providers via URL path.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end routing scenario: two provider registries, two \
+                 dispatches, and their divergent assertions read as a single \
+                 narrative"
+    )]
     #[tokio::test]
     async fn same_model_routes_to_different_providers() {
         // Create two providers both supporting chat_completions.
@@ -2077,6 +2092,7 @@ mod tests {
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
                 },
+                auth: Default::default(),
             },
             registry,
             ProviderAdapterRegistry::builtin(),

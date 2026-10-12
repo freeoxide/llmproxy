@@ -91,6 +91,12 @@ fn parse_tool_call_arguments(arguments: &str) -> Option<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 /// Decode an OpenAI [`ChatCompletionRequest`] into a normalised [`CoreRequest`].
+#[expect(
+    clippy::too_many_lines,
+    reason = "field-by-field wire decode of the OpenAI Chat request shape, kept \
+             in one place so the mapping can be audited against the API schema \
+             without jumping between helpers"
+)]
 pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, ProtocolError> {
     if req.model.is_empty() {
         return Err(ProtocolError::InvalidRequest("model is required".into()));
@@ -367,6 +373,12 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
 ///   separator into a single string for `reasoning_content`.
 /// - `stop_sequence` is silently dropped since OpenAI has no native field for it.
 /// - `provider_meta` is silently dropped (for provider adapters only).
+#[expect(
+    clippy::too_many_lines,
+    reason = "field-by-field wire encode of the OpenAI Chat response shape, kept \
+             in one place so the mapping can be audited against the API schema \
+             without jumping between helpers"
+)]
 pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, ProtocolError> {
     if !resp.provider_meta.is_empty() {
         tracing::warn!(
@@ -625,6 +637,13 @@ impl StreamEncoder {
     }
 
     /// Encode a single [`CoreEvent`] into zero or more [`ChatCompletionChunk`]s.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match arm per CoreEvent variant: the OpenAI Chat SSE chunk \
+                 wire shape is a single translation table, and splitting the arms \
+                 into helpers would separate each event's field mapping from the \
+                 chunk layout it produces"
+    )]
     pub fn encode_event(
         &mut self,
         event: CoreEvent,
