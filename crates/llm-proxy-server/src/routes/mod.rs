@@ -273,13 +273,24 @@ async fn inject_request_id(
 /// validation at startup), every request is stamped
 /// [`CallerId::anonymous`] and passes through unchanged.
 ///
-/// The bearer token is never logged and never echoed in the response. Failed
-/// attempts additionally consume the peer's IP rate-limit bucket: once it is
-/// empty, further failures skip the (CPU-costly) argon2 verification
-/// entirely, so a flood of garbage tokens cannot pin the blocking pool, while
-/// the response stays a uniform 401 either way. A failed attempt also emits a
-/// `ResponseFailed` so rejected requests stay attributable in the event log,
-/// mirroring the 404/405/408/413 layer-rejection pattern.
+/// The bearer token is never logged and never echoed in the response.
+///
+/// # Garbage-token flood bound
+///
+/// Every failed attempt (missing or invalid token) is charged to the peer's
+/// IP rate-limit bucket, and a peer whose bucket is empty is rejected
+/// **before** the CPU-costly argon2 verification runs. A flood of garbage
+/// tokens from one peer therefore pays at most `rate_limit_rpm` verifications
+/// per minute (times the number of configured keys) instead of one per
+/// request, and the blocking pool cannot be pinned by unauthenticated
+/// traffic. Successful authentications are never charged to the IP bucket —
+/// their requests are limited under the key id inside `prepare_request` —
+/// and the response stays a uniform 401 on every rejection path, so the gate
+/// leaks nothing about which check failed. When rate limiting is disabled
+/// (`rate_limit_rpm = 0`) no bound applies; the operator turned the limiter
+/// off. A failed attempt also emits a `ResponseFailed` so rejected requests
+/// stay attributable in the event log, mirroring the 404/405/408/413
+/// layer-rejection pattern.
 async fn require_client_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if !state.client_auth.is_enforced() {
         let mut req = req;
@@ -287,8 +298,31 @@ async fn require_client_auth(State(state): State<AppState>, req: Request, next: 
         return next.run(req).await;
     }
 
+    // Peer identity for the failure-budget gate; captured before the request
+    // is consumed by verification or the inner service.
+    let connect_info = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0);
+    let client_ip = crate::middleware::get_client_ip(
+        req.headers(),
+        connect_info.as_ref(),
+        state.trust_forwarded_headers(),
+    );
+
     let authenticated = match extract_bearer_token(req.headers()) {
-        Some(token) => state.client_auth.authenticate(token.expose_secret()).await,
+        Some(token) => {
+            // Flood gate BEFORE verification: a peer that already exhausted
+            // its failure budget is rejected without paying for argon2. The
+            // response is the same uniform 401 the verification failure
+            // produces, so the gate is not observable to the peer.
+            if !state.rate_limiter.would_allow(&client_ip) {
+                state.metrics.record_rate_limited();
+                None
+            } else {
+                state.client_auth.authenticate(token.expose_secret()).await
+            }
+        }
         None => None,
     };
 
@@ -300,17 +334,10 @@ async fn require_client_auth(State(state): State<AppState>, req: Request, next: 
             next.run(req).await
         }
         None => {
-            // Uniform rejection path: flood guard first (bounds the argon2
-            // spend of repeated failures), then event + 401 envelope.
-            let connect_info = req
-                .extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0);
-            let client_ip = crate::middleware::get_client_ip(
-                req.headers(),
-                connect_info.as_ref(),
-                state.trust_forwarded_headers(),
-            );
+            // Charge the failure to the peer's IP bucket so repeated failures
+            // drain it and trip the pre-verification gate above. When the
+            // bucket is already empty this consumes nothing and records the
+            // limiter metric.
             if !state.rate_limiter.is_allowed(&client_ip) {
                 state.metrics.record_rate_limited();
             }
@@ -583,5 +610,135 @@ mod tests {
             "https://app.example.com".to_owned(),
         ];
         assert!(cors_layer_for(Some(&origins)).is_some());
+    }
+}
+
+/// Tests for the garbage-token flood gate in [`require_client_auth`].
+///
+/// The gate's purpose: a peer whose failure budget is exhausted is rejected
+/// BEFORE the argon2 verification runs, so an unauthenticated flood cannot
+/// pin the blocking pool. The peer-visible response is the same uniform 401
+/// either way, so the gate is proven here through its one observable
+/// consequence: a peer that burned its budget cannot authenticate even with a
+/// VALID token until the bucket refills.
+#[cfg(test)]
+mod auth_gate_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Build an AppState with enforced client auth for `token` and the given
+    /// per-IP rate limit, plus a minimal router whose probe handler answers
+    /// 200 when a request makes it past the auth layer.
+    fn auth_router(rate_limit_rpm: u32) -> (Router, AppState) {
+        use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
+
+        let params = Params::new(8, 1, 1, None).expect("valid test params");
+        let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+        let phc = hasher
+            .hash_password_customized(
+                b"sekrit-token",
+                b"0123456789abcdef",
+                Some(&argon2::ARGON2ID_IDENT),
+                None,
+                params,
+            )
+            .expect("hash token")
+            .to_string();
+
+        let mut clients = std::collections::HashMap::new();
+        clients.insert("laptop".to_owned(), secrecy::SecretString::from(phc));
+        let app_config = llm_proxy_core::AppConfig {
+            server: llm_proxy_core::ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: std::time::Duration::from_secs(300),
+                shutdown_timeout: std::time::Duration::from_secs(30),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                allowed_origins: None,
+                server_name: "gate-test".to_owned(),
+                rate_limit_rpm,
+                trust_forwarded_headers: false,
+                dedup_window: std::time::Duration::ZERO,
+                log_format: Default::default(),
+            },
+            auth: llm_proxy_core::AuthConfig {
+                mode: llm_proxy_core::AuthMode::ClientKeys,
+                clients,
+            },
+        };
+
+        let state = crate::state::AppState::new(
+            app_config,
+            llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry"),
+            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
+            llm_proxy_provider::ProxyClient::new(),
+            crate::state::BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        );
+
+        let router = Router::new()
+            .route(
+                "/providers/x/v1/messages",
+                post(|| async { StatusCode::OK }),
+            )
+            .layer(from_fn_with_state(
+                state.clone(),
+                super::require_client_auth,
+            ));
+        (router, state)
+    }
+
+    fn bearer_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/x/v1/messages")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_token_passes_when_the_peer_has_budget() {
+        let (app, _state) = auth_router(100);
+        let response = app.oneshot(bearer_request("sekrit-token")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn exhausted_failure_budget_gates_verification_before_argon2() {
+        // rate_limit_rpm = 1: one failed attempt drains the peer's budget.
+        // `oneshot` consumes the router, so each request clones it; the clones
+        // share the same underlying state (one rate-limit bucket).
+        let (app, state) = auth_router(1);
+
+        // Failure #1 pays for verification and charges the last token.
+        let first = app
+            .clone()
+            .oneshot(bearer_request("wrong-token"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.metrics.get_snapshot().rate_limited, 0);
+
+        // Failure #2 carries a VALID token: the bucket is empty, so the gate
+        // rejects before verification. If the argon2 check ran first, this
+        // request would authenticate and the probe handler would answer 200.
+        let second = app.oneshot(bearer_request("sekrit-token")).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::UNAUTHORIZED,
+            "a peer with an exhausted failure budget must be gated before verification"
+        );
+        assert!(
+            state.metrics.get_snapshot().rate_limited >= 1,
+            "the gate records a limiter rejection"
+        );
     }
 }

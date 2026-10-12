@@ -449,3 +449,198 @@ the refactor instead.
 
 - cargo shear still not run (binary absent from this environment; no
   dependency changes this round).
+
+## committer — PRX-01
+
+- Commit: `499b22a8209686574420023c7ee1491a87ac0ae3` on branch
+  `prx/usage-ledger` (branched from master @ 7d91377).
+- Message: "Add named client keys with caller attribution".
+- Staged paths (32): .gitignore; .z-proflow/STATE.md; Cargo.lock; Cargo.toml;
+  apps/llm-proxy/src/platform.rs;
+  apps/llm-proxy/src/snapshots/llm_proxy_app__platform__tests__desktop_entry_basic.snap;
+  apps/llm-proxy/src/state.rs; apps/llm-proxy/tests/cli_validate.rs;
+  config.toml.example; crates/llm-proxy-core/src/lib.rs;
+  crates/llm-proxy-core/src/provider_config.rs;
+  crates/llm-proxy-protocol/src/client/anthropic.rs;
+  crates/llm-proxy-protocol/src/client/openai_chat.rs;
+  crates/llm-proxy-provider/src/adapter/gemini.rs;
+  crates/llm-proxy-provider/src/adapter/openai_chat.rs;
+  crates/llm-proxy-provider/src/adapter/responses.rs;
+  crates/llm-proxy-provider/tests/fixture_tests.rs;
+  crates/llm-proxy-server/Cargo.toml; crates/llm-proxy-server/src/lib.rs;
+  crates/llm-proxy-server/src/middleware.rs;
+  crates/llm-proxy-server/src/routes/chat.rs;
+  crates/llm-proxy-server/src/routes/core_pipeline.rs;
+  crates/llm-proxy-server/src/routes/messages.rs;
+  crates/llm-proxy-server/src/routes/mod.rs;
+  crates/llm-proxy-server/src/routes/models.rs;
+  crates/llm-proxy-server/src/routes/token_count.rs;
+  crates/llm-proxy-server/src/state.rs;
+  crates/llm-proxy-server/tests/chat_completions.rs;
+  crates/llm-proxy-server/tests/core_pipeline.rs;
+  crates/llm-proxy-server/tests/integration.rs;
+  crates/llm-proxy-server/tests/openrouter_e2e.rs;
+  crates/llm-proxy-storage/src/lib.rs.
+- The ask's explicit list was staged in full; the out-of-list files above
+  (core config/storage, server middleware/state/lib/routes-mod/models,
+  server + app tests, Cargo manifests + lock, config example) were staged as
+  area-relevant per the PRX-01 routing map and the implementer rounds in this
+  file — the listed route/protocol files reference types defined only in
+  them (RequestMeta/CallerId, RequestReceived.caller, AppConfig.auth), so the
+  commit would not compile without them. `.zcode/` left untracked (session
+  tooling, not area code).
+- Housekeeping: `.z-proflow/` appended to .gitignore in the same commit;
+  STATE.md itself force-added (`git add -f`, explicit path) so it stays
+  tracked while the rest of the directory is ignored.
+- No hooks configured (.git/hooks samples only, no core.hooksPath), so none
+  ran; no --no-verify used. Gates were not re-run by the committer — the ask
+  states PRX-01 is green on the full workspace gate set; that run belongs to
+  the script.
+
+## judge — PRX-01 — round 1
+
+Audited commit 499b22a8209686574420023c7ee1491a87ac0ae3 read-only against
+AGENTS.md, the STATE.md POLICY/TASK/project-rules, the [workspace.lints] wall
+plus clippy.toml, and the PRX-01 brief.
+
+### Gates run (exact commands, this round)
+
+- `cargo fmt --all --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+  — exit 0, zero warnings.
+- `cargo test --workspace --all-features` — exit 0, every suite ok.
+- `cargo shear` — "no issues found" (cargo-shear 1.14.0 installed this round
+  with `cargo +stable install cargo-shear --locked`; the pinned 1.96.1
+  toolchain cannot build it — its ra_ap_* deps require rustc 1.98).
+- Dependency rule: `cargo search argon2` + `cargo info argon2` — argon2 0.6.0
+  exists, RustCrypto/password-hashes, rust-version 1.85 (matches workspace
+  MSRV), MIT OR Apache-2.0. Rule satisfied.
+- docs/protocol.md does NOT document the RequestReceived shape (its line 71
+  "caller metadata" refers to CoreRequest and predates this area), so the
+  brief's conditional doc update does not apply.
+- Loopback refusal ordering verified: `load_toml_state` (serve.rs:62) runs
+  `load_app_config` → `validate_auth_config` and `ClientAuth::from_config`
+  before `bind_listener` (serve.rs:103) — refusal precedes any bind.
+
+### Findings
+
+1. MAJOR (fixRequired) — crates/llm-proxy-server/src/routes/mod.rs:276-279
+   and 303-316: the layer's doc comment claims "once [the IP bucket] is
+   empty, further failures skip the (CPU-costly) argon2 verification
+   entirely, so a flood of garbage tokens cannot pin the blocking pool" (and
+   the inline comment claims "flood guard first (bounds the argon2 spend)"),
+   but authentication at mod.rs:290-293 runs the full argon2 verification on
+   EVERY attempt before the limiter is consulted, and the limiter result
+   never gates anything (it only charges the bucket and records a metric).
+   The claimed CPU-exhaustion bound does not exist: a garbage-token flood
+   runs N argon2 hashes per request (N = configured verifiers) on the
+   blocking pool indefinitely, unauthenticated. Fix this run: check the
+   limiter BEFORE verification and reject without verifying when exhausted
+   (uniform 401 either way), or rewrite both comments to state the truth
+   (failures merely charge the bucket).
+2. MAJOR (defer to user) — crates/llm-proxy-server/src/routes/
+   core_pipeline.rs:452-462 with extract_bearer_token (routes/mod.rs:290):
+   `passthrough_auth = true` providers resolve their upstream api_key from
+   the inbound `Authorization: Bearer` header, which under `mode =
+   "client-keys"` is the proxy client key — so that combination silently
+   transmits the proxy client secret to the operator-configured upstream
+   endpoint as the provider credential, and config validation does not
+   reject it. The implementer flagged this honestly as punted; it needs a
+   deliberate design decision (reject the combination at startup, or channel
+   proxy auth via a distinct header) and must land by PRX-06's exit gate at
+   the latest. Not a PRX-01 brief requirement — user's call on the design.
+3. NIT (defer to user) — crates/llm-proxy-server/src/middleware.rs:365:
+   `OptionalConnectInfo` lost its last users in this commit (all handlers
+   moved to `RequestMeta`) and is now dead public API on the crate surface;
+   delete it.
+
+### Also checked, no finding
+
+- Non-test panic paths: none added (the two pre-existing
+  `Regex::new(...).expect()` at core_pipeline.rs:308/2308 date to c2437c8,
+  2026-06-09 — baseline, not this area).
+- No indexing/slicing, no `let _ =` on Result/Future, no MutexGuard across
+  await (locks in `cached_key_id`/`verify_uncached` are scoped after/without
+  awaits), no `#[allow]` (all new `#[expect]`s carry reasons at narrow
+  scope), no crate-level allows.
+- 401 body is the static "missing or invalid client auth token" envelope
+  (error_response.rs:473-477); no secret material echoed; tests assert the
+  no-echo property.
+- Secrets: verifiers PHC-hashed at rest, SecretString-wrapped, redacted in
+  Debug for both AuthConfig and ClientAuth; events/logs carry key ids only.
+- Re-exports single-path (`llm_proxy_core::{AuthConfig,AuthMode,
+  ANONYMOUS_CALLER}`, `llm_proxy_server::{CallerId,ClientAuth,
+  ClientAuthError}`).
+- Digest cache bounded (only verified tokens cached; ≤ one entry per key id).
+- config.toml.example documents [auth] without design narratives; default
+  DEFAULT_CONFIG_TOML untouched (loopback default still parses under
+  serde-defaulted [auth]).
+
+Verdict: findings — 1 major fix-required (doc/code mismatch on the auth
+flood guard), 1 major deferred (passthrough × client-keys secret channeling),
+1 nit (dead extractor). All workspace gates green as run above.
+
+## implementer — PRX-01 — round 3
+
+Audit-fix round. The audit (major) found that `require_client_auth`'s doc
+claimed failed attempts "skip the argon2 verification once the IP bucket is
+empty", but the round-1 code ran the full argon2 verification on EVERY
+attempt before consulting the limiter, and the limiter result never gated
+verification — it only charged the bucket and recorded a metric. Both the
+comment and the security property were false. Fixed by implementing the
+pre-verification gate (the audit's preferred option), not by weakening the
+comment.
+
+### Fix
+
+- `crates/llm-proxy-server/src/middleware.rs` — new
+  `RateLimiter::would_allow(client_ip) -> bool`: a non-consuming peek at the
+  peer's refilled balance (unknown peer → true, disabled limiter → true;
+  same refill math as `try_consume`, no mutation of `last_refill`).
+- `crates/llm-proxy-server/src/routes/mod.rs` — `require_client_auth`
+  restructured: the peer IP is extracted up front; when a bearer token is
+  present, `would_allow` gates BEFORE `authenticate` runs — a peer with an
+  exhausted failure budget gets the uniform 401 without paying argon2
+  (records `rate_limited`). The failure path still charges the bucket via
+  `is_allowed` so repeated failures drain it and trip the gate; successful
+  authentications are never charged (their limits live under the key id in
+  `prepare_request`). Doc comment rewritten to describe exactly this flow,
+  including the explicit caveat that `rate_limit_rpm = 0` (limiter disabled)
+  means no bound applies.
+
+### Tests (observable behavior, would fail on the round-1 code)
+
+- `routes::auth_gate_tests::exhausted_failure_budget_gates_verification_before_argon2`:
+  rate_limit_rpm = 1; failure #1 (wrong token) → 401 with `rate_limited == 0`
+  (it consumed the last token); failure #2 carries the VALID token → 401 and
+  `rate_limited >= 1`. On the round-1 code #2 would have authenticated and
+  the probe handler would have answered 200, so this test pins the gate
+  ordering.
+- `routes::auth_gate_tests::valid_token_passes_when_the_peer_has_budget`:
+  control — a valid token on a fresh budget still reaches the handler (200).
+- `middleware::tests::would_allow_*` (3 tests): drained peer → false,
+  other peers unaffected; unknown peer / disabled limiter → true; repeated
+  peeks neither drain nor refill (subsequent consume still denied).
+
+### Gate runs (this round, exact commands)
+
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D
+  warnings` → exit 0, zero warnings/errors.
+- `cargo test --workspace --all-features` → exit 0; 1239 passed, 0 failed
+  (28 suites, all ok).
+- `cargo fmt --all --check` → clean.
+- The script's own gate run remains the deciding one.
+
+### Interface notes
+
+- `RateLimiter::would_allow` is a new public method on `llm_proxy_server::
+  RateLimiter` (pure read; `#[must_use]`). No other signature changes.
+- Semantics note for PRX-06: a peer that exhausts its failure budget is
+  rejected pre-verification even with a valid token until the bucket refills
+  (rate_limit_rpm/60 per second); the response is a uniform 401 on every
+  rejection path, so the gate is not peer-observable.
+
+### Punted
+
+- None this round beyond the standing cargo-shear note (binary still absent
+  from this environment; no dependency changes this round).

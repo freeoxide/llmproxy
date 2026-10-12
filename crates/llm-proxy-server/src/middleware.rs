@@ -283,6 +283,37 @@ impl RateLimiter {
 
         bucket.try_consume(refill_rate)
     }
+
+    /// Whether a request from `client_ip` would currently be allowed,
+    /// **without consuming a token**.
+    ///
+    /// Pure read of the peer's current refilled balance: a peer with no
+    /// bucket yet would start full, so it reports `true`. Used by the
+    /// client-auth gate to reject peers whose failure budget is already
+    /// exhausted *before* running the CPU-costly argon2 verification; the
+    /// actual token consumption still happens on the failure path via
+    /// [`Self::is_allowed`], so successful authentications are never charged.
+    #[must_use]
+    pub fn would_allow(&self, client_ip: &str) -> bool {
+        if self.max_requests_per_minute == 0.0 {
+            return true;
+        }
+        let buckets = self.buckets.lock().unwrap_or_else(|e| {
+            tracing::warn!("rate limiter mutex poisoned; recovering from panic");
+            e.into_inner()
+        });
+        let Some(bucket) = buckets.get(client_ip) else {
+            return true;
+        };
+        // Same refill math as `try_consume`, but without mutating the bucket:
+        // compute the balance as of now and check it holds at least one token.
+        let elapsed = Instant::now()
+            .duration_since(bucket.last_refill)
+            .as_secs_f64();
+        let refill_rate = self.max_requests_per_minute / 60.0;
+        let tokens = (bucket.tokens + elapsed * refill_rate).min(bucket.max_tokens);
+        tokens >= 1.0
+    }
 }
 
 impl Default for RateLimiter {
@@ -1170,6 +1201,54 @@ mod tests {
         for _ in 0..1_000 {
             assert!(limiter.is_allowed("127.0.0.1"));
         }
+    }
+
+    // -- RateLimiter::would_allow (auth flood gate) -----------------------------
+
+    #[test]
+    fn would_allow_is_false_once_the_peer_bucket_is_drained() {
+        let limiter = RateLimiter::new(1);
+        assert!(
+            limiter.is_allowed("10.0.0.9"),
+            "first request consumes the only token"
+        );
+        // Refill is 1 token/minute, so within the test's lifetime the drained
+        // bucket stays empty and the peek must report denial.
+        assert!(
+            !limiter.would_allow("10.0.0.9"),
+            "drained peer must be denied by the peek"
+        );
+        // Other peers are unaffected: a fresh bucket starts full.
+        assert!(limiter.would_allow("10.0.0.8"));
+    }
+
+    #[test]
+    fn would_allow_reports_true_for_unknown_peer_and_disabled_limiter() {
+        let limiter = RateLimiter::new(100);
+        assert!(
+            limiter.would_allow("10.0.0.7"),
+            "unknown peer starts with a full bucket"
+        );
+
+        let disabled = RateLimiter::new(0);
+        for _ in 0..50 {
+            assert!(disabled.is_allowed("10.0.0.7"));
+        }
+        assert!(
+            disabled.would_allow("10.0.0.7"),
+            "a disabled limiter never denies"
+        );
+    }
+
+    #[test]
+    fn would_allow_does_not_consume_tokens() {
+        let limiter = RateLimiter::new(1);
+        assert!(limiter.is_allowed("10.0.0.6"));
+        // Repeated peeks must neither drain nor refill the bucket: the peer
+        // stays denied and a subsequent consume attempt is also denied.
+        assert!(!limiter.would_allow("10.0.0.6"));
+        assert!(!limiter.would_allow("10.0.0.6"));
+        assert!(!limiter.is_allowed("10.0.0.6"));
     }
 
     #[test]
