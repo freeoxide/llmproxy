@@ -2007,3 +2007,227 @@ each run).
 - The abuse family does not run under `--all-features`-only features or
   release mode differences; nothing in it is feature-gated beyond
   test-utils (RecordingBus), which the server dev-dep already enables.
+
+## committer — PRX-06
+
+- Commit: `a551619ad63ff8fd4504c2dc48b5124c69143a38` on `prx/usage-ledger`
+  (on top of 0c2614f).
+- Message: "Add secret-abuse test family across server, api, and storage".
+- Staged paths (7): crates/llm-proxy-server/tests/secret_abuse.rs (new);
+  crates/llm-proxy-api/tests/secret_abuse.rs (new);
+  crates/llm-proxy-storage/tests/secret_abuse.rs (new);
+  crates/llm-proxy-server/Cargo.toml (tracing-subscriber dev-dep);
+  crates/llm-proxy-api/Cargo.toml (tracing-subscriber dev-dep); Cargo.lock
+  (the two matching dependency entries); .z-proflow/STATE.md.
+- Exactly the ask's list; git status showed nothing else area-relevant (only
+  untracked .zcode/ — session tooling, left alone). Verified with find that
+  the new storage tests dir holds only secret_abuse.rs. Test content
+  cross-checked against the PRX-06 round-1 notes in this file (6+2+1 tests,
+  negative-with-positive-control pattern).
+- Same benign `git add` exit-1 advisory on the ignored `.z-proflow`
+  directory; STATE.md staged fully, `git diff` empty afterwards.
+- No hooks configured, so none ran; no --no-verify; no push. Gates not
+  re-run by the committer — the ask states PRX-06 is green on the full
+  workspace gate set.
+
+## judge — PRX-06 — round 1
+
+Audited commit a551619ad63ff8fd4504c2dc48b5124c69143a38 read-only against
+AGENTS.md, the STATE.md POLICY/TASK/project-rules, the [workspace.lints] wall
+plus clippy.toml, and the PRX-06 brief. Read the test-quality-audit skill
+first, per the ask. Tests-only commit (three new test binaries + two dev-dep
+edges); production code untouched, confirmed by `git show --stat`.
+
+### Gates run (exact commands, this round)
+
+- `cargo fmt --all --check` — exit 0, clean.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+  — exit 0, zero warnings.
+- `cargo test --workspace --all-features` — exit 0; 1323 passed, 0 failed
+  (every suite line "ok").
+- `cargo shear` (~/.cargo/bin/cargo-shear) — "✓ no issues found", exit 0.
+- Stability: `cargo test -p llm-proxy-server --test secret_abuse` ×5,
+  `-p llm-proxy-api --test secret_abuse` ×5, `-p llm-proxy-storage --test
+  secret_abuse` ×3 — 6/2/1 passed every run, zero flakes (the implementer's
+  process-global-capture claim holds at this repeat count).
+- Dependency rule: `tracing-subscriber` is the existing workspace dep
+  (root Cargo.toml:68, 0.3, tokio-rs); the commit adds only member dev-dep
+  edges to it — no new external crate; Cargo.lock diff is exactly those two
+  edges.
+
+### Mutation probes (test-quality-audit skill, AI-injection variant)
+
+Run in a throwaway `git worktree` at /tmp/prx6-mut (product tree untouched;
+worktree removed afterwards, `git status` back to baseline). One realistic
+bug injected per run, then the family's binary run against it:
+
+- Probe A — `tracing::debug!(token = …)` on the client-auth attempt path
+  (routes/mod.rs, inside `Some(token) =>`): KILLED by
+  `client_and_admin_tokens_never_reach_events_tracing_or_responses` (5 of 6
+  passed, the tracing-scan test failed and its output shows the leaked
+  `auth attempt token=prx6-…` line).
+- Probe B — `tracing::warn!(token = …)` on the admin 401 path
+  (api/src/auth.rs require_admin): KILLED by
+  `admin_token_never_appears_in_captured_usage_tracing`.
+- Probe C — ledger persists the failure message
+  (`format!("{}: {}", e.error_kind, e.message)` in
+  upsert_response_failed, sqlite.rs): KILLED by
+  `raw_ledger_bytes_persist_columns_but_never_event_messages`.
+
+3/3 mutants killed: the family's assertions have real detection power, not
+coverage-shaped passes.
+
+### Brief compliance, verified by reading the tests against the real surfaces
+
+1. Tokens in events/tracing/responses/db bytes: server tests 1-2 (RecordingBus
+   serialization, process-global tracing capture with a debug-level control,
+   401 bodies, AppState Debug, raw db+-wal+-shm byte scan with key-id/
+   provider/digest positive controls), api tests 1-2, storage test 1. The
+   "client authenticated" control is the real line at routes/mod.rs:357; the
+   api control is tower-http's on_request.rs:80 message. PHC verifiers are
+   scanned separately (hashed-at-rest is in config, never the ledger).
+2. /usage never carries bodies: server test 3 — an upstream that REFLECTS the
+   request body, all three endpoints on BOTH mounts scanned, plus
+   body_hash == sha256 of the exact bytes sent (pins the raw-bytes hashing
+   contract at core_pipeline.rs:522, not a tautology: it would catch hashing
+   normalized/re-serialized input). Reader SQL exposes caller + body_hash
+   only (reader.rs:519-524).
+3. Admin refusal on both mounts: server test 4 — missing → 401, wrong token
+   and a VALID client key → 401 with the byte-identical uniform body, admin
+   token → 200, on admin_router and the opt-in build_router; plus reverse
+   realm separation (admin token on a proxy route → 401).
+4. Attribution/isolation: server tests 5-6 — beta's response, request-id-
+   correlated log lines, and events never name alpha (unique key ids +
+   correlation make the shared process-global buffer sound); anonymous
+   attribution under mode "none" with a stray bearer in /usage/keys,
+   /usage/requests, and the raw bytes.
+
+Impossible-to-test properties are stated honestly in the implementer notes
+(passthrough × client-keys; admin failure budget) rather than papered over —
+exactly what the brief asked for.
+
+### AGENTS wall on the diff
+
+Every unwrap/expect/panic and the `row["body_hash"]` indexing are inside test
+modules (clippy.toml test escapes); no `#[allow]`/`#[expect]` in the new
+files; no unsafe; no `let _ =` on Result/Future; the MutexGuard in
+BufferWriterGuard is a synchronous Write scope, never across an await; module
+docs state what is tested, no design narratives.
+
+### Findings
+
+1. MAJOR (defer to user) — crates/llm-proxy-server/src/routes/
+   core_pipeline.rs:452-462: `passthrough_auth = true` providers still
+   resolve their upstream api_key from the inbound bearer header, so under
+   `mode = "client-keys"` the proxy client key is silently transmitted to the
+   configured upstream, and `validate_auth_config` still does not reject the
+   combination. Judge PRX-01 round 1 set the deadline "must land by PRX-06's
+   exit gate at the latest"; that gate is this area, and the design decision
+   (startup rejection or a distinct header) has not landed — the family
+   correctly refuses to enshrine the leak in a test, which means the plan's
+   exit-gate sentence is provable only over its enumerated surfaces (events,
+   logs, error responses, the SQLite file) and not against upstream
+   transmission. Still the user's call on the design; the deadline is now
+   past due.
+2. NIT (defer) — crates/llm-proxy-api/src/auth.rs:104-122: admin auth still
+   has no failure budget (carried over from judge PRX-03 finding 5); under
+   `admin_on_main_listener = true` the static token remains online-guessable
+   at one SHA-256 per attempt from every network the main listener reaches.
+   The family pins the uniform-401 behavior and the implementer documented
+   why a budget test is impossible until a budget exists; the hardening
+   itself remains open.
+
+### Also checked, no finding
+
+- No production code changed by this commit; the AGENTS product-code rules
+  are exercised only via the two dev-dep manifest lines (rule satisfied,
+  shear clean).
+- Test mix per the skill: 9 tests, all integration-level against real
+  routers/ledger/endpoints, zero mocks of the system under test (the only
+  mocks are upstream HTTP endpoints, the boundary the proxy serves); every
+  negative scan carries a positive control, so no vacuous-pass risk —
+  confirmed behaviorally by the 3/3 probe kills.
+- Stability of the process-global capture pattern: 5/5/3 repeats clean here
+  on top of the implementer's 12-15; the control assertions (capture
+  non-empty at debug level) make a silently-broken capture fail loudly
+  rather than pass vacuously.
+- Not run: `dist` checks (not this area); `cargo shear` inside the throwaway
+  worktree (no manifest changes there beyond reverting my probes).
+
+Verdict: findings — 1 major deferred (passthrough × client-keys, PRX-01
+carryover whose deadline elapsed this area), 1 nit deferred (admin failure
+budget, PRX-03 carryover). Nothing in this commit violates the rules or the
+brief; all workspace gates green and 3/3 mutation probes killed as run above.
+
+## final verifier — end of run
+
+Read-only pass at a551619 (tree clean for product code; only STATE.md
+modified). Gates checked against the repo, not against this file's claims.
+
+### Gate results
+
+- Gate A PASS — persistence with caller attribution and /usage behind admin
+  auth: RequestReceived.caller emitted at core_pipeline.rs:770 and :1091;
+  sqlite.rs insert persists caller (schema :158, index :187); [storage]
+  wiring in apps/llm-proxy/src/state.rs:103-121 (NoopBus when absent);
+  /usage/summary|requests|keys behind require_admin (api/routes.rs:62-76,
+  auth.rs:104-122); dedicated listener serve.rs:238-267, opt-in main mount
+  routes/mod.rs:175-181; validate_admin_mount provider_config.rs:1803.
+  Nuances: auth-layer rejections persist a failure-only row with no caller;
+  persistence is opt-in ([storage] absent = NoopBus).
+- Gate B PASS — validate_egress provider_config.rs:1581-1628 (scheme
+  allowlist + host check) and the transport honors it (transport.rs:243-253
+  reqwest::Proxy::all, defense-in-depth :519-544; upstream_client_for
+  state.rs:309; send sites core_pipeline.rs:825/:1146; startup error on
+  unusable URL, apps state.rs:79-97). Caveat: discovery traffic bypasses
+  egress (deferred finding, confirmed).
+- Gate C PASS on the enumerated surfaces — the PRX-06 family scans real
+  ledger bytes (db+wal+shm) with positive controls, real serialized events,
+  real response bodies, live tracing capture, both mounts, an echo upstream,
+  and pins body_hash == sha256(body). Verified detection power myself: a
+  token-leak mutation (tracing::debug!(token=…) in require_client_auth,
+  isolated worktree + private CARGO_TARGET_DIR) fails
+  client_and_admin_tokens_never_reach_events_tracing_or_responses at
+  secret_abuse.rs:251; the clean tree passes 6/2/1. Not covered (disclosed
+  by the implementer): upstream transmission of the client key under
+  passthrough_auth × client-keys — real, untested, outside the gate's
+  enumerated surfaces.
+
+### Deferred findings
+
+All 20 confirmed true against the code (details in the run result); the
+strongest empirical ones re-run here: musl build fails at openssl-sys
+(cargo check --target x86_64-unknown-linux-musl -p llm-proxy-provider →
+exit 101; cargo tree shows openssl-sys via default-tls because
+crates/llm-proxy-provider/Cargo.toml:23 lacks default-features=false);
+AuthConfig round-trip SUCCEEDS (scratch probe: serializes to
+mode = "client-keys" only, deserializes with 0 clients); ?limit=abc → 400
+text/plain "Failed to deserialize query string: limit: invalid digit
+found in string" (scratch axum 0.8.9 probe of the same extractor shape).
+
+### Build-cache incident (remediated)
+
+The first full-suite run here FAILED spuriously: cargo executed a stale,
+MUTATED test binary left in the shared CARGO_TARGET_DIR
+(~/.cargo/config.toml points every build at /home/thragg/.cache/
+cargo-target) by judge PRX-06's mutation probes — the worktree was removed
+but its artifacts stayed "fresh" (identical relative dep-info paths), and
+the binary emitted "auth attempt token=…", a string that exists in no
+source file (grep: only this file's judge notes mention it; strings on the
+stale binary contained it). Remediation: cargo clean -p for
+server/api/storage + removal of deps/secret_abuse-*; the full workspace
+suite then passed (cargo test --workspace --all-features, exit 0, every
+suite ok, 0 failed). Lesson for future mutation probes in this
+environment: never share the target dir with the tree under test.
+
+### STATE.md coherence
+
+All 7 commit shas exist (cat-file verified); every actor section present
+(survey, 6 implementers + PRX-01 rounds 2-3, 7 committers, 6 judges +
+PRX-01 round 2); no judge "clean" verdict to contradict (all judges
+carried deferred findings, all confirmed here); implementer claims
+spot-checked against code held. Minor: the HEADER ("next: spawn
+implementer PRX-01") was never updated after init; the PRX-06
+committer/judge sections are uncommitted working-tree state (same pattern
+as every earlier area — each commit's STATE.md ends at that area's
+implementer section).
