@@ -45,3 +45,4 @@ rust_decimal = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 llm-proxy-storage = { path = "../llm-proxy-storage", features = ["test-utils"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }

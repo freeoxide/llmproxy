@@ -1739,3 +1739,271 @@ lands outside this area.
 - Prerelease/announce customization, npm/homebrew/powershell installers,
   GitHub attestations, custom runners: not requested; defaults kept
   deliberately minimal per the brief.
+
+## committer — PRX-05
+
+- Commit: `0c2614f42dbef3b89624ef474be7a64b5f703138` on `prx/usage-ledger`
+  (on top of 3ecb2f3).
+- Message: "Add cargo-dist release pipeline for musl binaries".
+- Staged paths (5): dist-workspace.toml (new); .github/workflows/release.yml
+  (new); Cargo.toml ([profile.dist]); .cargo/config.toml (new);
+  .z-proflow/STATE.md.
+- Exactly the ask's list; git status showed nothing else area-relevant (only
+  untracked .zcode/ — session tooling, left alone). Content cross-checked
+  against the PRX-05 round-1 notes in this file (dist-workspace.toml shape,
+  dist-generated workflow, profile requirement, musl-gcc CC pin).
+- Same benign `git add` exit-1 advisory on the ignored `.z-proflow`
+  directory; STATE.md staged fully, `git diff` empty afterwards.
+- No hooks configured, so none ran; no --no-verify; no push. Gates not
+  re-run by the committer — the ask states PRX-05 is green on the full
+  workspace gate set. (The round notes flag a musl link blocker pending a
+  TLS-backend decision outside this area; it is not part of the workspace
+  gate set and nothing in this commit changes crate code.)
+
+## judge — PRX-05 — round 1
+
+Audited commit 0c2614f42dbef3b89624ef474be7a64b5f703138 read-only against
+AGENTS.md, the STATE.md POLICY/TASK/project-rules, the [workspace.lints] wall
+plus clippy.toml, and the PRX-05 brief. Read the rust-best-practices skill
+first, per the ask. No Rust code changed in this commit, so the Rust-side
+wall is exercised only as a regression check.
+
+### Gates and checks run (exact commands, this round)
+
+- `cargo fmt --all --check` — exit 0.
+- `cargo clippy --workspace --all-targets --all-features --locked --
+  -D warnings` — exit 0.
+- `cargo test --workspace --all-features` — exit 0, every suite
+  "0 failed".
+- `cargo shear` — "✓ no issues found", exit 0.
+- Lint inheritance — all 7 member Cargo.tomls carry `[lints]` with
+  `workspace = true` (awk over each member; a first grep attempt used a
+  wrong pattern and reported 0 — discarded, rerun correctly).
+- `dist generate --mode ci --check` (dist 0.32.0, already at
+  ~/.cargo/bin/dist) — exit 0: committed release.yml is byte-identical to
+  the tool's canonical output for this config.
+- `dist plan --output-format=json` — exit 0: announces v0.1.0, llm-proxy
+  0.1.0 only (lib crates not distributed); artifacts = the two musl
+  tar.xz + .sha256, llm-proxy-installer.sh, sha256.sum, source.tar.gz;
+  matrix = x86_64-musl@ubuntu-22.04 and aarch64-musl@ubuntu-22.04-arm
+  (native), both installing only musl-tools; pr_run_mode = plan;
+  desired_rust_toolchain = None (repo rust-toolchain.toml 1.96.1 governs).
+- `cargo info cargo-dist` — 0.32.0 is the latest published version
+  (rust-version 1.74, axodotdev), so "current stable" holds.
+- Brief compliance: ci.yml untouched (`git diff 3ecb2f..0c2614f -- .github/`
+  shows only release.yml added); no crate code touched (commit touches
+  dist-workspace.toml, release.yml, root Cargo.toml [profile.dist],
+  .cargo/config.toml, STATE.md only); Cargo.lock untouched and `--locked`
+  clippy green; config is the 7 canonical keys; git remote
+  (git@github.com:freeoxide/llmproxy) matches hosting and
+  workspace.package.repository.
+- YAML parse of release.yml + tomllib parse of dist-workspace.toml,
+  .cargo/config.toml, Cargo.toml — all OK.
+- openssl blocker INDEPENDENTLY REPRODUCED:
+  `cargo tree -i openssl-sys --target x86_64-unknown-linux-musl` →
+  openssl-sys 0.9.116 via reqwest 0.12.28 → hyper-tls → native-tls ←
+  llm-proxy-provider (provider declares reqwest WITHOUT
+  default-features = false, crates/llm-proxy-provider/Cargo.toml:23);
+  `cargo check --target x86_64-unknown-linux-musl -p llm-proxy-provider`
+  → exit 101, openssl-sys build script "Could not find directory of
+  OpenSSL installation". The CI musl jobs install only musl-tools, so
+  both build jobs fail on a tag push and the host job's if-guard
+  (release.yml:221) suppresses the GitHub Release. The implementer's
+  MAJOR disclosure is accurate.
+- CC override verified load-bearing both ways:
+  `cargo check --target aarch64-unknown-linux-musl -p llm-proxy-storage`
+  → exit 0 with the override (libsqlite3-sys compiles via musl-gcc);
+  same command with CC_aarch64_unknown_linux_musl preset to the missing
+  `aarch64-linux-musl-gcc` (cargo [env] does not override preset shell
+  env, so this simulates the override's absence) → exit 101, cc-rs
+  "failed to find tool 'aarch64-linux-musl-gcc'" — the exact failure the
+  arm64 CI job would hit without .cargo/config.toml.
+- Not run, stated honestly: `dist build` for either target (blocked by
+  the openssl failure — there is no local artifact to package), the
+  arm64-native compile/link, the shell installer end-to-end
+  (--artifacts=global), and any real GitHub Actions execution. The musl
+  build was exercised at check level on this machine, exactly as the
+  brief anticipated.
+
+### Findings
+
+1. MAJOR (defer to user) — crates/llm-proxy-provider/Cargo.toml:23 (the
+   blocker is shipped by this commit's pipeline,
+   .github/workflows/release.yml:145): the release pipeline as committed
+   cannot produce any artifact — reqwest keeps default features
+   (default-tls → native-tls → openssl-sys), which I reproduced failing
+   for x86_64-unknown-linux-musl, and the CI matrix installs no OpenSSL,
+   so both musl build jobs fail and no GitHub Release is ever cut; the
+   plan's stated purpose (deploy must not require building on the target
+   machine) is unmet until the TLS-backend decision lands (recommended:
+   `default-features = false` + `["json","stream","rustls-tls","socks",
+   "charset","http2"]` in the provider manifest). That fix edits PRX-04's
+   committed manifest and swaps the production TLS backend (cert
+   sourcing, TLS policy) — a security-relevant runtime change the
+   implementer correctly refused to make silently under this area's
+   "no changes to crate code" constraint; user's call, but it must land
+   before the first version tag is pushed.
+2. NIT (defer) — .cargo/config.toml:8: CC_aarch64_unknown_linux_musl is
+   forced for every cargo invocation in the repo, so a developer
+   cross-compiling aarch64-musl from x86_64 with a real cross toolchain
+   present silently gets the host-arch musl-gcc instead — wrong-arch
+   objects that `cargo check` accepts (no link) and only `cargo build`
+   exposes; the committed comment documents the CI rationale but not this
+   local-cross consequence. CI is unaffected (dist builds aarch64 natively
+   on the arm64 runner).
+
+### Also checked, no finding
+
+- No Rust source changed: panic-path/indexing/allow()/MutexGuard/Result-
+  drop rules are N/A for this diff; no new workspace dependencies
+  (cargo-dist is environment tooling, not a manifest dep); no re-exports;
+  docs rules N/A (config-file comments are sanctioned "why" comments, not
+  user-facing docs).
+- dist-workspace.toml is the current stable convention (0.32.0's own
+  generate/plan accept it; the ask's offered dist.toml-with-[workspace]
+  form is a hard parse error per the implementer's scratch
+  reproduction, consistent with the tool's layout rules); keys are the
+  canonical minimal set; install-path/hosting/install-updater all
+  accepted by plan.
+- [profile.dist] matches dist init's canonical output and is required
+  (dist invokes cargo with --profile dist; the redundant lto = "thin" is
+  the tool's own emitted bytes — not worth deviating from canonical
+  output the --check round-trip enforces).
+- release.yml is the verbatim generated workflow (5 jobs: plan,
+  build-local-artifacts, build-global-artifacts, host, announce;
+  pull_request triggers run `dist plan` only per pr_run_mode=plan;
+  fail-fast disabled; host gated on build success/skip) — hand-editing
+  it (e.g. SHA-pinning actions or job-scoping permissions) would break
+  the generate round-trip the tooling enforces, so those hardening
+  ideas belong upstream, not in findings against this area.
+- Workspace gates all green with .cargo/config.toml present (the CC
+  override is target-scoped and inert for host builds — empirically
+  confirmed by the green clippy/test runs).
+
+Verdict: findings — 1 major deferred (musl artifacts blocked on the
+TLS-backend decision, deadline: before the first release tag), 1 nit
+deferred. All workspace gates and config-coherence checks green as run
+above; the artifact build itself is blocked exactly as the implementer
+disclosed.
+
+## implementer — PRX-06 — round 1
+
+Secret-abuse test family: 9 new tests in three new test binaries, all
+driving the real surfaces (build_router / admin_router / client-auth layer /
+SqliteEventBus / /usage endpoints), every negative assertion paired with a
+positive control so a passing scan proves the scan read real content.
+
+### Changed paths
+
+- `crates/llm-proxy-server/tests/secret_abuse.rs` (new, 6 tests) —
+  1. client_and_admin_tokens_never_reach_events_tracing_or_responses:
+     two-key client-auth router + RecordingBus + process-global tracing
+     capture; drives valid/wrong/missing/admin-token-as-client traffic;
+     asserts every response body, every serialized event, the captured
+     tracing output, and `format!("{state:?}")` contain no client tokens,
+     no admin token, no PHC verifier strings, no provider key. Controls:
+     events >= 6, both key ids present on RequestReceived, capture
+     contains debug-level "client authenticated".
+  2. secrets_absent_from_raw_ledger_file_bytes: same traffic through a
+     real SqliteEventBus plus admin /usage traffic (200 + 401) on the
+     opt-in main mount; after close, scans db + -wal + -shm bytes:
+     tokens/verifiers/body marker absent; controls: key id, provider name,
+     and the sha256 body digest ARE findable in the bytes.
+  3. usage_serves_the_body_digest_but_never_the_body_content: mock
+     upstream REFLECTS the request body (worst case); on BOTH mounts
+     (dedicated admin_router + opt-in build_router) all three /usage
+     endpoints carry no body marker and no credentials; the request row's
+     body_hash equals hex sha256 of the exact body sent (digest, never the
+     body); caller attribution visible to the admin.
+  4. admin_surface_refuses_non_admin_credentials_on_both_mounts: for each
+     mount, missing token → 401 (not 403/5xx), wrong token → identical
+     uniform 401 body, a VALID client key → 401, admin token → 200; plus
+     realm separation the other way (admin token on a proxy route → 401).
+  5. one_callers_key_id_is_never_observable_by_another_caller: unique
+     per-test key ids; alpha's traffic precedes beta's; beta's response,
+     beta's events (filtered by x-request-id), and log lines correlated
+     with beta's request never name alpha; beta self-attribution intact.
+  6. anonymous_attribution_survives_the_loopback_exemption: mode "none"
+     with a stray bearer token sent anyway → caller is "anonymous" in
+     /usage/keys and /usage/requests and the raw bytes (control), stray
+     token never attributed and never in responses/ledger bytes.
+- `crates/llm-proxy-api/tests/secret_abuse.rs` (new, 2 tests) — admin
+  token never lands in the raw ledger file bytes (control: seeded caller
+  marker + digest findable); admin token never appears in captured usage
+  tracing (control: "started processing request" present) across all
+  three routes × all auth outcomes.
+- `crates/llm-proxy-storage/tests/secret_abuse.rs` (new, 1 test) — raw
+  db+wal+shm bytes persist caller/digest/stop-reason (controls) but never
+  the ResponseFailed.message marker: event-carried sanitized text is not
+  a ledger column, proven at the byte level.
+- `crates/llm-proxy-server/Cargo.toml`, `crates/llm-proxy-api/Cargo.toml`
+  — dev-dep `tracing-subscriber = { workspace = true }` (already a
+  workspace dep; no new external crate, Cargo.lock diff is exactly the
+  two member dependency edges).
+- `Cargo.lock` — the two dev-dep edges above.
+
+### Flake found and fixed during development (worth knowing)
+
+Thread-local `set_default` capture subscribers are UNRELIABLE in a
+parallel test binary: callsites first emitted on a thread with no
+subscriber can keep a stale "never" interest cache, so later request-path
+events silently vanish from a thread-local capture (observed: captures of
+62 bytes = probe-only vs 1842-5762 bytes across identical runs; 1-in-~10
+failures). `tracing::callsite::rebuild_interest` is not public in this
+tracing version, so both capture helpers install a PROCESS-GLOBAL
+subscriber (OnceLock-guarded, `set_global_default` exactly once per
+binary) and every test's traffic lands in the shared buffer. Per-caller
+isolation (test 5) uses key ids unique to that test plus
+request-id-correlated line filtering, which is the honest formulation
+under a shared buffer: a log line tied to beta's request must not name
+alpha. Verified stable: 12-15 consecutive parallel-mode repeats of each
+new binary, 6 repeats of the full three-crate suite (380 passed, 0 failed
+each run).
+
+### Self-checks run (this round, exact commands)
+
+- `cargo test -p llm-proxy-server -p llm-proxy-api -p llm-proxy-storage`
+  → 380 passed, 0 failed across 15 suites (includes the 9 new tests);
+  repeated 6× in parallel mode, identical results.
+- `cargo test -p llm-proxy --lib` → 50 passed, 0 failed (Cargo.lock
+  changed only by dev-dep edges; sanity that nothing indirect broke).
+- `cargo clippy --workspace --all-targets --all-features --locked --
+  -D warnings` → exit 0, zero warnings (one excessive-nesting hit in a
+  test was refactored away with an `events_for_request` helper, no
+  #[expect] needed).
+- `cargo fmt --all` + `cargo fmt --all --check` → clean.
+- `~/.cargo/bin/cargo-shear` → "✓ no issues found".
+- The script's own full-workspace gate run remains the deciding one.
+
+### Interface notes
+
+- No production code touched; no public surface changed. The only
+  manifests changed are the two dev-dep additions.
+- Test-technique note for anyone extending the family: thread-local
+  `set_default` captures are flaky under parallel tests (see above) —
+  reuse the global OnceLock capture pattern in `tests/secret_abuse.rs`
+  of either crate, and give per-caller assertions unique key ids plus
+  request-id correlation.
+- The PRX-01/PRX-03 deferred MAJOR (passthrough_auth × client-keys
+  silently channels the proxy client key upstream) is NOT covered by a
+  test: asserting the current behavior would enshrine the leak, and
+  asserting the desired behavior would fail the suite — it needs the
+  design decision (startup rejection or distinct header) first. Once it
+  lands, `tests/secret_abuse.rs` should grow an upstream-credential
+  capture test (mock upstream asserting the Authorization header it
+  receives under that combination).
+- Judge PRX-03 nit 5 (no failure budget on admin auth under the
+  main-listener posture) is likewise untestable until a budget exists;
+  the family pins the uniform-401 behavior instead.
+
+### Punted
+
+- No test that the client token never reaches the UPSTREAM request
+  headers under passthrough_auth × client-keys — blocked on the deferred
+  design decision above; documented here rather than papered over.
+- No dedicated test for admin-token absence from process memory dumps /
+  core dumps — out of scope for the suite (the Debug-render and
+  at-rest surfaces are covered).
+- The abuse family does not run under `--all-features`-only features or
+  release mode differences; nothing in it is feature-gated beyond
+  test-utils (RecordingBus), which the server dev-dep already enables.
