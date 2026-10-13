@@ -1490,3 +1490,252 @@ Bind-out/source-address selection deliberately NOT implemented (plan layer 2).
 - reqwest proxy env vars (HTTP_PROXY etc.): reqwest's system-proxy behavior
   is unchanged for the default client; an explicitly configured egress proxy
   replaces env resolution for that provider's client (reqwest semantics).
+
+## committer — PRX-04
+
+- Commit: `3ecb2f31aac50dc96e7d3270acd789c4c07cef99` on `prx/usage-ledger`
+  (on top of 045e2cb).
+- Message: "Route per-provider upstream traffic through a forward proxy".
+- Staged paths (18): crates/llm-proxy-core/src/provider_config.rs;
+  crates/llm-proxy-core/src/lib.rs; crates/llm-proxy-provider/src/transport.rs;
+  crates/llm-proxy-provider/Cargo.toml;
+  crates/llm-proxy-core/src/provider_registry.rs;
+  crates/llm-proxy-provider/src/discovery.rs;
+  crates/llm-proxy-server/src/state.rs;
+  crates/llm-proxy-server/src/routes/core_pipeline.rs;
+  crates/llm-proxy-server/src/catalog_service.rs;
+  crates/llm-proxy-server/src/routes/models.rs;
+  crates/llm-proxy-server/tests/chat_completions.rs;
+  crates/llm-proxy-server/tests/core_pipeline.rs;
+  crates/llm-proxy-server/tests/integration.rs;
+  crates/llm-proxy-server/tests/openrouter_e2e.rs; apps/llm-proxy/src/state.rs;
+  providers/opencode-go.toml.example; providers/opencode-zen.toml.example;
+  .z-proflow/STATE.md.
+- Exactly the ask's list; git status showed nothing else area-relevant (only
+  untracked .zcode/ — session tooling, left alone). The
+  registry/discovery/catalog/models diffs are the mechanical `egress: None`
+  literal additions the PRX-04 round notes describe; diff content
+  cross-checked against those notes.
+- Same benign `git add` exit-1 advisory on the ignored `.z-proflow`
+  directory; STATE.md staged fully, `git diff` empty afterwards.
+- No hooks configured, so none ran; no --no-verify; no push. Gates not
+  re-run by the committer — the ask states PRX-04 is green on the full
+  workspace gate set.
+
+## judge — PRX-04 — round 1
+
+Audited commit 3ecb2f31aac50dc96e7d3270acd789c4c07cef99 read-only against
+AGENTS.md, the STATE.md POLICY/TASK/project-rules, the [workspace.lints] wall
+plus clippy.toml, and the PRX-04 brief (read the rust-best-practices skill
+first, per the ask).
+
+### Gates run (exact commands, this round)
+
+- `cargo fmt --all --check` — exit 0, clean.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D
+  warnings` — exit 0, zero warnings.
+- `cargo test --workspace --all-features` — exit 0; 1314 passed, 0 failed,
+  every suite line "ok".
+- `cargo shear` (~/.cargo/bin/cargo-shear) — "✓ no issues found", exit 0.
+- Lint inheritance — all 7 member Cargo.tomls carry `[lints]` (grep count = 7).
+- socks-feature verification per the brief: `cargo info reqwest` (0.12.28),
+  `cargo tree -e features -p llm-proxy-provider -i reqwest` shows
+  `reqwest feature "socks"` active, and reqwest 0.12.28's manifest defines
+  `socks = []` — in-tree, no new crates; the commit indeed touches no
+  Cargo.lock, and `--locked` clippy/test above stayed green.
+- Mechanical scan of the commit diff: every unwrap/expect/panic hit is inside
+  `mod tests` (clippy.toml test escapes); no `#[allow]`, no `let _ =` on
+  Result/Future, no unsafe, no MutexGuard across await, new fns all take
+  &str.
+- Brief compliance verified by reading the diff: pooled_http_builder()
+  carries the exact old pool settings (20 idle/90s/10s connect) so try_new is
+  unchanged in effect; empty egress map returns the shared client
+  (ptr-identity tested state.rs:413-463); both upstream send sites switched
+  (core_pipeline.rs:825, 1146); config-load rejection wired through
+  validate_egress (provider_config.rs:1581) with deny_unknown_fields so
+  bind-out-style keys are refused; env interpolation happens before
+  validation (load_provider_config, provider_config.rs:1930-1993) so the
+  `${ENV_VAR}` doc claim holds; startup wiring happens before the listener
+  (apps/llm-proxy/src/state.rs egress block). Bind-out correctly absent.
+
+### Findings
+
+1. MAJOR (defer to user) — crates/llm-proxy-server/src/catalog_service.rs:137
+   (+ crates/llm-proxy-provider/src/discovery.rs:39-43): model-discovery
+   traffic bypasses the per-provider egress client — DiscoveryClient builds
+   its own direct reqwest client, and a provider configured with both
+   `[provider.egress]` and `[provider.discovery]` (non-Static catalog) sends
+   its live model-list requests from the host's real network path. The area
+   exists to hide the operator's exit geography from geo-restricted
+   upstreams, so this either fails against a geo-blocked endpoint or
+   discloses the real IP to the same upstream; the exclusion is disclosed
+   only in STATE.md "Punted", not where an operator reads
+   (providers/*.toml.example say "Route this provider's upstream traffic
+   through a forward proxy" without a discovery carve-out). The brief scopes
+   layer 1 to transport.rs, so fixing in-run is the user's call: wire
+   discovery through the egress client or document the exclusion at the
+   egress config surface.
+2. NIT (defer) — crates/llm-proxy-core/src/provider_config.rs:1044 and
+   crates/llm-proxy-provider/src/transport.rs:523/540: the
+   `InvalidEgressProxy` Display and the transport's InvalidConfig messages
+   echo the raw proxy URL (`"{proxy}"` / `{url:?}` verbatim), so a URL that
+   passes scheme/host validation but fails later (e.g.
+   `http://user:pass@[::1:8080`) prints proxy credentials in the startup
+   error — serve.rs logs startup failures via tracing::error!, and the
+   commit message claims userinfo is "never logged"; every other surface
+   (Debug, the info! line in load_toml_state) redacts. Redact with
+   redacted_proxy_url in the error payloads when the user prefers.
+
+## implementer — PRX-05 — round 1
+
+Release artifacts via cargo-dist 0.32.0 (current stable on crates.io; verified
+with `cargo info cargo-dist`). Config + generated release workflow land here;
+one workspace-property blocker was found by actually exercising the musl
+build (details below) — the artifacts cannot link until a TLS-backend decision
+lands outside this area.
+
+### Changed paths
+
+- `dist-workspace.toml` (new, workspace root) — cargo-dist 0.32.0 workspace
+  config: `[workspace] members = ["cargo:."]` + `[dist]` with
+  cargo-dist-version = "0.32.0", ci = "github", installers = ["shell"],
+  targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"],
+  install-path = "CARGO_HOME", hosting = "github", install-updater = false.
+  Exactly the shape `dist init` generates (run in a scratch copy to learn the
+  canonical form), with targets narrowed to the two musl triples. NOTE: the
+  ask offered "dist.toml or [workspace.metadata.dist]"; in 0.32.0 the
+  workspace-level file MUST be dist-workspace.toml if it carries the
+  `[workspace]` table — a root `dist.toml` containing `[workspace]` is a hard
+  parse error ("dist.toml can't have a [workspace], only dist-workspace.toml
+  can", reproduced in the scratch copy). dist-workspace.toml IS the current
+  stable convention (dist init's own output).
+- `.github/workflows/release.yml` (new) — generated verbatim by
+  `dist generate --mode ci` (296 lines; jobs plan → build-local-artifacts →
+  build-global-artifacts → host → announce; on: pull_request + version-ish
+  tag pushes; pr-run-mode default "plan" runs `dist plan` on PRs). The build
+  matrix (runners, apt packages, dist args) is computed at runtime by the
+  plan job, not hardcoded in the YAML. ci.yml untouched.
+- `Cargo.toml` — added `[profile.dist]` (inherits = "release", lto = "thin"),
+  byte-identical to `dist init`'s output. REQUIRED: dist passes
+  `--profile dist` unconditionally (cargo-dist 0.32.0 build/cargo.rs:139,155)
+  and cargo rejects undefined custom profiles. Inherits the release posture
+  (codegen-units = 1, strip = "symbols"). No other manifest change; no crate
+  code touched; Cargo.lock untouched.
+- `.cargo/config.toml` (new) — `[env] CC_aarch64_unknown_linux_musl =
+  "musl-gcc"`. Why: dist schedules aarch64-musl natively on ubuntu-22.04-arm
+  with only `musl-tools` (plan JSON), Ubuntu arm64 musl-tools ships ONLY
+  `musl-gcc` (packages.ubuntu.com jammy/arm64 filelist — no
+  aarch64-linux-musl-gcc), and cc 1.8.0 hardcodes `aarch64-linux-musl-gcc`
+  for that target (src/lib.rs:4549) with no musl fallback (x86_64-musl probes
+  ["x86_64-linux-musl", "musl"] and finds musl-gcc; aarch64 does not —
+  lib.rs:4691 vs 4549). Verified load-bearing by counterfactual below.
+  Inert for host and other-target builds (cc reads CC_<target> only for that
+  target; host `cargo check -p llm-proxy-storage` unaffected).
+
+### Self-checks run (this round, exact commands and results)
+
+- `cargo info cargo-dist` → 0.32.0, rust-version 1.74, axodotdev repo.
+  Installed via `cargo +stable install cargo-dist --version 0.32.0 --locked`
+  (binary name: `dist`; ~/.cargo/bin/dist --version → cargo-dist 0.32.0).
+- `dist plan` (real repo) → "announcing v0.1.0": llm-proxy 0.1.0 only (the
+  six lib crates correctly not distributed), artifacts = source.tar.gz +
+  checksums, llm-proxy-installer.sh, sha256.sum,
+  llm-proxy-{x86_64,aarch64}-unknown-linux-musl.tar.xz each with [bin]
+  llm-proxy + [misc] README.md + .sha256.
+- `dist plan --output-format=json` → build matrix: x86_64-musl on
+  ubuntu-22.04, aarch64-musl on ubuntu-22.04-arm (native, NOT cross —
+  build_wrapper_for_cross returns None for same-arch musl; no zigbuild),
+  both installing musl-tools; install via cargo-dist-installer.sh v0.32.0.
+- `dist generate --mode ci` then `dist generate --mode ci --check` → exit 0
+  (round-trip; release.yml byte-identical to the tool's canonical output,
+  diffed against the scratch reference).
+- `cargo fmt --all` + `cargo fmt --all --check` → clean. `cargo shear` →
+  "✓ no issues found". `cargo metadata --no-deps` → OK.
+- python yaml.safe_load(release.yml) → OK (5 jobs); tomllib parse of
+  dist-workspace.toml, .cargo/config.toml, Cargo.toml → OK.
+- REAL x86_64-musl exercise (musl-tools 1.2.5 installed via apt;
+  `rustup target add x86_64-unknown-linux-musl` for the pinned 1.96.1):
+  - `cargo check --target x86_64-unknown-linux-musl -p llm-proxy-storage`
+    → exit 0; libsqlite3.a produced by cc via musl-gcc; readelf on the
+    extracted sqlite3.o → ELF64, Machine x86-64, REL, no dynamic section.
+    The bundled-C musl path is genuinely exercised on this machine.
+  - `dist build --target=x86_64-unknown-linux-musl --print=linkage` → FAILED
+    at openssl-sys 0.9.116 ("Could not find directory of OpenSSL
+    installation" for TARGET=x86_64-unknown-linux-musl; musl has no system
+    OpenSSL and none is shipped). Root cause is workspace TLS, not dist
+    config: reqwest 0.12.28 default features include default-tls →
+    native-tls → openssl-sys (cargo tree -i openssl-sys confirms via
+    hyper-tls/native-tls ← reqwest ← llm-proxy-provider). The provider's
+    `rustls-tls` feature is compiled but NOT selected at runtime — reqwest
+    0.12.28 src/tls.rs:589-602 Default for TlsBackend picks default-tls
+    whenever that feature is present, and transport.rs never calls
+    .use_rustls_tls().
+- aarch64-musl counterfactual (on this x86_64 box, isolation from the
+  openssl noise via -p llm-proxy-storage):
+  - with .cargo/config.toml: `cargo check --target
+    aarch64-unknown-linux-musl -p llm-proxy-storage` → exit 0 (the build
+    script ran cc under musl-gcc; caveat: musl-gcc here emits host-arch
+    objects, and cargo check does not link — this proves the override is
+    honored and the C-compile step runs, NOT that aarch64 code is correct).
+  - without it (config moved aside): same command → exit 101,
+    "cc-rs: failed to find tool 'aarch64-linux-musl-gcc'" — exactly the
+    failure the arm64 CI job would hit without the override.
+- Not run and why: full workspace clippy/test — zero Rust source changed
+  (deciding gate run belongs to the script); `dist build` for aarch64 and
+  `--artifacts=global` (installer script) — blocked by the openssl finding;
+  there is no local artifact to package from.
+
+### Interface notes for dependent areas
+
+- MAJOR, needs a user decision (blocks the actual artifacts, not the
+  config): BOTH musl jobs in release.yml will fail at openssl-sys until the
+  workspace stops linking OpenSSL. Standard fix (one line,
+  crates/llm-proxy-provider/Cargo.toml — PRX-04's committed area, therefore
+  NOT done here per the brief's "no changes to crate code"):
+  `reqwest = { version = "0.12", default-features = false, features =
+  ["json", "stream", "rustls-tls", "socks", "charset", "http2"] }`.
+  This changes the production TLS backend from native-tls/OpenSSL (what
+  runs today) to rustls — a runtime behavior change (cert store sourcing,
+  TLS version policy) that deserves its own review round, not a silent
+  swap inside the release-config area. Everything else in the pipeline is
+  exercised and waiting on this. Vendored OpenSSL was considered and
+  rejected: nonstandard for musl, minutes-long builds per target, fragile
+  under musl-gcc.
+- Cross-area fact for PRX-04/judge: the `rustls-tls` feature currently in
+  crates/llm-proxy-provider/Cargo.toml:23 has NO runtime effect (compiled,
+  never selected — reqwest picks default-tls/native-tls; reqwest
+  src/tls.rs:589). If the author believed rustls was in use, it is not.
+- Release flow: push a version tag (e.g. v0.1.0) → release.yml builds both
+  musl archives + shell installer + sha256 checksums, publishes a GitHub
+  Release at github.com/freeoxide/llmproxy (hosting = "github", GITHUB_TOKEN,
+  contents: write). PRs run `dist plan` only (default pr-run-mode). Keep
+  release.yml unedited — `dist plan` in CI verifies it matches the config
+  (`generate --check` semantics); regenerate with `dist generate --mode ci`
+  after any config/upgrade change.
+- `[profile.dist]` is now load-bearing for `cargo build --profile dist`
+  (any local dist invocation); it inherits release (thin LTO, CGU 1,
+  stripped). dist-workspace.toml's `[workspace]` is cargo-dist's own
+  workspace concept (members = ["cargo:."]) — not a cargo workspace
+  declaration; do not confuse it with the root Cargo.toml.
+- No LICENSE file exists in the repo, so archives include README.md only
+  (auto-includes skip absent files). A LICENSE file would be auto-included
+  in archives and installers once added — not this area's call to add one.
+
+### Punted
+
+- The TLS-backend swap itself (see MAJOR note) — outside my declared paths
+  and a runtime-behavior decision; flagged for the user/PRX-06 fix round
+  with the exact recommended change. Until it lands, a tag push produces a
+  red release run (fail-fast: false, but the host/release job requires both
+  build jobs green, so no GitHub Release is cut).
+- aarch64-unknown-linux-musl end-to-end (real arm64 compile + link +
+  archive): impossible on this x86_64 machine (no cross toolchain, per the
+  brief's own assumption). Delivered instead: the CC override with a
+  demonstrated with/without counterfactual + the exact CI runner/package
+  facts (ubuntu-22.04-arm + musl-tools; musl-gcc is aarch64-native there).
+- Verifying the shell installer end-to-end (`--artifacts=global`) and the
+  `--print=linkage` static-link report: both need a successful local build,
+  blocked by the same openssl finding.
+- Prerelease/announce customization, npm/homebrew/powershell installers,
+  GitHub attestations, custom runners: not requested; defaults kept
+  deliberately minimal per the brief.

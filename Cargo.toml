@@ -167,3 +167,8 @@ literal_string_with_formatting_args = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# The profile that 'dist' will build with (cargo-dist passes --profile dist)
+[profile.dist]
+inherits = "release"
+lto = "thin"
