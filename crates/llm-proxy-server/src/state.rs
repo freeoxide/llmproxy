@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,9 +52,11 @@ pub struct BuildInfo {
 ///   verifiers only, never plaintext client secrets**; its manual `Debug`
 ///   prints the mode and key ids and never the verifier strings (a PHC hash
 ///   is offline-crackable, so it is treated as sensitive). Safe.
-/// - `AppState` -> remaining fields: `BuildInfo`, `proxy_client`, `Counter`,
-///   `Metrics`, `RateLimiter`, `RequestDeduplicator`, `RequestIdGenerator`,
-///   `model_catalogs`, `event_bus` -- none hold secrets. Safe.
+/// - `AppState` -> remaining fields: `BuildInfo`, `proxy_client`,
+///   `egress_clients`, `Counter`, `Metrics`, `RateLimiter`,
+///   `RequestDeduplicator`, `RequestIdGenerator`, `model_catalogs`,
+///   `event_bus` -- none hold secrets (the egress map keys are provider
+///   names and `ProxyClient`'s Debug prints no URLs). Safe.
 ///
 /// **Maintenance note:** Secret-backed fields use `secrecy::SecretString`, which
 /// redacts in `Debug`/`Display` regardless of whether the containing type
@@ -73,6 +76,13 @@ pub struct AppState {
     pub(crate) provider_adapters: Arc<ProviderAdapterRegistry>,
     /// Protocol-neutral HTTP transport client.
     pub(crate) proxy_client: Arc<ProxyClient>,
+    /// Per-provider egress clients for providers with `[provider.egress]`
+    /// configured, keyed by provider name. Empty by default, in which case
+    /// every provider uses `proxy_client` -- exactly the behavior from before
+    /// egress support existed. The serve path builds this map from the
+    /// provider registry before the listener binds, so an unusable proxy URL
+    /// is a startup error, not a runtime fallback.
+    pub(crate) egress_clients: Arc<HashMap<String, Arc<ProxyClient>>>,
     /// Build identifier reported by `/version`.
     pub(crate) build: Arc<BuildInfo>,
     /// Token counter for estimating token usage.
@@ -122,6 +132,7 @@ impl std::fmt::Debug for AppState {
             .field("providers", &self.providers)
             .field("provider_adapters", &self.provider_adapters)
             .field("proxy_client", &self.proxy_client)
+            .field("egress_clients", &self.egress_clients)
             .field("build", &self.build)
             .field("token_counter", &self.token_counter)
             .field("metrics", &self.metrics)
@@ -192,6 +203,7 @@ impl AppState {
             providers: Arc::new(providers),
             provider_adapters: Arc::new(provider_adapters),
             proxy_client: Arc::new(proxy_client),
+            egress_clients: Arc::new(HashMap::new()),
             build: Arc::new(build),
             token_counter: Counter::new(),
             metrics: Arc::new(Metrics::new()),
@@ -211,6 +223,22 @@ impl AppState {
     #[must_use]
     pub fn with_client_auth(mut self, client_auth: Arc<ClientAuth>) -> Self {
         self.client_auth = client_auth;
+        self
+    }
+
+    /// Replace the per-provider egress clients (builder-style).
+    ///
+    /// `cmd_serve` builds this map from `[provider.egress]` entries in the
+    /// provider registry before the listener binds, so a proxy URL reqwest
+    /// cannot use is a startup error; tests inject proxied clients the same
+    /// way. An empty map (the default) keeps every provider on the shared
+    /// `proxy_client`, exactly as before egress support existed.
+    #[must_use]
+    pub fn with_egress_clients(
+        mut self,
+        egress_clients: HashMap<String, Arc<ProxyClient>>,
+    ) -> Self {
+        self.egress_clients = Arc::new(egress_clients);
         self
     }
 
@@ -265,6 +293,37 @@ impl AppState {
         &self.providers
     }
 
+    /// The transport client to use for an upstream request to `provider`.
+    ///
+    /// Providers with a wired `[provider.egress]` client get that client;
+    /// every other provider gets the shared default client. When no provider
+    /// has egress configured (the common case) this returns the shared client
+    /// for every lookup, preserving the single-client behavior from before
+    /// egress support existed.
+    ///
+    /// If a provider's config carries an egress section but no client was
+    /// wired for it, that is a wiring bug: the request still goes out, but a
+    /// loud warning names the provider on every affected request so the
+    /// mis-wiring cannot silently turn into direct egress. The serve path
+    /// builds the map from the same registry, so production cannot hit this.
+    pub fn upstream_client_for(&self, provider: &str) -> &ProxyClient {
+        if let Some(client) = self.egress_clients.get(provider) {
+            return client;
+        }
+        if self
+            .providers
+            .get(provider)
+            .is_some_and(|config| config.egress.is_some())
+        {
+            tracing::warn!(
+                provider,
+                "provider has [provider.egress] configured but no egress client was wired; \
+                 its upstream traffic is leaving directly, not through the configured proxy"
+            );
+        }
+        &self.proxy_client
+    }
+
     /// Access the provider model catalog service.
     pub fn model_catalogs(&self) -> &ModelCatalogService {
         &self.model_catalogs
@@ -292,7 +351,6 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::net::SocketAddr;
 
     /// Helper: build a minimal TOML AppConfig for tests.
@@ -349,6 +407,64 @@ mod tests {
         assert_eq!(state.shutdown_timeout(), Duration::from_secs(30));
     }
 
+    // -- Per-provider egress client selection ---------------------------------
+
+    #[test]
+    fn upstream_client_for_returns_the_shared_client_without_egress() {
+        let state = AppState::new(
+            make_app_config(),
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        );
+        // Same object for every provider: the single-client behavior from
+        // before egress support existed.
+        for provider in ["opencode-go", "opencode-zen", "anything-else"] {
+            assert!(
+                std::ptr::eq(
+                    state.upstream_client_for(provider),
+                    state.proxy_client.as_ref()
+                ),
+                "provider {provider} without egress must use the shared client"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_client_for_returns_the_wired_client_only_for_that_provider() {
+        let egress_client = Arc::new(
+            ProxyClient::try_with_egress_proxy("socks5h://127.0.0.1:1080")
+                .expect("egress proxy client builds"),
+        );
+        let state = AppState::new(
+            make_app_config(),
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        )
+        .with_egress_clients(HashMap::from([(
+            "opencode-go".to_owned(),
+            Arc::clone(&egress_client),
+        )]));
+
+        assert!(
+            std::ptr::eq(
+                state.upstream_client_for("opencode-go"),
+                egress_client.as_ref()
+            ),
+            "the provider with egress must use its wired client"
+        );
+        assert!(
+            std::ptr::eq(
+                state.upstream_client_for("opencode-zen"),
+                state.proxy_client.as_ref()
+            ),
+            "providers without egress must keep the shared client"
+        );
+    }
+
     // -- Helper methods -------------------------------------------------------
 
     #[test]
@@ -374,6 +490,7 @@ mod tests {
             api_key: secrecy::SecretString::from("sk-secret-key-99999"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -478,6 +595,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -522,6 +640,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -642,6 +761,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -667,6 +787,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(

@@ -472,6 +472,59 @@ pub struct ProviderConfig {
     /// the key is the upstream model id. Defaults to empty (no cost accounting).
     #[serde(default)]
     pub pricing: HashMap<ModelId, ModelPricing>,
+    /// Upstream egress (network exit) configuration. When present, this
+    /// provider's upstream requests are sent through the configured forward
+    /// proxy instead of a direct connection. Absent means direct egress,
+    /// exactly as before the section existed.
+    #[serde(default)]
+    pub egress: Option<ProviderEgressConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// ProviderEgressConfig
+// ---------------------------------------------------------------------------
+
+/// Per-provider forward-proxy egress configuration (`[provider.egress]`).
+///
+/// The proxy URL scheme must be one of `socks5h://`, `socks5://`, `http://`,
+/// or `https://`; anything else is rejected at config load, never silently
+/// ignored. `socks5h://` resolves upstream hostnames at the proxy (the exit
+/// point's DNS view); `socks5://` resolves them locally.
+///
+/// The URL may carry userinfo (`http://user:pass@host:port`), which is passed
+/// to the transport as proxy authentication. [`Debug`] redacts the userinfo;
+/// only `scheme://host:port` is ever printed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEgressConfig {
+    /// Forward proxy URL (`socks5h://host:port`, `socks5://`, `http://`, or
+    /// `https://`). Supports `${ENV_VAR}` interpolation like other string
+    /// fields. The port is optional and defaults per scheme (1080 for socks).
+    pub proxy: String,
+}
+
+impl std::fmt::Debug for ProviderEgressConfig {
+    // SECURITY: the raw URL may carry proxy credentials as userinfo; print
+    // only the credential-free form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderEgressConfig")
+            .field("proxy", &redacted_proxy_url(&self.proxy))
+            .finish()
+    }
+}
+
+/// Render `scheme://host:port` from a proxy URL, dropping any userinfo.
+///
+/// URLs without a `://` separator print as `<unparsed>` rather than echoing a
+/// string that has not been through validation.
+fn redacted_proxy_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<unparsed>".to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let after_authority = rest.strip_prefix(authority).unwrap_or_default();
+    format!("{scheme}://{host}{after_authority}")
 }
 
 // ---------------------------------------------------------------------------
@@ -986,6 +1039,18 @@ pub enum ConfigValidationError {
         /// The endpoint URL that has an invalid scheme.
         endpoint: String,
     },
+    /// The `[provider.egress]` proxy URL is not usable as a forward proxy.
+    #[error(
+        "provider \"{provider}\": [provider.egress] proxy URL is invalid ({reason}): \"{proxy}\""
+    )]
+    InvalidEgressProxy {
+        /// Provider name.
+        provider: String,
+        /// The rejected proxy URL.
+        proxy: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
     /// An adapter header name or value contains CR or LF characters.
     #[error("provider \"{provider}\": adapter \"{adapter}\" header contains CR/LF characters")]
     HeaderContainsCrlf {
@@ -1128,6 +1193,7 @@ pub enum ConfigValidationError {
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     passthrough_auth: false,
+///     egress: None,
 ///     adapters: HashMap::from([(
 ///         "chat".to_owned(),
 ///         ProviderAdapterConfig {
@@ -1160,6 +1226,7 @@ pub enum ConfigValidationError {
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     passthrough_auth: false,
+///     egress: None,
 ///     adapters: HashMap::new(),
 ///     routes: ProviderRoutesConfig::default(),
 ///     model_aliases: HashMap::new(),
@@ -1183,6 +1250,7 @@ pub fn validate_provider_config(
     validate_pricing(provider, name)?;
     validate_adapters(provider, name, known_protocols)?;
     validate_discovery(provider, name)?;
+    validate_egress(provider, name)?;
 
     // Both the catalog and the model aliases reject unsafe model IDs, but only
     // when an adapter interpolates `{model}` into a Gemini endpoint URL.
@@ -1493,6 +1561,70 @@ fn scheme_region(endpoint: &str) -> &str {
         Some(idx) => &endpoint[..idx],
         None => "",
     }
+}
+
+/// Egress proxy schemes accepted in `[provider.egress]`.
+///
+/// `socks5h` resolves hostnames at the proxy; `socks5` resolves locally.
+/// SOCKS support is the reason the provider crate enables reqwest's `socks`
+/// cargo feature. Schemes outside this list are rejected at config load
+/// rather than silently ignored.
+const EGRESS_PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "http", "https"];
+
+/// An egress proxy URL, when configured, must name an accepted scheme and a
+/// non-empty host.
+///
+/// reqwest itself is deliberately lenient (it accepts scheme-less URLs by
+/// prefixing `http://`, and `socks4`/unknown schemes without complaint), so
+/// this check is the real gate: anything outside the accepted schemes is a
+/// config error, never a silently different proxy.
+fn validate_egress(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
+    let Some(egress) = &provider.egress else {
+        return Ok(());
+    };
+    let url = egress.proxy.trim();
+    if url.is_empty() {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "empty proxy URL",
+        });
+    }
+    let scheme = scheme_region(url);
+    if scheme.is_empty() {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "no URL scheme; expected socks5h://, socks5://, http://, or https://",
+        });
+    }
+    if !EGRESS_PROXY_SCHEMES
+        .iter()
+        .any(|accepted| scheme.eq_ignore_ascii_case(accepted))
+    {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "unsupported scheme; expected socks5h://, socks5://, http://, or https://",
+        });
+    }
+    // Everything after the scheme must hold a host. Cut the authority region
+    // at the first path/query/fragment separator, then drop any userinfo
+    // (`user:pass@`) so only the host portion is checked.
+    let authority = url
+        .strip_prefix(scheme)
+        .and_then(|after_scheme| after_scheme.strip_prefix("://"))
+        .unwrap_or_default();
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.trim().is_empty() {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "no proxy host",
+        });
+    }
+    Ok(())
 }
 
 /// Validate a map of static headers for CRLF injection and forbidden header names.
@@ -2253,6 +2385,192 @@ chat_completion = "chat"
         result.unwrap_err();
     }
 
+    // -----------------------------------------------------------------------
+    // [provider.egress]
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn egress_section_parses_and_absent_section_means_none() {
+        let with_egress: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "socks5h://127.0.0.1:1080"
+"#,
+        )
+        .expect("provider with egress parses");
+        assert_eq!(
+            with_egress.provider.egress,
+            Some(ProviderEgressConfig {
+                proxy: "socks5h://127.0.0.1:1080".to_owned(),
+            })
+        );
+
+        let without_egress: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+"#,
+        )
+        .expect("provider without egress parses");
+        assert_eq!(without_egress.provider.egress, None);
+    }
+
+    #[test]
+    fn egress_section_rejects_unknown_fields() {
+        let result = toml::from_str::<ProviderFile>(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "socks5h://127.0.0.1:1080"
+bind_out = "198.51.100.10"
+"#,
+        );
+        result.unwrap_err();
+    }
+
+    #[test]
+    fn egress_debug_redacts_proxy_userinfo_but_keeps_the_host() {
+        let egress = ProviderEgressConfig {
+            proxy: "http://proxy-user:proxy-pass@proxy.internal:3128".to_owned(),
+        };
+        let debug = format!("{egress:?}");
+        assert!(
+            !debug.contains("proxy-user") && !debug.contains("proxy-pass"),
+            "proxy credentials must never print: {debug}"
+        );
+        assert!(
+            debug.contains("proxy.internal:3128"),
+            "the credential-free host must stay visible for diagnostics: {debug}"
+        );
+        // No-scheme strings (possible only pre-validation) print nothing raw.
+        let raw = ProviderEgressConfig {
+            proxy: "user:pass@host".to_owned(),
+        };
+        assert!(
+            !format!("{raw:?}").contains("user:pass"),
+            "unvalidated URLs must not be echoed: {:?}",
+            raw
+        );
+    }
+
+    #[test]
+    fn validate_accepts_each_supported_egress_proxy_scheme() {
+        for url in [
+            "socks5h://tunnel.example.com:1080",
+            "socks5://127.0.0.1:1080",
+            "http://proxy.internal:3128",
+            "https://proxy.internal:8443",
+            // Schemes are case-insensitive (RFC 3986), like endpoint schemes.
+            "SOCKS5H://tunnel.example.com:1080",
+            // Userinfo is proxy authentication, not part of the host check.
+            "http://user:pass@proxy.internal:3128",
+            // Portless socks: reqwest defaults to 1080.
+            "socks5h://tunnel.example.com",
+        ] {
+            let file: ProviderFile = toml::from_str(&format!(
+                r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "{url}"
+"#
+            ))
+            .expect("parses");
+            assert_eq!(
+                validate_provider_config(&file.provider, None),
+                Ok(()),
+                "egress proxy {url} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unusable_egress_proxy_urls() {
+        // (url, reason fragment) pairs. Scheme-less URLs matter most: reqwest
+        // would silently prefix `http://` at client build, so config load is
+        // the only gate that can refuse them.
+        for (url, reason_fragment) in [
+            ("ftp://proxy:21", "unsupported scheme"),
+            ("socks4://127.0.0.1:1080", "unsupported scheme"),
+            ("127.0.0.1:1080", "no URL scheme"),
+            ("proxy.internal:3128", "no URL scheme"),
+            ("socks5h://", "no proxy host"),
+            ("http:///path", "no proxy host"),
+            ("", "empty proxy URL"),
+            ("   ", "empty proxy URL"),
+        ] {
+            let file: ProviderFile = toml::from_str(&format!(
+                r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "{url}"
+"#
+            ))
+            .expect("parses");
+            let err = validate_provider_config(&file.provider, None)
+                .expect_err("egress proxy must be rejected");
+            match &err {
+                ConfigValidationError::InvalidEgressProxy {
+                    provider, reason, ..
+                } => {
+                    assert_eq!(provider, "example");
+                    assert!(
+                        reason.contains(reason_fragment),
+                        "reason {reason:?} must name {reason_fragment:?} for {url:?}"
+                    );
+                }
+                other => panic!("expected InvalidEgressProxy for {url:?}, got {other:?}"),
+            }
+            // The operator-facing message names the provider and the URL.
+            let message = err.to_string();
+            assert!(message.contains("example"));
+            assert!(message.contains("[provider.egress]"));
+        }
+    }
+
+    #[test]
+    fn load_provider_config_rejects_invalid_egress_at_load_time() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("bad-egress.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "ftp://proxy.example.com:21"
+"#,
+        )
+        .expect("write provider toml");
+
+        let err = load_provider_config(&path, None).expect_err("load must reject bad egress");
+        assert!(
+            err.to_string().contains("egress"),
+            "error must point at the egress section: {err}"
+        );
+    }
+
     #[test]
     fn provider_debug_redacts_header_values_and_endpoint_query() {
         let config: ProviderFile = toml::from_str(
@@ -2570,6 +2888,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -2597,6 +2916,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -2624,6 +2944,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -2651,6 +2972,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2671,6 +2993,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2736,6 +3059,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2762,6 +3086,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2786,6 +3111,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2820,6 +3146,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2866,6 +3193,7 @@ input = 0.0000025
             api_key: SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: true,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2887,6 +3215,7 @@ input = 0.0000025
             api_key: SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),

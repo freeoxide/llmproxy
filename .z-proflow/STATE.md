@@ -1214,3 +1214,279 @@ Gates re-run after the fix (exact commands):
 -D warnings` → exit 0; `cargo test --workspace --all-features` → 1299
 passed, 0 failed; `cargo fmt --all --check` → clean; `cargo shear` →
 "✓ no issues found". Core tests: 181 passed (13 admin tests total).
+
+## committer — PRX-03
+
+- Commit: `045e2cbccf735b97e3c7e7afd68305851ed703f4` on `prx/usage-ledger`
+  (on top of 5e4126a).
+- Message: "Serve the /usage admin API from a dedicated listener".
+- Staged paths (28): Cargo.lock; config.toml.example; apps/llm-proxy/Cargo.toml;
+  apps/llm-proxy/src/commands/serve.rs; apps/llm-proxy/src/state.rs;
+  apps/llm-proxy/tests/cli_validate.rs; crates/llm-proxy-api/Cargo.toml;
+  crates/llm-proxy-api/src/lib.rs; crates/llm-proxy-api/src/auth.rs (new);
+  crates/llm-proxy-api/src/reader.rs (new); crates/llm-proxy-api/src/routes.rs
+  (new); crates/llm-proxy-api/tests/usage_api.rs (new);
+  crates/llm-proxy-core/src/lib.rs; crates/llm-proxy-core/src/provider_config.rs;
+  crates/llm-proxy-server/Cargo.toml; crates/llm-proxy-server/src/lib.rs;
+  crates/llm-proxy-server/src/middleware.rs;
+  crates/llm-proxy-server/src/routes/mod.rs;
+  crates/llm-proxy-server/src/routes/models.rs;
+  crates/llm-proxy-server/src/routes/core_pipeline.rs;
+  crates/llm-proxy-server/src/state.rs;
+  crates/llm-proxy-server/tests/admin_usage.rs (new);
+  crates/llm-proxy-server/tests/integration.rs;
+  crates/llm-proxy-server/tests/openrouter_e2e.rs;
+  crates/llm-proxy-server/tests/core_pipeline.rs;
+  crates/llm-proxy-server/tests/chat_completions.rs; .z-proflow/STATE.md.
+- Exactly the ask's list; git status showed nothing else area-relevant
+  (only untracked .zcode/ workflow scripts — session tooling, left alone;
+  verified with find that the api tests dir holds only usage_api.rs).
+  Diffs cross-checked against the PRX-03 round-1 "Changed paths" notes here.
+- Same benign `git add` exit-1 advisory on the ignored `.z-proflow`
+  directory; STATE.md staged fully, `git diff` empty afterwards.
+- No hooks configured, so none ran; no --no-verify; no push. Gates not
+  re-run by the committer — the ask states PRX-03 is green on the full
+  workspace gate set.
+
+## judge — PRX-03 — round 1
+
+Audited commit 045e2cbccf735b97e3c7e7afd68305851ed703f4 read-only against
+AGENTS.md, the STATE.md POLICY/TASK/project-rules, the [workspace.lints] wall
+plus clippy.toml, and the PRX-03 brief. Read the axum-code-review skill first;
+axum 0.8 / tower 0.5 / tower-http 0.6 / edition 2024 confirmed from the root
+Cargo.toml before applying its checklist.
+
+### Gates run (exact commands, this round)
+
+- `cargo fmt --all --check` — exit 0, clean.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D
+  warnings` — exit 0, zero warnings.
+- `cargo test --workspace --all-features` — 30 suites, all "0 failed",
+  1299 passed total.
+- `cargo shear` — "✓ no issues found" (exit 0).
+- Dependency rule — `cargo info humantime` (2.3.0, chronotope, MIT OR
+  Apache-2.0), `cargo info tower-http` (0.6.11, tower-rs, MIT), `cargo info
+  sha2` (0.10.9, RustCrypto/hashes): all exist, correctly spelled,
+  maintained; matches the server crate's existing direct-version style.
+- Lint inheritance — all 7 member Cargo.tomls carry `[lints] workspace =
+  true` (grep loop).
+- Targeted: `cargo test -p llm-proxy-api` (5+11 passed), `-p
+  llm-proxy-server --test admin_usage` (4), `-p llm-proxy-core admin` (13),
+  `-p llm-proxy --test cli_validate` (9).
+- Empirical probe: scratch axum-0.8 router with the same
+  `Query<{limit: Option<i64>}>` shape → `?limit=abc` returns **400
+  text/plain** "Failed to deserialize query string: limit: invalid digit
+  found in string" (NOT the JSON error envelope) — basis for nit 3.
+
+### Findings
+
+1. MAJOR (defer to user) — crates/llm-proxy-server/src/routes/
+   core_pipeline.rs:2043: the stream-path `ResponseCompleted` still emits
+   `ctx.core.model` (upstream always None), so `model_upstream` stays NULL
+   for every streaming request; the PRX-02 judge set this to "land by PRX-03
+   at the latest" and that deadline has now passed — instead PRX-03's
+   `group_by=model` (reader.rs:64-69) hardcodes grouping on
+   `model_requested` and its doc bakes the gap in as permanent semantics.
+   The fix (place `ctx.stream_metrics.upstream_model` — field exists at
+   core_pipeline.rs:1327 — on the event) is outside PRX-03's declared
+   paths; user's call, but the workaround is now load-bearing in a public
+   API.
+2. NIT (defer) — crates/llm-proxy-api/src/routes.rs:64-75: the usage router
+   installs auth/trace/nosniff/catch-panic but no TimeoutLayer, and the
+   main-listener merge sits outside the main api router's TimeoutLayer
+   (routes/mod.rs:139), so a `/usage/summary` with a large `window` (upper
+   bound: none) over an unpruned ledger (retention optional) runs an
+   unbounded full scan + per-row Decimal parse on the shared blocking pool;
+   every other request surface in this workspace bounds handler time.
+3. NIT (defer) — crates/llm-proxy-api/src/routes.rs:193: `limit: Option<i64>`
+   is the only non-String param, so a non-numeric `limit` is rejected by
+   axum's Query extractor with a plain-text 400 (verified by probe), while
+   every handler-validated 400 on the surface uses the JSON
+   `{"error":...}` envelope; parse it in-handler like window/since/until.
+4. NIT (defer) — crates/llm-proxy-api/src/reader.rs:327-369: summary's
+   counts/tokens and cost sums are two separate autocommit statements on
+   one read-only connection = two WAL snapshots; a writer commit between
+   them makes the two halves reflect different row sets, and
+   `costs.get(&group_row.key)` (reader.rs:365) drops any group that exists
+   only in the cost pass. One deferred transaction around both reads would
+   give a single snapshot.
+5. NIT (defer) — crates/llm-proxy-api/src/auth.rs:104-122: no attempt bound
+   on admin auth; under the `admin_on_main_listener` posture the static
+   bearer token is online-guessable from every network the main listener
+   reaches at one cheap SHA-256 per attempt with no failure budget —
+   client auth got exactly such a gate in PRX-01 round 3. Token entropy is
+   currently the only defense; PRX-06's abuse family or an admin failure
+   budget would close it.
+
+### Also checked, no finding
+
+- Brief compliance: all three endpoints present with the specified params;
+  reads on `SQLITE_OPEN_READ_ONLY` connections with busy_timeout (unit test
+  proves the flag refuses writes); every /usage route behind the admin
+  token on BOTH mounts (admin_usage.rs + usage_api.rs: missing/wrong/no
+  token → uniform 401, no echo); constant-time compare over fixed 32-byte
+  digests; separate `[auth.admin]` token in SecretString +
+  skip_serializing; dedicated listener default 127.0.0.1:main+1
+  (effective_admin_bind), non-loopback admin_bind WARNed, opt-in posture
+  named "admin-on-main-listener" and WARNed loudly (3 capture tests);
+  validation rejects admin-without-storage, empty token, admin_bind ==
+  bind, dead admin_bind/flag, port-65535 default when it would bind (4
+  cmd_validate e2e tests + 13 core tests); routes wired in
+  routes/mod.rs; app spawns the admin listener before PID/main bind, busy
+  port = clean startup error; opt-in + no explicit bind attempts no second
+  socket (addendum behavior, 2 core tests); quota-stats aggregate skipped
+  and noted per brief.
+- Security/SQL: all SQL is static text or closed-enum `{key}` interpolation
+  with bound parameters (provider filter, cursor, since/until, LIMIT all
+  bound — no concatenation of request data); responses never carry bodies
+  (test asserts no body/message keys; schema has no body column); 500s log
+  detail server-side and return a generic JSON body; nosniff + CatchPanic
+  on both mounts; no CORS on the merged usage mount (same-origin default,
+  safe direction); merged usage routes bypass require_client_auth by design
+  (admin token is the auth) and cannot be reached on main without the
+  opt-in (404 test even with the right token).
+- Correctness: keyset cursor is stable under concurrent writes/pruning;
+  cursor split_once handles colons in request ids; `since >= until`
+  rejected; limit 1..=1000 enforced (reject not clamp); costs summed in
+  rust_decimal with a test pinning a sum float gets wrong; summary
+  since/until saturating math; map_request_row column indices verified
+  against both the SELECT list and the PRX-02 schema (sqlite.rs:153-189) —
+  all 28 match.
+- AGENTS wall: every unwrap/expect in the diff is inside test modules; no
+  `#[allow]`/`#[expect]` added; no `let _ =` on Result/Future; no
+  indexing/slicing; no Mutex/RefCell/unsafe in the api crate at all; no
+  MutexGuard across await; single-path re-export (`pub use routes::
+  UsageApi`); `#![deny(missing_docs)]` satisfied; docs state behavior and
+  invariants, no design narratives; tower-http/sha2 direct-version
+  declarations mirror the server crate's existing convention.
+- Two-listener shutdown: shutdown_signal() is safely callable twice
+  (independent futures, both resolve); admin serve failure logged not
+  fatal; serve_with_deadline refactor preserves zero-deadline/timeout/
+  force-exit semantics.
+
+Verdict: findings — 1 major deferred (streaming upstream-model gap, PRX-02
+carryover whose deadline elapsed this area), 4 nits deferred. All workspace
+gates green as run above.
+
+## implementer — PRX-04 — round 1
+
+Per-provider egress, layer 1 only: `[provider.egress] proxy = "<url>"` in
+provider TOML, validated at config load, honored by a per-provider reqwest
+client; no egress configured = today's exact shared-client behavior.
+Bind-out/source-address selection deliberately NOT implemented (plan layer 2).
+
+### Changed paths
+
+- `crates/llm-proxy-core/src/provider_config.rs` — `ProviderEgressConfig`
+  (`[provider.egress] proxy: String`, deny_unknown_fields) on
+  `ProviderConfig.egress: Option<…>` (serde default; old configs parse
+  unchanged); manual `Debug` redacts userinfo via new `redacted_proxy_url`
+  (prints only scheme://host:port; `<unparsed>` for scheme-less strings);
+  `ConfigValidationError::InvalidEgressProxy { provider, proxy, reason }`;
+  `validate_egress` wired into `validate_provider_config` (scheme must be
+  socks5h/socks5/http/https case-insensitive, non-empty host after userinfo;
+  empty URL and scheme-less rejected). 7 new tests (parse/absent/unknown-field/
+  accept-matrix/reject-matrix/load-time/Debug-redaction) + the two doctest
+  literals updated.
+- `crates/llm-proxy-core/src/lib.rs` — export `ProviderEgressConfig`.
+- `crates/llm-proxy-provider/src/transport.rs` — `pooled_http_builder()`
+  extracted (the exact pool settings from the old `try_new`, now shared by
+  both constructors so they cannot drift); new
+  `ProxyClient::try_with_egress_proxy(&str)` = same pool/timeouts +
+  `.proxy(reqwest::Proxy::all(url)?)`, with a defense-in-depth
+  `validate_egress_proxy_url` (same 4-scheme allowlist — reqwest silently
+  accepts ftp://, socks4://, and scheme-less URLs by prefixing http://, so
+  config load is not the only gate); manual `Debug` on `ProxyClient` that
+  never delegates reqwest::Client's Debug (it prints the configured proxy
+  URI — reqwest src/client.rs:2761 `f.field("proxies", …)`). 5 new tests
+  incl. two end-to-end ones: an HTTP egress proxy observing the
+  absolute-form upstream target, and a real in-test SOCKS5 server proving
+  socks5h delivers the UNRESOLVED hostname to the proxy (remote DNS) and the
+  response traverses the tunnel.
+- `crates/llm-proxy-provider/Cargo.toml` — reqwest features += `socks`
+  (verified: docs.rs/reqwest/0.12 "By enabling the 'socks' feature it is
+  possible to use a socks proxy"; empirically reqwest 0.12.28 implements the
+  SOCKS handshake in-tree gated on the feature, connect.rs `mod socks` via
+  hyper-util — no new crate, Cargo.lock unchanged); tokio dev-dep += `io-util`
+  (test-side SOCKS handshake reads only).
+- `crates/llm-proxy-server/src/state.rs` — `AppState.egress_clients:
+  Arc<HashMap<String, Arc<ProxyClient>>>` (default empty), `with_egress_clients`
+  builder, `upstream_client_for(&str) -> &ProxyClient` (egress map hit else the
+  shared client; loud warn! if a provider config has egress but no wired
+  client — impossible via load_toml_state, the alarm guards future wiring
+  paths); Debug chain updated; 2 ptr-identity tests.
+- `crates/llm-proxy-server/src/routes/core_pipeline.rs` — both upstream send
+  sites (`handle_core_once`, `handle_core_stream`) now use
+  `state.upstream_client_for(&target.provider_name)`; empty map ⇒ the shared
+  client, zero behavior change.
+- `apps/llm-proxy/src/state.rs` — `load_toml_state` builds the egress map
+  from the registry BEFORE the listener binds: unusable proxy URL = startup
+  error (fail closed, never silent direct fallback); info! logs provider +
+  scheme only (never the URL — userinfo may carry credentials). 2 new tests:
+  wiring (egress provider in map, non-egress provider not, credentials never
+  printed) and startup-error for a URL reqwest cannot build
+  ("http://[::1:8080" passes core validation, fails Proxy::all).
+- 48 `ProviderConfig` literals across 10 files gain `egress: None`
+  (scripted sed, then awk-verified every literal got the line; the two
+  doctest literals fixed by hand).
+- `providers/opencode-{go,zen}.toml.example` — commented `[provider.egress]`
+  block (allowed schemes, socks5h DNS semantics, absent = direct).
+- NOT touched: `ref/`, `.git`, CI, `docs/` (docs/completed/remodel-proxy.md
+  is an archive of completed work, not living config reference),
+  DEFAULT_CONFIG_TOML (defaults.rs) — no egress in the default config.
+
+### Self-checks run (this round, exact commands)
+
+- `cargo test -p llm-proxy-core` — 187 passed + 6 doctests, 0 failed.
+- `cargo test -p llm-proxy-provider` — 298 + 63, 0 failed.
+- `cargo test -p llm-proxy-server` — all suites ok (184+4+39+60+40+13), 0 failed.
+- `cargo test -p llm-proxy-api -p llm-proxy-storage -p llm-proxy-protocol` — ok.
+- `cargo test -p llm-proxy` — 50+6+17+1+4+4+9, 0 failed.
+- `cargo fmt --all` + `cargo fmt --all --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features --locked --
+  -D warnings` — exit 0, zero warnings (one transient `unused-mut` in the new
+  test caught and fixed before this final run).
+- `cargo test --workspace --all-features` — exit 0; 1314 passed, 0 failed,
+  30 suites ok.
+- `cargo shear` (cargo-shear at ~/.cargo/bin) — "✓ no issues found".
+- Empirical reqwest probes (scratch project + vendored source): Proxy::all
+  accepts ftp://socks4://scheme-less (leniency that motivates the allowlist);
+  socks portless defaults to 1080; reqwest 0.12.28 socks impl is in-tree
+  behind the `socks` feature using hyper-util SocksV5 (Cargo.lock unchanged).
+- The script's own gate run remains the deciding one; the above is what I ran.
+
+### Interface notes for dependent areas
+
+- Config surface: `[provider.egress] proxy = "<url>"` per provider TOML;
+  validated inside `load_provider_config` (so `llm-proxy validate` and
+  serve both reject bad schemes with `InvalidEgressProxy`, which names the
+  provider and reason). Absent section = `ProviderConfig.egress: None`.
+- `llm_proxy_provider::ProxyClient::try_with_egress_proxy(&str) -> Result<
+  ProxyClient, ProviderError>` — same pool/timeouts as `try_new`, plus the
+  proxy. `llm_proxy_server::AppState::with_egress_clients(HashMap<String,
+  Arc<ProxyClient>>)` is the wiring hook (production: `load_toml_state`);
+  `AppState::upstream_client_for(&str) -> &ProxyClient` is the request-path
+  accessor. All ProviderConfig literal authors must now set `egress` (None
+  unless the provider configures a proxy).
+- Events/ledger: unchanged — egress adds no event fields; PRX-06's
+  secret-abuse family can extend the app wiring test's assertion (proxy
+  credentials never in `format!("{state:?}")`).
+- Explicitly NOT implemented (plan layer 2, per brief): bind-out /
+  source-address selection. Egress = forward proxy only; exit geography is
+  the tunnel endpoint's property.
+
+### Punted
+
+- Discovery traffic (`[provider.discovery]`, crates/llm-proxy-provider/
+  discovery.rs) does NOT use the egress client — it builds its own reqwest
+  client today; the brief scopes egress to the request transport
+  (transport.rs). A provider behind a geo-restricted upstream will need its
+  models list pinned via static catalog until discovery egress is decided.
+- Per-egress-client timeout overrides: `with_stream_idle_timeout` /
+  `with_upstream_headers_timeout` remain builder methods on ProxyClient
+  (unused outside tests today); a provider wanting different timeouts under
+  egress can chain them — no config surface added.
+- No egress for the admin/usage surface (loopback listener; meaningless).
+- reqwest proxy env vars (HTTP_PROXY etc.): reqwest's system-proxy behavior
+  is unchanged for the default client; an explicitly configured egress proxy
+  replaces env resolution for that provider's client (reqwest semantics).

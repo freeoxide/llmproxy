@@ -187,6 +187,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -458,6 +459,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2049,6 +2051,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key-a"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: adapters_a,
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
@@ -2074,6 +2077,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key-b"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: adapters_b,
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),

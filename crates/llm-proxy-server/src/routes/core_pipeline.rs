@@ -821,19 +821,23 @@ pub(crate) async fn handle_core_once(
         err
     })?;
 
-    let response_bytes = state.proxy_client.send(proxy_req).await.map_err(|e| {
-        let err = map_provider_error(&e, passthrough_auth);
-        state.metrics.record_failure();
-        emit_response_failed(
-            &state.event_bus,
-            &ctx.request_id,
-            Some(provider_name),
-            Some(&core.model),
-            &err,
-            ctx.start,
-        );
-        err
-    })?;
+    let response_bytes = state
+        .upstream_client_for(&target.provider_name)
+        .send(proxy_req)
+        .await
+        .map_err(|e| {
+            let err = map_provider_error(&e, passthrough_auth);
+            state.metrics.record_failure();
+            emit_response_failed(
+                &state.event_bus,
+                &ctx.request_id,
+                Some(provider_name),
+                Some(&core.model),
+                &err,
+                ctx.start,
+            );
+            err
+        })?;
 
     // Decode the provider response into a CoreResponse.
     let mut core_resp = adapter
@@ -1139,7 +1143,7 @@ pub(crate) async fn handle_core_stream(
 
     // Open the streaming connection.
     let byte_stream = state
-        .proxy_client
+        .upstream_client_for(&target.provider_name)
         .send_stream(proxy_req)
         .await
         .map_err(|e| {

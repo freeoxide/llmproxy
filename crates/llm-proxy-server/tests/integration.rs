@@ -67,6 +67,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
