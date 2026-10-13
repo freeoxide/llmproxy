@@ -20,6 +20,19 @@ trust_forwarded_headers = false
 # Window for rejecting identical path/body requests. "0ms" disables dedup.
 dedup_window = "0ms"
 server_name = "llm-proxy"
+# Dedicated listener for the read-only admin /usage API. Only read when
+# [auth.admin] is configured. Defaults to "127.0.0.1" on the port after
+# `bind` (loopback-only); set it explicitly to point at a tunnel interface
+# or a different port. Must differ from `bind`.
+# admin_bind = "127.0.0.1:3457"
+# Also serve /usage on the main listener behind the same admin token.
+# Off by default; enabling it names a distinct security posture
+# ("admin-on-main-listener") that startup warns about loudly: the admin
+# surface then reaches every network the main listener does. With no
+# explicit admin_bind set, this posture serves /usage on the main listener
+# only (no dedicated socket) — the option for setups where a second port
+# is not available.
+# admin_on_main_listener = false
 
 # Client authentication for proxy routes.
 #
@@ -53,3 +66,10 @@ mode = "none"
 # max_rows = 1000000
 # How often retention pruning runs. Default "1h"; must be at least "1s".
 # prune_interval = "1h"
+
+# Admin API for the usage ledger. Absent (the default) disables the /usage
+# surface entirely. Requires [storage]; every /usage route on every mount
+# demands "Authorization: Bearer <admin-token>" (compared in constant time).
+#
+# [auth.admin]
+# token = "${ADMIN_TOKEN}"

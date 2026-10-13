@@ -895,6 +895,7 @@ mod tests {
         llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
+            admin: None,
         }
     }
 
@@ -909,6 +910,7 @@ mod tests {
             llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,
                 clients,
+                admin: None,
             }
         };
         assert!(matches!(
@@ -919,6 +921,7 @@ mod tests {
         let keys_without_clients = llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients: HashMap::new(),
+            admin: None,
         };
         assert!(matches!(
             ClientAuth::from_config(&keys_without_clients),
@@ -983,6 +986,7 @@ mod tests {
         let config = llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
+            admin: None,
         };
         let auth = ClientAuth::from_config(&config).expect("valid config");
         assert_eq!(auth.authenticate("two").await.as_deref(), Some("beta"));

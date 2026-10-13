@@ -114,4 +114,126 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$eEnjdfBL8hfvU2QuGOpo
             "client-keys on a non-loopback bind should validate: {result:?}"
         );
     }
+
+    #[test]
+    fn validate_accepts_admin_api_with_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[auth.admin]
+token = "admin-secret"
+
+[storage]
+path = "usage.db"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        assert!(
+            result.is_ok(),
+            "admin + storage should validate: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_admin_token_without_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[auth.admin]
+token = "admin-secret"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let msg = format!(
+            "{:#}",
+            result.expect_err("admin without storage must be rejected")
+        );
+        assert!(
+            msg.contains("[auth.admin] requires"),
+            "error should point at the missing ledger: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_admin_on_main_listener_without_admin_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+admin_on_main_listener = true
+
+[storage]
+path = "usage.db"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let msg = format!("{:#}", result.expect_err("dead opt-in must be rejected"));
+        assert!(
+            msg.contains("admin_on_main_listener"),
+            "error should name the dead flag: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_admin_bind_equal_to_main_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+admin_bind = "127.0.0.1:3456"
+
+[auth.admin]
+token = "admin-secret"
+
+[storage]
+path = "usage.db"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let msg = format!("{:#}", result.expect_err("same-socket bind rejected"));
+        assert!(
+            msg.contains("must differ from server.bind"),
+            "error should explain the socket conflict: {msg}"
+        );
+    }
 }

@@ -18,6 +18,7 @@ llm-proxy-core = { workspace = true }
 llm-proxy-protocol = { path = "../llm-proxy-protocol" }
 llm-proxy-provider = { path = "../llm-proxy-provider" }
 llm-proxy-storage = { path = "../llm-proxy-storage" }
+llm-proxy-api = { path = "../llm-proxy-api" }
 
 axum = { workspace = true, features = ["macros", "json"] }
 tokio = { workspace = true, features = ["fs"] }
@@ -43,3 +44,4 @@ rust_decimal = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 llm-proxy-storage = { path = "../llm-proxy-storage", features = ["test-utils"] }
+tempfile = "3"

@@ -40,6 +40,48 @@ pub struct AppConfig {
     pub storage: Option<StorageConfig>,
 }
 
+/// Named security postures for where the admin `/usage` API is reachable.
+///
+/// Selected by config; the serve path logs the posture name loudly at startup
+/// so operators can see which surface they configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminMountPosture {
+    /// Default: `/usage` is served only on the dedicated
+    /// [`ServerConfig::admin_bind`] listener (loopback unless configured
+    /// otherwise); the main listener has no admin surface at all.
+    DedicatedListener,
+    /// Opt-in (`server.admin_on_main_listener = true`): `/usage` is also
+    /// served on the main `bind` listener behind the same admin token, so
+    /// the admin surface reaches every network the main listener does.
+    MainListener,
+}
+
+impl AdminMountPosture {
+    /// Stable name used in startup logs so operators can grep the posture
+    /// their config selected.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DedicatedListener => "dedicated-admin-listener",
+            Self::MainListener => "admin-on-main-listener",
+        }
+    }
+}
+
+impl AppConfig {
+    /// The admin `/usage` mount posture, or `None` when no
+    /// `[auth.admin]` token is configured (no admin surface anywhere).
+    #[must_use]
+    pub fn admin_posture(&self) -> Option<AdminMountPosture> {
+        let posture = if self.server.admin_on_main_listener {
+            AdminMountPosture::MainListener
+        } else {
+            AdminMountPosture::DedicatedListener
+        };
+        self.auth.admin.as_ref().map(|_| posture)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ServerConfig
 // ---------------------------------------------------------------------------
@@ -139,6 +181,58 @@ pub struct ServerConfig {
     /// header value are skipped (with a warning) when the router is built.
     #[serde(default)]
     pub allowed_origins: Option<Vec<String>>,
+    /// Dedicated listener bind for the admin `/usage` API. Only read when
+    /// `[auth.admin]` is configured; the default is `127.0.0.1` on the port
+    /// after `bind`'s port (see [`ServerConfig::effective_admin_bind`]), so
+    /// the admin surface stays loopback-only unless deliberately pointed at
+    /// a tunnel interface or removed port.
+    #[serde(default)]
+    pub admin_bind: Option<SocketAddr>,
+    /// Also serve `/usage` on the main listener behind the same admin token.
+    ///
+    /// Opt-in; selects the [`AdminMountPosture::MainListener`] posture, which
+    /// the serve path announces with a loud startup warning: the admin
+    /// surface then reaches every network the main listener does. With no
+    /// explicit `admin_bind` this posture serves `/usage` on the main
+    /// listener ONLY — no dedicated socket is attempted, which is exactly
+    /// what setups without a second available port need.
+    #[serde(default)]
+    pub admin_on_main_listener: bool,
+}
+
+impl ServerConfig {
+    /// Whether the dedicated admin listener binds at all.
+    ///
+    /// An explicit `admin_bind` always binds one. With none set, the
+    /// default loopback listener binds unless the main-listener opt-in
+    /// took over — `admin_on_main_listener = true` without an explicit
+    /// `admin_bind` is exactly the posture for setups where a second port
+    /// is not available, so no dedicated socket is attempted there.
+    #[must_use]
+    pub fn dedicated_admin_listener(&self) -> bool {
+        self.admin_bind.is_some() || !self.admin_on_main_listener
+    }
+
+    /// Bind address for the dedicated admin listener.
+    ///
+    /// `admin_bind` when configured; otherwise the default: `127.0.0.1` on
+    /// the port after `bind`'s port. `None` when that default port cannot be
+    /// derived (`bind` on port 65535) — `load_app_config` rejects that
+    /// combination whenever the dedicated listener would bind the default,
+    /// so validated configs that consult this while
+    /// [`ServerConfig::dedicated_admin_listener`] is true always resolve to
+    /// an address.
+    #[must_use]
+    pub fn effective_admin_bind(&self) -> Option<SocketAddr> {
+        match self.admin_bind {
+            Some(addr) => Some(addr),
+            None => self
+                .bind
+                .port()
+                .checked_add(1)
+                .map(|port| SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), port)),
+        }
+    }
 }
 
 const fn default_rate_limit_rpm() -> u32 {
@@ -185,6 +279,28 @@ pub struct AuthConfig {
     /// intentional.
     #[serde(default, skip_serializing)]
     pub clients: HashMap<String, SecretString>,
+    /// Admin API authentication (`[auth.admin]` section). When present, the
+    /// read-only `/usage` query surface is enabled and every `/usage` route
+    /// on every mount requires its bearer token.
+    #[serde(default)]
+    pub admin: Option<AdminAuthConfig>,
+}
+
+/// Admin API configuration (`[auth.admin]` section of `config.toml`).
+///
+/// A single bearer token guarding every `/usage` route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminAuthConfig {
+    /// The admin bearer token, presented as `Authorization: Bearer <token>`.
+    ///
+    /// Compared in constant time against a SHA-256 digest of the configured
+    /// token, so the plaintext never needs to be retained in memory. Wrapped
+    /// in [`SecretString`] so it is redacted in `Debug` output;
+    /// `skip_serializing` (mirroring `ProviderConfig::api_key`) keeps it out
+    /// of every `Serialize` path.
+    #[serde(skip_serializing)]
+    pub token: SecretString,
 }
 
 /// Default graceful-shutdown hard deadline (30 seconds).
@@ -1534,7 +1650,81 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     if let Some(storage) = cfg.storage.as_ref() {
         validate_storage_config(storage)?;
     }
+    validate_admin_mount(&cfg)?;
     Ok(cfg)
+}
+
+/// Validate the admin `/usage` mount against the rest of the config.
+///
+/// Rules:
+/// - `[auth.admin]` requires `[storage]`: without the usage ledger there is
+///   nothing to query, so serving `/usage` would only produce errors.
+/// - The admin token must not be empty (an empty token can never match a
+///   bearer token, so the section would be dead config hiding a mistake).
+/// - `server.admin_bind` must differ from `server.bind`: two listeners cannot
+///   share one socket.
+/// - Without `[auth.admin]`, `server.admin_bind` and
+///   `server.admin_on_main_listener` are dead config and are rejected.
+/// - The derived default admin port (`bind` port + 1) must exist: a `bind`
+///   on port 65535 with no explicit `admin_bind` has no distinct port to
+///   default to.
+fn validate_admin_mount(cfg: &AppConfig) -> Result<(), CoreError> {
+    let Some(admin) = cfg.auth.admin.as_ref() else {
+        if cfg.server.admin_bind.is_some() {
+            return Err(CoreError::ConfigValidation {
+                message: "server.admin_bind is configured but [auth.admin] is not; \
+                          set [auth.admin] token or remove server.admin_bind"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        if cfg.server.admin_on_main_listener {
+            return Err(CoreError::ConfigValidation {
+                message: "server.admin_on_main_listener = true but [auth.admin] is not \
+                          configured; there would be no admin token to guard /usage"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        return Ok(());
+    };
+    if admin.token.expose_secret().is_empty() {
+        return Err(CoreError::ConfigValidation {
+            message: "[auth.admin] token must not be empty".to_owned(),
+            source: None,
+        });
+    }
+    if cfg.storage.is_none() {
+        return Err(CoreError::ConfigValidation {
+            message: "[auth.admin] requires the [storage] usage ledger; configure \
+                      [storage] or remove [auth.admin]"
+                .to_owned(),
+            source: None,
+        });
+    }
+    if let Some(admin_bind) = cfg.server.admin_bind {
+        if admin_bind == cfg.server.bind {
+            return Err(CoreError::ConfigValidation {
+                message: format!(
+                    "server.admin_bind {admin_bind} must differ from server.bind; \
+                     the admin listener needs its own socket"
+                ),
+                source: None,
+            });
+        }
+    } else if !cfg.server.admin_on_main_listener && cfg.server.bind.port() == u16::MAX {
+        // The default admin port (bind port + 1) is only consulted when the
+        // dedicated listener binds it; under the main-listener opt-in with
+        // no explicit admin_bind, no second socket is attempted.
+        return Err(CoreError::ConfigValidation {
+            message: "server.bind port 65535 leaves no distinct port for the default \
+                      admin listener; set server.admin_bind explicitly or enable \
+                      server.admin_on_main_listener"
+                .to_owned(),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 /// Reserved caller name used for unauthenticated requests under
@@ -2869,6 +3059,220 @@ db_host = "postgres.example"
         assert!(
             load_app_config(&path).is_err(),
             "deny_unknown_fields must reject unrecognized [storage] keys"
+        );
+    }
+
+    // -- [auth.admin] / admin mount -------------------------------------------
+
+    /// Minimal valid `[storage]` section so admin tests vary only the admin
+    /// fields.
+    const STORAGE_SECTION: &str = "\n[storage]\npath = \"/tmp/usage.db\"\n";
+
+    #[test]
+    fn admin_section_parses_token_and_defaults_off() {
+        let (_dir, path) = write_app_config(&format!(
+            "{STORAGE_SECTION}\n[auth.admin]\ntoken = \"admin-secret\"\n"
+        ));
+        let config = load_app_config(&path).expect("valid [auth.admin]");
+        assert!(
+            config
+                .auth
+                .admin
+                .as_ref()
+                .is_some_and(|a| a.token.expose_secret() == "admin-secret"),
+            "admin token must parse into the SecretString"
+        );
+        assert!(
+            !config.server.admin_on_main_listener,
+            "main-listener mount must be opt-in"
+        );
+        assert_eq!(
+            config.server.effective_admin_bind(),
+            Some("127.0.0.1:3457".parse().unwrap()),
+            "default admin bind is loopback on the port after the main bind"
+        );
+        assert_eq!(
+            config.admin_posture(),
+            Some(AdminMountPosture::DedicatedListener),
+            "the default posture is the dedicated listener"
+        );
+    }
+
+    #[test]
+    fn admin_explicit_bind_and_main_listener_opt_in_parse() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:9900\"\nadmin_on_main_listener = true\n{STORAGE_SECTION}\n\
+             [auth.admin]\ntoken = \"admin-secret\"\n"
+        ));
+        let config = load_app_config(&path).expect("valid admin config");
+        assert_eq!(
+            config.server.effective_admin_bind(),
+            Some("127.0.0.1:9900".parse().unwrap()),
+            "explicit admin_bind wins over the derived default"
+        );
+        assert_eq!(
+            config.admin_posture(),
+            Some(AdminMountPosture::MainListener),
+            "admin_on_main_listener selects the main-listener posture"
+        );
+        assert_eq!(
+            AdminMountPosture::MainListener.name(),
+            "admin-on-main-listener",
+            "posture names are stable for log grepping"
+        );
+    }
+
+    #[test]
+    fn admin_without_storage_is_rejected() {
+        let (_dir, path) = write_app_config("\n[auth.admin]\ntoken = \"admin-secret\"\n");
+        let error = load_app_config(&path).expect_err("admin requires [storage]");
+        assert!(
+            error.to_string().contains("[auth.admin] requires"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_empty_token_is_rejected() {
+        let (_dir, path) =
+            write_app_config(&format!("{STORAGE_SECTION}\n[auth.admin]\ntoken = \"\"\n"));
+        let error = load_app_config(&path).expect_err("empty admin token rejected");
+        assert!(
+            error.to_string().contains("token must not be empty"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_bind_equal_to_main_bind_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:3456\"\n{STORAGE_SECTION}\n[auth.admin]\n\
+             token = \"admin-secret\"\n"
+        ));
+        let error = load_app_config(&path).expect_err("same-socket bind rejected");
+        assert!(
+            error.to_string().contains("must differ from server.bind"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_default_port_underviable_on_65535_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nbind = \"127.0.0.1:65535\"\nrequest_timeout = \"300s\"\n\
+                 log_level = \"info\"\nhot_reload = false\nserver_name = \"t\"\n{STORAGE_SECTION}\n\
+                 \n[auth.admin]\ntoken = \"admin-secret\"\n"
+            ),
+        )
+        .unwrap();
+        let error = load_app_config(&path).expect_err("no derivable admin port");
+        assert!(error.to_string().contains("65535"), "got: {error}");
+    }
+
+    #[test]
+    fn admin_main_listener_optin_needs_no_derivable_port() {
+        // The "no second port available" posture: with the main-listener
+        // opt-in and no explicit admin_bind, no dedicated socket is
+        // attempted, so an underivable default port must not reject the
+        // config.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nbind = \"127.0.0.1:65535\"\nrequest_timeout = \"300s\"\n\
+                 log_level = \"info\"\nhot_reload = false\nserver_name = \"t\"\n\
+                 admin_on_main_listener = true\n{STORAGE_SECTION}\n\
+                 \n[auth.admin]\ntoken = \"admin-secret\"\n"
+            ),
+        )
+        .unwrap();
+        let config = load_app_config(&path).expect("main-listener posture needs no port");
+        assert!(
+            !config.server.dedicated_admin_listener(),
+            "the opt-in without an explicit admin_bind must not bind a dedicated socket"
+        );
+    }
+
+    #[test]
+    fn explicit_admin_bind_keeps_the_dedicated_listener_under_the_optin() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:9900\"\nadmin_on_main_listener = true\n{STORAGE_SECTION}\n\
+             [auth.admin]\ntoken = \"admin-secret\"\n"
+        ));
+        let config = load_app_config(&path).expect("both mounts are legitimate");
+        assert!(
+            config.server.dedicated_admin_listener(),
+            "an explicit admin_bind always binds the dedicated listener"
+        );
+        assert_eq!(
+            config.admin_posture(),
+            Some(AdminMountPosture::MainListener),
+            "and the main-listener mount is on top of it"
+        );
+    }
+
+    #[test]
+    fn admin_bind_without_admin_section_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:9900\"\n{STORAGE_SECTION}"
+        ));
+        let error = load_app_config(&path).expect_err("dead admin_bind rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("server.admin_bind is configured"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_main_listener_flag_without_admin_section_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_on_main_listener = true\n{STORAGE_SECTION}"
+        ));
+        let error = load_app_config(&path).expect_err("dead flag rejected");
+        assert!(
+            error.to_string().contains("admin_on_main_listener"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_unknown_field_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "{STORAGE_SECTION}\n[auth.admin]\ntoken = \"admin-secret\"\nrotates = \"weekly\"\n"
+        ));
+        assert!(
+            load_app_config(&path).is_err(),
+            "deny_unknown_fields must reject unrecognized [auth.admin] keys"
+        );
+    }
+
+    #[test]
+    fn admin_posture_is_none_without_admin_section() {
+        let (_dir, path) = write_app_config(STORAGE_SECTION);
+        let config = load_app_config(&path).expect("valid config");
+        assert_eq!(
+            config.admin_posture(),
+            None,
+            "no [auth.admin] means no admin surface anywhere"
+        );
+    }
+
+    #[test]
+    fn admin_auth_config_debug_redacts_token() {
+        let admin = AdminAuthConfig {
+            token: SecretString::from("super-secret-admin-token"),
+        };
+        let debug = format!("{admin:?}");
+        assert!(
+            !debug.contains("super-secret-admin-token"),
+            "Debug must redact the admin token, got: {debug}"
         );
     }
 }

@@ -163,6 +163,23 @@ pub fn router(state: AppState) -> Router {
         // (audit LOW-27).
         .method_not_allowed_fallback(method_not_allowed);
 
+    // The admin `/usage` surface joins the MAIN listener only under the
+    // explicit `server.admin_on_main_listener` opt-in — a distinct, named
+    // security posture the serve path warns about loudly at startup. The
+    // default posture serves `/usage` on the dedicated admin listener
+    // ([`crate::admin_router`]) and leaves this listener without any admin
+    // surface. Config validation guarantees the flag implies `[auth.admin]`;
+    // `admin_router` returning `None` here keeps the default closed. The
+    // merge happens after `with_state` below because the usage router is
+    // already stateless.
+    let usage_on_main = match (
+        crate::admin_router(&state),
+        state.app_config.server.admin_on_main_listener,
+    ) {
+        (Some(usage), true) => Some(usage),
+        _ => None,
+    };
+
     // Config-gated CORS (audit LOW-12). A `CorsLayer` is installed only when
     // the operator explicitly lists cross-origin callers, and then only for
     // those exact origins. This replaces a former `CorsLayer::very_permissive()`
@@ -175,7 +192,7 @@ pub fn router(state: AppState) -> Router {
         None => router,
     };
 
-    router
+    let router: Router = router
         // Global, outermost middleware (audit LOW-11, LOW-12) -- applied to the
         // merged router so they cover every route and both fallbacks. CORS sits
         // just inside these so a preflight still receives the headers below and
@@ -192,7 +209,15 @@ pub fn router(state: AppState) -> Router {
             HeaderValue::from_static("nosniff"),
         ))
         .layer(CatchPanicLayer::new())
-        .with_state(state)
+        .with_state(state);
+
+    // Both routers are stateless here, so the opt-in usage surface merges
+    // cleanly (see `usage_on_main` above). It carries its own admin-auth,
+    // nosniff, panic-catch, and tracing layers.
+    match usage_on_main {
+        Some(usage) => router.merge(usage),
+        None => router,
+    }
 }
 
 /// Build a restrictive `CorsLayer` for an explicit allow-origin list, or return
@@ -663,10 +688,13 @@ mod auth_gate_tests {
                 trust_forwarded_headers: false,
                 dedup_window: std::time::Duration::ZERO,
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::ClientKeys,
                 clients,
+                admin: None,
             },
             storage: None,
         };

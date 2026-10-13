@@ -311,6 +311,8 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
             auth: Default::default(),
             storage: None,

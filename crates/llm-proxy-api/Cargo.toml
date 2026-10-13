@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Reserved public HTTP API surface for llm-proxy; a placeholder until the handler layer lands."
+description = "Read-only authenticated /usage query surface for the llm-proxy usage ledger."
 repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
@@ -12,3 +12,23 @@ categories.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+axum = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true }
+rust_decimal = { workspace = true }
+sha2 = "0.10"
+humantime = "2.3"
+tower-http = { version = "0.6", features = ["trace", "catch-panic", "set-header"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
+tower = { workspace = true, features = ["util"] }
+llm-proxy-storage = { path = "../llm-proxy-storage" }
+llm-proxy-protocol = { path = "../llm-proxy-protocol" }

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use axum::serve::{Listener, ListenerExt};
 use llm_proxy_core::LogFormat;
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
-use llm_proxy_server::{build_router, shutdown_signal};
+use llm_proxy_server::{admin_router, build_router, shutdown_signal};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -60,6 +60,11 @@ pub async fn cmd_serve(
     // Load TOML config and build state before writing the PID file. This
     // ensures a bad config does not leave a stale PID file on disk.
     let state = load_toml_state(&path, adapter_registry, proxy_client, port_override)?;
+
+    // Dedicated admin listener for the `/usage` surface (`[auth.admin]`),
+    // bound before the PID file and the main listener so a busy or unusable
+    // admin port is a clean startup error that leaves no stale PID file.
+    let admin = bind_admin_listener(&state).await?;
 
     // Attempt atomic PID file creation. If it fails because the file already
     // exists, check whether the existing owner is still alive before removing
@@ -132,26 +137,21 @@ pub async fn cmd_serve(
     )
     .with_graceful_shutdown(shutdown_signal());
 
-    let result = if shutdown_deadline.is_zero() {
-        serve.await
-    } else {
-        match tokio::time::timeout(shutdown_deadline, serve).await {
-            Ok(r) => r,
-            Err(_) => {
-                tracing::error!(
-                    deadline = ?shutdown_deadline,
-                    "graceful-shutdown deadline elapsed; forcing exit with in-flight connections dropped"
-                );
-                // Run PID cleanup best-effort, then exit. The deadline exists
-                // precisely to escape stuck connections, so we do not wait for
-                // them; remove_pid is fast, synchronous filesystem I/O.
-                if let Err(e) = remove_pid() {
-                    tracing::warn!(error = %e, "failed to remove PID file during shutdown");
-                }
-                std::process::exit(1);
+    // The admin listener serves concurrently and drains on its own copy of
+    // the shutdown signal; its failure is logged, not fatal to the main
+    // server (the proxies' clients come first).
+    let admin_serve = async {
+        if let Some((listener, router)) = admin {
+            if let Err(error) = axum::serve(listener, router.into_make_service())
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+            {
+                tracing::error!(%error, "admin usage listener failed");
             }
         }
     };
+
+    let result = serve_with_deadline(serve.into_future(), admin_serve, shutdown_deadline).await;
 
     if let Err(e) = remove_pid() {
         tracing::warn!(error = %e, "failed to remove PID file during shutdown");
@@ -176,6 +176,94 @@ pub async fn cmd_serve(
             Err(anyhow::anyhow!("server error: {}", e))
         }
     }
+}
+
+/// Serve the main and admin listeners concurrently under the graceful-
+/// shutdown hard deadline.
+///
+/// axum 0.8's `with_graceful_shutdown` waits indefinitely for in-flight
+/// connections to drain. Because the proxy serves long-lived streaming
+/// responses an upstream can hold open arbitrarily, one stuck stream could
+/// otherwise pin the process forever on SIGTERM/SIGINT. Once the deadline
+/// elapses after the signal, stuck connections are dropped and the process
+/// force-exits so an orchestrator (Kubernetes/LB) can recycle the pod.
+/// `shutdown_timeout == 0` disables the deadline (drain forever) for
+/// operators who want that.
+async fn serve_with_deadline<F, A>(
+    serve: F,
+    admin_serve: A,
+    shutdown_deadline: std::time::Duration,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+    A: std::future::Future<Output = ()>,
+{
+    if shutdown_deadline.is_zero() {
+        let (main, ()) = tokio::join!(serve, admin_serve);
+        return main;
+    }
+    match tokio::time::timeout(shutdown_deadline, async {
+        tokio::join!(serve, admin_serve)
+    })
+    .await
+    {
+        Ok((main, ())) => main,
+        Err(_) => {
+            tracing::error!(
+                deadline = ?shutdown_deadline,
+                "graceful-shutdown deadline elapsed; forcing exit with in-flight connections dropped"
+            );
+            // Run PID cleanup best-effort, then exit. The deadline exists
+            // precisely to escape stuck connections, so we do not wait for
+            // them; remove_pid is fast, synchronous filesystem I/O.
+            if let Err(e) = remove_pid() {
+                tracing::warn!(error = %e, "failed to remove PID file during shutdown");
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Bind the dedicated admin `/usage` listener when `[auth.admin]` is
+/// configured and the dedicated socket should exist.
+///
+/// The default bind is loopback on the port after the main bind
+/// (`ServerConfig::effective_admin_bind`). Under the
+/// `server.admin_on_main_listener` opt-in with no explicit `admin_bind`,
+/// NO dedicated socket is attempted — that is precisely the posture for
+/// setups where a second port is not available, and `/usage` is served on
+/// the main listener instead (handled inside `build_router`). An explicit
+/// `admin_bind` always binds the dedicated listener, alongside any
+/// main-listener mount. Returns `None` when there is nothing to bind.
+async fn bind_admin_listener(
+    state: &llm_proxy_server::AppState,
+) -> Result<Option<(TcpListener, axum::Router)>> {
+    let Some(posture) = state.app_config().admin_posture() else {
+        return Ok(None);
+    };
+    if !state.app_config().server.dedicated_admin_listener() {
+        tracing::info!(
+            posture = posture.name(),
+            "admin usage API served on the main listener only; no dedicated socket"
+        );
+        return Ok(None);
+    }
+    let Some(addr) = state.app_config().server.effective_admin_bind() else {
+        // Unreachable for validated configs: `load_app_config` rejects an
+        // admin API whose dedicated listener would bind a default port that
+        // cannot be derived. Refuse to guess a bind.
+        bail!("admin API enabled but no admin bind could be derived");
+    };
+    let Some(router) = admin_router(state) else {
+        bail!("admin API enabled but no /usage router could be built");
+    };
+    let listener = bind_listener(addr).await?;
+    info!(
+        addr = %addr,
+        posture = posture.name(),
+        "admin usage API listening (read-only, behind the admin token)"
+    );
+    Ok(Some((listener, router)))
 }
 
 /// Bind the listening TCP socket with connection-hardening options.

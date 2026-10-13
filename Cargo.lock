@@ -2311,6 +2311,7 @@ dependencies = [
  "llm-proxy-provider",
  "llm-proxy-server",
  "llm-proxy-storage",
+ "secrecy",
  "socket2",
  "tempfile",
  "time",
@@ -2324,6 +2325,24 @@ dependencies = [
 [[package]]
 name = "llm-proxy-api"
 version = "0.1.0"
+dependencies = [
+ "axum",
+ "humantime",
+ "llm-proxy-protocol",
+ "llm-proxy-storage",
+ "rusqlite",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
 
 [[package]]
 name = "llm-proxy-core"
@@ -2382,6 +2401,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures",
+ "llm-proxy-api",
  "llm-proxy-core",
  "llm-proxy-protocol",
  "llm-proxy-provider",
@@ -2392,6 +2412,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "time",
  "tokio",

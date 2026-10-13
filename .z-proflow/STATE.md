@@ -877,3 +877,340 @@ preserved when `[storage]` is absent.
   busy_timeout). Not in the brief.
 - DEFAULT_CONFIG_TOML (defaults.rs) unchanged — `[storage]` stays out of
   the default config, matching the NoopBus-by-default contract.
+
+## committer — PRX-02
+
+- Commit: `5e4126ad6aafcaf3cb16678328f0a51f2e70d942` on `prx/usage-ledger`
+  (on top of bf5c53f).
+- Message: "Persist the usage ledger to SQLite".
+- Staged paths (21 staged of the 22 listed): Cargo.toml; Cargo.lock;
+  config.toml.example; crates/llm-proxy-storage/Cargo.toml;
+  crates/llm-proxy-storage/src/lib.rs; crates/llm-proxy-storage/src/sqlite.rs
+  (new); crates/llm-proxy-core/src/lib.rs;
+  crates/llm-proxy-core/src/provider_config.rs;
+  crates/llm-proxy-server/src/state.rs;
+  crates/llm-proxy-server/src/routes/mod.rs;
+  crates/llm-proxy-server/src/routes/core_pipeline.rs;
+  crates/llm-proxy-server/src/routes/models.rs;
+  crates/llm-proxy-server/tests/chat_completions.rs;
+  crates/llm-proxy-server/tests/core_pipeline.rs;
+  crates/llm-proxy-server/tests/integration.rs;
+  crates/llm-proxy-server/tests/openrouter_e2e.rs; apps/llm-proxy/Cargo.toml;
+  apps/llm-proxy/src/state.rs; apps/llm-proxy/src/commands/serve.rs;
+  .z-proflow/STATE.md.
+- The 22nd listed path, crates/llm-proxy-core/Cargo.toml, is unmodified in
+  the working tree (not in git status); staging it was a no-op and nothing
+  was committed for it.
+- git status showed nothing area-relevant outside the list (only untracked
+  .zcode/, session tooling — left alone). Diff content checked against the
+  PRX-02 round-1 "Changed paths" notes in this file: all match.
+- Same benign `git add` exit-1 advisory as the fix round ("paths are
+  ignored: .z-proflow" on the directory) — STATE.md is tracked and staged
+  fully; verified `git diff` empty afterwards (nothing unstaged).
+- No hooks configured, so none ran; no --no-verify; no push. Gates not
+  re-run by the committer — the ask states PRX-02 is green on the full
+  workspace gate set.
+
+## judge — PRX-02 — round 1
+
+Audited commit 5e4126ad6aafcaf3cb16678328f0a51f2e70d942 read-only against
+AGENTS.md, the STATE.md POLICY/TASK/project-rules, the [workspace.lints] wall
+plus clippy.toml, and the PRX-02 brief. Read the rust-best-practices skill
+first.
+
+### Gates run (exact commands, this round)
+
+- `cargo fmt --all --check` — exit 0, clean.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D
+  warnings` — exit 0, zero warnings.
+- `cargo test --workspace --all-features` — exit 0, every suite ok, 0 failed.
+- `cargo shear` — "✓ no issues found" (exit 0).
+- Lint inheritance — all 7 member Cargo.tomls carry `[lints] workspace =
+  true` (grep loop over members).
+- Dependency rule — `cargo info rusqlite` → 0.40.2,
+  github.com/rusqlite/rusqlite, MIT; `cargo tree --invert rusqlite@0.40.2 -e
+  features` shows the `bundled` feature resolving through llm-proxy-storage.
+  Cargo.lock carries rusqlite 0.40.2 + libsqlite3-sys 0.38.2.
+
+### Findings
+
+1. MAJOR (defer to user) — crates/llm-proxy-server/src/routes/
+   core_pipeline.rs:2043: the stream-path `ResponseCompleted` carries
+   `ctx.core.model` — the client-decoded ModelRef whose `upstream` is always
+   None (both client decoders set it: anthropic.rs:43-46, openai_chat.rs:
+   108-111) — so this commit's ledger leaves `model_upstream` NULL for every
+   streaming request even when routing resolved an alias, while the once path
+   records it (core_pipeline.rs:963 via response_model_ref, adapter/mod.rs:
+   503). The resolved model IS in hand (`ctx.stream_metrics.upstream_model`,
+   core_pipeline.rs:1208) but never placed on the event. The brief requires
+   "requested and upstream model" columns; for the proxy's primary mode
+   (streaming) the usage-truth ledger silently lacks upstream attribution,
+   and PRX-03's group_by=model will read it. The emit site predates this
+   area, but this commit is what makes the gap persistent and user-facing.
+   Fix belongs in the server crate (outside PRX-02's declared paths) — must
+   land by PRX-03 at the latest; deferring is the user's call.
+2. NIT (defer) — crates/llm-proxy-storage/src/sqlite.rs:305-323:
+   `upsert_response_completed` sets `model_upstream = excluded.model_upstream`
+   unconditionally, while the failure path (sqlite.rs:362-371) deliberately
+   COALESCEs to preserve stored values; a completion carrying `upstream:
+   None` (every stream completion today, per finding 1) erases any upstream
+   stored by the paired RequestReceived, and no test asserts model_upstream
+   after a completion (the commit's own req-2 fixture does exactly this:
+   received Some("claude-3-upstream") → completed None).
+3. NIT (defer) — crates/llm-proxy-storage/src/sqlite.rs:504-536: the biased
+   select polls `rx.recv_many` before `prune.tick()`, so a continuously
+   non-empty channel starves retention indefinitely — pruning stops exactly
+   when the ledger grows fastest; additionally both retention DELETEs filter
+   on `COALESCE(received_at, completed_at)` (sqlite.rs:120, 133-137), an
+   expression none of the (received_at) indexes can serve, so every pass is a
+   full scan + sort.
+4. NIT (defer) — crates/llm-proxy-storage/src/sqlite.rs:524-531 (and the
+   panic-reopen path 437-444): a failed batch write rolls back and loses its
+   events with only a `tracing::error!`, and `dropped_events()` is not
+   incremented — so the counter the interface notes hand to PRX-03/PRX-06
+   under-counts ledger losses precisely when the ledger is unhealthy.
+
+### Also checked, no finding
+
+- Brief compliance: WAL (pragma + test), indexes on (received_at),
+  (provider, received_at), (caller, received_at) (test asserts all three);
+  token columns from Usage incl. reasoning + provenance label; cost columns
+  exact decimal TEXT, round-trip asserted (never float); stop_reason labels
+  with unknown preserved; error_kind + http_status on failures; body_hash
+  digest only — tests assert no `body`/`message` column exists; bounded
+  channel + try_send, drop-on-full counted (deterministic unconnected test);
+  NoopBus default preserved (wiring test; DEFAULT_CONFIG_TOML untouched —
+  defaults.rs last modified f5c1903, pre-area); [storage] validated in
+  load_app_config (9 rejection/parse tests), deny_unknown_fields; bus built
+  before listener bind, unusable path = startup error; retention on a timer
+  (first tick immediate), zero interval rejected at config and clamped in
+  the writer.
+- Caller contract (PRX-01 notes): caller persisted as TEXT and indexed;
+  test asserts the key id lands in the row.
+- Panic/indexing scan of the diff: every added unwrap/expect/panic is inside
+  test modules (clippy.toml allows); non-test code uses saturating math,
+  try_from + unwrap_or, and lock-poison recovery (`unwrap_or_else(|e|
+  e.into_inner())`); no slicing, no `let _ =` on Result/Future, no
+  `#[allow]`/`#[expect]` added at all; no MutexGuard across an await (close
+  is sync; the writer holds no std locks); catch-all match arms are required
+  (`StopReason`/`UsageProvenance` are `#[non_exhaustive]`).
+- SQL construction: every statement is a static string with bound
+  parameters; the only formatted value (`unknown:{inner}`) is parameter-
+  bound, never concatenated into SQL.
+- No secrets reach the ledger (caller is the key id; no token columns);
+  no listener surface changed by this commit.
+- Re-exports single-path (`pub use sqlite::{…}` from a private module;
+  `StorageConfig` joins core's existing single re-export); crate
+  `#![deny(missing_docs)]` satisfied; docs carry no design narratives.
+- `${HOME}` in config.toml.example's path example is legitimate:
+  load_app_config interpolates env vars (provider_config.rs:1477).
+
+Verdict: findings — 1 major deferred (streaming rows lose upstream-model
+attribution; PRX-03 deadline), 3 nits deferred. All workspace gates green
+as run above.
+
+## implementer — PRX-03 — round 1
+
+/usage admin endpoints: the placeholder llm-proxy-api crate is now the
+read-only query surface over the PRX-02 SQLite ledger, behind a constant-time
+admin token, served on a dedicated second listener by default and on the main
+listener only via an explicit, loudly-warned opt-in.
+
+### Changed paths
+
+- `crates/llm-proxy-api/Cargo.toml` — deps: axum, serde, thiserror, time,
+  tokio, tracing, rusqlite (workspace, bundled), rust_decimal (workspace),
+  sha2 0.10 (same version the server crate already uses), humantime 2.3
+  (verified on crates.io this round: `cargo info humantime` → 2.3.0, MIT,
+  chronotope repo; already in-tree via humantime-serde), tower-http 0.6
+  (trace/catch-panic/set-header). Dev-deps: serde_json, tempfile, tower
+  (util), llm-proxy-storage + llm-proxy-protocol (ledger fixtures).
+- `crates/llm-proxy-api/src/lib.rs` — crate replaced: docs + single-path
+  export `UsageApi`; `#![deny(missing_docs)]`.
+- `crates/llm-proxy-api/src/reader.rs` (new) — `UsageReader`: per-query
+  connections opened with `SQLITE_OPEN_READ_ONLY` + 5s busy_timeout (unit
+  test proves the flag refuses writes at the connection level); queries on
+  spawn_blocking with join errors reported, never unwrapped. Endpoints:
+  summary aggregates (counts/tokens/errors in SQL; costs fetched as decimal
+  TEXT and summed in Rust with rust_decimal — SQLite SUM would coerce to
+  float, and a test pins a sum that float gets wrong: 0.1…01+0.2…02 =
+  0.3…03 exactly); requests (keyset pagination on
+  (COALESCE(received_at,completed_at), request_id) DESC, limit 1..=1000
+  default 100, since inclusive / until exclusive, provider exact match,
+  opaque cursor "ms:request_id"); keys (per-caller counts + last_seen on the
+  same COALESCE axis). All SQL is static fragments with bound parameters;
+  the only interpolated strings are fixed group-by column names from a
+  closed enum.
+- `crates/llm-proxy-api/src/auth.rs` (new) — `AdminAuth`: stores only
+  SHA-256(token) (manual Debug redacts the digest); presented bearer tokens
+  are hashed and compared with a constant-time eq over fixed 32-byte
+  digests (length-independent). `require_admin` middleware: uniform 401
+  JSON envelope on every rejection path, token never echoed/logged.
+- `crates/llm-proxy-api/src/routes.rs` (new) — `UsageApi::new(path, token)`
+  + `.router()`; GET /usage/summary?window=…&group_by=provider|model|caller
+  (window humantime, default 24h; group_by default provider, groups on
+  model_requested since upstream attribution is sparse), GET
+  /usage/requests, GET /usage/keys. Router carries its own admin-auth,
+  TraceLayer, nosniff, CatchPanicLayer so both mounts get identical
+  protections. 400s for bad params with safe messages; 500s log the detail
+  server-side and return a generic body.
+- `crates/llm-proxy-api/tests/usage_api.rs` (new, 11 tests) — seeded via a
+  real SqliteEventBus (5 requests: 2 completed exact-decimal costs, 1
+  failed, 1 caller-less orphan failure, 1 two-hour-old row): auth refusal +
+  no-echo on all three routes; provider/model/caller grouping; exact cost
+  sums; window exclusion (1h vs 4h, 7d accepted); paging + provider filter
+  + since/until semantics; invalid-param 400 matrix; rows carry digests but
+  never body/message keys; live-writer WAL read (query succeeds while the
+  writer task is still running).
+- `crates/llm-proxy-core/src/provider_config.rs` — `AdminAuthConfig`
+  (`[auth.admin] token: SecretString`, skip_serializing, deny_unknown_fields)
+  on `AuthConfig.admin` (serde default); `ServerConfig.admin_bind:
+  Option<SocketAddr>` + `admin_on_main_listener: bool` (both serde-default,
+  old configs parse unchanged); `ServerConfig::effective_admin_bind()`
+  (admin_bind or 127.0.0.1:main_port+1, None when underivable);
+  `AdminMountPosture { DedicatedListener, MainListener }` + `name()`;
+  `AppConfig::admin_posture()`; `validate_admin_mount` in load_app_config
+  (admin requires [storage]; token non-empty; admin_bind must differ from
+  bind; admin_bind/flag without [auth.admin] rejected; port-65535 default
+  derivation rejected). 11 new tests.
+- `crates/llm-proxy-core/src/lib.rs` — export `AdminAuthConfig`,
+  `AdminMountPosture`.
+- `crates/llm-proxy-server/src/lib.rs` — `pub fn admin_router(&AppState)
+  -> Option<Router>` (None when no [auth.admin]/[storage]); secrecy import.
+- `crates/llm-proxy-server/src/routes/mod.rs` — `build_router` merges the
+  usage router onto the MAIN listener iff `admin_on_main_listener` (merge
+  happens after `with_state`; both routers stateless); doc names the
+  posture split.
+- `crates/llm-proxy-server/tests/admin_usage.rs` (new, 4 tests) — 404 for
+  /usage on the main listener by default even with the right token; opt-in
+  mount refuses missing/wrong tokens without echo and serves with the right
+  one; dedicated admin router same behavior; admin_router None without
+  [auth.admin]. All under `auth.mode = "none"` (proxy open, /usage closed).
+- `crates/llm-proxy-server/Cargo.toml` — llm-proxy-api dep; tempfile
+  dev-dep.
+- `crates/llm-proxy-server/src/{state.rs, middleware.rs, routes/mod.rs,
+  routes/models.rs, routes/core_pipeline.rs}` +
+  `tests/{integration,openrouter_e2e,core_pipeline,chat_completions}.rs` —
+  mechanical field additions to existing literals (ServerConfig +=
+  admin_bind/admin_on_main_listener, AuthConfig += admin). Insertion was
+  scripted; a first buggy script mangled routes/mod.rs and was restored
+  byte-exact from HEAD via `git show HEAD:` redirection before redoing it
+  correctly (final diffs are insertions-only, verified by `git diff --stat`
+  and the full suite).
+- `apps/llm-proxy/src/state.rs` — `warn_admin_posture(&AppConfig)` called
+  from load_toml_state: MainListener posture → loud WARN naming
+  "admin-on-main-listener"; dedicated non-loopback admin_bind → WARN;
+  loopback default stays quiet. 3 capture tests (JSON subscriber buffer).
+- `apps/llm-proxy/src/commands/serve.rs` — `bind_admin_listener(&state)`
+  binds the dedicated admin listener before the PID file and main listener
+  (busy admin port = clean startup error, no stale PID); serves it
+  concurrently, draining on its own shutdown_signal copy, failure logged
+  not fatal; `serve_with_deadline` extracted (cmd_serve was over the
+  100-line clippy threshold after the additions) preserving the exact
+  zero-deadline/timeout/force-exit semantics.
+- `apps/llm-proxy/tests/cli_validate.rs` — 4 new end-to-end cmd_validate
+  cases: admin+storage accepted; admin-without-storage rejected;
+  flag-without-admin rejected; admin_bind == bind rejected.
+- `apps/llm-proxy/Cargo.toml` — secrecy dev-dep (posture-warning tests).
+- `config.toml.example` — [server] admin_bind/admin_on_main_listener docs
+  (opt-in posture named) + [auth.admin] token section.
+- `Cargo.lock` — humantime/tower-http additions for the api crate.
+
+### Self-checks run (this round, exact commands)
+
+- `cargo test -p llm-proxy-core` — 179 passed, 0 failed (11 new admin
+  config tests among them).
+- `cargo test -p llm-proxy-api` — 5 unit + 11 integration passed, 0 failed.
+- `cargo test -p llm-proxy-server --test admin_usage` — 4 passed.
+- `cargo test -p llm-proxy --lib state::` — 9 passed; `cargo test -p
+  llm-proxy --test cli_validate` — 9 passed.
+- `cargo fmt --all` + `cargo fmt --all --check` — clean.
+- `cargo clippy --workspace --all-targets --all-features --locked --
+  -D warnings` — exit 0, zero warnings/errors (final run after the last
+  edit; local run, the script's gate is deciding).
+- `cargo test --workspace --all-features` — 1297 passed, 0 failed (summed
+  across all `test result` lines, 28 suites).
+- `cargo shear` (cargo-shear at ~/.cargo/bin) — "✓ no issues found".
+- Baseline note: the ask's pre-existing red gates (clippy/test on untouched
+  master) were fixed in PRX-01 round 2; this round's local runs of the full
+  gate set are green as reported above.
+
+### Interface notes for dependent areas
+
+- `llm_proxy_api::UsageApi::new(db_path: impl Into<PathBuf>,
+  admin_token: &str)` → `.router()` (stateless `Router`). Server crate:
+  `llm_proxy_server::admin_router(&AppState) -> Option<Router>`;
+  `build_router` auto-mounts /usage on the main listener iff
+  `server.admin_on_main_listener` — no extra wiring needed by callers.
+- Config surface (validated in `load_app_config`, so `llm-proxy validate`
+  catches all of it): `[auth.admin] token`; `server.admin_bind`;
+  `server.admin_on_main_listener`. Old configs parse unchanged (all
+  serde-defaulted). `ServerConfig::effective_admin_bind()` is the one
+  source of truth for the listener address; `AppConfig::admin_posture()`
+  plus `AdminMountPosture::name()` is the one source of the posture name
+  for logs.
+- /usage contract: summary `window` is a humantime duration (default 24h),
+  `group_by` = provider|model|caller (model = `model_requested`);
+  requests `since`/`until` are RFC 3339 (since inclusive, until exclusive),
+  `limit` 1..=1000 (default 100), `cursor` is opaque — pass back
+  `next_cursor` verbatim; costs are exact decimal STRINGS in JSON (parse
+  with rust_decimal, never float). Time axis everywhere is
+  COALESCE(received_at, completed_at) — i.e. the RECEIVED time for normal
+  rows, the failure time only for failure-only rows.
+- Admin 401 body is uniform `{"error":{"type":"unauthorized","message":
+  "missing or invalid admin token"}}`; no token material is ever echoed or
+  logged; comparison is constant-time over SHA-256 digests. PRX-06 can
+  assert on both mounts via crates/llm-proxy-api/tests/usage_api.rs and
+  crates/llm-proxy-server/tests/admin_usage.rs fixtures (seed pattern:
+  SqliteEventBus emit → close → UsageApi::new(path, token).router()).
+- PRX-04/PRX-05: no interactions; `[server]` gained two serde-defaulted
+  fields, so provider/egress config work is unaffected.
+- AppState unchanged (admin surface is built from AppConfig on demand —
+  the reader is path-based and needs no shared state).
+
+### Punted
+
+- Quota-stats-compatible aggregate (CodexBar): SKIPPED — explicitly
+  optional per the brief.
+- The main-listener /usage mount sits OUTSIDE the config-gated CORS layer
+  (the merge happens after `with_state`, CORS layers the stateful router):
+  browsers get the same-origin default, which is the safe posture the CORS
+  finding wanted; a browser-based admin dashboard on another origin would
+  need allowed_origins extended to the usage mount later.
+- No `x-request-id` header on admin routes: the inject layer lives in the
+  server crate, which now depends on the api crate (dependency direction
+  forbids reuse); responses carry no correlation id. PRX-06 can revisit if
+  it needs one.
+- No rate limiting on admin auth: each attempt costs one SHA-256 (no argon2,
+  no KDF), so there is no CPU-exhaustion vector like the client-auth flood
+  gate addresses.
+- `SqliteEventBus::dropped_events()` is not surfaced on /usage (PRX-02
+  punted the same counter); a future `/usage/stats` could expose it.
+- DEFAULT_CONFIG_TOML (defaults.rs) unchanged — no admin sections in the
+  default config; the admin API stays opt-in.
+- The COALESCE time-axis filters cannot use the (received_at) indexes
+  (carried over from judge PRX-02 nit 3 — storage crate is PRX-02's area);
+  summary/requests are scans over the window's rows. Fine at admin traffic
+  volumes; an indexed expression column would fix it if it ever matters.
+
+### Round 1 addendum — dedicated-listener suppression under the opt-in
+
+Caught before submit against the brief's own motivation ("a second port is
+not available"): the first cut always bound the dedicated admin listener,
+which would fail startup exactly in the setups the opt-in exists for.
+Corrected rule, in one place (`ServerConfig::dedicated_admin_listener()`):
+an explicit `admin_bind` always binds the dedicated listener; with none set,
+the default loopback listener binds UNLESS `admin_on_main_listener = true`,
+in which case `/usage` is main-listener-only and no second socket is
+attempted. `validate_admin_mount` now rejects an underivable default admin
+port only when the dedicated listener would actually bind it (port-65535 +
+opt-in + no admin_bind is VALID). 2 new core tests
+(`admin_main_listener_optin_needs_no_derivable_port`,
+`explicit_admin_bind_keeps_the_dedicated_listener_under_the_optin`);
+serve.rs logs "served on the main listener only; no dedicated socket".
+
+Gates re-run after the fix (exact commands):
+`cargo clippy --workspace --all-targets --all-features --locked --
+-D warnings` → exit 0; `cargo test --workspace --all-features` → 1299
+passed, 0 failed; `cargo fmt --all --check` → clean; `cargo shear` →
+"✓ no issues found". Core tests: 181 passed (13 admin tests total).

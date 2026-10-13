@@ -238,6 +238,8 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
             auth: Default::default(),
             storage: None,
@@ -1312,6 +1314,7 @@ mod tests {
         llm_proxy_server::ClientAuth::from_config(&llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
+            admin: None,
         })
         .expect("valid client auth")
     }
@@ -2223,6 +2226,8 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
                 auth: Default::default(),
                 storage: None,
@@ -2334,6 +2339,8 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_secs(60),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
                 auth: Default::default(),
                 storage: None,
@@ -2669,6 +2676,8 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
                 auth: Default::default(),
                 storage: None,
@@ -2927,6 +2936,8 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
             auth: Default::default(),
             storage: None,

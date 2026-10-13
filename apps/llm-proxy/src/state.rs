@@ -101,6 +101,12 @@ pub(crate) fn load_toml_state(
         "loaded TOML config"
     );
 
+    // Announce the admin-mount security posture loudly at startup so the
+    // operator sees which surface their config selected. The
+    // main-listener opt-in is a different, deliberately less-isolated
+    // posture than the default loopback-only dedicated listener.
+    warn_admin_posture(&app_config);
+
     Ok(AppState::new_with_catalog_dir(
         app_config,
         registry,
@@ -111,6 +117,44 @@ pub(crate) fn load_toml_state(
     )
     .with_client_auth(std::sync::Arc::new(client_auth))
     .with_event_bus(event_bus))
+}
+
+/// Emit the startup warnings naming the admin `/usage` mount posture.
+///
+/// `admin_on_main_listener = true` deliberately exposes the admin surface on
+/// the main listener, so it is called out by name. A dedicated admin
+/// listener on a non-loopback address is likewise called out (the default is
+/// loopback-only); the operator may have pointed it at a tunnel interface,
+/// but the warning makes that choice visible in every startup log.
+pub fn warn_admin_posture(config: &AppConfig) {
+    use llm_proxy_core::AdminMountPosture;
+    match config.admin_posture() {
+        Some(AdminMountPosture::MainListener) => {
+            tracing::warn!(
+                posture = AdminMountPosture::MainListener.name(),
+                main_bind = %config.server.bind,
+                "ADMIN SECURITY POSTURE: /usage is also served on the main listener, \
+                 protected only by the admin token — every network that reaches the \
+                 main listener reaches the admin API. Set server.admin_on_main_listener \
+                 = false to return to the loopback-only dedicated admin listener."
+            );
+        }
+        Some(AdminMountPosture::DedicatedListener) => {
+            if let Some(bind) = config.server.effective_admin_bind()
+                && !bind.ip().is_loopback()
+            {
+                tracing::warn!(
+                    posture = AdminMountPosture::DedicatedListener.name(),
+                    admin_bind = %bind,
+                    "ADMIN SECURITY POSTURE: the dedicated admin listener binds a \
+                     non-loopback address; any peer that reaches it can attempt the \
+                     admin token. Point server.admin_bind back at loopback unless a \
+                     tunnel requires otherwise."
+                );
+            }
+        }
+        None => {}
+    }
 }
 
 /// Check if a provider with catalog enforcement enabled has no usable models.
@@ -555,5 +599,96 @@ path = \"{}\"
         );
         // And close() on the default bus is a no-op that must not hang.
         llm_proxy_storage::EventBus::close(state.event_bus().as_ref());
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin posture startup warnings
+    // -----------------------------------------------------------------------
+
+    fn admin_app_config(
+        on_main: bool,
+        admin_bind: Option<std::net::SocketAddr>,
+    ) -> llm_proxy_core::AppConfig {
+        use llm_proxy_core::{AdminAuthConfig, ServerConfig, StorageConfig};
+        llm_proxy_core::AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: std::time::Duration::from_secs(300),
+                shutdown_timeout: std::time::Duration::from_secs(30),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                allowed_origins: None,
+                server_name: "posture-test".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                dedup_window: std::time::Duration::ZERO,
+                log_format: Default::default(),
+                admin_bind,
+                admin_on_main_listener: on_main,
+            },
+            auth: llm_proxy_core::AuthConfig {
+                mode: llm_proxy_core::AuthMode::None,
+                clients: std::collections::HashMap::new(),
+                admin: Some(AdminAuthConfig {
+                    token: secrecy::SecretString::from("admin-secret"),
+                }),
+            },
+            storage: Some(StorageConfig {
+                path: "usage.db".into(),
+                max_age: None,
+                max_rows: None,
+                prune_interval: std::time::Duration::from_secs(3600),
+            }),
+        }
+    }
+
+    /// Capture the warnings [`warn_admin_posture`] emits for `config`.
+    fn captured_posture_warnings(config: &llm_proxy_core::AppConfig) -> Vec<u8> {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let layer = build_log_layer(&LogFormat::Json, BufferWriter(std::sync::Arc::clone(&buf)));
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(layer);
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            warn_admin_posture(config);
+        }
+        buf.lock().expect("buffer lock not poisoned").clone()
+    }
+
+    #[test]
+    fn main_listener_optin_is_warned_about_loudly_by_name() {
+        let config = admin_app_config(true, None);
+        let captured = String::from_utf8(captured_posture_warnings(&config))
+            .expect("captured bytes are UTF-8");
+        assert!(
+            captured.contains("admin-on-main-listener"),
+            "the posture must be named for grepping: {captured}"
+        );
+        assert!(
+            captured.contains("ADMIN SECURITY POSTURE"),
+            "the warning must be loud and identifiable: {captured}"
+        );
+    }
+
+    #[test]
+    fn dedicated_loopback_posture_stays_quiet() {
+        let config = admin_app_config(false, None);
+        let captured = String::from_utf8(captured_posture_warnings(&config))
+            .expect("captured bytes are UTF-8");
+        assert!(
+            !captured.contains("ADMIN SECURITY POSTURE"),
+            "the default loopback posture needs no warning: {captured}"
+        );
+    }
+
+    #[test]
+    fn dedicated_non_loopback_bind_is_warned_about() {
+        let config = admin_app_config(false, Some("10.0.0.5:9900".parse().unwrap()));
+        let captured = String::from_utf8(captured_posture_warnings(&config))
+            .expect("captured bytes are UTF-8");
+        assert!(
+            captured.contains("non-loopback"),
+            "a non-loopback admin listener must be called out: {captured}"
+        );
     }
 }

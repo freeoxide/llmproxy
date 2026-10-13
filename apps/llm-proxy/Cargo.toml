@@ -45,5 +45,6 @@ vergen-gix = { workspace = true }
 [dev-dependencies]
 insta = { version = "1.42", features = ["yaml", "filters"] }
 llm-proxy-protocol = { path = "../../crates/llm-proxy-protocol" }
+secrecy = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }
