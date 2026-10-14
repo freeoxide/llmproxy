@@ -1,16 +1,3 @@
-//! SQLite-backed [`EventBus`]: the persistent per-request usage ledger.
-//!
-//! One `requests` row per request id, filled in as the request's events
-//! arrive: `RequestReceived` inserts the row, and the terminal event
-//! (`ResponseCompleted` or `ResponseFailed`) completes it. Requests that fail
-//! before routing (client-auth rejections, unknown routes) produce only a
-//! terminal event, so those rows carry `received_at IS NULL` and the failure
-//! timestamp in `completed_at`.
-//!
-//! Writes are group-committed by a single dedicated tokio task behind a
-//! bounded channel; [`EventBus::emit`] never blocks the calling task and
-//! drops (and counts) events when the channel is full.
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,22 +11,10 @@ use tokio::sync::watch;
 
 use crate::{EventBus, ProxyEvent};
 
-/// Bounded-channel capacity for the default constructor.
 const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
-
-/// Maximum events pulled from the channel and committed per transaction.
 const WRITE_BATCH_MAX: usize = 256;
-
-/// How long [`EventBus::close`] waits for the writer to drain before giving
-/// up (shutdown must stay bounded).
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// SQLite busy timeout for concurrent connections (tests, admin readers).
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
 
 /// Errors from the SQLite usage ledger.
 #[derive(Debug, thiserror::Error)]
@@ -65,10 +40,6 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
 }
 
-// ---------------------------------------------------------------------------
-// Retention
-// ---------------------------------------------------------------------------
-
 /// Retention bounds applied to the ledger on a timer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
@@ -77,31 +48,20 @@ pub struct RetentionPolicy {
     /// Keep at most this many rows; the oldest rows are deleted when the cap
     /// is exceeded. `None` is unlimited.
     pub max_rows: Option<u64>,
-    /// How often the pruning pass runs. Must be at least 1 second (the
-    /// pruning timer rejects a zero period; `load_app_config` enforces this
-    /// for config-file users).
+    /// How often the pruning pass runs; must be at least 1 second (a zero
+    /// period is rejected by the pruning timer).
     pub prune_every: Duration,
 }
 
 impl RetentionPolicy {
-    /// Whether any retention bound is configured.
     fn is_bounded(&self) -> bool {
         self.max_age.is_some() || self.max_rows.is_some()
     }
 }
 
-/// Run one retention pass, deleting rows past `policy`'s bounds.
-///
-/// Public so operators/tests can prune deterministically; the writer task
-/// calls it on the [`RetentionPolicy::prune_every`] timer. Age pruning uses
-/// `COALESCE(received_at, completed_at)` so failure-only rows (no
-/// `received_at`) are still subject to retention.
-///
-/// Returns the number of rows deleted.
-///
-/// # Errors
-///
-/// Returns [`StorageError::Sqlite`] if any statement fails.
+/// Run one retention pass, deleting rows past `policy`'s bounds; returns the
+/// number of rows deleted. Age pruning covers failure-only rows (no
+/// `received_at`) via `COALESCE(received_at, completed_at)`.
 pub fn run_retention_pass(
     conn: &mut Connection,
     policy: &RetentionPolicy,
@@ -111,9 +71,6 @@ pub fn run_retention_pass(
     }
     let mut deleted: u64 = 0;
     if let Some(max_age) = policy.max_age {
-        // A max_age whose millis do not fit i64 (Duration::MAX) saturates to
-        // "the beginning of time", deleting nothing — the safe direction for
-        // an absurd value.
         let cutoff = unix_millis(OffsetDateTime::now_utc())
             .saturating_sub(i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX));
         let n = conn.execute(
@@ -143,13 +100,6 @@ pub fn run_retention_pass(
     Ok(deleted)
 }
 
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
-
-/// Ledger schema. Costs are stored as decimal strings (never floats or
-/// reals); `body_hash` is the request-body *digest* from
-/// [`crate::RequestReceived`], never the body itself.
 const SCHEMA_SQL: &str = "\
 CREATE TABLE IF NOT EXISTS requests (
     request_id            TEXT PRIMARY KEY,
@@ -188,23 +138,14 @@ CREATE INDEX IF NOT EXISTS idx_requests_caller_timestamp
     ON requests (caller, received_at);
 ";
 
-/// Open a WAL-mode connection and make sure the schema exists.
 fn open_connection(path: &Path) -> Result<Connection, StorageError> {
     let open_err = |source: rusqlite::Error| StorageError::Open {
         path: path.display().to_string(),
         source,
     };
     let conn = Connection::open(path).map_err(open_err)?;
-    // WAL keeps readers (tests, the future admin API) lock-free while the
-    // single writer commits. `pragma_update` errors if the engine cannot
-    // honor the mode (e.g. a filesystem without shared memory), which is a
-    // startup error rather than a silent downgrade.
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(open_err)?;
-    // NORMAL is the recommended WAL pairing: commits do not fsync the WAL on
-    // every transaction; durability is preserved across process crashes and
-    // only a power loss can lose the last commits (the database never
-    // corrupts).
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(open_err)?;
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(open_err)?;
@@ -212,19 +153,12 @@ fn open_connection(path: &Path) -> Result<Connection, StorageError> {
     Ok(conn)
 }
 
-// ---------------------------------------------------------------------------
-// Event → row mapping
-// ---------------------------------------------------------------------------
-
-/// OffsetDateTime → Unix epoch milliseconds.
 fn unix_millis(ts: OffsetDateTime) -> i64 {
     ts.unix_timestamp()
         .saturating_mul(1000)
         .saturating_add(i64::from(ts.millisecond()))
 }
 
-/// Stable, human-readable label for a stop reason (used verbatim by ledger
-/// consumers grouping on this column).
 fn stop_reason_label(reason: &StopReason) -> String {
     match reason {
         StopReason::EndTurn => "end_turn".to_owned(),
@@ -238,8 +172,6 @@ fn stop_reason_label(reason: &StopReason) -> String {
     }
 }
 
-/// Stable label for usage provenance (`Usage`'s companion field; lets ledger
-/// consumers distinguish provider-reported usage from synthetic zeros).
 fn provenance_label(provenance: &UsageProvenance) -> &'static str {
     match provenance {
         UsageProvenance::ProviderReported => "provider_reported",
@@ -249,8 +181,6 @@ fn provenance_label(provenance: &UsageProvenance) -> &'static str {
     }
 }
 
-/// Write one event's row effects. Terminal events upsert, so a failure for a
-/// request that was never received still leaves a row.
 fn write_event(conn: &Connection, event: &ProxyEvent) -> Result<(), StorageError> {
     match event {
         ProxyEvent::RequestReceived(e) => insert_request_received(conn, e),
@@ -259,8 +189,6 @@ fn write_event(conn: &Connection, event: &ProxyEvent) -> Result<(), StorageError
     }
 }
 
-/// Insert the request row. A duplicate request id (retry, bug) must not
-/// clobber the original row.
 fn insert_request_received(
     conn: &Connection,
     e: &crate::RequestReceived,
@@ -287,8 +215,6 @@ fn insert_request_received(
     Ok(())
 }
 
-/// Complete the request row with usage, cost, and stop reason (or insert it,
-/// if the request event was never seen).
 fn upsert_response_completed(
     conn: &Connection,
     e: &crate::ResponseCompleted,
@@ -346,10 +272,6 @@ fn upsert_response_completed(
     Ok(())
 }
 
-/// Complete the request row with failure facts (or insert it, if the request
-/// event was never seen). provider/model are optional on failures; COALESCE
-/// keeps values already stored by the request's RequestReceived row instead
-/// of overwriting them with NULL.
 fn upsert_response_failed(
     conn: &Connection,
     e: &crate::ResponseFailed,
@@ -383,22 +305,9 @@ fn upsert_response_failed(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Writer task
-// ---------------------------------------------------------------------------
-
-/// One unit of blocking work for the writer's connection.
 enum WriterOp {
-    /// Commit a batch of events in one transaction (group commit).
-    Write {
-        /// Events to persist.
-        events: Vec<ProxyEvent>,
-    },
-    /// Apply the retention policy.
-    Prune {
-        /// Bounds to enforce.
-        policy: RetentionPolicy,
-    },
+    Write { events: Vec<ProxyEvent> },
+    Prune { policy: RetentionPolicy },
 }
 
 fn run_op(conn: &mut Connection, op: WriterOp) -> Result<u64, StorageError> {
@@ -415,11 +324,6 @@ fn run_op(conn: &mut Connection, op: WriterOp) -> Result<u64, StorageError> {
     }
 }
 
-/// Run `op` on the writer's connection on the blocking pool, then hand the
-/// connection back. If the blocking closure panics the original connection is
-/// lost inside it; a fresh one is opened so the writer can continue. Returns
-/// `None` only when the ledger cannot be reopened (the writer stops and
-/// subsequent emits are counted as dropped).
 async fn exec_on_conn(
     path: &Path,
     conn: Connection,
@@ -463,7 +367,6 @@ async fn exec_on_conn(
     }
 }
 
-/// Flag the writer sets once it has exited (drained or failed).
 type DoneFlag = Arc<(Mutex<bool>, Condvar)>;
 
 fn signal_done(done: &DoneFlag) {
@@ -473,8 +376,6 @@ fn signal_done(done: &DoneFlag) {
     done.1.notify_all();
 }
 
-/// The single ledger writer: drains the bounded channel in batches, applies
-/// retention on a timer, and drains-and-exits when closed.
 async fn writer_task(
     path: PathBuf,
     conn: Connection,
@@ -484,20 +385,12 @@ async fn writer_task(
     done: DoneFlag,
 ) {
     let pruning = retention.is_bounded();
-    // Defensively clamp: a zero period would panic the interval timer.
-    // Config validation rejects it, direct construction might not.
     let mut prune = tokio::time::interval(retention.prune_every.max(Duration::from_secs(1)));
     prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The connection moves into each blocking call and back out; the Option
-    // slot lets a path that loses the connection (unrecoverable failure)
-    // break the loop without the borrow checker seeing a moved value on the
-    // paths that continue.
     let mut conn_slot = Some(conn);
     let mut buf: Vec<ProxyEvent> = Vec::with_capacity(WRITE_BATCH_MAX);
 
     loop {
-        // Poll the shutdown value each iteration so a signal that arrived
-        // while a batch was being written is never missed.
         if *shutdown.borrow_and_update() {
             break;
         }
@@ -510,7 +403,6 @@ async fn writer_task(
             }
             received = rx.recv_many(&mut buf, WRITE_BATCH_MAX) => {
                 if received == 0 {
-                    // Every sender dropped; nothing more can arrive.
                     break;
                 }
                 let Some(conn) = conn_slot.take() else { break };
@@ -563,8 +455,6 @@ async fn writer_task(
         }
     }
 
-    // Final drain so close() is a flush: everything queued behind the
-    // shutdown signal is persisted before the writer exits.
     while let Ok(event) = rx.try_recv() {
         buf.push(event);
     }
@@ -583,21 +473,9 @@ async fn writer_task(
     signal_done(&done);
 }
 
-// ---------------------------------------------------------------------------
-// SqliteEventBus
-// ---------------------------------------------------------------------------
-
 /// SQLite-backed [`EventBus`]: persists every event to one `requests` ledger.
-///
-/// `emit` hands the event to a dedicated writer task through a bounded
-/// channel and never blocks: a full channel drops the event and increments a
-/// dropped-events counter ([`SqliteEventBus::dropped_events`]) rather than
-/// back-pressuring the response path.
-///
-/// # Runtime requirement
-///
-/// [`SqliteEventBus::open`] spawns the writer task and must be called from
-/// within a tokio runtime.
+/// `emit` never blocks — a full channel drops the event and increments
+/// [`SqliteEventBus::dropped_events`]. Open inside a tokio runtime.
 #[derive(Debug)]
 pub struct SqliteEventBus {
     tx: Sender<ProxyEvent>,
@@ -608,23 +486,13 @@ pub struct SqliteEventBus {
 }
 
 impl SqliteEventBus {
-    /// Open (or create) the ledger at `path` and start the writer task.
-    ///
-    /// The database is opened in WAL mode with the `requests` schema and its
-    /// indexes created if absent; parent directories of `path` are created.
-    /// Retention bounds, when configured, are enforced on a timer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`StorageError`] if the directory cannot be created, the
-    /// database cannot be opened (or WAL mode refused), or the schema cannot
-    /// be initialized. Blocking filesystem work happens here; call at
-    /// startup, not on the hot path.
+    /// Open (or create) the ledger at `path` and start its writer task (parent
+    /// directories, WAL mode, and schema created as needed). Blocking
+    /// filesystem work: call at startup, not on the hot path.
     pub fn open(path: impl AsRef<Path>, retention: RetentionPolicy) -> Result<Self, StorageError> {
         Self::open_with_capacity(path, retention, DEFAULT_CHANNEL_CAPACITY)
     }
 
-    /// Like [`SqliteEventBus::open`] with an explicit channel capacity.
     fn open_with_capacity(
         path: impl AsRef<Path>,
         retention: RetentionPolicy,
@@ -660,14 +528,8 @@ impl SqliteEventBus {
         })
     }
 
-    /// Test-only constructor with a live channel but no writer task and no
-    /// database: the channel fills and never drains, so drop-on-full behavior
-    /// is deterministic.
     #[cfg(test)]
     fn unconnected(capacity: usize) -> Self {
-        // Leak the receiver so it outlives this constructor (a local binding
-        // would drop at return, making try_send report Closed instead of
-        // Full). The process-exit reclaim makes the leak irrelevant.
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
         Box::leak(Box::new(rx));
@@ -712,14 +574,11 @@ impl EventBus for SqliteEventBus {
     }
 
     fn close(&self) {
-        // Signal first; an error means the writer already exited and the done
-        // flag is already set.
         if let Ok(shutdown_tx) = self.shutdown_tx.lock() {
             if shutdown_tx.send(true).is_err() {
                 tracing::debug!("usage-ledger writer had already exited");
             }
         }
-        // Bounded wait for the writer's final drain.
         let deadline = Instant::now() + CLOSE_DRAIN_TIMEOUT;
         let mut guard = self.done.0.lock().unwrap_or_else(|e| e.into_inner());
         while !*guard {
@@ -743,10 +602,6 @@ impl EventBus for SqliteEventBus {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -832,7 +687,6 @@ mod tests {
         })
     }
 
-    /// Poll until `cond` holds (2s budget at 10ms cadence).
     async fn wait_until(description: &str, mut cond: impl FnMut() -> bool) {
         for _ in 0..200 {
             if cond() {
@@ -843,7 +697,6 @@ mod tests {
         panic!("condition not met within 2s: {description}");
     }
 
-    /// Open a second connection to the ledger for assertions.
     fn reader(path: &Path) -> Connection {
         Connection::open(path).expect("open ledger for assertions")
     }
@@ -950,7 +803,6 @@ mod tests {
         assert_eq!(row.6, "claude-3");
         assert_eq!(row.7.as_deref(), Some("claude-3-upstream"));
         assert_eq!(row.8, "sha256-digest-only");
-        // No body column exists at all: only the digest is ever stored.
         let has_body_column: i64 = scalar(
             &conn,
             "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'body'",
@@ -1067,7 +919,6 @@ mod tests {
         })
         .await;
 
-        // Costs are stored as exact decimal text and must round-trip.
         let cost_input_text = text_column(
             &conn,
             "SELECT cost_input FROM requests WHERE request_id = 'req-cost'",
@@ -1115,11 +966,8 @@ mod tests {
         let db = dir.path().join("usage.db");
         let bus = SqliteEventBus::open(&db, unbounded()).expect("open ledger");
 
-        // A failure with no provider must not erase the provider stored by
-        // the request event.
         bus.emit(&received_event("req-3", "laptop"));
         bus.emit(&failed_event("req-3", None));
-        // A failure for a request that was never received still gets a row.
         bus.emit(&failed_event("orphan-1", Some("prov-b")));
 
         let conn = reader(&db);
@@ -1183,8 +1031,6 @@ mod tests {
             .as_deref(),
             Some("prov-b")
         );
-        // The sanitized message field is not a ledger column by design; the
-        // error kind and status are the persisted failure facts.
         let has_message_column: i64 = scalar(
             &conn,
             "SELECT COUNT(*) FROM pragma_table_info('requests') WHERE name = 'message'",
@@ -1199,8 +1045,6 @@ mod tests {
 
     #[test]
     fn emit_counts_drops_when_channel_is_full_and_never_blocks() {
-        // No writer task: the channel fills and stays full, so every emit
-        // past capacity must return immediately and be counted.
         let bus = SqliteEventBus::unconnected(8);
         for i in 0..20 {
             bus.emit(&received_event(&format!("req-{i}"), "laptop"));
@@ -1272,7 +1116,6 @@ mod tests {
             scalar(&conn, "SELECT COUNT(*) FROM requests") == 5
         })
         .await;
-        // Two ancient rows, three recent (just under an hour old).
         let now_ms = unix_millis(OffsetDateTime::now_utc());
         for (id, ts) in [
             ("p0", 1000_i64),
@@ -1316,7 +1159,6 @@ mod tests {
             "the newest row survives the cap"
         );
 
-        // An unbounded policy prunes nothing, even when called directly.
         let deleted = run_retention_pass(&mut conn, &unbounded()).expect("no-op pass");
         assert_eq!(deleted, 0);
     }
@@ -1334,10 +1176,6 @@ mod tests {
             },
         )
         .expect("open ledger");
-        // The row must carry a current timestamp: an ancient one would be
-        // deleted by the timer's immediate first tick before this test can
-        // observe it. The 1h age bound lets it survive until the test
-        // backdates it below.
         let ProxyEvent::RequestReceived(mut fresh) = received_event("stale", "laptop") else {
             panic!("builder returns RequestReceived");
         };
@@ -1357,8 +1195,6 @@ mod tests {
             [],
         )
         .expect("backdate row");
-        // The writer's own timer (1s cadence) must delete the stale row with
-        // no manual pass.
         wait_until("timer prunes the stale row", || {
             scalar(
                 &conn,

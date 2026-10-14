@@ -1,14 +1,6 @@
-//! Structured request/response event log surface and persistence.
-//!
-//! This crate defines the event types and the [`EventBus`] trait that
-//! backends implement: [`NoopBus`] (the default when no `[storage]` config
-//! is present), [`RecordingBus`] for tests, and [`SqliteEventBus`], the
-//! persistent per-request usage ledger.
-//!
-//! Events are emitted at request/response boundaries in the server crate.
-//! [`SqliteEventBus`] (behind the storage config) persists them to SQLite;
-//! [`RecordingBus`] (behind the `test-utils` cargo feature) lets integration
-//! tests assert on the event sequence.
+//! Event types and the [`EventBus`] trait for the per-request usage ledger.
+//! Backends: [`NoopBus`] (default), [`RecordingBus`] (behind the `test-utils`
+//! feature), and [`SqliteEventBus`] (persistent SQLite ledger).
 
 #![deny(missing_docs)]
 
@@ -20,14 +12,7 @@ mod sqlite;
 
 pub use sqlite::{RetentionPolicy, SqliteEventBus, StorageError, run_retention_pass};
 
-// ---------------------------------------------------------------------------
-// ProxyEvent
-// ---------------------------------------------------------------------------
-
 /// One request/response lifecycle event, ready to persist or emit.
-///
-/// Internally tagged via `kind` so JSON/TOML consumers can discriminate without
-/// a wrapper object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProxyEvent {
@@ -39,10 +24,6 @@ pub enum ProxyEvent {
     ResponseFailed(ResponseFailed),
 }
 
-// ---------------------------------------------------------------------------
-// RequestReceived
-// ---------------------------------------------------------------------------
-
 /// Event payload for a received request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestReceived {
@@ -51,9 +32,8 @@ pub struct RequestReceived {
     /// When the request was received (RFC 3339).
     #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
-    /// Authenticated client key id, or `"anonymous"` when the request was
-    /// served under the loopback no-auth exemption. Key ids are operator
-    /// chosen; client secrets never appear on events.
+    /// Authenticated client key id, or `"anonymous"` under the loopback
+    /// no-auth exemption. Client secrets never appear on events.
     pub caller: String,
     /// Provider name from the URL path.
     pub provider: String,
@@ -70,10 +50,6 @@ pub struct RequestReceived {
     pub body_hash: String,
 }
 
-// ---------------------------------------------------------------------------
-// ResponseCompleted
-// ---------------------------------------------------------------------------
-
 /// Event payload for a completed response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseCompleted {
@@ -84,8 +60,7 @@ pub struct ResponseCompleted {
     pub timestamp: OffsetDateTime,
     /// Provider name.
     pub provider: String,
-    /// Upstream message id, if available from `MessageStart` or
-    /// `CoreResponse.id`.
+    /// Upstream message id, when the provider supplied one.
     pub upstream_message_id: Option<String>,
     /// Requested and upstream model.
     pub model: ModelRef,
@@ -99,15 +74,8 @@ pub struct ResponseCompleted {
     pub latency_ms: u64,
 }
 
-// ---------------------------------------------------------------------------
-// ResponseFailed
-// ---------------------------------------------------------------------------
-
-/// Event payload for a failed response.
-///
-/// `model` and `provider` are optional because early failures (unknown
-/// provider, JSON parse error, rate limit) can occur before the model or
-/// provider is confirmed.
+/// Event payload for a failed response; `model` and `provider` are optional
+/// because early failures can occur before either is confirmed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFailed {
     /// Proxy-generated unique request identifier.
@@ -121,14 +89,9 @@ pub struct ResponseFailed {
     pub model: Option<ModelRef>,
     /// Error kind string from the `RouteError` variant name.
     pub error_kind: String,
-    /// Sanitized error message; API keys and URLs are always redacted.
-    ///
-    /// For upstream errors whose status is passed through to the client
-    /// (400/413/429, and client-owned 401/403) this field holds a generic
-    /// proxy message so the provider's own schema (field names, model
-    /// identifiers, request echoes) never reaches the client; the real
-    /// upstream body is logged server-side only. For statuses that collapse to
-    /// 502, this field contains the truncated, key/URL-redacted upstream body.
+    /// Sanitized error message; API keys and URLs are always redacted, and
+    /// the provider's own response schema never reaches the client — statuses
+    /// passed through hold a generic proxy message, 502s a truncated body.
     pub message: String,
     /// HTTP status code returned to the client.
     pub http_status: u16,
@@ -136,30 +99,15 @@ pub struct ResponseFailed {
     pub latency_ms: u64,
 }
 
-// ---------------------------------------------------------------------------
-// EventBus trait + implementations
-// ---------------------------------------------------------------------------
-
 /// In-process event sink.
-///
-/// Implementations: [`NoopBus`], [`RecordingBus`] (tests), and
-/// [`SqliteEventBus`] (persistent ledger).
-///
-/// `Debug` is a super-trait so that `Arc<dyn EventBus>` can be formatted in
-/// `AppState`'s manual `Debug` impl.
 pub trait EventBus: Send + Sync + std::fmt::Debug {
     /// Emit one event. Must not block the calling task; backends do IO on a
     /// dedicated writer task.
     fn emit(&self, event: &ProxyEvent);
 
-    /// Signal that no further events will be emitted, flush anything still
-    /// queued, and release the writer.
-    ///
-    /// Called once at process shutdown, after the HTTP server has stopped
-    /// serving (so no new events can race the flush). The default is a
-    /// no-op, which is correct for stateless sinks. Implementations must
-    /// stay bounded: give up after a finite wait rather than hang shutdown.
-    /// May block briefly; wrap in `spawn_blocking` from async code.
+    /// Signal that no further events will be emitted and flush anything
+    /// queued; called once at process shutdown. Implementations must stay
+    /// bounded and may block briefly; wrap in `spawn_blocking` from async code.
     fn close(&self) {}
 }
 
@@ -171,13 +119,12 @@ impl EventBus for NoopBus {
     fn emit(&self, _event: &ProxyEvent) {}
 }
 
-/// Test-only sink that records events for assertions. Available behind the
-/// `test-utils` cargo feature (NOT `#[cfg(test)]`, which is stripped when the
-/// crate is compiled as a dependency).
+/// Test-only sink that records events for assertions; available behind the
+/// `test-utils` cargo feature.
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Default)]
 pub struct RecordingBus {
-    /// Recorded events, guarded by a mutex for interior mutability.
+    /// Recorded events.
     pub events: std::sync::Mutex<Vec<ProxyEvent>>,
 }
 
@@ -188,11 +135,8 @@ impl RecordingBus {
         Self::default()
     }
 
-    /// Snapshot the recorded events (cloned under the lock).
-    ///
-    /// Recovers from mutex poison rather than returning an empty `Vec`, so a
-    /// poisoned bus still reflects the events recorded before the panic
-    /// (consistent with the recover-poison pattern used in `metrics.rs`).
+    /// Snapshot the recorded events (cloned under the lock); recovers from
+    /// mutex poison rather than dropping events recorded before the panic.
     pub fn snapshot(&self) -> Vec<ProxyEvent> {
         self.events
             .lock()
@@ -204,9 +148,6 @@ impl RecordingBus {
 #[cfg(any(test, feature = "test-utils"))]
 impl EventBus for RecordingBus {
     fn emit(&self, event: &ProxyEvent) {
-        // Recover from mutex poison so a poisoned bus still records the event
-        // rather than silently dropping it (recover-poison pattern, consistent
-        // with `metrics.rs` and `catalog_service.rs`).
         self.events
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -239,7 +180,6 @@ mod tests {
     #[test]
     fn noop_bus_emit_does_not_panic_or_record() {
         let bus = NoopBus;
-        // NoopBus has nowhere to record; just ensure emit is callable.
         let event = ProxyEvent::RequestReceived(sample_request_received());
         bus.emit(&event);
     }
@@ -280,14 +220,6 @@ mod tests {
         use time::OffsetDateTime;
         use time::format_description::well_known::Rfc3339;
 
-        // Pin a known timestamp instead of `now_utc()` so the format assertions
-        // are deterministic and the round-trip can be checked exactly. The
-        // nanos value (`123_456_789`) is deliberately chosen to be nonzero at
-        // every precision group (ms/us/ns): `time`'s RFC 3339 serializer
-        // trims trailing zero groups, so a value like `123_000_000` would be
-        // emitted as milliseconds (`.123`, 3 digits) rather than nanoseconds.
-        // Forcing nonzero nanos guarantees the full 9-digit fractional component
-        // is emitted, so the precision assertion below is meaningful.
         let timestamp = OffsetDateTime::from_unix_timestamp(1_700_000_000)
             .expect("valid unix timestamp")
             .replace_nanosecond(123_456_789)
@@ -307,33 +239,20 @@ mod tests {
             body_hash: "abc123".to_owned(),
         });
         let json = serde_json::to_string(&event).expect("serialize");
-        // Internally tagged by `kind`.
         assert!(json.contains(r#""kind":"request_received""#), "got: {json}");
 
-        // Extract the serialized timestamp string from the JSON and validate a
-        // full RFC 3339 shape rather than only asserting `contains('T')`. The
-        // previous weaker assertion would pass for any value with a literal
-        // 'T' anywhere, masking a malformed/non-RFC-3339 timestamp.
         let extracted = extract_json_string_field(&json, "timestamp")
             .expect("timestamp field present and a JSON string");
-        // Must end in 'Z' (UTC) or a numeric offset like +00:00 / -05:00.
         assert!(
             extracted.ends_with('Z') || is_numeric_offset_suffix(&extracted),
             "timestamp must end in Z or a numeric offset, got: {extracted}"
         );
-        // Full RFC 3339 round-trip: parsing the extracted string back into an
-        // OffsetDateTime must succeed and reproduce the original instant.
         let parsed =
             OffsetDateTime::parse(&extracted, &Rfc3339).expect("timestamp parses as RFC 3339");
         assert_eq!(
             parsed, timestamp,
             "timestamp must round-trip through RFC 3339; got: {extracted}"
         );
-        // Precision: `time::serde::rfc3339` emits a fractional-seconds component
-        // and trims trailing zero groups (3 digits for whole-ms, 6 for whole-us,
-        // 9 otherwise). Our pinned nanos are nonzero at every group, so the full
-        // 9-digit nanosecond component is emitted. Confirm the subsecond part is
-        // present and carries nanosecond precision.
         let frac = extracted
             .split('.')
             .nth(1)
@@ -350,9 +269,7 @@ mod tests {
         );
     }
 
-    /// Return true if `s` ends in an RFC 3339 numeric offset like `+00:00`.
     fn is_numeric_offset_suffix(s: &str) -> bool {
-        // A numeric offset is `[+-]HH:MM` (6 chars).
         if s.len() < 6 {
             return false;
         }
@@ -364,12 +281,6 @@ mod tests {
         tail[1..].chars().all(|c| c.is_ascii_digit() || c == ':')
     }
 
-    /// Extract the string value of a top-level JSON string field from a
-    /// serialized `ProxyEvent` payload.
-    ///
-    /// Returns `None` if the field is absent or not a JSON string. Honors the
-    /// JSON `\"` escape so an embedded quote does not prematurely terminate the
-    /// value.
     fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
         let needle = format!("\"{field}\":\"");
         let start = json.find(&needle)? + needle.len();
@@ -398,22 +309,8 @@ mod tests {
         Some(json[start..end].to_owned())
     }
 
-    /// Source guard: `ProxyEvent` has no secret-carrying field by construction
-    /// (the API key lives in `ProviderConfig`, never on an event). This test
-    /// guards against future regressions where a field named like a secret
-    /// (`api_key`, `secret`, `token`, `bearer`, `authorization`, `password`)
-    /// is accidentally added to one of the event payloads.
-    ///
-    /// It serializes all three variants and asserts none of the forbidden
-    /// secret-bearing field names appear as a JSON key. It also populates every
-    /// string content field with a sentinel and asserts the JSON only ever
-    /// surfaces it under one of the *known* field names (proving no new,
-    /// unknown string field was silently introduced).
     #[test]
     fn proxy_event_has_no_secret_field_by_construction() {
-        // Field-name fragments that would indicate a secret-bearing field if
-        // they appeared as a JSON key. None of these are legitimate `ProxyEvent`
-        // field names.
         const FORBIDDEN_KEY_FRAGMENTS: &[&str] = &[
             "api_key",
             "apikey",
@@ -425,12 +322,8 @@ mod tests {
             "passwd",
         ];
 
-        // A sentinel placed in every legitimate string content field. It SHOULD
-        // appear in the serialized JSON (under the known field names) — the
-        // assertions below check it never appears under a forbidden field name.
         const SENTINEL: &str = "ZZ-sentinel-content-ZZ";
 
-        // --- RequestReceived ---
         let req = ProxyEvent::RequestReceived(RequestReceived {
             request_id: SENTINEL.to_owned(),
             timestamp: OffsetDateTime::now_utc(),
@@ -448,7 +341,6 @@ mod tests {
         let req_json = serde_json::to_string(&req).expect("serialize RequestReceived");
         assert_no_forbidden_secret_key(&req_json, FORBIDDEN_KEY_FRAGMENTS);
 
-        // --- ResponseCompleted ---
         let done = ProxyEvent::ResponseCompleted(ResponseCompleted {
             request_id: SENTINEL.to_owned(),
             timestamp: OffsetDateTime::now_utc(),
@@ -466,7 +358,6 @@ mod tests {
         let done_json = serde_json::to_string(&done).expect("serialize ResponseCompleted");
         assert_no_forbidden_secret_key(&done_json, FORBIDDEN_KEY_FRAGMENTS);
 
-        // --- ResponseFailed ---
         let failed = ProxyEvent::ResponseFailed(ResponseFailed {
             request_id: SENTINEL.to_owned(),
             timestamp: OffsetDateTime::now_utc(),
@@ -476,9 +367,6 @@ mod tests {
                 upstream: Some(SENTINEL.to_owned()),
             }),
             error_kind: SENTINEL.to_owned(),
-            // The `message` field is sanitized error text; place the sentinel
-            // here too so the guard proves it surfaces only as a value, never
-            // under a forbidden key.
             message: SENTINEL.to_owned(),
             http_status: 429,
             latency_ms: 2,
@@ -487,17 +375,8 @@ mod tests {
         assert_no_forbidden_secret_key(&failed_json, FORBIDDEN_KEY_FRAGMENTS);
     }
 
-    /// Assert that none of `fragments` appear as a JSON key in `json`.
-    ///
-    /// A JSON key is always serialized as `"fragment"` immediately followed by
-    /// `:` (modulo whitespace, which `serde_json::to_string` does not emit), so
-    /// checking for `"fragment":` avoids false positives where a fragment shows
-    /// up inside a legitimate string value.
     fn assert_no_forbidden_secret_key(json: &str, fragments: &[&str]) {
         for frag in fragments {
-            // Match the fragment as a JSON key: a `"` then the fragment then `"`
-            // then optional whitespace then `:`. serde_json emits no spaces, so
-            // the common shape is `"frag":`.
             let key_shape_quoted = format!("\"{frag}\":");
             assert!(
                 !json.contains(&key_shape_quoted),
@@ -521,7 +400,6 @@ mod tests {
         let json = serde_json::to_string(&event).expect("serialize");
         let back: ProxyEvent = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(back, ProxyEvent::ResponseFailed(_)));
-        // Sanity: UsageProvenance must be referenced so it is not flagged unused.
         let _ = UsageProvenance::Unknown;
     }
 }
