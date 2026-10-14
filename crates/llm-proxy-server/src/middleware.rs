@@ -53,10 +53,8 @@ impl RequestDeduplicator {
     }
 
     /// Check whether this request is a duplicate, keyed by path and body.
-    ///
-    /// Including the path distinguishes requests to different protocol
-    /// endpoints (e.g. `/v1/messages` vs `/v1/chat/completions`) that
-    /// happen to carry the same body.
+    /// The path distinguishes requests to different protocol endpoints
+    /// that carry the same body.
     pub fn is_duplicate_with_path(&self, path: &str, body: &[u8]) -> bool {
         if self.window_ms == 0 {
             return false;
@@ -400,8 +398,6 @@ impl std::fmt::Debug for ClientAuth {
 
 impl ClientAuth {
     /// Build authentication state from the `[auth]` config section.
-    ///
-    /// # Errors
     ///
     /// Returns [`ClientAuthError`] on contradictory mode/client combinations,
     /// reserved or empty key ids, or an unparseable verifier string.

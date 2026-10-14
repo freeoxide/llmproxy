@@ -92,8 +92,6 @@ impl ModelCatalogService {
 
     /// Return the merged, filtered catalog, optionally refreshing it live.
     ///
-    /// # Errors
-    ///
     /// Returns an error when a live refresh fails without stale/static fallback,
     /// or when a cache file is unsafe or malformed.
     pub async fn catalog(

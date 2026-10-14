@@ -1,6 +1,9 @@
 use tokio::signal;
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM (Unix only).
+///
+/// A handler install failure resolves (fail-safe) rather than parking on
+/// [`std::future::pending`], so graceful shutdown proceeds instead of hanging.
 pub async fn shutdown_signal() {
     let ctrl_c = async {
         match signal::ctrl_c().await {
