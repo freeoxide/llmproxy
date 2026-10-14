@@ -1,20 +1,5 @@
-//! OpenAI Chat Completions client protocol adapter.
-//!
-//! Translates between OpenAI Chat Completions API wire format and the normalised
-//! core protocol types.  This adapter only knows about OpenAI Chat Completions
-//! and the core types -- it never imports provider, server, or config code.
-//!
-//! ## Scope guardrails
-//!
-//! This module must **not** import or call:
-//! - `llm_proxy_provider`
-//! - `llm_proxy_server`
-//! - core config or routing modules
-//! - endpoint classification helpers
-//! - scenario or fallback code
-//!
-//! The `transformer/` module was removed in Phase 11; the guard test at the
-//! bottom of this file remains as a regression safety net.
+//! OpenAI Chat Completions client protocol adapter: translates between the
+//! OpenAI Chat wire format and the normalised core protocol types.
 
 use std::sync::Arc;
 
@@ -33,16 +18,6 @@ use crate::openai::{
     FunctionCall, ToolCall, UsageInfo,
 };
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/// Return the current Unix timestamp in seconds.
-///
-/// The `u64 -> i64` cast is safe because `u64::MAX` corresponds to a date
-/// ~584 billion years in the future, which is unreachable in any real timeline.
-/// `unwrap_or_default()` produces 0 if the system clock is before the Unix epoch,
-/// which maps cleanly to `i64`.
 fn unix_timestamp_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,11 +28,6 @@ fn unix_timestamp_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Clamp a tool-call index from `usize` to the OpenAI wire `i32` range.
-///
-/// OpenAI represents tool-call indices as `i32` inside JSON chunks.  If a
-/// provider ever emits an index larger than `i32::MAX` we clamp it and emit a
-/// warning so the stream is not broken by an overflow panic.
 fn clamp_tool_index(index: usize) -> i32 {
     let capped = index.min(i32::MAX as usize);
     let clamped = capped as i32;
@@ -71,8 +41,6 @@ fn clamp_tool_index(index: usize) -> i32 {
     clamped
 }
 
-/// Parses a tool-call `arguments` JSON string, warning and yielding `None`
-/// when the provider emitted something that is not valid JSON.
 fn parse_tool_call_arguments(arguments: &str) -> Option<serde_json::Value> {
     match serde_json::from_str::<serde_json::Value>(arguments) {
         Ok(value) => Some(value),
@@ -85,10 +53,6 @@ fn parse_tool_call_arguments(arguments: &str) -> Option<serde_json::Value> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// decode_request
-// ---------------------------------------------------------------------------
 
 /// Decode an OpenAI [`ChatCompletionRequest`] into a normalised [`CoreRequest`].
 #[expect(
@@ -139,19 +103,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 });
             }
             "assistant" => {
-                // Ordering: Thinking -> ToolUse -> Text. OpenAI's wire format
-                // has reasoning_content, tool_calls, and content as parallel
-                // fields with no defined ordering. This ordering is a
-                // deterministic choice that puts thinking before tool calls
-                // and text content.
-                //
-                // Read content_text before other fields are moved so the borrow
-                // checker is satisfied.
                 let assistant_text = msg.content_text();
                 let mut content = Vec::new();
                 if let Some(thinking) = msg.reasoning_content {
-                    // OpenAI returns Some("") for reasoning_content on non-reasoning
-                    // models; treat empty string as absent.
                     if !thinking.is_empty() {
                         content.push(CoreContent::Thinking {
                             text: thinking,
@@ -193,10 +147,6 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 });
             }
             "tool" => {
-                // OpenAI tool messages carry an optional `is_error` flag (some
-                // providers spell it `status`, handled via a serde alias on
-                // ChatMessage). Default to false when absent, matching the
-                // Anthropic adapter's `block.is_error.unwrap_or(false)`.
                 let is_error = msg.is_error.unwrap_or(false);
                 let tool_text = msg.content_text();
                 let tool_use_id = msg.tool_call_id.ok_or_else(|| {
@@ -244,14 +194,6 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
 
     let mut stop = None;
     if let Some(s) = req.stop {
-        // Converge with the canonical `core::deserialize_stop` (audit GAP-LOW-8):
-        // `null`/missing => no stop; a non-string item in a stop array, or a
-        // top-level stop value that is not a string/array/null, is a client
-        // error (rejected) rather than silently dropped. Previously this path
-        // warn-logged and kept the surviving items, and treated an empty array
-        // as `Some(vec![])` instead of `None` — both divergences from the core
-        // wire-format rule. The shared `json_type_name` helper yields
-        // byte-identical error messages to `deserialize_stop`.
         match s {
             serde_json::Value::Null => {}
             serde_json::Value::String(st) => stop = Some(vec![st]),
@@ -268,7 +210,6 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         }
                     }
                 }
-                // Empty stop array == no stop, matching `deserialize_stop`.
                 if result.is_empty() {
                     stop = None;
                 } else {
@@ -359,20 +300,9 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
     }
 }
 
-// ---------------------------------------------------------------------------
-// encode_response
-// ---------------------------------------------------------------------------
-
-/// Encode a [`CoreResponse`] into an OpenAI [`ChatCompletionResponse`].
-///
-/// # Content handling
-///
-/// - Multiple `CoreContent::Text` blocks are concatenated into a single string
-///   without separator, since OpenAI's `content` field is a single string.
-/// - Multiple `CoreContent::Thinking` blocks are concatenated with a newline
-///   separator into a single string for `reasoning_content`.
-/// - `stop_sequence` is silently dropped since OpenAI has no native field for it.
-/// - `provider_meta` is silently dropped (for provider adapters only).
+/// Encode a [`CoreResponse`] into an OpenAI [`ChatCompletionResponse`]:
+/// text blocks concatenate without separator and thinking blocks join with
+/// `\n`; `stop_sequence` and `provider_meta` are dropped.
 #[expect(
     clippy::too_many_lines,
     reason = "field-by-field wire encode of the OpenAI Chat response shape, kept \
@@ -409,14 +339,9 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
     for block in resp.content {
         match block {
             CoreContent::Text { text, .. } => {
-                // Multiple text blocks are concatenated without separator.
                 content_text.push_str(&text);
             }
             CoreContent::Thinking { text, .. } => {
-                // Concatenate multiple Thinking blocks with a newline separator
-                // rather than silently overwriting earlier blocks. OpenAI exposes
-                // reasoning_content as a single string, so concatenation is the
-                // least-lossy approach.
                 if reasoning.is_some() {
                     tracing::warn!(
                         "multiple Thinking blocks in response; concatenating with newline separator"
@@ -460,26 +385,16 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
                 );
             }
             CoreContent::ToolResult { .. } => {
-                // Tool results should not appear in assistant responses -- this
-                // likely indicates a logic error upstream.
                 tracing::warn!(
                     "ToolResult in response content is unexpected for OpenAI Chat encode; dropping"
                 );
             }
             CoreContent::RedactedThinking { .. } => {
-                // RedactedThinking cannot be represented in OpenAI Chat.
-                // Unlike Document/Audio/Video (safe to drop), RedactedThinking
-                // signals that thinking occurred but is intentionally withheld.
-                // Dropping it silently would lose that signal, so we warn and
-                // skip rather than returning Err, so that any previously encoded
-                // blocks (text, tool_calls) are preserved.
                 tracing::warn!(
                     "OpenAI Chat Completions does not support redacted thinking; omitting block"
                 );
             }
             CoreContent::Refusal { text } => {
-                // OpenAI has a native refusal field on assistant messages.
-                // Encode the refusal text into the dedicated field.
                 refusal_text = Some(text);
             }
         }
@@ -501,9 +416,6 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
 
     let usage = encode_usage(&resp.usage);
 
-    // NOTE: The timestamp is non-deterministic, which prevents snapshot testing
-    // of the full output. If deterministic output is needed, accept `created` as
-    // a parameter or read it from CoreResponse.provider_meta.
     let created = unix_timestamp_secs();
 
     Ok(ChatCompletionResponse {
@@ -522,15 +434,6 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
     })
 }
 
-/// Map [`StopReason`] to an OpenAI `finish_reason` string.
-///
-/// The plan's encode rules table maps ToolUse, MaxTokens, and "other normal stop"
-/// explicitly. The additional mappings:
-///
-/// - `Refusal` -> `"content_filter"` (OpenAI uses content_filter for refused outputs)
-/// - `StopSequence` -> `"stop"` (falls under "other normal stop")
-/// - `Error` -> `"stop"` with warning (no native error finish reason in OpenAI)
-/// - `Unknown` -> `"stop"` (safe default, "other normal stop")
 fn encode_finish_reason(reason: StopReason) -> String {
     match reason {
         StopReason::EndTurn => "stop".to_owned(),
@@ -552,12 +455,6 @@ fn encode_finish_reason(reason: StopReason) -> String {
     }
 }
 
-/// Encode core [`Usage`] into an OpenAI [`UsageInfo`].
-///
-/// Known limitation: `reasoning_tokens` are dropped because [`UsageInfo`] does not
-/// have a `completion_tokens_details` field. If a provider reports non-zero
-/// reasoning tokens, they are logged as a warning. To fix this, add a
-/// `completion_tokens_details` field to `UsageInfo` mirroring the OpenAI API shape.
 fn encode_usage(usage: &Usage) -> UsageInfo {
     if let Some(rt) = usage.reasoning_tokens {
         if rt != 0 {
@@ -571,60 +468,27 @@ fn encode_usage(usage: &Usage) -> UsageInfo {
         prompt_tokens: usage.input_tokens,
         completion_tokens: usage.output_tokens,
         total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
-        // Cache token mapping:
-        //
-        //   cache_creation_input_tokens -> prompt_cache_miss_tokens
-        //   cache_read_input_tokens    -> prompt_cache_hit_tokens
-        //
-        // This is an intentional semantic mapping: cache_creation means the prompt was
-        // NOT in the cache (a miss), and the cache was populated as a side effect.
-        // Therefore cache_creation_input_tokens represents the cache-miss cost.
-        //
-        // Operators correlating upstream provider usage with downstream client usage
-        // should be aware that these fields are inverses of each other:
-        //   - Upstream "creation" = Downstream "miss"  (same tokens, different label)
-        //   - Upstream "read"     = Downstream "hit"    (same tokens, same label)
         prompt_cache_hit_tokens: usage.cache_read_input_tokens,
         prompt_cache_miss_tokens: usage.cache_creation_input_tokens,
     }
 }
 
-// ---------------------------------------------------------------------------
-// StreamEncoder
-// ---------------------------------------------------------------------------
-
 /// Stateful encoder that converts [`CoreEvent`] values into OpenAI
-/// [`ChatCompletionChunk`] values.
-///
-/// The encoder is constructed with a stable completion `id`, `model`,
-/// `created` timestamp, and the `include_usage` flag (from stream_options).
-/// Every `chat.completion.chunk` reuses that `id`/`model`/`created`.
-///
-/// `id` and `model` are stored as `Arc<str>` rather than `String` so that
-/// cloning the encoder (and any future sharing of these values) is a cheap
-/// refcount bump instead of a heap allocation. The per-chunk owned `String`
-/// required by [`ChatCompletionChunk`] is materialised once in `Self::make_chunk`.
+/// [`ChatCompletionChunk`] values, reusing a stable `id`/`model`/`created`
+/// across chunks (stored as `Arc<str>` so cloning is a refcount bump).
 #[derive(Debug)]
 pub struct StreamEncoder {
-    /// Stable completion ID across all chunks.
     id: Arc<str>,
-    /// Model name.
     model: Arc<str>,
-    /// Unix timestamp.
     created: i64,
-    /// Whether to emit the usage chunk at the end.
     include_usage: bool,
-    /// Whether the terminal chunk has been emitted.
     finished: bool,
-    /// Buffered usage from the latest UsageDelta.
     pending_usage: Option<UsageInfo>,
 }
 
 impl StreamEncoder {
-    /// Create a new stream encoder.
-    ///
-    /// The route constructs these args from the first `CoreEvent::MessageStart`
-    /// and the decoded request.
+    /// Create a new stream encoder; the route builds these args from the first
+    /// `CoreEvent::MessageStart` and the decoded request.
     pub fn new(id: String, model: String, created: i64, include_usage: bool) -> Self {
         Self {
             id: id.into(),
@@ -656,9 +520,6 @@ impl StreamEncoder {
 
         match event {
             CoreEvent::MessageStart { .. } => {
-                // OpenAI does not have an explicit start event -- the first
-                // chunk implicitly starts the response.
-                // Emit a role chunk.
                 chunks.push(self.make_chunk(Choice {
                     index: 0,
                     message: None,
@@ -679,18 +540,12 @@ impl StreamEncoder {
 
             CoreEvent::ContentStart { index, kind } => {
                 match kind {
-                    ContentKind::ToolUse => {
-                        // Tool use start is handled by ToolCallStart.
-                    }
-                    ContentKind::Text | ContentKind::Thinking => {
-                        // Text/thinking start is implicit; deltas follow.
-                    }
+                    ContentKind::ToolUse => {}
+                    ContentKind::Text | ContentKind::Thinking => {}
                     _ => {
                         tracing::warn!(kind = ?kind, "unsupported ContentKind in OpenAI stream");
                     }
                 }
-                // OpenAI does not use content block indices in the same way Anthropic
-                // does -- the chunk-level position is implicit. Discard the index.
                 let _ = index;
             }
 
@@ -788,10 +643,7 @@ impl StreamEncoder {
                 }));
             }
 
-            CoreEvent::ToolCallStop { .. } => {
-                // No explicit event needed in OpenAI; the finish_reason
-                // on the terminal chunk signals tool completion.
-            }
+            CoreEvent::ToolCallStop { .. } => {}
 
             CoreEvent::UsageDelta { usage } => {
                 self.pending_usage = Some(encode_usage(&usage));
@@ -816,7 +668,6 @@ impl StreamEncoder {
                     }),
                 }));
 
-                // If include_usage is set, emit a final usage chunk.
                 if self.include_usage {
                     let usage = self.pending_usage.take().unwrap_or(UsageInfo {
                         prompt_tokens: 0,
@@ -832,13 +683,6 @@ impl StreamEncoder {
             }
 
             CoreEvent::Error { error } => {
-                // Defense-in-depth note: the error message is embedded in the
-                // ProtocolError which may be logged or sent as a client response.
-                // Sanitization of secrets happens at CoreStreamError::new()
-                // construction time in the provider adapter. Only the error kind
-                // is used here to avoid leaking unsanitized messages through logs.
-                // Using Display (lowercase) instead of Debug (PascalCase) for a
-                // stable, human-readable format.
                 self.finished = true;
                 return Err(ProtocolError::Encode(format!(
                     "stream error: {}",
@@ -846,21 +690,15 @@ impl StreamEncoder {
                 )));
             }
 
-            CoreEvent::Ping => {
-                // No-op for OpenAI unless the route chooses heartbeat.
-            }
+            CoreEvent::Ping => {}
         }
 
         Ok(chunks)
     }
 
-    /// Flush any remaining buffered events.
-    ///
-    /// When the stream terminated abnormally (no prior `MessageStop`), emits a
-    /// synthetic finish_reason=`"stop"` chunk so the client receives a proper
-    /// terminal signal. If `include_usage` is set, also emits a final usage chunk.
-    /// This is analogous to how the Anthropic encoder emits synthetic terminal
-    /// events in `finish()`.
+    /// Flush remaining buffered events when the stream ended without a
+    /// `MessageStop`: emits a synthetic `finish_reason = "stop"` chunk (with
+    /// a warning), plus the final usage chunk when `include_usage` is set.
     pub fn finish(&mut self) -> Result<Vec<ChatCompletionChunk>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
@@ -873,7 +711,6 @@ impl StreamEncoder {
 
         let mut chunks = Vec::new();
 
-        // Emit a synthetic finish chunk.
         chunks.push(self.make_chunk(Choice {
             index: 0,
             message: None,
@@ -891,7 +728,6 @@ impl StreamEncoder {
             }),
         }));
 
-        // If include_usage is set, emit a final usage chunk.
         if self.include_usage {
             let usage = self.pending_usage.take().unwrap_or(UsageInfo {
                 prompt_tokens: 0,
@@ -908,20 +744,6 @@ impl StreamEncoder {
 
     fn make_chunk(&self, choice: Choice) -> ChatCompletionChunk {
         ChatCompletionChunk {
-            // GAP-LOW-7 (evaluated, deferred by design): the per-chunk
-            // allocation of `id`/`model` persists here because
-            // `ChatCompletionChunk` is ALSO a deserialized *input* type
-            // (upstream provider SSE chunks are decoded into it at
-            // `adapter/openai_chat.rs`), so its `id`/`model` must stay owned
-            // `String`. Eliminating the allocation would require either serde's
-            // `rc` feature workspace-wide (a deliberate footgun: transparent
-            // `Arc`/`Rc` deserialization) or a parallel output-only chunk type
-            // that must stay wire-compatible with this one — both
-            // disproportionate for a GAP-LOW on a network-bound path, where
-            // upstream LLM latency dominates two small allocations per chunk.
-            // The encoder stores `id`/`model` as `Arc<str>` so that any future
-            // cloning of the encoder is a refcount bump; the per-chunk owned
-            // `String` remains the single unavoidable allocation.
             id: self.id.to_string(),
             object: "chat.completion.chunk".to_owned(),
             created: self.created,
@@ -931,9 +753,6 @@ impl StreamEncoder {
         }
     }
 
-    /// Build the terminal usage-only chunk. Shares the same `id`/`model`
-    /// materialisation path as `Self::make_chunk` to keep the two chunk
-    /// shapes consistent.
     fn make_usage_chunk(&self, usage: UsageInfo) -> ChatCompletionChunk {
         ChatCompletionChunk {
             id: self.id.to_string(),
@@ -945,54 +764,26 @@ impl StreamEncoder {
         }
     }
 
-    /// Mark the encoder as finished so that subsequent `finish()` calls return
-    /// empty events. This is used after emitting an in-band error event to
-    /// prevent the finalization path from emitting synthetic terminal events.
+    /// Mark the encoder as finished so subsequent `finish()` calls return
+    /// empty; used after emitting an in-band error.
     pub fn mark_finished(&mut self) {
         self.finished = true;
     }
 }
 
-// ---------------------------------------------------------------------------
-// stream_error_sse_payload
-// ---------------------------------------------------------------------------
-
-/// Build the OpenAI Chat stream-error SSE payload for a [`CoreEvent::Error`].
-///
-/// [`StreamEncoder::encode_event`] deliberately returns `Err` for
-/// `CoreEvent::Error` (the OpenAI Chat wire format has no dedicated error
-/// chunk type), so the normal encode path yields no SSE event for an error.
-/// When an error is the *leading* event of a stream, dropping it silently
-/// would leave the first-byte boundary uncrossed and surface a misleading
-/// "empty stream" 502 to the client. This helper synthesizes the error as an
-/// ordinary OpenAI error-object `data:` line so it can cross the boundary as a
-/// real in-band SSE event (200 + error object + `[DONE]`), mirroring the
-/// post-first-byte `emit_stream_error` path in the server crate.
-///
-/// The `error.kind` selects the OpenAI `type` string so the client can
-/// classify the failure (e.g. `rate_limit` vs `server_error`); the sanitized
-/// `error.message()` is used verbatim (it was sanitized at
-/// [`CoreStreamError::new`] construction time in the adapter).
-///
-/// Returns the JSON string suitable for a `data: <json>` SSE line, or `None`
-/// if serialization fails (treated as a dropped event by the caller). The
-/// caller is responsible for emitting the trailing `data: [DONE]` terminator.
+/// Build the OpenAI stream-error payload as an error-object `data:` line so
+/// a *leading* error crosses the first-byte boundary. Returns the JSON, or
+/// `None` if serialization fails; the caller emits the `data: [DONE]`.
 pub fn stream_error_sse_payload(error: &crate::core::CoreStreamError) -> Option<String> {
     let error_type = match error.kind {
         crate::core::CoreStreamErrorKind::InvalidRequest => "invalid_request_error",
         crate::core::CoreStreamErrorKind::Authentication => "authentication_error",
         crate::core::CoreStreamErrorKind::Permission => "permission_error",
         crate::core::CoreStreamErrorKind::RateLimit => "rate_limit_error",
-        // Upstream provider failures and internal proxy errors both surface as
-        // server-side errors on the OpenAI wire format.
         crate::core::CoreStreamErrorKind::Upstream | crate::core::CoreStreamErrorKind::Internal => {
             "server_error"
         }
     };
-    // Reuse the same typed structs as the HTTP error path so both stay
-    // consistent at compile time. Built inline (rather than via the server
-    // crate's `openai_stream_error_json_with_type`) to keep this adapter free
-    // of server/config dependencies (see the module scope guardrails).
     #[derive(serde::Serialize)]
     #[serde(deny_unknown_fields)]
     struct ErrorBody {
@@ -1016,17 +807,11 @@ pub fn stream_error_sse_payload(error: &crate::core::CoreStreamError) -> Option<
     serde_json::to_string(&body).ok()
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::UsageProvenance;
     use crate::openai::{FunctionDef, ToolDef};
-
-    // -- helpers ------------------------------------------------------------
 
     fn make_openai_request() -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -1076,8 +861,6 @@ mod tests {
         }
     }
 
-    // -- decode tests -------------------------------------------------------
-
     #[test]
     fn plain_text_request_decodes_to_core() {
         let req = make_openai_request();
@@ -1114,7 +897,6 @@ mod tests {
             CoreContent::Text { text, .. } => assert_eq!(text, "You are helpful"),
             _ => panic!("expected Text"),
         }
-        // System message should NOT appear in messages.
         assert_eq!(core.messages.len(), 1);
         assert_eq!(core.messages[0].role, CoreRole::User);
     }
@@ -1347,8 +1129,6 @@ mod tests {
 
     #[test]
     fn empty_user_content_with_cache_control_preserves_cache() {
-        // When a user message has empty content but carries cache_control,
-        // the cache_control must not be silently dropped.
         let mut req = make_openai_request();
         req.messages[0].content = serde_json::Value::String(String::new());
         req.messages[0].cache_control = Some(OpenAICacheControl {
@@ -1375,8 +1155,6 @@ mod tests {
 
     #[test]
     fn empty_system_content_with_cache_control_preserves_cache() {
-        // When a system message has empty content but carries cache_control,
-        // the cache_control must not be silently dropped.
         let mut req = make_openai_request();
         req.messages.insert(
             0,
@@ -1447,8 +1225,6 @@ mod tests {
         assert_eq!(core.tools.len(), 1);
         assert_eq!(core.tools[0].name, "get_weather");
     }
-
-    // -- encode tests -------------------------------------------------------
 
     #[test]
     fn core_text_response_encodes_to_route_response() {
@@ -1556,8 +1332,6 @@ mod tests {
         assert_eq!(msg.content, serde_json::Value::String("answer".into()));
     }
 
-    // -- streaming encode tests ---------------------------------------------
-
     #[test]
     fn streaming_text_event_mapping() {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
@@ -1658,7 +1432,6 @@ mod tests {
                 stop_sequence: None,
             })
             .unwrap();
-        // Two chunks: finish + usage.
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].choices.len(), 1);
         assert!(chunks[1].usage.is_some());
@@ -1678,7 +1451,6 @@ mod tests {
                 stop_sequence: None,
             })
             .unwrap();
-        // Only the finish chunk, no usage chunk.
         assert_eq!(chunks.len(), 1);
     }
 
@@ -1688,19 +1460,12 @@ mod tests {
         let result = enc.encode_event(CoreEvent::Error {
             error: CoreStreamError::new(CoreStreamErrorKind::RateLimit, "too many requests".into()),
         });
-        // Error events now return Err so the route handler can emit a proper
-        // error response, rather than leaking error text into content delta.
         assert!(result.is_err());
         assert!(matches!(result, Err(ProtocolError::Encode(_))));
     }
 
     #[test]
     fn stream_error_sse_payload_builds_typed_error_object() {
-        // The OpenAI StreamEncoder drops CoreEvent::Error (returns Err). The
-        // route handler uses this helper to synthesize the error as an ordinary
-        // OpenAI error-object `data:` line so a *leading* error crosses the
-        // first-byte boundary instead of surfacing a misleading 502
-        // (audit LOW, stream-ids-01).
         let payload = stream_error_sse_payload(&CoreStreamError::new(
             CoreStreamErrorKind::RateLimit,
             "too many requests".into(),
@@ -1708,10 +1473,8 @@ mod tests {
         .expect("payload serializes");
         let json: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(json["error"]["message"], "too many requests");
-        // RateLimit maps to the OpenAI rate-limit error type.
         assert_eq!(json["error"]["type"], "rate_limit_error");
         assert!(json["error"]["code"].is_null());
-        // Must NOT carry Anthropic-shaped fields.
         assert!(json.get("type").is_none() || json["type"].is_null());
     }
 
@@ -1766,7 +1529,6 @@ mod tests {
     #[test]
     fn streaming_finish_without_prior_events_emits_synthetic_terminal() {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
-        // No events sent at all -- finish() should emit a synthetic terminal chunk.
         let remaining = enc.finish().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(
@@ -1775,13 +1537,8 @@ mod tests {
         );
     }
 
-    // -- every CoreEvent variant handled ------------------------------------
-
     #[test]
     fn every_core_event_variant_maps_or_errors_intentionally() {
-        // Test all ContentKind variants for ContentStart. The OpenAI stream
-        // encoder handles Text, Thinking, and ToolUse explicitly; other kinds
-        // produce a warning log and no events.
         let content_kinds: Vec<ContentKind> = vec![
             ContentKind::Text,
             ContentKind::Thinking,
@@ -1802,7 +1559,6 @@ mod tests {
             assert!(result.is_ok(), "ContentStart {:?} should not error", kind);
         }
 
-        // Test all other CoreEvent variants.
         let variants: Vec<CoreEvent> = vec![
             CoreEvent::MessageStart {
                 id: None,
@@ -1846,8 +1602,6 @@ mod tests {
             let result = enc.encode_event(event.clone());
             match event {
                 CoreEvent::Error { .. } => {
-                    // Error events intentionally return Err so the route handler
-                    // can emit a proper error response.
                     assert!(result.is_err(), "Error event should return Err");
                 }
                 _ => {
@@ -1856,8 +1610,6 @@ mod tests {
             }
         }
     }
-
-    // -- unsupported content variants ---------------------------------------
 
     #[test]
     fn encode_image_drops_with_warning() {
@@ -1901,7 +1653,6 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        // Refusal text goes into the native refusal field, not content.
         assert_eq!(msg.refusal.as_deref(), Some("I cannot help"));
         assert!(msg.content_is_empty());
     }
@@ -1996,8 +1747,6 @@ mod tests {
         assert!(msg.content_is_empty());
     }
 
-    // -- metadata / provider hints ------------------------------------------
-
     #[test]
     fn provider_hints_raw_preserved_in_decode() {
         let mut req = make_openai_request();
@@ -2058,7 +1807,6 @@ mod tests {
             cost: None,
         };
         let out = encode_response(resp).unwrap();
-        // RedactedThinking is skipped (not an error), so content is empty.
         let msg = out.choices[0].message.as_ref().unwrap();
         assert!(msg.content_is_empty());
     }
@@ -2088,7 +1836,6 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        // Prior Text block is preserved even though RedactedThinking follows.
         assert_eq!(msg.content, serde_json::Value::String("hello".into()));
     }
 
@@ -2132,17 +1879,8 @@ mod tests {
         assert!(out.id.starts_with("chatcmpl-"));
     }
 
-    // -- source guard -------------------------------------------------------
-
     #[test]
     fn client_openai_chat_does_not_import_forbidden_modules() {
-        // Source guard: this module must not import llm_proxy_provider,
-        // llm_proxy_server, core config/routing, endpoint classification,
-        // scenario/fallback code, or transformer/*. The crate dependency
-        // graph prevents most of these at compile time (those crates are not
-        // dependencies of llm-proxy-protocol). This runtime check provides
-        // a secondary defense by verifying that the module source does not
-        // contain forbidden import patterns in `use` statements.
         let source = include_str!("openai_chat.rs");
         for line in source.lines() {
             let trimmed = line.trim();
@@ -2173,8 +1911,6 @@ mod tests {
             }
         }
     }
-
-    // -- edge-case tests ----------------------------------------------------
 
     #[test]
     fn decode_empty_model_returns_error() {
@@ -2233,8 +1969,6 @@ mod tests {
             cost: None,
         };
         let out = encode_response(resp).unwrap();
-        // stop_sequence is dropped (OpenAI has no field for it), but the
-        // stop_reason is mapped to "stop".
         assert_eq!(out.choices[0].finish_reason.as_deref(), Some("stop"));
     }
 
@@ -2264,7 +1998,6 @@ mod tests {
         };
         let out = encode_response(resp).unwrap();
         let msg = out.choices[0].message.as_ref().unwrap();
-        // Multiple Thinking blocks are concatenated with newline separator.
         assert_eq!(msg.reasoning_content.as_deref(), Some("first\nsecond"));
     }
 
@@ -2300,7 +2033,6 @@ mod tests {
         })
         .unwrap();
         let remaining = enc.finish().unwrap();
-        // Should produce finish chunk + usage chunk.
         assert_eq!(remaining.len(), 2);
         assert_eq!(
             remaining[0].choices[0].finish_reason.as_deref(),
@@ -2309,8 +2041,6 @@ mod tests {
         assert!(remaining[1].usage.is_some());
         assert_eq!(remaining[1].usage.as_ref().unwrap().prompt_tokens, 50);
     }
-
-    // -- tool_call validation tests -------------------------------------------
 
     #[test]
     fn tool_call_missing_id_returns_error() {
@@ -2321,7 +2051,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: vec![ToolCall {
                 index: Some(0),
-                id: None, // missing id
+                id: None,
                 r#type: Some("function".into()),
                 function: Some(FunctionCall {
                     name: Some("get_weather".into()),
@@ -2357,7 +2087,7 @@ mod tests {
                 index: Some(0),
                 id: Some("call_1".into()),
                 r#type: Some("function".into()),
-                function: None, // missing function
+                function: None,
             }],
             name: None,
             tool_call_id: None,
@@ -2389,7 +2119,7 @@ mod tests {
                 id: Some("call_1".into()),
                 r#type: Some("function".into()),
                 function: Some(FunctionCall {
-                    name: None, // missing name
+                    name: None,
                     arguments: Some("{}".into()),
                 }),
             }],
@@ -2420,7 +2150,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: vec![],
             name: None,
-            tool_call_id: None, // missing tool_call_id
+            tool_call_id: None,
             cache_control: None,
             refusal: None,
             is_error: None,
@@ -2462,7 +2192,6 @@ mod tests {
         let core = decode_request(req).unwrap();
         match &core.messages[1].content[0] {
             CoreContent::ToolUse { input, .. } => {
-                // Malformed arguments should be replaced with an empty object.
                 assert_eq!(
                     input,
                     &serde_json::json!({}),
@@ -2475,9 +2204,6 @@ mod tests {
 
     #[test]
     fn tool_message_is_error_decodes_to_core() {
-        // A tool message carrying `is_error: Some(true)` must surface in the
-        // decoded CoreContent::ToolResult, mirroring the Anthropic adapter's
-        // `tool_result_with_is_error_decodes_to_core` regression test.
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "tool".into(),
@@ -2496,7 +2222,6 @@ mod tests {
             _ => panic!("expected ToolResult"),
         }
 
-        // An absent `is_error` field must default to false (no semantic flip).
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "tool".into(),
@@ -2515,8 +2240,6 @@ mod tests {
             _ => panic!("expected ToolResult"),
         }
 
-        // Some OpenAI-compatible providers spell the flag `status`; the serde
-        // alias on ChatMessage must deserialize it into `is_error`.
         let json = serde_json::json!({
             "model": "gpt-4o",
             "messages": [
@@ -2539,11 +2262,6 @@ mod tests {
 
     #[test]
     fn assistant_with_reasoning_tool_calls_and_text_preserves_order() {
-        // Locks the documented Thinking -> ToolUse -> Text ordering invariant
-        // (see the comment in the "assistant" arm of decode_request). The OpenAI
-        // wire format carries reasoning_content, tool_calls, and content as
-        // parallel fields with no defined ordering; a refactor of the early-read
-        // borrow-checker workaround must not silently reorder these.
         let mut req = make_openai_request();
         req.messages.push(ChatMessage {
             role: "assistant".into(),
@@ -2581,8 +2299,6 @@ mod tests {
         );
     }
 
-    // -- stop field parsing tests ---------------------------------------------
-
     #[test]
     fn stop_as_string_decodes_to_single_element_vec() {
         let mut req = make_openai_request();
@@ -2593,7 +2309,6 @@ mod tests {
 
     #[test]
     fn stop_as_null_decodes_to_none() {
-        // Converges with core::deserialize_stop: explicit null means "no stop".
         let mut req = make_openai_request();
         req.stop = Some(serde_json::Value::Null);
         let core = decode_request(req).unwrap();
@@ -2602,8 +2317,6 @@ mod tests {
 
     #[test]
     fn stop_as_empty_array_decodes_to_none() {
-        // Converges with core::deserialize_stop: an empty stop array is "no
-        // stop", not Some(vec![]).
         let mut req = make_openai_request();
         req.stop = Some(serde_json::json!([]));
         let core = decode_request(req).unwrap();
@@ -2612,9 +2325,6 @@ mod tests {
 
     #[test]
     fn stop_as_non_string_non_array_is_rejected() {
-        // GAP-LOW-8: a top-level stop value that is not a string/array/null is
-        // a client error (matching core::deserialize_stop), not silently
-        // dropped as it was before.
         let mut req = make_openai_request();
         req.stop = Some(serde_json::json!(42));
         let err = decode_request(req).unwrap_err();
@@ -2631,8 +2341,6 @@ mod tests {
 
     #[test]
     fn stop_array_with_non_string_items_is_rejected() {
-        // GAP-LOW-8: a non-string item in a stop array is a client error
-        // (matching core::deserialize_stop), not filtered out as it was before.
         let mut req = make_openai_request();
         req.stop = Some(serde_json::json!(["STOP", 123, "END"]));
         let err = decode_request(req).unwrap_err();

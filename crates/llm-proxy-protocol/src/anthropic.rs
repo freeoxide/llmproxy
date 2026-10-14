@@ -1,15 +1,8 @@
 //! Anthropic API types for the Messages API.
 //!
 //! Reference: <https://docs.anthropic.com/en/api/messages>
-//!
-//! This module contains request/response types for the Anthropic Messages API,
-//! including support for streaming via Server-Sent Events.
 
 use serde::{Deserialize, Serialize, Serializer};
-
-// ---------------------------------------------------------------------------
-// MessageRequest
-// ---------------------------------------------------------------------------
 
 /// A request to the Anthropic Messages API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,35 +36,25 @@ pub struct MessageRequest {
     /// Extended thinking configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
-    /// Controls which (if any) tool the model must call.
-    ///
-    /// Accepts `{"type": "auto"}`, `{"type": "any"}`, or
-    /// `{"type": "tool", "name": "..."}` as defined by the Anthropic
-    /// Messages API.
+    /// Controls which (if any) tool the model must call. Accepts
+    /// `{"type": "auto"}`, `{"type": "any"}`, or `{"type": "tool", "name": "..."}`
+    /// as defined by the Anthropic Messages API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
 }
 
 impl MessageRequest {
-    /// Extracts the system prompt text from the `system` field.
-    ///
-    /// Anthropic accepts `system` as either a plain string or an array of
-    /// [`SystemContentBlock`]:
-    ///
-    /// ```json
-    /// "system": "You are helpful"
-    /// "system": [{"type":"text","text":"You are helpful","cache_control":...}]
-    /// ```
+    /// Extracts the system prompt text from the `system` field, which may be
+    /// a plain string or an array of [`SystemContentBlock`]s; array text blocks
+    /// are joined with `\n`, and anything unparseable falls back to raw JSON.
     #[must_use]
     pub fn system_text(&self) -> String {
         let Some(value) = &self.system else {
             return String::new();
         };
-        // Try plain string first.
         if let Some(s) = value.as_str() {
             return s.to_owned();
         }
-        // Try array of SystemContentBlock.
         if let Some(arr) = value.as_array() {
             let parts: Vec<String> = arr
                 .iter()
@@ -83,14 +66,11 @@ impl MessageRequest {
                 return parts.join("\n");
             }
         }
-        // Fallback: raw JSON string.
         value.to_string()
     }
 
-    /// Validates that required fields are present.
-    ///
-    /// Returns `Ok(())` if all required fields are present, or a
-    /// `ProtocolError::InvalidRequest` with a description of the problem.
+    /// Validates that required fields are present; returns
+    /// `ProtocolError::InvalidRequest` describing the first problem otherwise.
     pub fn validate(&self) -> Result<(), crate::client::ProtocolError> {
         if self.model.is_empty() {
             return Err(crate::client::ProtocolError::InvalidRequest(
@@ -112,10 +92,6 @@ impl MessageRequest {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SystemContentBlock
-// ---------------------------------------------------------------------------
-
 /// A content block inside the `system` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,10 +107,6 @@ pub struct SystemContentBlock {
     pub cache_control: Option<CacheControl>,
 }
 
-// ---------------------------------------------------------------------------
-// CacheControl
-// ---------------------------------------------------------------------------
-
 /// Cache control directives for prompt caching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,20 +116,9 @@ pub struct CacheControl {
     pub r#type: String,
 }
 
-// ---------------------------------------------------------------------------
-// Metadata
-// ---------------------------------------------------------------------------
-
-/// Optional metadata attached to a [`MessageRequest`].
-///
-/// Unknown metadata fields beyond `user_id` are preserved in the `extra`
-/// flattened map so they can be forwarded to `RequestMetadata.raw` during
-/// decode rather than silently dropped.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted because this struct
-/// uses `#[serde(flatten)]` to capture unknown fields. The flattened `extra`
-/// map may grow large with arbitrary client metadata; callers that need to
-/// bound payload size should check `extra.len()` before forwarding.
+/// Optional metadata attached to a [`MessageRequest`]; unknown fields are
+/// preserved in `extra` (via `#[serde(flatten)]`, so `deny_unknown_fields`
+/// is not set) and forwarded to `RequestMetadata.raw`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     /// An external identifier for the end-user.
@@ -168,20 +129,9 @@ pub struct Metadata {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-// ---------------------------------------------------------------------------
-// Message
-// ---------------------------------------------------------------------------
-
-/// A single message in the conversation.
-///
-/// The `content` field can be either a plain string or an array of
-/// [`ContentBlock`].
-///
-/// Note: `deny_unknown_fields` is intentionally omitted here even though the
-/// parent `MessageRequest` has it. New Anthropic message-level fields (e.g. a
-/// future `metadata` field on individual messages) should be tolerated rather
-/// than causing deserialization failures at this layer. The parent struct's
-/// `deny_unknown_fields` already guards against truly unknown top-level fields.
+/// A single message in the conversation; `content` is either a plain string
+/// or an array of [`ContentBlock`]s. Unknown fields are tolerated (no
+/// `deny_unknown_fields`) so future Anthropic fields decode cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Message {
@@ -192,21 +142,14 @@ pub struct Message {
 }
 
 impl Message {
-    /// Parses the message `content` into a list of [`ContentBlock`].
-    ///
-    /// Handles both a plain string and an array-of-blocks representation:
-    ///
-    /// ```json
-    /// "content": "hello"
-    /// "content": [{"type":"text","text":"hello"}]
-    /// ```
+    /// Parses the message `content` into a list of [`ContentBlock`]s; accepts
+    /// both `"content": "text"` and `"content": [block, ...]` wire shapes.
     #[must_use]
     #[expect(deprecated, reason = "constructs ContentBlock with output: None")]
     pub fn content_blocks(&self) -> Vec<ContentBlock> {
         if self.content.is_null() {
             return Vec::new();
         }
-        // Try plain string first.
         if let Some(s) = self.content.as_str() {
             return vec![ContentBlock {
                 r#type: "text".to_owned(),
@@ -225,7 +168,6 @@ impl Message {
                 data: None,
             }];
         }
-        // Try array of content blocks.
         if let Some(arr) = self.content.as_array() {
             let mut blocks = Vec::with_capacity(arr.len());
             for item in arr {
@@ -249,32 +191,9 @@ impl Message {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ContentBlock
-// ---------------------------------------------------------------------------
-
-/// A block of content within a message.
-///
-/// The `r#type` field determines which other fields are populated:
-///
-/// | Type                 | Populated fields                                  |
-/// |----------------------|---------------------------------------------------|
-/// | `"text"`             | `text`                                            |
-/// | `"tool_use"`         | `id`, `name`, `input`                             |
-/// | `"tool_result"`      | `tool_use_id`, `content`, `is_error`              |
-/// | `"thinking"`         | `thinking`, `signature`                           |
-/// | `"redacted_thinking"`| `data`                                            |
-/// | `"image"`            | `source`                                          |
-///
-/// Note: `deny_unknown_fields` is intentionally omitted because this struct
-/// receives polymorphic content blocks from external JSON. Unknown block types
-/// must be tolerated so that future Anthropic API additions do not break
-/// deserialization. The `Serialize` impl handles unknown types via the
-/// catch-all arm.
-///
-/// Note: `#[non_exhaustive]` is applied to allow future field additions
-/// without breaking downstream code, since this struct represents an external
-/// protocol and all fields are public.
+/// A block of content within a message; `r#type` selects the populated
+/// fields (`"text"`, `"tool_use"`, `"tool_result"`, `"thinking"`,
+/// `"redacted_thinking"`, `"image"`). Unknown types must be tolerated.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct ContentBlock {
@@ -458,10 +377,8 @@ impl ContentBlock {
         }
     }
 
-    /// Returns the appropriate tool ID for this block.
-    ///
-    /// For `"tool_result"` blocks returns `tool_use_id`; for all others
-    /// (notably `"tool_use"`) returns `id`.
+    /// Returns the tool ID for this block: `tool_use_id` for `"tool_result"`,
+    /// `id` for every other type.
     #[must_use]
     pub fn get_tool_id(&self) -> &str {
         if self.r#type == "tool_result" {
@@ -471,13 +388,10 @@ impl ContentBlock {
         }
     }
 
-    /// Extracts text from a `"tool_result"` block's `content` field.
-    ///
-    /// The `content` field can be a plain string or an array of content
-    /// blocks. Falls back to the deprecated `output` field.
+    /// Extracts text from a `"tool_result"` block's `content` field (string
+    /// or array of text blocks), falling back to the deprecated `output`.
     #[must_use]
     pub fn text_content(&self) -> String {
-        // Try the content field first.
         if let Some(ref val) = self.content {
             if let Some(s) = val.as_str() {
                 return s.to_owned();
@@ -494,7 +408,6 @@ impl ContentBlock {
                 }
             }
         }
-        // Fallback to the deprecated output field.
         #[expect(
             deprecated,
             reason = "reads the deprecated `output` field as a text fallback"
@@ -509,14 +422,6 @@ impl ContentBlock {
     }
 }
 
-/// Serializes an unknown / future content block type by emitting every non-`None`
-/// field.
-///
-/// This clones every field to construct an intermediate `AllFields` struct.
-/// The clone cost is acceptable because (a) unknown block types are rare,
-/// and (b) the approach keeps the Serialize impl maintainable by leveraging
-/// derive rather than a manual `SerializeMap` that conditionally includes
-/// each field.
 fn serialize_unknown_block<S>(block: &ContentBlock, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -637,11 +542,6 @@ impl Serialize for ContentBlock {
                 map.end()
             }
             "image" => {
-                // When `source` is `None` we emit an empty ImageSource placeholder.
-                // This produces structurally valid but semantically meaningless JSON.
-                // The `new_image` constructor requires a source, so this branch is only
-                // reachable for blocks constructed with Default or deserialized from
-                // malformed input.
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", &self.r#type)?;
                 map.serialize_entry(
@@ -659,10 +559,6 @@ impl Serialize for ContentBlock {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ImageSource
-// ---------------------------------------------------------------------------
-
 /// An image source embedded in a content block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -675,10 +571,6 @@ pub struct ImageSource {
     /// Base64-encoded image data.
     pub data: String,
 }
-
-// ---------------------------------------------------------------------------
-// Tool
-// ---------------------------------------------------------------------------
 
 /// A tool definition for function calling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -693,10 +585,6 @@ pub struct Tool {
     pub input_schema: serde_json::Value,
 }
 
-// ---------------------------------------------------------------------------
-// ToolResult
-// ---------------------------------------------------------------------------
-
 /// The result of executing a tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -710,22 +598,8 @@ pub struct ToolResult {
     pub is_error: Option<bool>,
 }
 
-// ---------------------------------------------------------------------------
-// MessageResponse
-// ---------------------------------------------------------------------------
-
-/// A response from the Anthropic Messages API.
-///
-/// This struct is both constructed for client-facing output AND deserialized
-/// from upstream Anthropic SSE events (specifically `message_start` events
-/// contain a full `MessageResponse` snapshot). `Deserialize` is required for
-/// the SSE decode path; `Serialize` is required for the encode path.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted because this is an
-/// outbound-only type -- the proxy constructs it internally and serializes
-/// it to clients. It is never deserialized from external input. Omitting
-/// `deny_unknown_fields` is consistent with other outbound response types
-/// (`ChatCompletionResponse`, `ResponsesResponse`, `GeminiResponse`).
+/// A response from the Anthropic Messages API, built by the encode path
+/// and deserialized from upstream `message_start` SSE snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct MessageResponse {
@@ -750,15 +624,8 @@ pub struct MessageResponse {
     pub usage: Usage,
 }
 
-// ---------------------------------------------------------------------------
-// Usage
-// ---------------------------------------------------------------------------
-
-/// Token usage statistics returned with every response.
-///
-/// Uses `i32` for token counts for consistency with the Anthropic API wire
-/// format (JSON integers) and the core `Usage` type. The ~2.1 billion limit
-/// is well beyond any realistic single request.
+/// Token usage statistics returned with every response; counts are `i32`,
+/// matching the Anthropic JSON integer wire format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Usage {
@@ -774,10 +641,6 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<i32>,
 }
 
-// ---------------------------------------------------------------------------
-// ContentBlockDelta
-// ---------------------------------------------------------------------------
-
 /// A streaming delta event for a content block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentBlockDelta {
@@ -790,19 +653,13 @@ pub struct ContentBlockDelta {
     pub delta: Delta,
 }
 
-// ---------------------------------------------------------------------------
-// Delta
-// ---------------------------------------------------------------------------
-
 /// A partial update in a streaming response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Delta {
     /// Delta type (e.g. `"text_delta"`, `"thinking_delta"`, `"input_json_delta"`).
-    ///
-    /// Kept as `Option<String>` with `#[serde(default)]` for forward-compatibility
-    /// with future Anthropic delta types. In practice the Anthropic API always
-    /// includes this field; `None` indicates a malformed or unknown delta.
+    /// `Option` with `#[serde(default)]` for forward compatibility; `None`
+    /// indicates a malformed or unknown delta.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub r#type: Option<String>,
     /// Partial text content.
@@ -821,10 +678,6 @@ pub struct Delta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// MessageEvent
-// ---------------------------------------------------------------------------
 
 /// A Server-Sent Event from the Anthropic streaming API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -854,10 +707,6 @@ pub struct MessageEvent {
     pub error: Option<ApiError>,
 }
 
-// ---------------------------------------------------------------------------
-// ApiError
-// ---------------------------------------------------------------------------
-
 /// An error returned by the Anthropic API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -869,10 +718,6 @@ pub struct ApiError {
     pub message: String,
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 #[expect(
     deprecated,
@@ -880,8 +725,6 @@ pub struct ApiError {
 )]
 mod tests {
     use super::*;
-
-    // -- system_text --------------------------------------------------------
 
     #[test]
     fn system_text_none_when_absent() {
@@ -950,8 +793,6 @@ mod tests {
         assert_eq!(req.system_text(), "You are helpful. \nBe concise.");
     }
 
-    // -- content_blocks -----------------------------------------------------
-
     #[test]
     fn content_blocks_from_string() {
         let msg = Message {
@@ -991,8 +832,6 @@ mod tests {
         };
         assert!(msg.content_blocks().is_empty());
     }
-
-    // -- validate -----------------------------------------------------------
 
     #[test]
     fn validate_ok() {
@@ -1059,8 +898,6 @@ mod tests {
             matches!(err, crate::client::ProtocolError::InvalidRequest(ref msg) if msg == "messages is required")
         );
     }
-
-    // -- ContentBlock custom serialize --------------------------------------
 
     #[test]
     fn serialize_text_block() {
@@ -1189,8 +1026,6 @@ mod tests {
         assert_eq!(json.as_object().unwrap().len(), 3);
     }
 
-    // -- text_content -------------------------------------------------------
-
     #[test]
     fn text_content_from_string_content() {
         let block = ContentBlock {
@@ -1258,8 +1093,6 @@ mod tests {
         assert_eq!(block.text_content(), "legacy output");
     }
 
-    // -- get_tool_id --------------------------------------------------------
-
     #[test]
     fn get_tool_id_tool_result() {
         let block = ContentBlock {
@@ -1280,8 +1113,6 @@ mod tests {
         assert_eq!(block.get_tool_id(), "tu_99");
     }
 
-    // -- helper to build a minimal block for tests --------------------------
-
     fn make_minimal_block() -> ContentBlock {
         ContentBlock {
             r#type: String::new(),
@@ -1301,10 +1132,6 @@ mod tests {
         }
     }
 
-    // -- text_content: empty string content -----------------------------------
-
-    /// Characterization: `text_content()` returns an empty string when
-    /// `content` is `Some(Value::String(""))`.
     #[test]
     fn text_content_from_empty_string_content() {
         let block = ContentBlock {

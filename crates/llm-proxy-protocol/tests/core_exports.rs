@@ -1,9 +1,5 @@
-//! Integration smoke test: verifies that the core module is publicly
-//! exported and the primary types can be imported, constructed, and
-//! serialized.
-//!
-//! This prevents the Phase 1 gate from passing if `core.rs` or
-//! `pub mod core;` is missing.
+//! Smoke test: the core module is publicly exported and its primary types
+//! construct and round-trip through serde.
 
 #[cfg(test)]
 mod tests {
@@ -15,7 +11,6 @@ mod tests {
         Usage, UsageProvenance,
     };
 
-    /// Trivial compile-time check: the types exist and are constructible.
     #[test]
     fn core_types_are_exported() {
         let _request: CoreRequest;
@@ -31,7 +26,6 @@ mod tests {
         let _provenance: UsageProvenance;
     }
 
-    /// Stronger check: construct a minimal CoreRequest and verify serialization.
     #[test]
     fn core_request_serializes() {
         let req = CoreRequest {
@@ -64,7 +58,6 @@ mod tests {
         assert_eq!(back.model.requested, "test-model");
     }
 
-    /// Verify CacheControlType enum is exported and works.
     #[test]
     fn cache_control_type_is_exported() {
         let cc = CacheControl {
@@ -76,7 +69,6 @@ mod tests {
         );
     }
 
-    /// Verify that CoreEvent variants can be serialized and deserialized.
     #[test]
     fn core_event_round_trips() {
         let events = vec![
@@ -102,7 +94,6 @@ mod tests {
         }
     }
 
-    /// Verify that CoreRequest round-trips with full structural equality.
     #[test]
     fn core_request_full_round_trip() {
         let req = CoreRequest {
@@ -137,11 +128,6 @@ mod tests {
         );
     }
 
-    /// Verify that CoreResponse round-trips with full structural equality.
-    ///
-    /// Analogous to `core_request_full_round_trip` but exercises the response type
-    /// with diverse content variants (Text, ToolUse, Thinking) and all CoreResponse
-    /// fields including usage, stop_reason, stop_sequence, and provider_meta.
     #[test]
     fn core_response_full_round_trip() {
         let mut provider_meta = serde_json::Map::new();

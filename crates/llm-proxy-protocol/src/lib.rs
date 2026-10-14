@@ -1,8 +1,6 @@
-//! llm-proxy-protocol: wire-format types for the LLM proxy.
-//!
-//! Contains request/response types for the Anthropic Messages API,
-//! OpenAI Chat Completions API, Responses API, Google Gemini API,
-//! and the normalised core protocol types.
+//! llm-proxy-protocol: wire-format types for the LLM proxy — Anthropic
+//! Messages, OpenAI Chat Completions, Responses API, Gemini API, and the
+//! normalised core protocol types.
 
 #![deny(missing_docs)]
 

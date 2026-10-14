@@ -1,58 +1,12 @@
-//! Core protocol types for the LLM proxy.
-//!
-//! This module defines the normalized internal representation that sits between
-//! client protocol adapters and provider adapters.  Every adapter translates
-//! **to** or **from** these types -- never directly to another adapter's wire
-//! format.
-//!
-//! ## Design rules
-//!
-//! * Chat-endpoint focused.  Do not add embeddings, image generation, audio
-//!   endpoints, rerank, files, or batch families here.
-//! * Chat content still preserves image/document/audio/video blocks because
-//!   those can appear inside chat requests and responses.
-//! * The stream error type is `CoreStreamError` (not `CoreError`) to avoid
-//!   colliding with the config / registry error owned by the core crate.
-//!
-//! ## Opaque field safety
-//!
-//! Several fields hold opaque JSON data that passes through the proxy without
-//! interpretation: [`RequestMetadata::raw`], [`ProviderHints::raw`],
-//! [`CoreResponse::provider_meta`], [`SamplingOptions::thinking`], and
-//! [`CoreToolChoice::Raw`].  These opaque fields use a **redacting `Debug`
-//! implementation** that shows only the JSON type and approximate size (e.g.
-//! `Object(3 keys)`, `String(42 bytes)`) rather than printing values verbatim.
-//! This is a defense-in-depth measure: adapters **must not** store secrets (API
-//! keys, bearer tokens, etc.) in any of these fields.  Strip credentials before
-//! placing data into these fields.
-//!
-//! ## Equality semantics
-//!
-//! Types that contain [`serde_json::Value`] fields derive `PartialEq` but **not**
-//! `Eq`, because `serde_json::Value` uses `f64` internally and does not implement
-//! `Eq`.  Equality comparisons on such types are partial: if any JSON value field
-//! contains NaN, the comparison may return `false` unpredictably.  This primarily
-//! affects test assertions; production code should not rely on exact equality of
-//! JSON-heavy types.
-//!
-//! ## Forward compatibility
-//!
-//! All public enums are annotated with `#[non_exhaustive]`, so adding new variants
-//! is not a semver-breaking change.  Core structs use `#[serde(deny_unknown_fields)]`
-//! to ensure that unknown fields cause a deserialization error rather than being
-//! silently dropped.  Wire-type structs in `openai.rs` may use `#[serde(flatten)]`
-//! with an extra `Map` for passthrough instead.
+//! Normalised core protocol types between client and provider adapters;
+//! adapters translate to/from these, never to each other's wire formats.
+//! Opaque JSON fields redact their `Debug` output — do not store secrets.
 
 use std::fmt;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// OpaqueJsonRef -- redacting Debug wrapper for borrowed serde_json::Value
-// ---------------------------------------------------------------------------
-
-/// A reference wrapper for redacting Debug output of a borrowed `Value`.
 struct OpaqueJsonRef<'a>(&'a serde_json::Value);
 
 impl fmt::Debug for OpaqueJsonRef<'_> {
@@ -61,16 +15,6 @@ impl fmt::Debug for OpaqueJsonRef<'_> {
     }
 }
 
-/// Formats a [`serde_json::Value`] for debug output without revealing content.
-///
-/// Bool and Number values are shown without their actual values for consistency
-/// with the redaction policy: a malicious payload could encode secret fragments
-/// in number values or boolean field names.
-///
-/// Note: `String(N bytes)` reveals the string length. This is an intentional
-/// trade-off: hiding the length would make debugging harder (e.g. diagnosing
-/// empty vs populated fields). If this becomes a security concern, change to
-/// `String(_)`.
 fn redact_value(val: &serde_json::Value, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match val {
         serde_json::Value::Null => f.write_str("Null"),
@@ -82,7 +26,6 @@ fn redact_value(val: &serde_json::Value, f: &mut fmt::Formatter<'_>) -> fmt::Res
     }
 }
 
-/// Formats a [`serde_json::Map`] for debug output without revealing content.
 fn redact_map(
     map: &serde_json::Map<String, serde_json::Value>,
     f: &mut fmt::Formatter<'_>,
@@ -90,16 +33,8 @@ fn redact_map(
     write!(f, "Object({} keys)", map.len())
 }
 
-// ---------------------------------------------------------------------------
-// ModelRef
-// ---------------------------------------------------------------------------
-
-/// A model identifier that tracks both the client-facing name and the resolved
-/// upstream name.
-///
-/// `requested` is always the model the client asked for.  Provider resolution
-/// may populate `upstream` with the actual upstream model id.  Adapters must
-/// **not** replace `requested`.
+/// A model identifier tracking both the client-facing name and the resolved
+/// upstream name; adapters must not replace `requested`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelRef {
@@ -110,32 +45,21 @@ pub struct ModelRef {
 }
 
 impl ModelRef {
-    /// Returns the effective model identifier for the provider.
-    ///
-    /// If `upstream` is set it is used; otherwise `requested` is used.
+    /// Returns the effective model identifier: `upstream` if set, else `requested`.
     pub fn provider_model(&self) -> &str {
         self.upstream.as_deref().unwrap_or(&self.requested)
     }
 }
 
-// ---------------------------------------------------------------------------
-// CoreRequest
-// ---------------------------------------------------------------------------
-
-/// A normalized chat request.
-///
-/// This is the canonical internal representation of a client's intent.
-/// Client adapters decode their wire format into this shape; provider adapters
-/// encode it into the provider's wire format.
+/// A normalized chat request: the canonical internal representation that
+/// client adapters decode into and provider adapters encode from.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreRequest {
     /// Model identifier (client-facing + optional upstream override).
     pub model: ModelRef,
-    /// System / developer instructions (canonical location).
-    ///
-    /// Client adapters should normalise system-role messages into this field
-    /// where the client protocol allows it.
+    /// System / developer instructions (canonical location); client adapters
+    /// normalise system-role messages into this field where possible.
     pub system: Vec<CoreContent>,
     /// Conversation turns after system content has been separated.
     pub messages: Vec<CoreMessage>,
@@ -168,10 +92,6 @@ impl fmt::Debug for CoreRequest {
             .finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// CoreMessage / CoreRole
-// ---------------------------------------------------------------------------
 
 /// A single conversation turn.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -207,22 +127,9 @@ pub enum CoreRole {
     Tool,
 }
 
-// ---------------------------------------------------------------------------
-// CoreContent
-// ---------------------------------------------------------------------------
-
-/// A single content block inside a message or system prompt.
-///
-/// Variants cover text, media, tool interactions, and extended thinking.
-/// Each variant is a struct-like enum arm so that fields are named and
-/// self-documenting.
-///
-/// Note: `deny_unknown_fields` is applied to ensure that serialization
-/// round-trips are lossless. If a provider adds new fields to a content
-/// block variant that the proxy does not model, those fields will be
-/// rejected at deserialization. This is intentional for the core protocol
-/// type: provider-specific passthrough should use `provider_hints` or the
-/// extra maps on wire-format types rather than extending core variants.
+/// A single content block inside a message or system prompt: text, media,
+/// tool interactions, and extended thinking. Unknown variant fields are
+/// rejected on decode; passthrough belongs in `provider_hints`/extra maps.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -276,20 +183,14 @@ pub enum CoreContent {
     Thinking {
         /// The thinking text.
         text: String,
-        /// Optional cryptographic signature (e.g. Anthropic-style).
-        ///
-        /// This field contains security-sensitive data.  It is redacted in
-        /// `Debug` output to `[REDACTED]` as a defense-in-depth measure.
+        /// Optional cryptographic signature (e.g. Anthropic-style); redacted to
+        /// `[REDACTED]` in `Debug` output.
         signature: Option<String>,
     },
     /// Redacted thinking block whose plaintext is not available.
     RedactedThinking {
-        /// Opaque redacted data.
-        ///
-        /// Uses `serde_json::Value` rather than `String` because providers may
-        /// encode the redacted data in different forms (base64 string, JSON object,
-        /// etc.). The Anthropic adapter always converts non-string values to a JSON
-        /// string during serialization.
+        /// Opaque redacted data (`serde_json::Value` since providers encode it
+        /// differently); the Anthropic adapter converts non-strings to strings.
         data: serde_json::Value,
     },
     /// A model refusal to answer.
@@ -355,10 +256,6 @@ impl fmt::Debug for CoreContent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CacheControl
-// ---------------------------------------------------------------------------
-
 /// Cache-control directive attached to a content block.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,10 +272,8 @@ impl fmt::Debug for CacheControl {
     }
 }
 
-/// Known cache control type variants.
-///
-/// Uses an enum with a catch-all `Other` variant so that unknown values from
-/// future provider extensions are preserved rather than rejected.
+/// Known cache control type variants; unknown provider values are preserved
+/// in `Other(String)` rather than rejected.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheControlType {
@@ -429,10 +324,6 @@ impl<'de> Deserialize<'de> for CacheControlType {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CoreTool / CoreToolChoice
-// ---------------------------------------------------------------------------
-
 /// A tool definition available to the model.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -441,15 +332,9 @@ pub struct CoreTool {
     pub name: String,
     /// Human-readable description.
     pub description: Option<String>,
-    /// JSON Schema describing the tool's parameters.
-    ///
-    /// Tool parameter schemas must be JSON objects. The type system cannot
-    /// encode that constraint, so it is enforced on the wire decode path:
-    /// [`Deserialize`] rejects any `input_schema` that is not a JSON object
-    /// (see [`deserialize_input_schema_object`]). In-crate adapters that build
-    /// a [`CoreTool`] with the struct literal should supply a JSON object for
-    /// this field; adapters that translate an upstream schema default to an
-    /// empty object when the upstream value is absent.
+    /// JSON Schema describing the tool's parameters; must be a JSON object,
+    /// enforced on decode via [`deserialize_input_schema_object`]. Struct-literal
+    /// builders supply an object (empty when upstream omits it).
     #[serde(deserialize_with = "deserialize_input_schema_object")]
     pub input_schema: serde_json::Value,
 }
@@ -479,11 +364,8 @@ pub enum CoreToolChoice {
         /// Name of the tool to call.
         name: String,
     },
-    /// Temporary preservation of a client tool-choice shape that has no
-    /// canonical variant yet.
-    ///
-    /// Must not contain unrelated wire nesting.  Adapter tests must either
-    /// round-trip it intentionally or move it into metadata / provider hints.
+    /// A client tool-choice shape with no canonical variant yet; adapter tests
+    /// must round-trip it intentionally or move it into metadata/hints.
     Raw(serde_json::Value),
 }
 
@@ -499,87 +381,42 @@ impl fmt::Debug for CoreToolChoice {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SamplingOptions
-// ---------------------------------------------------------------------------
-
-/// Sampling parameters that control generation behaviour.
-///
-/// The decode boundary (i.e. the `Deserialize` impl) enforces the universal
-/// sampling invariants so they cannot be bypassed:
-/// - `temperature`, if present, is finite and `>= 0`.
-/// - `top_p`, if present, is finite and in `[0, 1]`.
-///
-/// `max_tokens` is intentionally **not** range-checked here: a value of `0`
-/// is a legitimate sentinel for some providers (e.g. OpenAI) and the proxy
-/// forwards it for the upstream to accept or reject.  See
-/// [`SamplingOptions::max_tokens`] for details.
+/// Sampling parameters. The decode boundary enforces `temperature` finite
+/// `>= 0` and `top_p` finite in `[0, 1]`; `max_tokens` is not range-checked
+/// (a `0` sentinel is legitimate for some providers; the upstream decides).
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingOptions {
-    /// Sampling temperature.
-    ///
-    /// Must be finite and `>= 0`.  Both constraints are enforced symmetrically
-    /// on the decode path (via [`deserialize_temperature`]) and the encode path
-    /// (via [`serialize_finite_f64`]).  Non-finite values are rejected because
-    /// `serde_json` silently converts them to `null`, which would silently lose
-    /// the value during a serialize -> deserialize round-trip.
+    /// Sampling temperature; must be finite and `>= 0`, enforced on both the
+    /// decode and encode paths (serde_json would turn non-finite into `null`).
     #[serde(
         default,
         serialize_with = "serialize_finite_f64",
         deserialize_with = "deserialize_temperature"
     )]
     pub temperature: Option<f64>,
-    /// Nucleus sampling parameter.
-    ///
-    /// Must be finite and in `[0, 1]`.  See [`Self::temperature`] for the
-    /// finite-value handling rationale; the bounds are enforced symmetrically
-    /// via [`deserialize_top_p`] and [`serialize_finite_f64`].
+    /// Nucleus sampling parameter; must be finite and in `[0, 1]`, enforced
+    /// symmetrically on the decode and encode paths.
     #[serde(
         default,
         serialize_with = "serialize_finite_f64",
         deserialize_with = "deserialize_top_p"
     )]
     pub top_p: Option<f64>,
-    /// Maximum number of tokens to generate.
-    ///
-    /// Not range-checked at the core decode boundary.  The semantics of a `0`
-    /// or negative value vary by provider (Anthropic treats `<= 0` as invalid
-    /// in [`crate::anthropic`] validation; OpenAI accepts `max_tokens >= 0`),
-    /// so the proxy forwards the value and lets the upstream decide.  This
-    /// mirrors the integration-test contract that `max_tokens=0` must not
-    /// trigger an internal error.
+    /// Maximum number of tokens to generate. Not range-checked at the core
+    /// decode boundary; providers treat `<= 0` differently, so forward it.
     pub max_tokens: Option<i32>,
-    /// Stop sequences.
-    ///
-    /// OpenAI's Chat Completions API allows `stop` to be a bare string
-    /// (`"STOP"`), an array (`["STOP"]`), or null.  Anthropic always uses an
-    /// array.  This field normalises all forms into `Vec<String>` at
-    /// deserialization time: a bare string becomes a single-element vec.
+    /// Stop sequences; normalised at deserialization into `Vec<String>` — a
+    /// bare OpenAI string becomes a single-element vec.
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
     /// Reasoning effort level (e.g. `"low"`, `"medium"`, `"high"`).
     pub reasoning_effort: Option<String>,
-    /// Extended thinking configuration (provider-specific JSON).
-    ///
-    /// This is intentionally opaque.  Expected shapes vary by provider, e.g.
-    /// Anthropic: `{"type": "enabled", "budget_tokens": N}`.  Because the field
-    /// accepts arbitrary client-supplied JSON (and a malicious payload could
-    /// embed secret fragments in field names or values), it is redacted in
-    /// [`fmt::Debug`] output via [`OpaqueJsonRef`] as a defense-in-depth
-    /// measure.  Do not place genuinely secret data here and assume it will be
-    /// printed.
+    /// Extended thinking configuration (provider-specific JSON, e.g. Anthropic
+    /// `{"type": "enabled", "budget_tokens": N}`); redacted in `Debug` output.
     pub thinking: Option<serde_json::Value>,
 }
 
-/// Serializes an `Option<f64>`, rejecting non-finite values (NaN, Infinity).
-///
-/// This is the symmetric encode-side guard for the finite-value invariants on
-/// [`SamplingOptions::temperature`] and [`SamplingOptions::top_p`].  Without
-/// it, an in-memory-constructed `CoreRequest` (e.g. one an adapter mutated
-/// after decode) with a non-finite sampling value would serialize to `null`
-/// via `serde_json`'s default float handling and silently lose the value on
-/// any serialize -> deserialize round-trip through the proxy.
 fn serialize_finite_f64<S>(val: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -593,12 +430,6 @@ where
     }
 }
 
-/// Deserializer for [`SamplingOptions::temperature`].
-///
-/// Enforces the universal sampling invariants at the point of ingestion:
-/// the value must be finite and `>= 0`.  `serde_json` silently converts
-/// non-finite floats to `null`, which would otherwise become `None` on
-/// round-trip; rejecting here keeps the invariant from being bypassed.
 fn deserialize_temperature<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -615,12 +446,6 @@ where
     }
 }
 
-/// Deserializer for [`SamplingOptions::top_p`].
-///
-/// Enforces the universal sampling invariants at the point of ingestion:
-/// the value must be finite and in `[0, 1]`.  See [`deserialize_temperature`]
-/// for why finiteness is enforced here rather than left to a separate
-/// validation step.
 fn deserialize_top_p<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -637,13 +462,6 @@ where
     }
 }
 
-/// Deserializer for [`CoreTool::input_schema`] that rejects non-object values.
-///
-/// Tool parameter schemas must be JSON objects. The type system cannot encode
-/// that constraint on a [`serde_json::Value`] field, so the invariant is
-/// enforced here on the wire decode path rather than in an easy-to-bypass
-/// constructor (mirroring the [`deserialize_temperature`] / [`deserialize_top_p`]
-/// convention of baking invariants into the deserializer).
 fn deserialize_input_schema_object<'de, D>(deserializer: D) -> Result<serde_json::Value, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -657,9 +475,6 @@ where
     Ok(v)
 }
 
-/// Custom deserializer for `SamplingOptions::stop` that accepts a bare string,
-/// an array of strings, or null.  This normalises the OpenAI wire format where
-/// `stop` can be polymorphic.
 fn deserialize_stop<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -696,12 +511,6 @@ where
     }
 }
 
-/// Returns a human-readable name for a JSON value type.
-///
-/// `pub(crate)` so the per-provider client decoders (e.g. OpenAI Chat's
-/// `decode_request`) can produce byte-identical stop-array error messages to
-/// the canonical `deserialize_stop`, keeping the two wire-format rules from
-/// diverging again (audit GAP-LOW-8).
 pub(crate) fn json_type_name(val: &serde_json::Value) -> &'static str {
     match val {
         serde_json::Value::Null => "null",
@@ -713,19 +522,7 @@ pub(crate) fn json_type_name(val: &serde_json::Value) -> &'static str {
     }
 }
 
-impl SamplingOptions {
-    // The universal sampling invariants (temperature finite & >= 0, top_p
-    // finite & in [0, 1]) are enforced directly in the field deserializers
-    // ([`deserialize_temperature`], [`deserialize_top_p`]) so they cannot be
-    // bypassed.  `max_tokens` range validation is deliberately left to the
-    // provider adapter / upstream (see the field doc); it is not a core-decode
-    // invariant.
-    //
-    // There is intentionally no `validate()` method here: a previous version
-    // had one, but it was never wired into any request-handling path, which
-    // gave a false sense of correctness.  Baking the checks into the
-    // deserializer removes that trap.
-}
+impl SamplingOptions {}
 
 impl fmt::Debug for SamplingOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -739,10 +536,6 @@ impl fmt::Debug for SamplingOptions {
             .finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// RequestMetadata
-// ---------------------------------------------------------------------------
 
 /// Caller metadata attached to a request.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -763,7 +556,6 @@ impl fmt::Debug for RequestMetadata {
     }
 }
 
-/// Helper that wraps a Map reference for redacted Debug output.
 struct RedactedMap<'a>(&'a serde_json::Map<String, serde_json::Value>);
 
 fn redact_map_helper(map: &serde_json::Map<String, serde_json::Value>) -> RedactedMap<'_> {
@@ -776,23 +568,9 @@ impl fmt::Debug for RedactedMap<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ProviderHints
-// ---------------------------------------------------------------------------
-
-/// Opaque hints consumed only by provider adapters.
-///
-/// Provider hints carry client-side metadata that influences how a provider
-/// adapter encodes a request, but which does not belong in the canonical
-/// `CoreRequest` fields.  Examples include:
-///
-/// - `stream_options` (OpenAI Chat: `{"include_usage": true}`)
-/// - ` thinking` configuration passthrough
-/// - provider-specific flags like `reasoning_effort` mapping hints
-///
-/// **Architectural rule:** No adapter may special-case another protocol's
-/// hints.  Client adapters write hints; provider adapters read only the
-/// hints they understand.  Unknown keys must be silently ignored.
+/// Opaque hints consumed only by provider adapters (e.g. OpenAI
+/// `stream_options`). No adapter may special-case another protocol's hints;
+/// unknown keys must be silently ignored.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderHints {
@@ -807,10 +585,6 @@ impl fmt::Debug for ProviderHints {
             .finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// CoreResponse
-// ---------------------------------------------------------------------------
 
 /// A normalized non-streaming chat response.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -828,19 +602,13 @@ pub struct CoreResponse {
     pub stop_sequence: Option<String>,
     /// Token usage statistics.
     pub usage: Usage,
-    /// Provider-specific metadata (warnings, extra fields, etc.).
-    ///
-    /// Uses a `Map` (not bare `Value`) so that the field serializes as `{}`
-    /// when empty rather than `null`, distinguishing "no metadata" from
-    /// "null metadata".
+    /// Provider-specific metadata; a `Map` (not bare `Value`) so it serializes
+    /// as `{}` when empty rather than `null`.
     #[serde(default)]
     pub provider_meta: serde_json::Map<String, serde_json::Value>,
-    /// Computed USD cost for this request, if pricing was configured for the
-    /// model. `None` when no pricing is configured; in that case the field is
-    /// omitted from serialization so the wire shape is byte-identical to a
-    /// build without cost accounting. Not surfaced on the Anthropic/OpenAI
-    /// client wire (those formats have no cost field); available to the event
-    /// log and the future API crate.
+    /// Computed USD cost, `None` (and omitted from serialization) when no
+    /// pricing is configured. Not on the Anthropic/OpenAI client wire;
+    /// available to the event log and API crate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<Cost>,
 }
@@ -860,18 +628,8 @@ impl fmt::Debug for CoreResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cost
-// ---------------------------------------------------------------------------
-
-/// Computed cost for one request, in USD.
-///
-/// All fields are [`Decimal`] to avoid floating-point money. Derived from
-/// [`Usage`] and a per-token price table; the multiplication lives in the
-/// server crate (the first crate that sees both [`Usage`] and the core
-/// `ModelPricing` type). A request for a model with no configured pricing
-/// simply has no [`Cost`] (the carrier is `Option<Cost>`), so responses are
-/// unchanged when pricing is absent.
+/// Computed cost for one request, in USD, derived from [`Usage`] and a
+/// per-token price table; `Decimal` throughout to avoid floating-point money.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cost {
@@ -888,10 +646,6 @@ pub struct Cost {
     /// Total cost = input + output + cache_creation + cache_read + reasoning.
     pub total: Decimal,
 }
-
-// ---------------------------------------------------------------------------
-// StopReason
-// ---------------------------------------------------------------------------
 
 /// Why the model stopped generating.
 #[non_exhaustive]
@@ -910,31 +664,14 @@ pub enum StopReason {
     /// An error occurred.
     Error,
     /// The stop reason was not recognised by the adapter's finish-reason map.
-    ///
-    /// The original provider value is carried in the inner string so it
-    /// survives the normalize → core → encode pipeline and remains available in
-    /// diagnostics: the encoder logs it when mapping to a native finish reason.
-    /// This mirrors [`CacheControlType::Other`], which solves the same
-    /// problem for cache-control types. The sentinel `"absent"` indicates the
-    /// provider omitted the finish-reason field entirely rather than sending an
-    /// unmapped value.
+    /// The original provider value is carried so it survives into diagnostics;
+    /// the sentinel `"absent"` means the provider omitted the field entirely.
     Unknown(String),
 }
 
-// ---------------------------------------------------------------------------
-// Usage / UsageProvenance
-// ---------------------------------------------------------------------------
-
-/// Token usage statistics.
-///
-/// Must carry provenance.  Never report fabricated or zero-filled usage as
-/// [`UsageProvenance::ProviderReported`]; absent or zero-filled provider
-/// usage is [`UsageProvenance::SyntheticZero`] / [`UsageProvenance::Unknown`].
-///
-/// Uses `i32` for token counts for consistency with provider wire formats
-/// (JSON integers) and the Anthropic/OpenAI API types. The ~2.1 billion limit
-/// is well beyond any realistic single request. If aggregated or batch usage
-/// is needed in the future, consider widening to `i64`.
+/// Token usage statistics; must carry [`UsageProvenance`] — never report
+/// fabricated or zero-filled usage as `ProviderReported`. Counts are `i32`,
+/// matching provider wire formats.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
@@ -953,11 +690,8 @@ pub struct Usage {
 }
 
 impl Usage {
-    /// Creates a synthetic-zero usage with all token counts set to zero.
-    ///
-    /// Use this when the provider did not report any usage data.
-    /// The provenance is set to [`UsageProvenance::SyntheticZero`] to
-    /// distinguish synthesised zeros from genuine provider-reported zeros.
+    /// Creates a synthetic-zero usage; provenance is
+    /// [`UsageProvenance::SyntheticZero`], distinguishing it from provider zeros.
     pub fn synthetic_zero() -> Self {
         Self {
             input_tokens: 0,
@@ -967,10 +701,8 @@ impl Usage {
         }
     }
 
-    /// Creates a provider-reported usage with the given token counts.
-    ///
-    /// The provenance is set to [`UsageProvenance::ProviderReported`].
-    /// Callers must ensure these numbers actually came from the provider.
+    /// Creates a provider-reported usage; callers must ensure the numbers
+    /// actually came from the provider.
     pub fn provider_reported(input_tokens: i32, output_tokens: i32) -> Self {
         Self {
             input_tokens,
@@ -994,18 +726,9 @@ pub enum UsageProvenance {
     Unknown,
 }
 
-// ---------------------------------------------------------------------------
-// CoreEvent (streaming)
-// ---------------------------------------------------------------------------
-
-/// A single normalised streaming event.
-///
-/// V1 streaming carries only `Text`, `Thinking`, and `ToolUse` incrementally
-/// (text/thinking/tool-call deltas).  `Image`, `Document`, `Audio`, and
-/// `Video` have no per-delta stream event; if a provider streams them the
-/// adapter buffers the block and emits it through the non-stream
-/// [`CoreResponse`] content path, or rejects it.  Stream encoders therefore
-/// never receive deltas for those kinds.
+/// A single normalised streaming event. V1 streams only text, thinking, and
+/// tool-use incrementally; image/document/audio/video have no per-delta
+/// event and travel via the non-stream [`CoreResponse`] path or are rejected.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1135,10 +858,6 @@ impl fmt::Debug for CoreEvent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ContentKind
-// ---------------------------------------------------------------------------
-
 /// Discriminator for content block types.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1149,12 +868,9 @@ pub enum ContentKind {
     Thinking,
     /// Tool invocation.
     ToolUse,
-    /// Tool result.
-    ///
-    /// Note: `ToolResult` has no corresponding streaming delta event.  It is
-    /// used only for `ContentStart` signalling in non-standard cases where a
-    /// tool result block begins in a stream.  The actual content is carried
-    /// through the non-stream `CoreResponse` content path.
+    /// Tool result. Has no streaming delta event; used only for `ContentStart`
+    /// signalling — actual content travels through the non-stream
+    /// [`CoreResponse`] content path.
     ToolResult,
     /// Image.
     Image,
@@ -1168,28 +884,9 @@ pub enum ContentKind {
     Refusal,
 }
 
-// ---------------------------------------------------------------------------
-// CoreStreamError / CoreStreamErrorKind
-// ---------------------------------------------------------------------------
-
-/// An error that occurred during streaming.
-///
-/// Named `CoreStreamError` (not `CoreError`) to avoid colliding with the
-/// config/registry error owned by the core crate.  The two are unrelated
-/// types in different crates.
-///
-/// # Message safety
-///
-/// The `message` field is intentionally `pub(crate)` to enforce that all
-/// construction goes through [`CoreStreamError::new()`], which documents the
-/// sanitization contract.  Adapters must strip API keys, bearer tokens, and
-/// other secrets before passing the message to `new()`.
-///
-/// The `Debug` impl redacts the message to its character count.  The `Display`
-/// impl shows only the error kind, not the message content.  The `Serialize`
-/// impl includes the message verbatim for internal transport between proxy
-/// components -- do **not** serialize `CoreStreamError` directly into
-/// client-facing API responses.
+/// An error that occurred during streaming. The `message` is `pub(crate)`
+/// and must be sanitized (strip API keys/tokens) before
+/// [`CoreStreamError::new`]; `Debug`/`Display` redact it — never serialize it to clients.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CoreStreamError {
@@ -1201,22 +898,15 @@ pub struct CoreStreamError {
 }
 
 impl CoreStreamError {
-    /// Constructs a new `CoreStreamError` with the given kind and message.
-    ///
-    /// Callers **must** sanitize `message` before passing it: strip API keys,
-    /// bearer tokens, and other secrets from upstream provider error text.
+    /// Constructs a new `CoreStreamError`; callers **must** sanitize `message`
+    /// (strip API keys, bearer tokens, and other secrets) before passing it.
     pub fn new(kind: CoreStreamErrorKind, message: String) -> Self {
         Self { kind, message }
     }
 
-    /// Returns the error message.
-    ///
-    /// The message was sanitized at construction time by the adapter that
-    /// created this error. Note that the `message` field is
-    /// `#[serde(skip_serializing)]`, so values reconstructed via `Deserialize`
-    /// (e.g. after being transported between proxy components) return an empty
-    /// string here -- the message is only present on instances built directly
-    /// via [`new`](CoreStreamError::new).
+    /// Returns the error message. Because the field is
+    /// `#[serde(skip_serializing)]`, instances rebuilt via `Deserialize`
+    /// return `""`; only [`new`](CoreStreamError::new) instances carry it.
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -1226,7 +916,6 @@ impl fmt::Debug for CoreStreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoreStreamError")
             .field("kind", &self.kind)
-            // Truncate message to avoid leaking sensitive error details.
             .field("message", &format_args!("{} chars", self.message.len()))
             .finish()
     }
@@ -1234,28 +923,14 @@ impl fmt::Debug for CoreStreamError {
 
 impl fmt::Display for CoreStreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Intentionally do NOT include self.message here to avoid leaking
-        // unsanitized upstream error text through Display (used by
-        // tracing::error!("{err}"), error chains, etc.).  Use
-        // `error.message()` explicitly if the full message is needed.
         write!(f, "{}", self.kind)
     }
 }
 
 impl std::error::Error for CoreStreamError {}
-// NOTE: CoreStreamError uses a manual Error impl rather than thiserror derive
-// because it also carries custom Serialize/Deserialize, a redacting Debug that
-// hides the message field, and a Display that intentionally omits the message
-// for security.  thiserror's `#[error()]` attribute would conflict with the
-// hand-rolled Display, and the derive macro does not support the serde +
-// redacting-Debug combination used here.
 
-/// Category of a stream error.
-///
-/// Each variant maps to a canonical HTTP status code via
-/// [`CoreStreamErrorKind::http_status()`].  Adapters should use this mapping
-/// rather than inventing their own, so that all providers produce consistent
-/// HTTP responses.
+/// Category of a stream error; use [`CoreStreamErrorKind::http_status`]
+/// for the canonical HTTP mapping rather than adapter-specific codes.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoreStreamErrorKind {
@@ -1275,14 +950,6 @@ pub enum CoreStreamErrorKind {
 
 impl CoreStreamErrorKind {
     /// Returns the canonical HTTP status code for this error kind.
-    ///
-    /// Mapping:
-    /// - `InvalidRequest` -> 400
-    /// - `Authentication` -> 401
-    /// - `Permission` -> 403
-    /// - `RateLimit` -> 429
-    /// - `Upstream` -> 502
-    /// - `Internal` -> 500
     pub fn http_status(&self) -> u16 {
         match self {
             Self::InvalidRequest => 400,
@@ -1307,10 +974,6 @@ impl fmt::Display for CoreStreamErrorKind {
         }
     }
 }
-
-// ===========================================================================
-// Unit tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1384,11 +1047,6 @@ mod tests {
         }
     }
 
-    // The manual `Debug` impl for `CoreResponse` (unlike a derived one) is
-    // hand-maintained, so a future edit could silently drop the `cost` field
-    // from its output. Since `cost` is the only audit-relevant field surfaced
-    // for observability/pricing diagnostics, pin its presence in the `{:?}`
-    // output here.
     #[test]
     fn core_response_debug_includes_cost_when_present() {
         use std::str::FromStr;
@@ -1408,20 +1066,15 @@ mod tests {
             usage: Usage::default(),
             provider_meta: serde_json::Map::new(),
             cost: Some(Cost {
-                // Only set `total`; the rest come from `Default` so this test is
-                // robust to field reordering/renaming of the per-component fields.
                 total: Decimal::from_str("0.003").unwrap(),
                 ..Cost::default()
             }),
         };
         let debug = format!("{resp:?}");
-        // The field name must appear (manual Debug could drop it silently).
         assert!(
             debug.contains("cost:"),
             "CoreResponse Debug must include the `cost` field, got: {debug}"
         );
-        // And the value must render (Decimal Debug is non-empty), proving the
-        // field carries the `Some(Cost)` payload rather than being stubbed.
         assert!(
             debug.contains("0.003"),
             "CoreResponse Debug must surface the total cost value, got: {debug}"
@@ -1430,9 +1083,6 @@ mod tests {
 
     #[test]
     fn core_response_debug_sensible_when_cost_absent() {
-        // When no pricing is configured, `cost` is `None`. The manual Debug
-        // must still render the field name (so the field is observable as
-        // absent, not silently elided) with a `None` value.
         let resp = CoreResponse {
             id: None,
             model: ModelRef {
@@ -1611,7 +1261,6 @@ mod tests {
             provider_hints: ProviderHints::default(),
         };
         assert_eq!(req.system.len(), 2);
-        // System content stays in `system`, not in messages.
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, CoreRole::User);
     }
@@ -1647,7 +1296,6 @@ mod tests {
         };
         let json = serde_json::to_string(&req).expect("serialize CoreRequest");
         let back: CoreRequest = serde_json::from_str(&json).expect("deserialize CoreRequest");
-        // With PartialEq on CoreRequest, we can compare the whole struct.
         assert_eq!(req, back);
     }
 
@@ -1685,7 +1333,6 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).expect("serialize CoreResponse");
         let back: CoreResponse = serde_json::from_str(&json).expect("deserialize CoreResponse");
-        // Full structural equality catches any serialization drift.
         assert_eq!(resp, back);
     }
 
@@ -1758,13 +1405,10 @@ mod tests {
 
         let json = serde_json::to_string(&events).expect("serialize CoreEvent vec");
         let back: Vec<CoreEvent> = serde_json::from_str(&json).expect("deserialize CoreEvent vec");
-        // Compare all events except the Error variant, whose `message` field
-        // uses #[serde(skip_serializing)] and will be empty after round-trip.
         for (i, (original, round_tripped)) in events.iter().zip(back.iter()).enumerate() {
             match (original, round_tripped) {
                 (CoreEvent::Error { error: orig }, CoreEvent::Error { error: rt }) => {
                     assert_eq!(orig.kind, rt.kind, "kind mismatch at event {i}");
-                    // message is skip_serializing, so it comes back empty.
                     assert!(
                         rt.message.is_empty(),
                         "message should be empty after round-trip at event {i}"
@@ -1816,13 +1460,8 @@ mod tests {
         assert_eq!(back.provenance, UsageProvenance::ProviderReported);
     }
 
-    // =======================================================================
-    // New edge-case and coverage tests (audit round 1)
-    // =======================================================================
-
     #[test]
     fn cache_control_type_known_and_unknown_variants() {
-        // Test serialization (takes ownership) then From conversion on a fresh value.
         let json = serde_json::to_string(&CacheControlType::Ephemeral).unwrap();
         assert_eq!(json, "\"ephemeral\"");
         let back: CacheControlType = serde_json::from_str(&json).unwrap();
@@ -2002,9 +1641,7 @@ mod tests {
     #[test]
     fn core_request_rejects_wrong_field_types() {
         let cases = vec![
-            // model.requested should be string, not number
             r#"{"model": {"requested": 123}, "messages": [], "system": [], "tools": [], "sampling": {}, "stream": false, "metadata": {}, "provider_hints": {}}"#,
-            // stream should be bool, not string
             r#"{"model": {"requested": "m"}, "messages": [], "system": [], "tools": [], "sampling": {}, "stream": "yes", "metadata": {}, "provider_hints": {}}"#,
         ];
         for bad in cases {
@@ -2169,8 +1806,6 @@ mod tests {
             let json = serde_json::to_string(&err).expect("serialize CoreStreamError");
             let back: CoreStreamError =
                 serde_json::from_str(&json).expect("deserialize CoreStreamError");
-            // kind round-trips; message is #[serde(skip_serializing)] so it
-            // comes back empty.
             assert_eq!(err.kind, back.kind);
             assert!(back.message.is_empty());
         }
@@ -2341,13 +1976,8 @@ mod tests {
         assert_eq!(req, back);
     }
 
-    // =======================================================================
-    // Audit round 2 -- edge-case and coverage tests
-    // =======================================================================
-
     #[test]
     fn sampling_options_stop_deserializes_bare_string() {
-        // OpenAI allows stop: "STOP" as a bare string.
         let json = r#"{"stop": "STOP"}"#;
         let opts: SamplingOptions = serde_json::from_str(json).unwrap();
         assert_eq!(opts.stop, Some(vec!["STOP".to_owned()]));
@@ -2375,8 +2005,6 @@ mod tests {
 
     #[test]
     fn sampling_options_rejects_out_of_range_sampling_values() {
-        // temperature >= 0 and top_p in [0, 1] are enforced at the decode
-        // boundary so a client cannot smuggle them through to the upstream.
         let bad_temp = r#"{"temperature": -0.5}"#;
         assert!(
             serde_json::from_str::<SamplingOptions>(bad_temp).is_err(),
@@ -2392,8 +2020,6 @@ mod tests {
             serde_json::from_str::<SamplingOptions>(bad_top_p_high).is_err(),
             "top_p > 1 should be rejected at decode time"
         );
-        // max_tokens is intentionally NOT range-checked here (provider-specific
-        // semantics): a 0 or negative value must still decode successfully.
         let zero_max = r#"{"max_tokens": 0}"#;
         let opts: SamplingOptions =
             serde_json::from_str(zero_max).expect("max_tokens=0 must decode");
@@ -2402,9 +2028,6 @@ mod tests {
 
     #[test]
     fn sampling_options_nan_temperature_is_rejected_on_serialize_and_deserialize() {
-        // The encode side guards against NaN so an in-memory-constructed value
-        // (e.g. one an adapter mutated after decode) cannot silently lose data
-        // via serde_json's NaN -> null conversion during a round-trip.
         let opts = SamplingOptions {
             temperature: Some(f64::NAN),
             ..Default::default()
@@ -2413,11 +2036,7 @@ mod tests {
             serde_json::to_string(&opts).is_err(),
             "serializing NaN temperature should error, not silently emit null"
         );
-        // The decode side rejects NaN at ingestion.
         let bad = r#"{"temperature": NaN}"#;
-        // serde_json rejects bare `NaN` tokens at the lexer level already; the
-        // deserializer guard is the second line of defence for any float that
-        // parses as non-finite.
         assert!(
             serde_json::from_str::<SamplingOptions>(bad).is_err(),
             "NaN temperature should not decode"
@@ -2450,7 +2069,6 @@ mod tests {
 
     #[test]
     fn core_request_large_messages_round_trips() {
-        // Build a request with many messages to exercise large-input handling.
         let messages: Vec<CoreMessage> = (0..1000)
             .map(|i| CoreMessage {
                 role: CoreRole::User,
@@ -2481,8 +2099,6 @@ mod tests {
 
     #[test]
     fn deeply_nested_tool_result_round_trips() {
-        // Build a deeply nested ToolResult chain.  Depth kept at 20 to stay
-        // within serde_json's default recursion limit (128).
         let depth = 20;
         let mut content = CoreContent::Text {
             text: "leaf".into(),
@@ -2521,7 +2137,6 @@ mod tests {
     #[test]
     fn core_stream_error_display_and_error_traits() {
         let err = CoreStreamError::new(CoreStreamErrorKind::RateLimit, "too many requests".into());
-        // Display shows the kind, not the raw message (defense-in-depth).
         let display = format!("{err}");
         assert!(
             display.contains("rate_limit"),
@@ -2532,7 +2147,6 @@ mod tests {
             "Display should not leak message"
         );
 
-        // Error trait
         let _: &dyn std::error::Error = &err;
     }
 
@@ -2687,10 +2301,6 @@ mod tests {
         assert!(!debug.contains("secret"), "Debug should redact Raw value");
     }
 
-    // =======================================================================
-    // Audit round 3 -- deny_unknown_fields, missing round-trips, edge cases
-    // =======================================================================
-
     #[test]
     fn core_request_rejects_unknown_fields() {
         let json = r#"{
@@ -2754,13 +2364,11 @@ mod tests {
 
     #[test]
     fn sampling_options_stop_rejects_array_with_non_strings() {
-        // Array containing a number should be rejected.
         let json = r#"{"stop": ["STOP", 42]}"#;
         assert!(
             serde_json::from_str::<SamplingOptions>(json).is_err(),
             "should reject array with non-string items"
         );
-        // Array containing a boolean should be rejected.
         let json2 = r#"{"stop": [true]}"#;
         assert!(
             serde_json::from_str::<SamplingOptions>(json2).is_err(),
@@ -2825,13 +2433,10 @@ mod tests {
 
     #[test]
     fn bool_and_number_redacted_in_debug() {
-        // Bool and Number values should not show their actual values in Debug.
         let content = CoreContent::Image {
             source: serde_json::json!({"flag": true, "count": 42}),
         };
         let debug = format!("{content:?}");
-        // The outer Object type is shown but Bool/Number values inside are
-        // not printed verbatim -- redact_value hides inner details.
         assert!(
             debug.contains("Object"),
             "should show Object type for source"
@@ -2840,19 +2445,16 @@ mod tests {
 
     #[test]
     fn core_content_rejects_unknown_fields_in_variant() {
-        // Text variant with an extra field should be rejected, not silently dropped.
         let json = r#"{"Text": {"text": "hi", "secret_extra": "leaked"}}"#;
         assert!(
             serde_json::from_str::<CoreContent>(json).is_err(),
             "CoreContent::Text should reject unknown field"
         );
-        // ToolUse variant with an extra field.
         let json2 = r#"{"ToolUse": {"id": "1", "name": "fn", "input": {}, "extra": true}}"#;
         assert!(
             serde_json::from_str::<CoreContent>(json2).is_err(),
             "CoreContent::ToolUse should reject unknown field"
         );
-        // ToolResult variant with an extra field.
         let json3 =
             r#"{"ToolResult": {"tool_use_id": "1", "content": [], "is_error": false, "extra": 1}}"#;
         assert!(
@@ -2863,19 +2465,16 @@ mod tests {
 
     #[test]
     fn core_event_rejects_unknown_fields_in_variant() {
-        // TextDelta with an extra field.
         let json = r#"{"TextDelta": {"index": 0, "text": "hi", "extra": true}}"#;
         assert!(
             serde_json::from_str::<CoreEvent>(json).is_err(),
             "CoreEvent::TextDelta should reject unknown field"
         );
-        // MessageStart with an extra field.
         let json2 = r#"{"MessageStart": {"id": null, "model": {"requested": "m"}, "extra": 1}}"#;
         assert!(
             serde_json::from_str::<CoreEvent>(json2).is_err(),
             "CoreEvent::MessageStart should reject unknown field"
         );
-        // MessageStop with an extra field.
         let json3 =
             r#"{"MessageStop": {"stop_reason": "EndTurn", "stop_sequence": null, "extra": true}}"#;
         assert!(

@@ -1,26 +1,11 @@
-//! Responses API and Gemini API request/response types.
-//!
-//! These types model the wire format for two LLM provider families:
-//!
-//! - **Responses API** – the OpenAI-style Responses endpoint used for
-//!   chat completions with optional tool use and streaming.
-//! - **Gemini API** – the Google Gemini generate-content endpoint,
-//!   including streaming chunk support.
-//!
-//! Every struct derives `Debug`, `Clone`, `Serialize`, and `Deserialize`
-//! so they can be serialized/deserialized directly via `serde_json`.
+//! Responses API (OpenAI-style) and Gemini API (Google generate-content)
+//! wire-format request/response types, including streaming chunk support.
 
 use serde::{Deserialize, Serialize};
 
-// ---------------------------------------------------------------------------
-// Responses API types
-// ---------------------------------------------------------------------------
-
-/// Top-level request body for the Responses API.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted because this is an
-/// outbound-only type -- the proxy constructs it internally via
-/// `transform_to_responses()` and sends it to upstream providers.
+/// Top-level request body for the Responses API; outbound-only (the proxy
+/// constructs it via `transform_to_responses()`), so unknown-field
+/// rejection is not applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesRequest {
     /// Model identifier (e.g. `"gpt-4o"`).
@@ -68,11 +53,8 @@ pub struct ResponsesReasoning {
     pub effort: Option<String>,
 }
 
-/// Non-streaming response from the Responses API.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted on upstream response
-/// types. Providers may add fields that the proxy does not model; unknown
-/// fields are silently ignored rather than causing parse failures.
+/// Non-streaming response from the Responses API; unknown provider fields
+/// are silently ignored rather than failing decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesResponse {
     /// Unique response identifier.
@@ -131,18 +113,9 @@ pub struct ResponsesUsage {
     pub output_tokens: i32,
 }
 
-/// A single chunk in a streaming Responses API response.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted on streaming chunk
-/// types. Upstream providers may add new event fields at any time; unknown
-/// fields are silently ignored rather than causing chunk drops. The `delta`
-/// field carries incremental text for `response.output_text.delta` events.
-/// For `response.function_call_arguments.delta` events, the delta carries
-/// incremental JSON arguments for tool calls. Parallel function calls have
-/// their argument deltas interleaved and disambiguated by `output_index`; the
-/// Responses API provider adapter tracks open blocks per `output_index` and
-/// emits the full `CoreEvent` tool call lifecycle
-/// (`ToolCallStart`/`ToolCallDelta`/`ToolCallStop`) for each.
+/// A single chunk in a streaming Responses API response; `delta` carries
+/// incremental text or tool-call JSON arguments, interleaved across parallel
+/// calls and disambiguated by `output_index`. Unknown fields are ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesChunk {
     /// Chunk type discriminator.
@@ -158,30 +131,15 @@ pub struct ResponsesChunk {
     pub usage: Option<ResponsesUsage>,
     /// Error object present on `response.failed` events.
     pub error: Option<serde_json::Value>,
-    /// Upstream output-item index carried on `response.output_item.added`,
-    /// `response.function_call_arguments.delta`, and
-    /// `response.function_call_arguments.done` events.
-    ///
-    /// The Responses API interleaves parallel function-call argument deltas and
-    /// disambiguates them via this index. Defaults to `None` so legacy chunks
-    /// that predate the field (and non-indexed events like `response.created`)
-    /// still parse. When absent on a function-call event the adapter falls back
-    /// to treating it as a single serial call.
+    /// Upstream output-item index carried on function-call events; parallel
+    /// function-call argument deltas are disambiguated via this index.
+    /// Defaults to `None` so legacy/non-indexed chunks still parse.
     #[serde(default)]
     pub output_index: Option<usize>,
 }
 
-// ---------------------------------------------------------------------------
-// Gemini API types
-// ---------------------------------------------------------------------------
-
-/// Top-level request body for the Gemini generate-content endpoint.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted for outbound-only
-/// request structs. The proxy constructs these internally and never
-/// deserializes them from external input, so unknown field protection
-/// provides no benefit and would be overly restrictive if the proxy adds
-/// passthrough fields in the future.
+/// Top-level request body for the Gemini generate-content endpoint;
+/// outbound-only, so unknown-field rejection is not applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiRequest {
     /// Conversation contents to send to the model.
@@ -190,12 +148,9 @@ pub struct GeminiRequest {
     pub generation_config: Option<GeminiGenerationConfig>,
     /// Tools available to the model.
     pub tools: Vec<GeminiTool>,
-    /// When `Some(true)` the server streams chunked responses.
-    ///
-    /// Note: The Gemini API typically accepts stream as a query parameter
-    /// (`?alt=sse`) rather than a body field. This field is kept for internal
-    /// bookkeeping by the adapter, which should translate it to the appropriate
-    /// query parameter when constructing the HTTP request.
+    /// When `Some(true)` the server streams chunked responses; the Gemini API
+    /// usually takes streaming as the `?alt=sse` query parameter, which the
+    /// adapter constructs from this field.
     pub stream: Option<bool>,
 }
 
@@ -204,21 +159,14 @@ pub struct GeminiRequest {
 pub struct GeminiContent {
     /// Speaker role (e.g. `"user"`, `"model"`).
     pub role: String,
-    /// Ordered content parts within this message.
-    ///
-    /// Defaults to an empty vec when omitted. The Gemini API may return a
-    /// candidate with no `parts` (e.g. empty content blocks), so this field is
-    /// deserialized with a default rather than treated as required.
+    /// Ordered content parts within this message; defaults to empty when
+    /// omitted (Gemini may return candidates with no `parts`).
     #[serde(default)]
     pub parts: Vec<GeminiPart>,
 }
 
-/// A single content part inside a Gemini message.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted because Gemini may
-/// return additional part types (e.g. `inline_data`, `file_data`) that the
-/// proxy does not model yet. Unknown fields are silently ignored rather than
-/// causing parse failures.
+/// A single content part inside a Gemini message; unknown fields are
+/// ignored since Gemini may return part types the proxy does not model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GeminiPart {
@@ -313,11 +261,8 @@ pub struct GeminiFunctionDeclaration {
     pub parameters: Option<serde_json::Value>,
 }
 
-/// Non-streaming response from the Gemini generate-content endpoint.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted on upstream response
-/// types. Providers may add fields that the proxy does not model; unknown
-/// fields are silently ignored rather than causing parse failures.
+/// Non-streaming response from the Gemini generate-content endpoint;
+/// unknown provider fields are silently ignored rather than failing decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiResponse {
     /// Candidate completions.
@@ -330,13 +275,9 @@ pub struct GeminiResponse {
 /// A single candidate in a Gemini response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiCandidate {
-    /// The generated content.
-    ///
-    /// This is optional because real Gemini API responses routinely omit
-    /// `content` entirely for candidates blocked by `SAFETY`/`RECITATION` or
-    /// for prompt-feedback-only responses. A missing `content` is treated as
-    /// producing no text parts; the stop reason is derived from
-    /// `finish_reason` instead.
+    /// The generated content; optional because Gemini omits it for candidates
+    /// blocked by `SAFETY`/`RECITATION`. Missing `content` yields no text
+    /// parts; derive the stop reason from `finish_reason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<GeminiContent>,
     /// Reason the model stopped generating (e.g. `"STOP"`).
@@ -345,9 +286,6 @@ pub struct GeminiCandidate {
 }
 
 /// Token usage metadata reported by the Gemini API.
-///
-/// Uses manual `#[serde(rename)]` attributes for consistency with other Gemini
-/// types in this module, rather than `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiUsage {
     /// Number of tokens in the prompt.
@@ -361,11 +299,8 @@ pub struct GeminiUsage {
     pub total_token_count: i32,
 }
 
-/// A single chunk in a streaming Gemini response.
-///
-/// Note: `deny_unknown_fields` is intentionally omitted on streaming chunk
-/// types. Upstream providers may add new fields at any time; unknown fields
-/// are silently ignored rather than causing chunk drops.
+/// A single chunk in a streaming Gemini response; unknown fields are
+/// silently ignored rather than causing chunk drops.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiStreamChunk {
     /// Candidate completions in this chunk.
@@ -374,10 +309,6 @@ pub struct GeminiStreamChunk {
     #[serde(rename = "usageMetadata")]
     pub usage_metadata: Option<GeminiUsage>,
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -488,7 +419,6 @@ mod tests {
 
     #[test]
     fn responses_chunk_output_index_defaulted_when_absent() {
-        // Legacy chunks that predate `output_index` must still parse into None.
         let json = r#"{"type":"response.created","id":"resp_1"}"#;
         let back: ResponsesChunk = serde_json::from_str(json).unwrap();
         assert!(back.output_index.is_none());
