@@ -14,13 +14,8 @@ pub struct CatalogFileMetadata {
     /// Catalog source, normally `live`.
     pub source: String,
     /// Best-effort timestamp string (normally RFC 3339) recording when the
-    /// catalog was generated.
-    ///
-    /// This is an opaque, operator-controlled cache value that is **not**
-    /// validated at parse time. Format validity is checked only where the
-    /// value is consumed (e.g. staleness comparison in `catalog_service`); a
-    /// malformed value parses to `None` there and the entry is treated as
-    /// stale. Do not rely on this field being a well-formed RFC 3339 string.
+    /// catalog was generated. Opaque and **not** validated at parse time:
+    /// consumers treat a malformed value as stale.
     pub generated_at: String,
     /// Discovered model entries.
     #[serde(default)]
@@ -63,10 +58,8 @@ pub fn parse_catalog_file(raw: &str) -> Result<CatalogFile, CoreError> {
 
 /// Merge static and discovered catalog entries according to provider config.
 ///
-/// In `Hybrid` mode, static entries override discovered entries that share the
-/// same `id` (static metadata wins). Each input is borrowed, so each retained
-/// entry is cloned exactly once — no second clone of the `id` for a throwaway
-/// map key.
+/// In `Hybrid` mode, static entries override discovered entries that share
+/// the same `id` (static metadata wins).
 ///
 /// ```
 /// use std::time::Duration;
@@ -96,11 +89,6 @@ pub fn merge_catalog(
     config: &ProviderCatalogConfig,
     discovered: &[StaticModelCatalogEntry],
 ) -> Vec<StaticModelCatalogEntry> {
-    // Deduplicate by id via a `Vec` instead of a `BTreeMap<String, _>` so the
-    // id is not cloned a second time purely to serve as a discarded map key
-    // (the value already carries its own `id`). The catalog is bounded and
-    // built only on the cold refresh path, so the linear override lookup is
-    // cheaper than the redundant allocation it replaces.
     let mut entries: Vec<StaticModelCatalogEntry> = Vec::new();
 
     if matches!(
@@ -117,7 +105,6 @@ pub fn merge_catalog(
     ) {
         for model in &config.models {
             if let Some(existing) = entries.iter_mut().find(|entry| entry.id == model.id) {
-                // Static metadata overrides the discovered entry for this id.
                 *existing = model.clone();
             } else {
                 entries.push(model.clone());
@@ -125,15 +112,6 @@ pub fn merge_catalog(
         }
     }
 
-    // Restore the deterministic by-id ordering that the previous `BTreeMap`
-    // dedup provided as a side effect of keyed insertion. A stable, sorted
-    // model list is an observable contract of the `/v1/models` endpoint
-    // (clients paginate and snapshot-test on it; `first_id`/`last_id` depend on
-    // a fixed order), so the clone-elimination refactor above must not drop it.
-    // Sorting the owned Vec in place by the already-present `id` field avoids
-    // the second `id.clone()` that the `BTreeMap<String, _>` key required, so
-    // this keeps the GAP-LOW-7 benefit without sacrificing sorted output. Ids
-    // are unique after dedup, so the unstable variant is safe.
     entries.sort_unstable_by(|a, b| a.id.cmp(&b.id));
     entries
         .into_iter()
@@ -164,9 +142,6 @@ pub fn merge_catalog(
 /// ```
 #[must_use]
 pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
-    // Evaluate each `allow` pattern against `model` exactly once; both
-    // `allowed` and `explicitly_allowed` are derived from this single pass so
-    // `glob_matches` (which takes the `GLOB_CACHE` mutex) isn't re-run.
     let matched: Vec<bool> = allow
         .iter()
         .map(|pattern| glob_matches(pattern, model))
@@ -180,20 +155,8 @@ pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
     allowed && (!denied || explicitly_allowed)
 }
 
-/// Cache of compiled glob-to-regex patterns.
-///
-/// Avoids recompiling the same glob pattern on every call to [`glob_matches`].
-/// Uses `LazyLock` for thread-safe one-time initialization per unique pattern.
 static GLOB_CACHE: std::sync::Mutex<Vec<(String, Regex)>> = std::sync::Mutex::new(Vec::new());
 
-/// Match `value` against a simple glob `pattern` supporting only `*` and `?`.
-///
-/// Characters that are special in regex (`.`, `+`, `(`, etc.) are escaped
-/// via [`regex::escape`] so they match literally. Invalid patterns silently
-/// return `false`.
-///
-/// Compiled regexes are cached for reuse so the same pattern is only
-/// compiled once per process.
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let mut cache = GLOB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, regex)) = cache.iter().find(|(p, _)| p == pattern) {
@@ -266,13 +229,11 @@ mod tests {
             &config(ProviderCatalogMode::Hybrid),
             &[model("shared", Some("discovered")), model("other", None)],
         );
-        // The static entry should override the discovered entry for "shared".
         let shared = merged
             .iter()
             .find(|m| m.id == "shared")
             .expect("shared model should be present");
         assert_eq!(shared.display_name.as_deref(), Some("static"));
-        // The discovered-only "other" should also be present.
         let other = merged
             .iter()
             .find(|m| m.id == "other")
@@ -282,11 +243,6 @@ mod tests {
 
     #[test]
     fn merge_catalog_sorts_output_by_id() {
-        // Regression guard for the sorted-by-id contract: the `/v1/models`
-        // endpoint paginates and snapshot-tests on a stable, lexicographic
-        // model order. An earlier BTreeMap dedup provided this for free; the
-        // Vec dedup that replaced it does not, so the sort is now explicit.
-        // Feed models in deliberately non-sorted insertion order.
         let cfg = ProviderCatalogConfig {
             mode: ProviderCatalogMode::Discovered,
             enforce: false,
@@ -311,10 +267,6 @@ mod tests {
 
     #[test]
     fn merge_catalog_sorts_after_static_override() {
-        // The static-override path updates a discovered entry in place (keeping
-        // its discovered-list position) rather than re-appending, so the final
-        // sort must run AFTER the override. Verify a static entry that overrides
-        // a discovered one still lands in its correct sorted position.
         let cfg = ProviderCatalogConfig {
             mode: ProviderCatalogMode::Hybrid,
             enforce: false,
@@ -367,7 +319,6 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.iter().any(|m| m.id == "discovered-a"));
         assert!(merged.iter().any(|m| m.id == "discovered-b"));
-        // Static "shared" model should NOT be present in Discovered mode.
         assert!(!merged.iter().any(|m| m.id == "shared"));
     }
 
@@ -381,28 +332,22 @@ mod tests {
                 model("shared", Some("discovered")),
             ],
         );
-        // Only static entries should be present.
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "shared");
-        // The static display_name should win since only static entries are used.
         assert_eq!(merged[0].display_name.as_deref(), Some("static"));
     }
 
     #[test]
     fn glob_matches_special_regex_characters() {
-        // Dots should be treated literally, not as regex wildcards.
         assert!(glob_matches("model.v2", "model.v2"));
         assert!(!glob_matches("model.v2", "modelXv2"));
-        // Plus signs, parentheses should be literal.
         assert!(glob_matches("model+v2", "model+v2"));
         assert!(!glob_matches("model+v2", "modelvv2"));
-        // Parentheses.
         assert!(glob_matches("model(test)", "model(test)"));
     }
 
     #[test]
     fn glob_matches_slashes_in_model_ids() {
-        // Real-world model IDs with slashes and dots.
         assert!(glob_matches(
             "accounts/fireworks/models/deepseek-v3p1",
             "accounts/fireworks/models/deepseek-v3p1"

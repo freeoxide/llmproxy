@@ -1,22 +1,11 @@
 //! Provider registry: load provider TOML files and resolve route targets to
 //! adapter configurations.
 //!
-//! # Provider-based routing
-//!
-//! ```text
-//! provider_name + route_kind  -> provider config + route -> adapter name
-//! adapter_name                -> protocol + endpoint + headers
-//! requested_model             -> model_aliases -> upstream_model
-//! ```
-//!
-//! The registry does **not**:
-//!
-//! - translate protocol fields
-//! - parse response or stream chunks
-//! - build final protocol-specific URL paths
-//! - inspect messages or content
-//! - mutate sampling, tools, metadata, reasoning, cache, or stream intent
-//! - infer protocol families from model names
+//! Resolution chain: provider name and route kind select a provider config and
+//! adapter; the requested model is mapped through `model_aliases` to the
+//! upstream model. The registry does not translate protocol fields, parse
+//! responses or stream chunks, build final protocol-specific URLs, inspect
+//! messages, or infer protocol families from model names.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -64,10 +53,6 @@ pub enum ProviderRouteResolutionError {
     },
 }
 
-// ---------------------------------------------------------------------------
-// ProviderAdapterTargetConfig
-// ---------------------------------------------------------------------------
-
 /// Fully resolved adapter target produced by the provider registry.
 ///
 /// Contains everything the provider adapter layer needs to build an upstream
@@ -97,12 +82,11 @@ pub struct ProviderAdapterTargetConfig {
     pub requested_model: String,
     /// The model name to send to the upstream provider.
     pub upstream_model: String,
-    /// Optional static headers from the adapter config (e.g. `anthropic-version`).
-    ///
-    /// `Arc`-shared with the source [`crate::provider_config::ProviderAdapterConfig`] so producing a
-    /// resolved target per request is a refcount bump, not a `HashMap` clone
-    /// (LOW-5). Downstream code that needs to mutate (e.g. defaulting the
-    /// `anthropic-version` header) materializes an owned copy.
+    /// Optional static headers from the adapter config (e.g.
+    /// `anthropic-version`), `Arc`-shared with the source
+    /// [`crate::provider_config::ProviderAdapterConfig`] so resolving a route
+    /// per request is a refcount bump, not a map clone. Downstream code that
+    /// needs to mutate materializes an owned copy.
     pub headers: Arc<HashMap<String, String>>,
 }
 
@@ -121,10 +105,6 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
             .finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// ProviderRegistry
-// ---------------------------------------------------------------------------
 
 /// Loads provider TOML files and resolves provider routes to
 /// [`ProviderAdapterTargetConfig`]s.
@@ -171,12 +151,8 @@ impl ProviderRegistry {
         })?;
 
         let mut providers: HashMap<String, ProviderConfig> = HashMap::new();
-        // Track which file each provider name was first loaded from, so that
-        // duplicate-name errors can report *both* file paths for quick diagnosis.
         let mut source_paths: HashMap<String, std::path::PathBuf> = HashMap::new();
 
-        // Collect and sort entries by filename for deterministic ordering across
-        // platforms (filesystem order is not guaranteed).
         let mut sorted_entries: Vec<_> =
             entries
                 .collect::<Result<Vec<_>, _>>()
@@ -189,10 +165,6 @@ impl ProviderRegistry {
         for entry in sorted_entries {
             let file_path = entry.path();
 
-            // Skip symlinks to prevent a malicious actor with write access to
-            // the providers directory from tricking the proxy into reading
-            // arbitrary files. This check uses symlink_metadata which does not
-            // follow symlinks, unlike entry.file_type() which does.
             if file_path.is_symlink() {
                 tracing::warn!(
                     path = %file_path.display(),
@@ -201,7 +173,6 @@ impl ProviderRegistry {
                 continue;
             }
 
-            // Skip non-regular files (directories, pipes, sockets, etc.).
             if let Ok(ft) = entry.file_type() {
                 if !ft.is_file() {
                     tracing::debug!(
@@ -250,10 +221,6 @@ impl ProviderRegistry {
 
     /// Build a registry from an existing map of provider configs.
     ///
-    /// Returns an error if any two configs share the same provider name
-    /// (this should not happen if the caller built the map correctly, but
-    /// we validate defensively).
-    ///
     /// # Errors
     ///
     /// Returns [`CoreError::ProviderResolution`] if duplicate provider names
@@ -296,10 +263,6 @@ impl ProviderRegistry {
         &self,
         known_protocols: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<(), CoreError> {
-        // Note: This allocates a String per protocol name. The set is tiny
-        // (4 built-in protocols) and this runs once at startup, so the cost
-        // is negligible. A HashSet<String> is used because the input iterator
-        // owns its items and we cannot borrow from them.
         let known: HashSet<String> = known_protocols
             .into_iter()
             .map(|s| s.as_ref().to_owned())
@@ -345,14 +308,12 @@ impl ProviderRegistry {
         route_kind: ProviderRouteKind,
         requested_model: &str,
     ) -> Result<ProviderAdapterTargetConfig, ProviderRouteResolutionError> {
-        // 1. Look up the provider.
         let provider = self.providers.get(provider_name).ok_or_else(|| {
             ProviderRouteResolutionError::UnknownProvider {
                 provider: provider_name.to_owned(),
             }
         })?;
 
-        // 2. Look up the route to find the adapter name.
         let adapter_name = provider.routes.get(route_kind).ok_or_else(|| {
             let route_name = match route_kind {
                 ProviderRouteKind::ChatCompletions => "chat_completions",
@@ -364,7 +325,6 @@ impl ProviderRegistry {
             }
         })?;
 
-        // 3. Look up the adapter to get protocol, endpoint, and headers.
         let adapter_cfg = provider.adapters.get(adapter_name).ok_or_else(|| {
             let available = if provider.adapters.is_empty() {
                 "(none)".to_owned()
@@ -387,7 +347,6 @@ impl ProviderRegistry {
             }
         })?;
 
-        // 4. Apply provider-local model alias if present.
         let upstream_model = provider
             .model_aliases
             .get(requested_model)
@@ -467,12 +426,7 @@ impl<'a> IntoIterator for &'a ProviderRegistry {
     }
 }
 
-/// Maximum number of adapter names shown in error messages before truncation.
 const MAX_ADAPTERS_IN_ERROR: usize = 5;
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -554,14 +508,11 @@ mod tests {
             )]),
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
-        // Pricing is keyed by the UPSTREAM (alias-resolved) model id.
         let p = registry
             .pricing_for("example", "real-upstream-model")
             .expect("pricing present");
         assert_eq!(p.input.to_string(), "0.001");
-        // The client-facing alias is NOT a pricing key.
         assert!(registry.pricing_for("example", "alias-name").is_none());
-        // Unknown provider / model -> None.
         assert!(
             registry
                 .pricing_for("other", "real-upstream-model")
@@ -615,9 +566,6 @@ mod tests {
         ));
     }
 
-    // -- load_from_dir tests ---------------------------------------------------
-
-    /// Helper: write a minimal valid provider TOML file into `dir`.
     fn write_provider(dir: &std::path::Path, filename: &str, name: &str) {
         let content = format!(
             r#"
@@ -686,32 +634,26 @@ chat_completions = "chat"
         let dir = tempfile::tempdir().expect("temp dir");
         write_provider(dir.path(), "real.toml", "real");
 
-        // Create a symlink to the real file.
         #[cfg(unix)]
         {
             let link = dir.path().join("linked.toml");
             std::os::unix::fs::symlink(dir.path().join("real.toml"), &link)
                 .expect("create symlink");
         }
-        // On non-Unix, skip symlink creation (test still passes; just fewer entries).
         let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
-        // Should only have "real" -- the symlink must be skipped.
         assert!(registry.get("real").is_some());
         assert_eq!(registry.len(), 1, "symlink should be skipped");
     }
 
-    // -- MissingAdapter test ---------------------------------------------------
-
     #[test]
     fn resolve_provider_route_returns_missing_adapter_error() {
-        // Build a provider with a route that points to a non-existent adapter.
         let provider = ProviderConfig {
             name: "broken".to_owned(),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
             egress: None,
-            adapters: HashMap::new(), // no adapters defined
+            adapters: HashMap::new(),
             routes: ProviderRoutesConfig {
                 chat_completions: Some("nonexistent_adapter".to_owned()),
                 messages: None,
@@ -733,8 +675,6 @@ chat_completions = "chat"
                 if provider == "broken" && adapter == "nonexistent_adapter"
         ));
     }
-
-    // -- from_providers duplicate detection -----------------------------------
 
     #[test]
     fn from_providers_rejects_duplicate_names() {
@@ -762,8 +702,6 @@ chat_completions = "chat"
         assert!(matches!(err, CoreError::ProviderResolution { .. }));
         assert!(err.to_string().contains("duplicate provider name"));
     }
-
-    // -- len() / is_empty() / get() -------------------------------------------
 
     #[test]
     fn empty_registry_is_empty_and_zero_len() {
@@ -794,8 +732,6 @@ chat_completions = "chat"
         assert!(registry.get("test").is_some());
         assert!(registry.get("nonexistent").is_none());
     }
-
-    // -- catalog_models() -----------------------------------------------------
 
     #[test]
     fn catalog_models_returns_none_for_unknown_provider() {
@@ -840,11 +776,8 @@ chat_completions = "chat"
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let models = registry.catalog_models("test").expect("provider exists");
-        // Default catalog has no models.
         assert!(models.is_empty());
     }
-
-    // -- resolve without alias (fallback) -------------------------------------
 
     #[test]
     fn resolve_without_alias_returns_requested_model() {
@@ -879,8 +812,6 @@ chat_completions = "chat"
         assert_eq!(target.requested_model, "gpt-4o");
     }
 
-    // -- IntoIterator ---------------------------------------------------------
-
     #[test]
     fn into_iterator_works() {
         let provider_a = ProviderConfig {
@@ -908,11 +839,8 @@ chat_completions = "chat"
         assert!(names.contains(&"b"));
     }
 
-    // -- Adapter list truncation in MissingAdapter error ----------------------
-
     #[test]
     fn missing_adapter_error_truncates_long_adapter_list() {
-        // Build a provider with >5 adapters and a route pointing to a non-existent one.
         let mut adapters = HashMap::new();
         for i in 0..7 {
             adapters.insert(

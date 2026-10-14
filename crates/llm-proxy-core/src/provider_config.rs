@@ -1,9 +1,6 @@
 //! TOML provider configuration types, parsing, env-var interpolation, and
-//! validation for the routing system.
-//!
-//! This is the sole configuration system for the proxy, loaded from the main
-//! `config.toml` file. The main file contains server settings; provider files
-//! contain provider-scoped routing and catalog configuration.
+//! validation. The main `config.toml` holds server settings; provider files
+//! hold provider-scoped routing and catalog configuration.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,10 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::env_interpolate::{find_env_var_refs, find_unresolved_env_var, interpolate_env_vars};
 use crate::error::CoreError;
-
-// ---------------------------------------------------------------------------
-// Main config: AppConfig
-// ---------------------------------------------------------------------------
 
 /// Top-level TOML application configuration.
 ///
@@ -41,9 +34,6 @@ pub struct AppConfig {
 }
 
 /// Named security postures for where the admin `/usage` API is reachable.
-///
-/// Selected by config; the serve path logs the posture name loudly at startup
-/// so operators can see which surface they configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminMountPosture {
     /// Default: `/usage` is served only on the dedicated
@@ -57,8 +47,7 @@ pub enum AdminMountPosture {
 }
 
 impl AdminMountPosture {
-    /// Stable name used in startup logs so operators can grep the posture
-    /// their config selected.
+    /// Stable name for this posture, used in startup logs.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -82,10 +71,6 @@ impl AppConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ServerConfig
-// ---------------------------------------------------------------------------
-
 /// Log output format for the tracing subscriber.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -101,7 +86,7 @@ impl LogFormat {
     /// Read the format from the `RUST_LOG_FORMAT` env var (case-insensitive).
     ///
     /// Defaults to [`LogFormat::Plain`] when unset or unrecognized. Read at
-    /// subscriber init (before config load), consistent with `RUST_LOG`.
+    /// subscriber init, before config load.
     pub fn from_env() -> Self {
         match std::env::var("RUST_LOG_FORMAT")
             .unwrap_or_default()
@@ -126,20 +111,16 @@ pub struct ServerConfig {
     /// Hard deadline for graceful shutdown.
     ///
     /// After receiving SIGINT/SIGTERM the server stops accepting new
-    /// connections and waits this long for in-flight requests to drain.
-    /// Because the proxy serves long-lived streaming responses that an
-    /// upstream can hold open arbitrarily, an unbounded drain would let a
-    /// single stuck stream pin the process indefinitely. If the deadline
-    /// elapses the process force-exits so orchestrators (Kubernetes/LB)
-    /// can recycle the pod. `0s` disables the hard deadline (drain
-    /// forever) but is strongly discouraged.
+    /// connections and waits this long for in-flight requests to drain, then
+    /// force-exits so orchestrators can recycle the process. `0s` disables
+    /// the hard deadline (drain forever) but is strongly discouraged.
     #[serde(default = "default_shutdown_timeout", with = "humantime_serde")]
     pub shutdown_timeout: Duration,
     /// Log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`.
     pub log_level: String,
     /// Log output format for the tracing subscriber: `"plain"` (default) or
-    /// `"json"`. Applied at subscriber init from the `RUST_LOG_FORMAT` env var
-    /// (see [`LogFormat::from_env`]); this field documents the intended default.
+    /// `"json"`. The effective format is read from `RUST_LOG_FORMAT` at
+    /// subscriber init (see [`LogFormat::from_env`]); this field documents intent.
     #[serde(default)]
     pub log_format: LogFormat,
     /// Reserved hot-reload flag. Configuration loading rejects `true`.
@@ -166,15 +147,13 @@ pub struct ServerConfig {
     pub dedup_window: Duration,
     /// Public server name reported in version/health endpoints.
     pub server_name: String,
-    /// Cross-origin origins permitted to call the proxy from a browser
-    /// (audit LOW-12).
+    /// Cross-origin origins permitted to call the proxy from a browser.
     ///
     /// `None` (the default) installs **no** CORS layer, so browsers enforce a
     /// same-origin policy and this server-to-server proxy is not unexpectedly
     /// reachable from arbitrary web origins. Setting a list installs a
     /// restrictive `CorsLayer` that echoes `Access-Control-Allow-Origin` only
-    /// for these exact origins -- replacing a former `very_permissive` policy
-    /// that admitted every origin.
+    /// for these exact origins.
     ///
     /// Each entry should be an absolute origin (`scheme://host[:port]`),
     /// e.g. `"https://app.example.com"`. Entries that fail to parse as a
@@ -183,9 +162,7 @@ pub struct ServerConfig {
     pub allowed_origins: Option<Vec<String>>,
     /// Dedicated listener bind for the admin `/usage` API. Only read when
     /// `[auth.admin]` is configured; the default is `127.0.0.1` on the port
-    /// after `bind`'s port (see [`ServerConfig::effective_admin_bind`]), so
-    /// the admin surface stays loopback-only unless deliberately pointed at
-    /// a tunnel interface or removed port.
+    /// after `bind`'s port (see [`ServerConfig::effective_admin_bind`]).
     #[serde(default)]
     pub admin_bind: Option<SocketAddr>,
     /// Also serve `/usage` on the main listener behind the same admin token.
@@ -194,8 +171,7 @@ pub struct ServerConfig {
     /// the serve path announces with a loud startup warning: the admin
     /// surface then reaches every network the main listener does. With no
     /// explicit `admin_bind` this posture serves `/usage` on the main
-    /// listener ONLY — no dedicated socket is attempted, which is exactly
-    /// what setups without a second available port need.
+    /// listener ONLY — no dedicated socket is attempted.
     #[serde(default)]
     pub admin_on_main_listener: bool,
 }
@@ -204,10 +180,8 @@ impl ServerConfig {
     /// Whether the dedicated admin listener binds at all.
     ///
     /// An explicit `admin_bind` always binds one. With none set, the
-    /// default loopback listener binds unless the main-listener opt-in
-    /// took over — `admin_on_main_listener = true` without an explicit
-    /// `admin_bind` is exactly the posture for setups where a second port
-    /// is not available, so no dedicated socket is attempted there.
+    /// default loopback listener binds unless `admin_on_main_listener`
+    /// took over.
     #[must_use]
     pub fn dedicated_admin_listener(&self) -> bool {
         self.admin_bind.is_some() || !self.admin_on_main_listener
@@ -218,10 +192,7 @@ impl ServerConfig {
     /// `admin_bind` when configured; otherwise the default: `127.0.0.1` on
     /// the port after `bind`'s port. `None` when that default port cannot be
     /// derived (`bind` on port 65535) — `load_app_config` rejects that
-    /// combination whenever the dedicated listener would bind the default,
-    /// so validated configs that consult this while
-    /// [`ServerConfig::dedicated_admin_listener`] is true always resolve to
-    /// an address.
+    /// combination whenever the dedicated listener would bind the default.
     #[must_use]
     pub fn effective_admin_bind(&self) -> Option<SocketAddr> {
         match self.admin_bind {
@@ -238,10 +209,6 @@ impl ServerConfig {
 const fn default_rate_limit_rpm() -> u32 {
     100
 }
-
-// ---------------------------------------------------------------------------
-// AuthConfig
-// ---------------------------------------------------------------------------
 
 /// Client authentication mode for proxy routes.
 ///
@@ -271,12 +238,9 @@ pub struct AuthConfig {
     ///
     /// Each value is a PHC-format password-hashing string (argon2id), never a
     /// plaintext secret. Wrapped in [`SecretString`] so the value is redacted
-    /// in `Debug` output.
-    ///
-    /// `skip_serializing` (mirroring `ProviderConfig::api_key`) prevents the
-    /// hashes from leaking through any `Serialize` path; deserializing a
-    /// config that was serialized will therefore fail on this field, which is
-    /// intentional.
+    /// in `Debug` output. `skip_serializing` keeps the hashes out of every
+    /// `Serialize` path, so serializing then deserializing a config fails on
+    /// this field — by design.
     #[serde(default, skip_serializing)]
     pub clients: HashMap<String, SecretString>,
     /// Admin API authentication (`[auth.admin]` section). When present, the
@@ -296,17 +260,12 @@ pub struct AdminAuthConfig {
     ///
     /// Compared in constant time against a SHA-256 digest of the configured
     /// token, so the plaintext never needs to be retained in memory. Wrapped
-    /// in [`SecretString`] so it is redacted in `Debug` output;
-    /// `skip_serializing` (mirroring `ProviderConfig::api_key`) keeps it out
-    /// of every `Serialize` path.
+    /// in [`SecretString`] and `skip_serializing`, keeping it out of `Debug`
+    /// output and every `Serialize` path.
     #[serde(skip_serializing)]
     pub token: SecretString,
 }
 
-/// Default graceful-shutdown hard deadline (30 seconds).
-///
-/// Chosen to comfortably exceed the maximum upstream request timeout while
-/// bounding how long a stuck streaming connection can delay process recycle.
 const fn default_shutdown_timeout() -> Duration {
     Duration::from_secs(30)
 }
@@ -315,11 +274,6 @@ const fn default_dedup_window() -> Duration {
     Duration::ZERO
 }
 
-// ---------------------------------------------------------------------------
-// StorageConfig
-// ---------------------------------------------------------------------------
-
-/// Default retention-pruning interval (1 hour).
 const fn default_prune_interval() -> Duration {
     Duration::from_secs(3600)
 }
@@ -351,16 +305,6 @@ pub struct StorageConfig {
     pub prune_interval: Duration,
 }
 
-/// Validate `[storage]`.
-///
-/// Rules:
-/// - `path` must not be empty.
-/// - `max_age`, when set, must be positive: a zero age would delete every row
-///   on every pass and indicates a unit mistake rather than intent.
-/// - `max_rows`, when set, must be at least 1 (zero would keep nothing).
-/// - `prune_interval` must be at least 1 second; the pruning timer in the
-///   storage crate panics on a zero period, and a sub-second prune cadence
-///   serves no purpose.
 fn validate_storage_config(storage: &StorageConfig) -> Result<(), CoreError> {
     if storage.path.as_os_str().is_empty() {
         return Err(CoreError::ConfigValidation {
@@ -397,10 +341,6 @@ fn validate_storage_config(storage: &StorageConfig) -> Result<(), CoreError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// ProviderFile
-// ---------------------------------------------------------------------------
-
 /// Wrapper for a single provider TOML file.
 ///
 /// Each provider is defined in its own file with a top-level `[provider]`
@@ -411,10 +351,6 @@ pub struct ProviderFile {
     /// The provider definition.
     pub provider: ProviderConfig,
 }
-
-// ---------------------------------------------------------------------------
-// ProviderConfig (custom Debug to redact api_key)
-// ---------------------------------------------------------------------------
 
 /// Provider configuration loaded from a dedicated TOML file.
 ///
@@ -431,15 +367,10 @@ pub struct ProviderConfig {
     /// this field is constructed, so the resolved value is what gets wrapped).
     ///
     /// Wrapped in [`SecretString`]: redacted in [`Debug`] and [`Display`] output
-    /// and zeroized on drop. Not serialized (`skip_serializing`) -- use explicit
-    /// methods if you need to write a config file.
-    ///
-    /// WHY `skip_serializing`: prevents credentials from leaking through
-    /// serialization paths (e.g. debug logs, API responses, config dumps).
-    /// Round-tripping a `ProviderFile` through serialize/deserialize will
-    /// FAIL because `skip_serializing` omits `api_key` and `api_key` is a
-    /// required field. This is intentional -- credentials should never
-    /// round-trip through serialization.
+    /// and zeroized on drop. Not serialized (`skip_serializing`): credentials
+    /// never leak through serialization paths, so round-tripping a
+    /// `ProviderFile` through serialize/deserialize FAILS because `api_key`
+    /// is a required field. This is intentional.
     #[serde(skip_serializing)]
     pub api_key: SecretString,
     /// Authentication header style.
@@ -474,15 +405,10 @@ pub struct ProviderConfig {
     pub pricing: HashMap<ModelId, ModelPricing>,
     /// Upstream egress (network exit) configuration. When present, this
     /// provider's upstream requests are sent through the configured forward
-    /// proxy instead of a direct connection. Absent means direct egress,
-    /// exactly as before the section existed.
+    /// proxy instead of a direct connection; absent means direct egress.
     #[serde(default)]
     pub egress: Option<ProviderEgressConfig>,
 }
-
-// ---------------------------------------------------------------------------
-// ProviderEgressConfig
-// ---------------------------------------------------------------------------
 
 /// Per-provider forward-proxy egress configuration (`[provider.egress]`).
 ///
@@ -504,8 +430,6 @@ pub struct ProviderEgressConfig {
 }
 
 impl std::fmt::Debug for ProviderEgressConfig {
-    // SECURITY: the raw URL may carry proxy credentials as userinfo; print
-    // only the credential-free form.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderEgressConfig")
             .field("proxy", &redacted_proxy_url(&self.proxy))
@@ -513,10 +437,6 @@ impl std::fmt::Debug for ProviderEgressConfig {
     }
 }
 
-/// Render `scheme://host:port` from a proxy URL, dropping any userinfo.
-///
-/// URLs without a `://` separator print as `<unparsed>` rather than echoing a
-/// string that has not been through validation.
 fn redacted_proxy_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return "<unparsed>".to_owned();
@@ -527,15 +447,10 @@ fn redacted_proxy_url(url: &str) -> String {
     format!("{scheme}://{host}{after_authority}")
 }
 
-// ---------------------------------------------------------------------------
-// ModelId / ModelPricing
-// ---------------------------------------------------------------------------
-
 /// Provider-local model identifier used as a pricing key.
 ///
 /// Transparent newtype over `String` so it serializes as a plain string in
-/// TOML/JSON. Intentionally minimal: existing `String` model fields elsewhere
-/// are not migrated to this type.
+/// TOML/JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ModelId(
@@ -582,23 +497,9 @@ pub struct ModelPricing {
     pub reasoning: Decimal,
 }
 
-/// Upper bound for any per-token USD price accepted by config validation.
-///
-/// Every real per-token price is far below $1; values above $1000/token are
-/// treated as gross misconfigurations (stray exponents, per-1M-token prices
-/// entered verbatim, misplaced decimals) and rejected at load time. See
-/// [`validate_provider_config`]. `compute_cost` uses checked arithmetic on top
-/// of this, so the proxy can never panic on overflow regardless.
-///
-/// Returned by a function rather than a `const` because `Decimal` has no
-/// const constructor at this rust_decimal version (`Decimal::new` is not const).
 fn max_per_token_price() -> Decimal {
     Decimal::new(1_000, 0)
 }
-
-// ---------------------------------------------------------------------------
-// AuthStyle
-// ---------------------------------------------------------------------------
 
 /// How the API key is sent in HTTP headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -614,16 +515,6 @@ pub enum AuthStyle {
     Both,
 }
 
-// ---------------------------------------------------------------------------
-// ProviderAdapterConfig
-// ---------------------------------------------------------------------------
-
-/// Serialize an `Arc<HashMap<String, String>>` by value (LOW-5).
-///
-/// serde only implements `Serialize`/`Deserialize` for `Arc<T>` behind its `rc`
-/// feature, which this crate deliberately leaves OFF (it is a footgun: it
-/// deserializes `Rc`/`Arc` by reference-sharing). These helpers give the shared
-/// headers map ordinary by-value (de)serialization without enabling that feature.
 fn serialize_arc_headers<S>(
     headers: &Arc<HashMap<String, String>>,
     serializer: S,
@@ -634,7 +525,6 @@ where
     headers.as_ref().serialize(serializer)
 }
 
-/// Deserialize a headers map into a fresh `Arc` (by value, not reference-shared).
 fn deserialize_arc_headers<'de, D>(
     deserializer: D,
 ) -> Result<Arc<HashMap<String, String>>, D::Error>
@@ -661,11 +551,9 @@ pub struct ProviderAdapterConfig {
     pub endpoint: String,
     /// Static headers to include in upstream requests (e.g. anthropic-version).
     ///
-    /// Wrapped in [`Arc`] because adapter headers are fixed at config-load time
-    /// and shared across every request that resolves to this adapter; resolving
-    /// a route then bumps the refcount instead of deep-cloning the map (LOW-5).
-    /// Serde deserializes this by value (wrapping the parsed `HashMap` in
-    /// `Arc::new`) without the `rc` feature.
+    /// Wrapped in [`Arc`]: adapter headers are fixed at config-load time and
+    /// shared across every request that resolves to this adapter, so downstream
+    /// code that needs to mutate must materialize an owned copy.
     #[serde(
         default,
         serialize_with = "serialize_arc_headers",
@@ -689,10 +577,6 @@ pub(crate) fn endpoint_without_query(endpoint: &str) -> &str {
         .split_once('?')
         .map_or(endpoint, |(base, _query)| base)
 }
-
-// ---------------------------------------------------------------------------
-// ProviderRouteKind & ProviderRoutesConfig
-// ---------------------------------------------------------------------------
 
 /// The kind of client-facing route being requested.
 ///
@@ -735,15 +619,7 @@ impl ProviderRoutesConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ProviderDiscoveryKind & ProviderDiscoveryConfig
-// ---------------------------------------------------------------------------
-
 /// Supported discovery backends for fetching upstream model lists.
-///
-/// Provider-specific discovery kinds are only justified when authentication,
-/// pagination, or response shape differs materially from the OpenAI-compatible
-/// default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderDiscoveryKind {
@@ -824,10 +700,6 @@ impl std::fmt::Debug for ProviderDiscoveryConfig {
             .finish()
     }
 }
-
-// ---------------------------------------------------------------------------
-// ProviderCatalogMode & StaticModelCatalogEntry & ProviderCatalogConfig
-// ---------------------------------------------------------------------------
 
 /// How the model catalog is assembled for a provider.
 ///
@@ -914,7 +786,7 @@ pub struct ProviderCatalogConfig {
 }
 
 fn default_cache_ttl() -> Duration {
-    Duration::from_secs(24 * 60 * 60) // 24 hours
+    Duration::from_secs(24 * 60 * 60)
 }
 
 fn default_allow_all() -> Vec<String> {
@@ -933,10 +805,6 @@ impl Default for ProviderCatalogConfig {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Validation error
-// ---------------------------------------------------------------------------
 
 /// Errors produced during config validation.
 ///
@@ -1142,10 +1010,6 @@ pub enum ConfigValidationError {
     },
 }
 
-// ---------------------------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------------------------
-
 /// Validate a single [`ProviderConfig`].
 ///
 /// Checks:
@@ -1252,8 +1116,6 @@ pub fn validate_provider_config(
     validate_discovery(provider, name)?;
     validate_egress(provider, name)?;
 
-    // Both the catalog and the model aliases reject unsafe model IDs, but only
-    // when an adapter interpolates `{model}` into a Gemini endpoint URL.
     let uses_gemini_model_template = provider.adapters.values().any(|adapter| {
         adapter.protocol == "gemini_generate_content" && adapter.endpoint.contains("{model}")
     });
@@ -1264,7 +1126,6 @@ pub fn validate_provider_config(
     Ok(())
 }
 
-/// Provider name must be non-empty and a URL-safe slug of at most 64 chars.
 fn validate_name(name: &str) -> Result<(), ConfigValidationError> {
     if name.trim().is_empty() {
         return Err(ConfigValidationError::EmptyProviderName);
@@ -1281,10 +1142,6 @@ fn validate_name(name: &str) -> Result<(), ConfigValidationError> {
     Ok(())
 }
 
-/// Checks the configured API key.
-///
-/// Skipped entirely for passthrough auth: the upstream credential comes from
-/// the inbound client request, so the configured key may be empty or unset.
 fn validate_api_key(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
     if provider.passthrough_auth {
         return Ok(());
@@ -1303,8 +1160,6 @@ fn validate_api_key(provider: &ProviderConfig, name: &str) -> Result<(), ConfigV
     Ok(())
 }
 
-/// Pricing keys must be non-empty and every price must be non-negative and
-/// within the per-token upper bound.
 fn validate_pricing(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
     for (model_id, pricing) in &provider.pricing {
         if model_id.as_str().is_empty() {
@@ -1328,13 +1183,6 @@ fn validate_pricing(provider: &ProviderConfig, name: &str) -> Result<(), ConfigV
                     message: format!("negative {field} price"),
                 });
             }
-            // Upper bound: every real per-token USD price is well under $1, so
-            // any value above $1000/token is a gross misconfiguration (a stray
-            // exponent, a per-1M-token price entered verbatim, or a misplaced
-            // decimal). Rejecting it here fails fast at config-load instead of
-            // letting a bad entry produce nonsensical costs. `compute_cost`
-            // additionally uses checked arithmetic so even a value that slipped
-            // past this bound can never panic on overflow.
             let max_price = max_per_token_price();
             if value > max_price {
                 return Err(ConfigValidationError::InvalidPricing {
@@ -1352,9 +1200,6 @@ fn validate_pricing(provider: &ProviderConfig, name: &str) -> Result<(), ConfigV
     Ok(())
 }
 
-/// Every adapter needs a name, a protocol, and an HTTP(S) endpoint, plus
-/// header checks. Non-HTTP schemes are rejected to prevent SSRF via crafted
-/// endpoints.
 fn validate_adapters(
     provider: &ProviderConfig,
     name: &str,
@@ -1400,8 +1245,6 @@ fn validate_adapters(
     Ok(())
 }
 
-/// Discovery, when configured, needs an HTTP(S) endpoint, valid headers, and
-/// non-zero limits.
 fn validate_discovery(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
     let Some(discovery) = &provider.discovery else {
         return Ok(());
@@ -1436,8 +1279,6 @@ fn validate_discovery(provider: &ProviderConfig, name: &str) -> Result<(), Confi
     Ok(())
 }
 
-/// Catalog entries need a non-empty ID, and a Gemini-safe one when an adapter
-/// interpolates the model into its endpoint URL.
 fn validate_catalog(
     provider: &ProviderConfig,
     name: &str,
@@ -1463,7 +1304,6 @@ fn validate_catalog(
     Ok(())
 }
 
-/// Each configured route must name a non-empty adapter that actually exists.
 fn validate_routes(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
     for (route_kind, adapter_name) in [
         (
@@ -1493,8 +1333,6 @@ fn validate_routes(provider: &ProviderConfig, name: &str) -> Result<(), ConfigVa
     Ok(())
 }
 
-/// Alias keys and targets must be non-empty, and targets Gemini-safe when an
-/// adapter interpolates the model into its endpoint URL.
 fn validate_model_aliases(
     provider: &ProviderConfig,
     name: &str,
@@ -1523,11 +1361,6 @@ fn validate_model_aliases(
     Ok(())
 }
 
-/// Forbidden HTTP header names that providers must not set via static headers.
-///
-/// These headers are managed by the HTTP transport layer and must not be
-/// overridden by provider configuration, as doing so could break request
-/// routing, authentication, or connection handling.
 const FORBIDDEN_HEADERS: &[&str] = &[
     "authorization",
     "cookie",
@@ -1540,22 +1373,11 @@ const FORBIDDEN_HEADERS: &[&str] = &[
     "transfer-encoding",
 ];
 
-/// Check whether an endpoint URL has a valid HTTP(S) scheme.
-///
-/// Rejects non-HTTP schemes (e.g. `file://`, `ftp://`) to prevent SSRF
-/// attacks via crafted endpoint URLs.
 fn has_valid_http_scheme(endpoint: &str) -> bool {
-    // Schemes are case-insensitive per RFC 3986 (e.g. `HTTP://`, `Https://`),
-    // and reqwest accepts them. Lowercase only the leading scheme region
-    // (everything up to the first `://`, capped at the known scheme length) so
-    // the prefix test is case-insensitive without allocating a full lowercase
-    // copy of the endpoint or pulling the `url` crate into llm-proxy-core.
     let scheme_region = scheme_region(endpoint);
     scheme_region.eq_ignore_ascii_case("http") || scheme_region.eq_ignore_ascii_case("https")
 }
 
-/// Return the leading scheme region of `endpoint` (the text before the first
-/// `://`, or the empty string when no `://` separator is present).
 fn scheme_region(endpoint: &str) -> &str {
     match endpoint.find("://") {
         Some(idx) => &endpoint[..idx],
@@ -1563,21 +1385,8 @@ fn scheme_region(endpoint: &str) -> &str {
     }
 }
 
-/// Egress proxy schemes accepted in `[provider.egress]`.
-///
-/// `socks5h` resolves hostnames at the proxy; `socks5` resolves locally.
-/// SOCKS support is the reason the provider crate enables reqwest's `socks`
-/// cargo feature. Schemes outside this list are rejected at config load
-/// rather than silently ignored.
 const EGRESS_PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "http", "https"];
 
-/// An egress proxy URL, when configured, must name an accepted scheme and a
-/// non-empty host.
-///
-/// reqwest itself is deliberately lenient (it accepts scheme-less URLs by
-/// prefixing `http://`, and `socks4`/unknown schemes without complaint), so
-/// this check is the real gate: anything outside the accepted schemes is a
-/// config error, never a silently different proxy.
 fn validate_egress(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
     let Some(egress) = &provider.egress else {
         return Ok(());
@@ -1608,9 +1417,6 @@ fn validate_egress(provider: &ProviderConfig, name: &str) -> Result<(), ConfigVa
             reason: "unsupported scheme; expected socks5h://, socks5://, http://, or https://",
         });
     }
-    // Everything after the scheme must hold a host. Cut the authority region
-    // at the first path/query/fragment separator, then drop any userinfo
-    // (`user:pass@`) so only the host portion is checked.
     let authority = url
         .strip_prefix(scheme)
         .and_then(|after_scheme| after_scheme.strip_prefix("://"))
@@ -1627,10 +1433,6 @@ fn validate_egress(provider: &ProviderConfig, name: &str) -> Result<(), ConfigVa
     Ok(())
 }
 
-/// Validate a map of static headers for CRLF injection and forbidden header names.
-///
-/// Shared between adapter header validation and discovery header validation
-/// to avoid duplicating the same checks.
 fn validate_headers(
     headers: &HashMap<String, String>,
     provider: &str,
@@ -1675,10 +1477,6 @@ fn is_safe_gemini_model_id(model: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-// ---------------------------------------------------------------------------
-// TOML loading
-// ---------------------------------------------------------------------------
-
 /// Load and parse a main [`AppConfig`] TOML file.
 ///
 /// The raw file content is first processed for `${ENV_VAR}` interpolation,
@@ -1708,7 +1506,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
         source,
     })?;
 
-    // Check for env vars that resolve to empty, consistent with provider config.
     for (var_name, resolved) in find_env_var_refs(&raw) {
         if let Some(value) = resolved {
             if value.is_empty() {
@@ -1724,10 +1521,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
 
     let interpolated = interpolate_env_vars(&raw);
 
-    // After interpolation, check for any unresolved env vars (set but not
-    // present in the environment). This ensures `${MISSING_VAR}` in server
-    // fields like `bind` or `server_name` is caught rather than silently
-    // passed through as a literal string.
     if let Some(var) = find_unresolved_env_var(&interpolated) {
         return Err(CoreError::ConfigValidation {
             message: format!("app config contains unresolvable environment variable \"{var}\""),
@@ -1744,12 +1537,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             source: None,
         });
     }
-    // Reject a zero or sub-second request timeout. tower-http's `TimeoutLayer`
-    // builds `tokio::time::sleep(self.timeout)` on every call; `sleep(ZERO)` is
-    // immediately ready, so `request_timeout = "0s"` would return 408 for every
-    // API request before any handler runs. A sub-second timeout is almost
-    // always a misconfiguration (e.g. mistyped units) and silently bricks the
-    // API the same way. Require at least one second. (HIGH-2 / LOW-10.)
     const MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
     if cfg.server.request_timeout < MIN_REQUEST_TIMEOUT {
         return Err(CoreError::ConfigValidation {
@@ -1762,12 +1549,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             source: None,
         });
     }
-    // Reject a dedup window whose millisecond magnitude does not fit u64. The
-    // deduplicator stores the window as a `u64` millisecond count (see
-    // `AppState::new_with_catalog_dir` in llm-proxy-server), so an out-of-range
-    // `Duration` would otherwise silently fall back to the `unwrap_or` default
-    // rather than being reported. `Duration::MAX` is the only realistic value
-    // that trips this, and it indicates a misconfiguration.
     if u64::try_from(cfg.server.dedup_window.as_millis()).is_err() {
         return Err(CoreError::ConfigValidation {
             message: format!(
@@ -1786,20 +1567,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     Ok(cfg)
 }
 
-/// Validate the admin `/usage` mount against the rest of the config.
-///
-/// Rules:
-/// - `[auth.admin]` requires `[storage]`: without the usage ledger there is
-///   nothing to query, so serving `/usage` would only produce errors.
-/// - The admin token must not be empty (an empty token can never match a
-///   bearer token, so the section would be dead config hiding a mistake).
-/// - `server.admin_bind` must differ from `server.bind`: two listeners cannot
-///   share one socket.
-/// - Without `[auth.admin]`, `server.admin_bind` and
-///   `server.admin_on_main_listener` are dead config and are rejected.
-/// - The derived default admin port (`bind` port + 1) must exist: a `bind`
-///   on port 65535 with no explicit `admin_bind` has no distinct port to
-///   default to.
 fn validate_admin_mount(cfg: &AppConfig) -> Result<(), CoreError> {
     let Some(admin) = cfg.auth.admin.as_ref() else {
         if cfg.server.admin_bind.is_some() {
@@ -1845,9 +1612,6 @@ fn validate_admin_mount(cfg: &AppConfig) -> Result<(), CoreError> {
             });
         }
     } else if !cfg.server.admin_on_main_listener && cfg.server.bind.port() == u16::MAX {
-        // The default admin port (bind port + 1) is only consulted when the
-        // dedicated listener binds it; under the main-listener opt-in with
-        // no explicit admin_bind, no second socket is attempted.
         return Err(CoreError::ConfigValidation {
             message: "server.bind port 65535 leaves no distinct port for the default \
                       admin listener; set server.admin_bind explicitly or enable \
@@ -1864,16 +1628,6 @@ fn validate_admin_mount(cfg: &AppConfig) -> Result<(), CoreError> {
 /// attribution becomes ambiguous.
 pub const ANONYMOUS_CALLER: &str = "anonymous";
 
-/// Validate `[auth]` against itself and against the bind address.
-///
-/// Rules:
-/// - `mode = "none"` with a non-empty `[auth.clients]` is contradictory
-///   (configured keys would be silently ignored) and is rejected.
-/// - `mode = "client-keys"` requires at least one `[auth.clients]` entry.
-/// - `mode = "none"` is only permitted on a loopback bind: a non-loopback
-///   bind with no client keys would expose the proxy to every reachable
-///   peer with no authentication, so startup refuses.
-/// - Key ids must be non-empty and must not be [`ANONYMOUS_CALLER`].
 fn validate_auth_config(auth: &AuthConfig, bind: SocketAddr) -> Result<(), CoreError> {
     let clients_empty = auth.clients.is_empty();
     match auth.mode {
@@ -1960,26 +1714,10 @@ pub fn load_provider_config(
         source,
     })?;
 
-    // Before interpolation, check if any env vars referenced in the raw TOML
-    // resolve to empty strings. This must happen before interpolation replaces
-    // the ${VAR} pattern, otherwise we lose the diagnostic info about which
-    // env var was empty.
-    //
-    // WHY: We scan the raw TOML string with the shared env-var regex instead of
-    // parsing the TOML twice. This avoids a redundant full TOML parse just to
-    // extract the api_key value for the empty-env-var check.
     for (var_name, resolved) in find_env_var_refs(&raw) {
         match resolved {
-            None => {
-                // Env var is not set -- interpolation will leave ${VAR} as-is.
-                // The unresolved-env-var check below (after interpolation) will
-                // catch this for all fields, not just api_key.
-            }
+            None => {}
             Some(value) if value.is_empty() => {
-                // Provider name is not yet known (no parse has occurred), so we
-                // include the file path as context instead. Carried as a typed
-                // `CoreError::ConfigValidation` source via `From` (GAP-LOW-11),
-                // so this failure is variant-recoverable by callers.
                 return Err(ConfigValidationError::EmptyEnvVar {
                     provider: format!("(file: {})", path.display()),
                     var: var_name,
@@ -1990,11 +1728,6 @@ pub fn load_provider_config(
         }
     }
 
-    // Now perform full interpolation on the raw content and check for any
-    // unresolved env vars that remain. This catches ${MISSING_VAR} patterns
-    // in *any* field (endpoint, protocol, name), not just api_key.
-    // validate_provider_config only checks api_key for unresolved patterns,
-    // so a whole-file check is needed here to match load_app_config behavior.
     let interpolated = interpolate_env_vars(&raw);
     if let Some(var) = find_unresolved_env_var(&interpolated) {
         return Err(CoreError::ConfigValidation {
@@ -2005,16 +1738,9 @@ pub fn load_provider_config(
         });
     }
     let file: ProviderFile = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
-    // The typed `ConfigValidationError` flows into `CoreError::ConfigValidation`
-    // as a first-class typed source via `From` (GAP-LOW-11), not boxed behind
-    // `dyn Error`, so callers can match on the concrete variant.
     validate_provider_config(&file.provider, known_protocols).map_err(CoreError::from)?;
     Ok(file.provider)
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -2045,13 +1771,11 @@ server_name = "test"
         assert_eq!(config.server.rate_limit_rpm, 100);
         assert!(!config.server.trust_forwarded_headers);
         assert_eq!(config.server.dedup_window, Duration::ZERO);
-        // shutdown_timeout omits from the TOML above and must default to 30s (HIGH-1).
         assert_eq!(config.server.shutdown_timeout, Duration::from_secs(30));
     }
 
     #[test]
     fn app_config_accepts_explicit_shutdown_timeout() {
-        // Operators may override the 30s default; the value round-trips verbatim.
         let config: AppConfig = toml::from_str(
             r#"
 [server]
@@ -2095,7 +1819,6 @@ server_name = "test"
 
     #[test]
     fn load_app_config_rejects_zero_request_timeout() {
-        // HIGH-2: a zero timeout makes every API request 408 before any handler.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(
@@ -2122,7 +1845,6 @@ server_name = "test"
 
     #[test]
     fn load_app_config_rejects_subsecond_request_timeout() {
-        // Sub-second timeouts are almost always a mistyped unit and brick the API.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(
@@ -2149,9 +1871,6 @@ server_name = "test"
 
     #[test]
     fn load_app_config_rejects_dedup_window_exceeding_u64_millis() {
-        // A dedup window whose millisecond magnitude does not fit u64 (only
-        // realistically `Duration::MAX`) cannot be stored by the deduplicator
-        // and must be rejected at load time rather than silently clamped.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(
@@ -2176,10 +1895,6 @@ server_name = "test"
         );
     }
 
-    /// Write a config file with the given `bind` and `[auth]` body into a
-    /// fresh temp dir, returning the dir (the config lives at
-    /// `config.toml` inside it). The returned guard keeps the file alive;
-    /// callers run [`load_app_config`] on it directly.
     fn config_dir_with_auth(bind: &str, auth_body: &str) -> tempfile::TempDir {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("config.toml");
@@ -2213,8 +1928,6 @@ server_name = "test"
 
     #[test]
     fn auth_none_on_non_loopback_bind_is_rejected() {
-        // The core safety rule of client identity: an anonymous proxy exposed
-        // past loopback must refuse to start, before any listener binds.
         for bind in ["0.0.0.0:3456", "192.168.1.4:3456", "[::]:3456"] {
             let dir = config_dir_with_auth(bind, "");
             let error = load_app_config(dir.path().join("config.toml"))
@@ -2228,8 +1941,6 @@ server_name = "test"
 
     #[test]
     fn auth_none_on_ipv6_loopback_bind_is_accepted() {
-        // `::1` is loopback; the loopback exemption is about the address, not
-        // the address family.
         let dir = config_dir_with_auth("[::1]:3456", "");
         load_app_config(dir.path().join("config.toml")).expect("ipv6 loopback accepted");
     }
@@ -2275,8 +1986,6 @@ mode = "client-keys"
 
     #[test]
     fn auth_client_keys_with_a_client_accepts_any_bind() {
-        // With at least one hashed key configured, a non-loopback bind is a
-        // legitimate deployment and must load.
         let dir = config_dir_with_auth(
             "0.0.0.0:3456",
             r#"
@@ -2326,8 +2035,6 @@ mode = "client-keys"
 
     #[test]
     fn auth_clients_do_not_leak_through_debug() {
-        // The hash (let alone a plaintext secret) must never surface in Debug
-        // output of the config, matching the api_key discipline.
         let config: AppConfig = toml::from_str(
             r#"
 [server]
@@ -2355,14 +2062,11 @@ laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hashvalue"
 
     #[test]
     fn has_valid_http_scheme_is_case_insensitive() {
-        // Schemes are case-insensitive per RFC 3986 and reqwest accepts mixed
-        // case; the validator must not reject `HTTP://` / `Https://`.
         assert!(has_valid_http_scheme("http://host"));
         assert!(has_valid_http_scheme("https://host"));
         assert!(has_valid_http_scheme("HTTP://host"));
         assert!(has_valid_http_scheme("Https://host"));
         assert!(has_valid_http_scheme("HtTp://host/path"));
-        // Non-HTTP schemes are still rejected.
         assert!(!has_valid_http_scheme("file://host"));
         assert!(!has_valid_http_scheme("ftp://host"));
         assert!(!has_valid_http_scheme("host"));
@@ -2384,10 +2088,6 @@ chat_completion = "chat"
 
         result.unwrap_err();
     }
-
-    // -----------------------------------------------------------------------
-    // [provider.egress]
-    // -----------------------------------------------------------------------
 
     #[test]
     fn egress_section_parses_and_absent_section_means_none() {
@@ -2453,7 +2153,6 @@ bind_out = "198.51.100.10"
             debug.contains("proxy.internal:3128"),
             "the credential-free host must stay visible for diagnostics: {debug}"
         );
-        // No-scheme strings (possible only pre-validation) print nothing raw.
         let raw = ProviderEgressConfig {
             proxy: "user:pass@host".to_owned(),
         };
@@ -2471,11 +2170,8 @@ bind_out = "198.51.100.10"
             "socks5://127.0.0.1:1080",
             "http://proxy.internal:3128",
             "https://proxy.internal:8443",
-            // Schemes are case-insensitive (RFC 3986), like endpoint schemes.
             "SOCKS5H://tunnel.example.com:1080",
-            // Userinfo is proxy authentication, not part of the host check.
             "http://user:pass@proxy.internal:3128",
-            // Portless socks: reqwest defaults to 1080.
             "socks5h://tunnel.example.com",
         ] {
             let file: ProviderFile = toml::from_str(&format!(
@@ -2500,9 +2196,6 @@ proxy = "{url}"
 
     #[test]
     fn validate_rejects_unusable_egress_proxy_urls() {
-        // (url, reason fragment) pairs. Scheme-less URLs matter most: reqwest
-        // would silently prefix `http://` at client build, so config load is
-        // the only gate that can refuse them.
         for (url, reason_fragment) in [
             ("ftp://proxy:21", "unsupported scheme"),
             ("socks4://127.0.0.1:1080", "unsupported scheme"),
@@ -2539,7 +2232,6 @@ proxy = "{url}"
                 }
                 other => panic!("expected InvalidEgressProxy for {url:?}, got {other:?}"),
             }
-            // The operator-facing message names the provider and the URL.
             let message = err.to_string();
             assert!(message.contains("example"));
             assert!(message.contains("[provider.egress]"));
@@ -2609,9 +2301,6 @@ x-discovery-secret = "super-sensitive-value"
 
     #[test]
     fn env_interpolated_api_key_loads_into_secret_string() {
-        // Production secret-loading path: `${VAR}` in the raw TOML is resolved
-        // by env interpolation *before* serde constructs the `SecretString`, so
-        // the resolved value is what gets wrapped and `expose_secret()` returns.
         let _lock = crate::test_support::TestEnvLock::acquire();
         let _guard =
             crate::test_support::EnvVarGuard::set("_LLM_PROXY_TEST_SECRET_KEY", "sk-resolved-007");
@@ -2801,8 +2490,6 @@ id = "models/gemini-2.5-pro"
         validate_provider_config(&provider.provider, None).unwrap();
     }
 
-    // -- Adapter header CRLF validation ---------------------------------------
-
     #[test]
     fn adapter_rejects_header_with_crlf() {
         let mut provider: ProviderFile = toml::from_str(
@@ -2857,8 +2544,6 @@ endpoint = "https://example.com/v1/models"
         ));
     }
 
-    // -- Empty adapter name, protocol, model alias key/target -----------------
-
     #[test]
     fn validate_rejects_empty_adapter_name() {
         let provider: ProviderFile = toml::from_str(
@@ -2874,7 +2559,6 @@ endpoint = "https://example.com/v1"
 "#,
         )
         .expect("provider config");
-        // The TOML key "" is deserialized as an empty string.
         assert!(matches!(
             validate_provider_config(&provider.provider, None),
             Err(ConfigValidationError::EmptyAdapterName { .. })
@@ -2968,7 +2652,7 @@ endpoint = "https://example.com/v1"
     #[test]
     fn validate_rejects_provider_name_exceeding_length_limit() {
         let provider = ProviderConfig {
-            name: "a".repeat(65), // 65 chars exceeds the 64-char limit
+            name: "a".repeat(65),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
@@ -2989,7 +2673,7 @@ endpoint = "https://example.com/v1"
     #[test]
     fn validate_accepts_provider_name_at_max_length() {
         let provider = ProviderConfig {
-            name: "a".repeat(64), // exactly 64 chars
+            name: "a".repeat(64),
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
@@ -3001,13 +2685,8 @@ endpoint = "https://example.com/v1"
             catalog: None,
             pricing: Default::default(),
         };
-        // Should not fail on name validation (will fail on empty api_key
-        // if key is empty, but our key is "key").
-        // Actually no adapters/routes means it passes.
         validate_provider_config(&provider, None).unwrap();
     }
-
-    // -- Pricing / cost ------------------------------------------------------
 
     #[test]
     fn model_pricing_parses_from_toml_with_quoted_decimals() {
@@ -3039,8 +2718,6 @@ reasoning = "0.000010"
 
     #[test]
     fn model_pricing_unquoted_float_is_rejected() {
-        // An unquoted decimal is parsed by TOML as f64; rust_decimal rejects
-        // floats, so deserialization fails. Operators MUST quote decimals.
         let raw = r#"
 [provider]
 name = "test"
@@ -3102,10 +2779,6 @@ input = 0.0000025
 
     #[test]
     fn validate_rejects_implausibly_large_pricing() {
-        // A per-token USD price above the MAX_PER_TOKEN_PRICE bound is a gross
-        // misconfiguration (a stray exponent, a per-1M-token price entered
-        // verbatim, or a misplaced decimal) and is rejected at load time rather
-        // than allowed to produce nonsensical costs.
         let provider = ProviderConfig {
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
@@ -3119,7 +2792,6 @@ input = 0.0000025
             catalog: None,
             pricing: HashMap::from([(
                 ModelId::new("gpt-4o"),
-                // $1000000/token: parses cleanly as a Decimal but exceeds the bound.
                 ModelPricing {
                     input: "1000000".parse().unwrap(),
                     ..ModelPricing::default()
@@ -3139,8 +2811,6 @@ input = 0.0000025
 
     #[test]
     fn validate_accepts_realistic_pricing_below_bound() {
-        // A realistic per-token price (a few $/1M tokens -> tiny $/token) is
-        // accepted. Guards against the upper bound being too tight.
         let provider = ProviderConfig {
             name: "test".to_owned(),
             api_key: SecretString::from("key"),
@@ -3167,17 +2837,14 @@ input = 0.0000025
     #[test]
     fn log_format_from_env_reads_rust_log_format() {
         let _lock = crate::test_support::TestEnvLock::acquire();
-        // "json" (case-insensitive) -> Json.
         {
             let _g = crate::test_support::EnvVarGuard::set("RUST_LOG_FORMAT", "JSON");
             assert_eq!(LogFormat::from_env(), LogFormat::Json);
         }
-        // Unrecognized value -> Plain.
         {
             let _g = crate::test_support::EnvVarGuard::set("RUST_LOG_FORMAT", "xml");
             assert_eq!(LogFormat::from_env(), LogFormat::Plain);
         }
-        // Empty string -> Plain (same as unset).
         {
             let _g = crate::test_support::EnvVarGuard::set("RUST_LOG_FORMAT", "");
             assert_eq!(LogFormat::from_env(), LogFormat::Plain);
@@ -3186,8 +2853,6 @@ input = 0.0000025
 
     #[test]
     fn validate_accepts_empty_api_key_when_passthrough_auth() {
-        // A passthrough-auth provider gets its upstream credential from the
-        // inbound client request, so an empty/unset api_key must be allowed.
         let provider = ProviderConfig {
             name: "test".to_owned(),
             api_key: SecretString::from(""),
@@ -3209,7 +2874,6 @@ input = 0.0000025
 
     #[test]
     fn validate_rejects_empty_api_key_when_not_passthrough() {
-        // Non-passthrough providers still require a non-empty api_key.
         let provider = ProviderConfig {
             name: "test".to_owned(),
             api_key: SecretString::from(""),
@@ -3229,9 +2893,6 @@ input = 0.0000025
         ));
     }
 
-    // -- [storage] -----------------------------------------------------------
-
-    /// Minimal valid main config with a `[storage]` section appended.
     fn write_app_config(extra_storage: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -3391,10 +3052,6 @@ db_host = "postgres.example"
         );
     }
 
-    // -- [auth.admin] / admin mount -------------------------------------------
-
-    /// Minimal valid `[storage]` section so admin tests vary only the admin
-    /// fields.
     const STORAGE_SECTION: &str = "\n[storage]\npath = \"/tmp/usage.db\"\n";
 
     #[test]
@@ -3504,10 +3161,6 @@ db_host = "postgres.example"
 
     #[test]
     fn admin_main_listener_optin_needs_no_derivable_port() {
-        // The "no second port available" posture: with the main-listener
-        // opt-in and no explicit admin_bind, no dedicated socket is
-        // attempted, so an underivable default port must not reject the
-        // config.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(

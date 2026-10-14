@@ -1,30 +1,6 @@
-//! Core types shared across all `llm-proxy` crates.
-//!
-//! Provides:
-//!
-//! - **Configuration**: the TOML [`AppConfig`]/[`ProviderConfig`] types with
-//!   env-var interpolation and validation.
-//! - **Routing**: [`ProviderRouteKind`] and [`ProviderRoutesConfig`] for
-//!   provider-based route resolution.
-//! - **Registry**: [`ProviderRegistry`] and [`ProviderAdapterTargetConfig`] for
-//!   resolving provider routes to concrete adapter configurations.
-//! - **Metrics**: the runtime [`Metrics`] collector with counters and latency
-//!   histograms.
-//! - **Token counting**: [`Counter`] and [`MessageContent`] for usage tracking.
-//! - **PID management**: [`PidManager`] for daemon mode.
-//! - **Errors**: the crate-level [`CoreError`] enum.
-//!
-//! # Crate layout
-//!
-//! ```text
-//! provider_config   - TOML provider/app config types
-//! provider_registry - Provider registry and adapter target resolution
-//! env_interpolate   - Shared ${ENV_VAR} interpolation
-//! token             - Token counting
-//! metrics           - Runtime metrics
-//! pid               - PID file management
-//! error             - Crate-level errors
-//! ```
+//! Core types shared across all `llm-proxy` crates: configuration, routing,
+//! the provider registry, metrics, token counting, PID management, and
+//! errors.
 
 #![deny(missing_docs)]
 
