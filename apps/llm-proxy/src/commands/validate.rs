@@ -1,7 +1,3 @@
-//! `validate` command implementation.
-//!
-//! Validates TOML config and prints provider route table.
-
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -19,7 +15,6 @@ use crate::state::catalog_enforcement_warning;
 pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     let path = resolve_config(config_path);
 
-    // Reject JSON config and non-TOML extensions.
     validate_toml_extension(&path)?;
 
     println!("validating config: {}", path.display());
@@ -27,7 +22,6 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     let app_config: AppConfig = load_app_config(&path)
         .with_context(|| format!("loading TOML config from {}", path.display()))?;
 
-    // Print settings summary.
     println!();
     println!("=== Server Configuration ===");
     println!("  bind:            {}", app_config.server.bind);
@@ -48,7 +42,6 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     );
     println!("  server_name:     {}", app_config.server.server_name);
 
-    // Load and validate providers.
     let providers_dir = providers_dir_for(&path);
     let registry = if providers_dir.exists() {
         ProviderRegistry::load_from_dir(&providers_dir)
@@ -58,7 +51,6 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
             .with_context(|| "building empty provider registry")?
     };
 
-    // Validate provider protocols against builtin adapters.
     let adapter_registry = ProviderAdapterRegistry::builtin();
     let known_protocols = adapter_registry.protocol_names();
     registry
@@ -87,7 +79,6 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
         }
     }
 
-    // Print provider route table: route_kind -> adapter/protocol
     println!();
     println!("=== Provider Routes ===");
     if registry.is_empty() {
@@ -121,8 +112,6 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Print one provider's route table, returning one message per route whose
-/// adapter could not be resolved.
 fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<String> {
     println!("{}:", provider.name);
 

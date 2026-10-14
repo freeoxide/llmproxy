@@ -15,16 +15,6 @@ use tracing::info;
 
 use crate::paths::providers_dir_for;
 
-/// Load TOML config files and build [`AppState`] in TOML new-runtime mode.
-///
-/// Loads the main `AppConfig` from `path`, then scans a `providers/` directory
-/// next to `path` for provider TOML files. Uses [`ProviderRegistry::load_from_dir`]
-/// which handles non-regular-file filtering, deterministic sorted ordering, and
-/// duplicate-name detection. Protocol validation is performed separately against
-/// the builtin adapter set after loading.
-///
-/// Takes ownership of `adapter_registry` and `proxy_client` since they are
-/// consumed by [`AppState::new`] and not reused after this call.
 pub(crate) fn load_toml_state(
     path: &Path,
     adapter_registry: ProviderAdapterRegistry,
@@ -34,16 +24,12 @@ pub(crate) fn load_toml_state(
     let mut app_config: AppConfig = llm_proxy_core::load_app_config(path)
         .with_context(|| format!("loading TOML config from {}", path.display()))?;
 
-    // Apply CLI port override.
-    // In-place mutation is safe here: the config is consumed by AppState::new
-    // below and is not shared with any other caller.
     if let Some(p) = port_override {
         let mut bind = app_config.server.bind;
         bind.set_port(p);
         app_config.server.bind = bind;
     }
 
-    // Load provider files from providers/ directory next to the main config.
     let providers_dir = providers_dir_for(path);
     let registry = if providers_dir.exists() {
         ProviderRegistry::load_from_dir(&providers_dir)
@@ -53,7 +39,6 @@ pub(crate) fn load_toml_state(
             .with_context(|| "building empty provider registry")?
     };
 
-    // Validate all provider protocols against the builtin adapter set.
     let known_protocols = adapter_registry.protocol_names();
     registry
         .validate_protocols(known_protocols)
@@ -66,16 +51,9 @@ pub(crate) fn load_toml_state(
         }
     }
 
-    // Build the client-auth state here (before the listener binds) so an
-    // invalid verifier hash is a startup error, not a runtime fail-closed.
     let client_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
         .with_context(|| "building client auth from [auth] config")?;
 
-    // Build per-provider egress clients from [provider.egress] entries here
-    // (also before the listener binds) so a proxy URL the transport cannot
-    // use is a startup error, never a silent fallback to direct egress.
-    // Providers without an egress section get no entry and keep using the
-    // shared default client, exactly as before the section existed.
     let mut egress_clients = std::collections::HashMap::new();
     for provider in registry.iter() {
         if let Some(egress) = &provider.egress {
@@ -85,8 +63,6 @@ pub(crate) fn load_toml_state(
                     provider.name
                 )
             })?;
-            // Log the provider and scheme, not the URL: egress proxy URLs may
-            // carry userinfo credentials.
             info!(
                 provider = %provider.name,
                 scheme = egress.proxy.split("://").next().unwrap_or_default(),
@@ -96,10 +72,6 @@ pub(crate) fn load_toml_state(
         }
     }
 
-    // Build the persistent event bus from `[storage]` (also before the
-    // listener binds) so an unusable ledger path is a startup error rather
-    // than a silent no-op. Absent `[storage]` keeps the NoopBus default:
-    // nothing is persisted, exactly as before the section existed.
     let event_bus: std::sync::Arc<dyn llm_proxy_storage::EventBus> = match &app_config.storage {
         Some(storage) => {
             let bus = llm_proxy_storage::SqliteEventBus::open(
@@ -126,10 +98,6 @@ pub(crate) fn load_toml_state(
         "loaded TOML config"
     );
 
-    // Announce the admin-mount security posture loudly at startup so the
-    // operator sees which surface their config selected. The
-    // main-listener opt-in is a different, deliberately less-isolated
-    // posture than the default loopback-only dedicated listener.
     warn_admin_posture(&app_config);
 
     Ok(AppState::new_with_catalog_dir(
@@ -147,11 +115,8 @@ pub(crate) fn load_toml_state(
 
 /// Emit the startup warnings naming the admin `/usage` mount posture.
 ///
-/// `admin_on_main_listener = true` deliberately exposes the admin surface on
-/// the main listener, so it is called out by name. A dedicated admin
-/// listener on a non-loopback address is likewise called out (the default is
-/// loopback-only); the operator may have pointed it at a tunnel interface,
-/// but the warning makes that choice visible in every startup log.
+/// Warns when the admin surface is mounted on the main listener or when the
+/// dedicated admin listener binds a non-loopback address.
 pub fn warn_admin_posture(config: &AppConfig) {
     use llm_proxy_core::AdminMountPosture;
     match config.admin_posture() {
@@ -225,25 +190,9 @@ pub fn build_info() -> BuildInfo {
 
 /// Initialize the tracing subscriber.
 ///
-/// Uses `RUST_LOG` env var with fallback to "info". The output format is
-/// selected by `log_format`: [`LogFormat::Plain`] (default) for human-readable
-/// logs, [`LogFormat::Json`] for structured JSON (one object per line). The
-/// format is read from the `RUST_LOG_FORMAT` env var at init via
-/// [`LogFormat::from_env`], before the TOML config is loaded (tracing is needed
-/// during config loading itself). To control log verbosity, set `RUST_LOG`.
+/// Reads `RUST_LOG` (falling back to `"info"`) and the output format from
+/// `RUST_LOG_FORMAT` via [`LogFormat::from_env`].
 pub fn init_tracing(log_format: &LogFormat) {
-    // Delegates to [`build_log_layer`] so the format-selection logic
-    // (`.json()` vs plain) is exercised by `build_log_layer`'s own tests and
-    // is not duplicated here. The public signature is unchanged.
-    //
-    // The filter is attached *to the boxed layer* (via `Layer::with_filter`)
-    // rather than to the registry first. `build_log_layer` returns a type-erased
-    // `Box<dyn Layer<Registry>>`; chaining `.with(filter).with(boxed_layer)`
-    // would require the erased layer to implement `Layer<Layered<EnvFilter,
-    // Registry>>`, which the `Box<dyn Layer<S>>` blanket impl does not provide
-    // (its `S` is fixed to `Registry`). Filtering the layer instead yields a
-    // concrete `Filtered<..>` type that implements `Layer<Registry>` and
-    // composes cleanly with `registry().with(...)`.
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -252,27 +201,11 @@ pub fn init_tracing(log_format: &LogFormat) {
     tracing_subscriber::registry().with(layer).init();
 }
 
-/// Build the [`EnvFilter`] for tracing.
-///
-/// Falls back to `"info"` when `RUST_LOG` is unset. `"info"` is a known-valid
-/// filter string, so `parse_lossy` is safe here (it never panics).
 fn build_env_filter() -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::builder().parse_lossy("info"))
 }
 
-/// Build the tracing-subscriber fmt layer for `log_format`, writing to the sink
-/// produced by `make_writer`.
-///
-/// Extracted from [`init_tracing`] so the format selection
-/// (plain vs `.json()`) is independently testable: a test passes a buffer-backed
-/// [`MakeWriter`] here, installs the composed subscriber as the thread-local
-/// default, emits a [`tracing::event!`], and asserts on the captured bytes —
-/// without needing to call the global, process-wide `init()` (which can only
-/// run once and would race with other tests).
-///
-/// Returns a boxed, type-erased layer so callers (and tests) do not have to
-/// name the concrete `Layer` generic over the writer type.
 fn build_log_layer<W>(
     log_format: &LogFormat,
     make_writer: W,
@@ -363,45 +296,12 @@ enforce = true
         assert!(warning.is_none());
     }
 
-    // -----------------------------------------------------------------------
-    // Log format tests (drive the extracted `build_log_layer` helper)
-    // -----------------------------------------------------------------------
-    //
-    // These tests install the composed subscriber as the thread-local default
-    // via `Subscriber::set_default` (a scoped guard), NOT via the global
-    // `init()`. `init()` can only run once per process and would race with
-    // other tests; `set_default` scopes the subscriber to this thread only, so
-    // a buffer `MakeWriter` captures exactly the events emitted here. This is
-    // the standard `tracing-subscriber` pattern for isolated format tests.
-
-    /// Emit a known `tracing::event!` while `subscriber` is the thread-local
-    /// default, returning the captured bytes.
     fn capture_event_for(log_format: &LogFormat) -> Vec<u8> {
         use std::sync::{Arc, Mutex};
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        // `BufferWriter` is a tiny newtype that implements
-        // `tracing_subscriber::fmt::MakeWriter` by locking the shared buffer
-        // and returning a `MutexGuard`-backed writer. The layer clones the
-        // `BufferWriter` (cheap `Arc` clone) internally; we keep the original
-        // `Arc` to read the captured bytes after the event is emitted.
         let layer = build_log_layer(log_format, BufferWriter(Arc::clone(&buf)));
-        // `SubscriberExt::with` must be in scope to compose the layer onto the
-        // registry. `set_default` (not the one-shot global `init`) scopes the
-        // subscriber to this thread only, so a buffer `MakeWriter` captures
-        // exactly the events emitted here and tests do not race with each other.
         use tracing_subscriber::layer::SubscriberExt;
         let subscriber = tracing_subscriber::registry().with(layer);
-        // Scope the subscriber to this thread only. `set_default` (from the
-        // `tracing` crate) takes the subscriber by value and returns a guard
-        // that restores the prior subscriber on drop. This avoids the global
-        // `init()` (one-shot, process-wide, would race with other tests).
-        //
-        // The fmt layer (and the subscriber+guard that own it) clones the
-        // `BufferWriter`/`Arc` internally and may outlive the `event!` call, so
-        // this helper does NOT depend on `Arc::try_unwrap` to recover the
-        // buffer (that would race the layer's drop and panic spuriously). The
-        // captured bytes are read through a shared `lock()` on the live `Arc`
-        // instead, which is correct regardless of how many clones exist.
         {
             let _guard = tracing::subscriber::set_default(subscriber);
             tracing::event!(
@@ -414,15 +314,6 @@ enforce = true
         buf.lock().expect("buffer lock not poisoned").clone()
     }
 
-    /// `MakeWriter` implementation backed by a shared, lockable byte buffer.
-    ///
-    /// `tracing_subscriber::fmt::MakeWriter` is not implemented for
-    /// `Arc<Mutex<Vec<u8>>>` directly (the `Arc<W>` blanket impl requires
-    /// `W: MakeWriter`, and `Mutex<Vec<u8>>` is not a writer), so this newtype
-    /// provides the impl explicitly. Each `make_writer` call returns a
-    /// `MutexGuard<'static>`-shaped writer that appends bytes to the shared
-    /// buffer; the `MutexGuard` is `Send` and `Sync` and lives as long as the
-    /// borrowed `Arc` (which the layer clones and holds for `'static`).
     #[derive(Clone)]
     struct BufferWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -434,8 +325,6 @@ enforce = true
         }
     }
 
-    /// Write handle for [`BufferWriter`], backed by a `MutexGuard` over the
-    /// shared buffer. Implements `Write` by appending directly.
     struct BufferWriterGuard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
 
     impl<'a> std::io::Write for BufferWriterGuard<'a> {
@@ -449,11 +338,6 @@ enforce = true
         }
     }
 
-    /// Minimal structural check that `line` is a single JSON object (starts with
-    /// `{`, ends with `}`). A full `serde_json` parse is intentionally avoided
-    /// to keep this test off a `serde_json` dev-dependency in the app crate; the
-    /// brace check plus key-content assertions below are sufficient to
-    /// distinguish the JSON formatter from the human-readable plain formatter.
     fn looks_like_json_object(line: &str) -> bool {
         let trimmed = line.trim();
         trimmed.starts_with('{') && trimmed.ends_with('}')
@@ -467,7 +351,6 @@ enforce = true
             !captured.is_empty(),
             "a tracing::event! must produce output under LogFormat::Json"
         );
-        // Each non-empty line must be a single JSON object (one per event).
         for line in captured.lines() {
             if line.trim().is_empty() {
                 continue;
@@ -477,10 +360,6 @@ enforce = true
                 "LogFormat::Json line must be a JSON object, got: {line}"
             );
         }
-        // The JSON formatter emits `level` and the `fields.message` payload as
-        // structured keys. Assert both are present to prove our `event!`
-        // reached the JSON formatter and the fields were serialized (not
-        // dropped by a future edit to `build_log_layer`).
         assert!(
             captured.contains("\"level\"") && captured.contains("INFO"),
             "JSON log must carry the structured `level` field, got: {captured}"
@@ -499,10 +378,6 @@ enforce = true
             !captured.is_empty(),
             "a tracing::event! must produce output under LogFormat::Plain"
         );
-        // Take the first non-empty line. Under Plain it is human-readable text
-        // like `2026-... INFO log_format_test: ...` and must NOT be a JSON
-        // object — if it were, the format selection in `build_log_layer` would
-        // be broken (Plain behaving like Json).
         let first = captured
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -511,18 +386,12 @@ enforce = true
             !looks_like_json_object(first),
             "Plain log line must NOT be a JSON object, got: {first}"
         );
-        // Sanity: the probe message still reached the formatter.
         assert!(
             captured.contains("log-format-probe"),
             "Plain log must still carry the emitted message, got: {captured}"
         );
     }
 
-    // -----------------------------------------------------------------------
-    // [storage] wiring into load_toml_state
-    // -----------------------------------------------------------------------
-
-    /// Write a minimal valid main config, optionally with a [storage] section.
     fn write_main_config(
         dir: &std::path::Path,
         storage_section: Option<&str>,
@@ -573,9 +442,6 @@ path = \"{}\"
             "[storage] must wire the SQLite ledger, got: {debug}"
         );
 
-        // The ledger accepts and persists an event end to end: emit through
-        // the wired bus, close (drain), then the database file must exist
-        // with content (the writer checkpoints its WAL on close).
         let event =
             llm_proxy_storage::ProxyEvent::RequestReceived(llm_proxy_storage::RequestReceived {
                 request_id: "wiring-1".to_owned(),
@@ -623,16 +489,9 @@ path = \"{}\"
             debug.contains("NoopBus"),
             "absent [storage] must keep the no-op bus (today's behavior), got: {debug}"
         );
-        // And close() on the default bus is a no-op that must not hang.
         llm_proxy_storage::EventBus::close(state.event_bus().as_ref());
     }
 
-    // -----------------------------------------------------------------------
-    // [provider.egress] wiring into load_toml_state
-    // -----------------------------------------------------------------------
-
-    /// Write a providers/ dir next to the main config with one provider file,
-    /// optionally carrying an egress section.
     fn write_provider_file(dir: &std::path::Path, egress: Option<&str>) {
         let egress_section = egress.unwrap_or_default();
         std::fs::create_dir_all(dir.join("providers")).unwrap();
@@ -660,16 +519,12 @@ chat_completions = "chat"
     #[tokio::test]
     async fn load_toml_state_wires_egress_client_only_for_configured_providers() {
         let dir = tempfile::tempdir().unwrap();
-        // The proxy URL carries userinfo: it must reach the transport as proxy
-        // authentication but must never be printed with the credentials.
         write_provider_file(
             dir.path(),
             Some(
                 "[provider.egress]\nproxy = \"socks5h://egress-user:egress-pass@127.0.0.1:1080\"\n",
             ),
         );
-        // A second provider with no egress section must keep the shared
-        // default client.
         std::fs::write(
             dir.path().join("providers/direct.toml"),
             r#"
@@ -697,9 +552,6 @@ chat_completions = "chat"
         )
         .expect("state builds with an egress provider");
 
-        // Observable through the state Debug: the egress map holds exactly the
-        // provider that configured egress, and the proxy credentials never
-        // print (the credential-free host:port may).
         let debug = format!("{state:?}");
         let egress_map = debug
             .split("egress_clients: ")
@@ -723,9 +575,6 @@ chat_completions = "chat"
     #[tokio::test]
     async fn load_toml_state_rejects_egress_url_the_transport_cannot_use() {
         let dir = tempfile::tempdir().unwrap();
-        // Malformed IPv6 host: passes config validation (scheme http, host
-        // non-empty) but the transport cannot build a proxy from it, so the
-        // serve path must refuse to start rather than fall back to direct.
         write_provider_file(
             dir.path(),
             Some("[provider.egress]\nproxy = \"http://[::1:8080\"\n"),
@@ -750,10 +599,6 @@ chat_completions = "chat"
             "the error must name the provider: {message}"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Admin posture startup warnings
-    // -----------------------------------------------------------------------
 
     fn admin_app_config(
         on_main: bool,
@@ -792,7 +637,6 @@ chat_completions = "chat"
         }
     }
 
-    /// Capture the warnings [`warn_admin_posture`] emits for `config`.
     fn captured_posture_warnings(config: &llm_proxy_core::AppConfig) -> Vec<u8> {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let layer = build_log_layer(&LogFormat::Json, BufferWriter(std::sync::Arc::clone(&buf)));

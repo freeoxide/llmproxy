@@ -1,6 +1,4 @@
 //! Command implementations.
-//!
-//! Each command is in its own submodule for clarity.
 
 mod autostart;
 mod init;

@@ -1,10 +1,6 @@
-//! Integration tests for the `serve` command.
-//!
-//! Starting the server binds a port and blocks, so these tests only cover the
-//! pre-flight config validation that `serve` runs before it would bind. The
-//! full `validate_toml_extension` accept/reject matrix is exercised as per-case
-//! unit tests in `src/config_validation.rs` (see LOW-20); this file keeps a
-//! single smoke test confirming the error shape `serve` surfaces.
+//! Integration tests for the `serve` command: pre-flight config validation
+//! only (starting the server binds and blocks). The full extension matrix
+//! lives in `src/config_validation.rs`.
 
 #[cfg(test)]
 mod tests {

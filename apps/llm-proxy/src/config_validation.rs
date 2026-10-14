@@ -58,8 +58,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // `is_toml_config` matrix, split into one assertion per test so a single
-    // regression points at the exact input shape that broke (see LOW-20).
     #[test]
     fn is_toml_config_accepts_lowercase_toml() {
         assert!(is_toml_config(Path::new("a.toml")));

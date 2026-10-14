@@ -1,7 +1,3 @@
-//! `autostart` command implementations.
-//!
-//! Manages auto-start on login: enable, disable, and status.
-
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -19,11 +15,8 @@ use crate::platform::format_plist;
 
 /// Run the `autostart enable` command.
 ///
-/// If the launchd plist (macOS) or `.desktop` entry (Linux) already exists,
-/// the command aborts unless `force` is set, mirroring `cmd_init`'s overwrite
-/// guard. This prevents a hand-edited unit (`KeepAlive`, custom
-/// `EnvironmentVariables`, `StartInterval`, …) being silently rewritten on the
-/// next `enable` (audit GAP-MED-4).
+/// Aborts when the launchd plist (macOS) or `.desktop` entry (Linux) already
+/// exists, unless `force` is set.
 pub fn cmd_autostart_enable(
     config_path: Option<&Path>,
     port: Option<u16>,
@@ -34,10 +27,6 @@ pub fn cmd_autostart_enable(
         .with_context(|| format!("creating directory {}", dir.display()))?;
 
     let exe = std::env::current_exe().with_context(|| "resolving current executable")?;
-    // Build args as strings for plist/desktop entry display. Lossy conversion is
-    // acceptable here because these are display-only strings that are XML-escaped
-    // by format_plist(). Non-UTF-8 paths are rare and the lossy replacement is
-    // sufficient for auto-start purposes.
     let mut args = vec![exe.to_string_lossy().to_string(), "serve".to_owned()];
 
     if let Some(p) = config_path {
@@ -64,7 +53,6 @@ pub fn cmd_autostart_enable(
 
         std::fs::write(&plist_path, plist_content)
             .with_context(|| format!("writing {}", plist_path.display()))?;
-        // Set restrictive permissions on the plist file.
         set_private_permissions(&plist_path)?;
 
         println!("created launchd plist at {}", plist_path.display());
@@ -81,7 +69,6 @@ pub fn cmd_autostart_enable(
         require_overwrite_ok(&desktop_path, "desktop entry", force)?;
         std::fs::write(&desktop_path, desktop_content)
             .with_context(|| format!("writing {}", desktop_path.display()))?;
-        // Set restrictive permissions on the desktop entry.
         set_private_permissions(&desktop_path)?;
         println!("created desktop entry at {}", desktop_path.display());
     }
@@ -180,12 +167,6 @@ pub fn cmd_autostart_status() -> Result<()> {
     Ok(())
 }
 
-/// Reject an overwrite of an existing unit file unless `force` is set.
-///
-/// Returns `Ok(())` when the path does not exist or `force` is set, otherwise
-/// an error naming the file and offering `--force`. Extracted as a pure
-/// function so the clobber guard is unit-testable without resolving the real
-/// `$HOME`-derived plist/desktop path (audit GAP-MED-4).
 fn require_overwrite_ok(path: &std::path::Path, kind: &str, force: bool) -> Result<()> {
     if path.exists() && !force {
         bail!(

@@ -103,7 +103,6 @@ mod tests {
 
     #[test]
     fn parse_models_write_catalog_requires_live() {
-        // --write-catalog requires --live; clap should reject this.
         let result = Cli::try_parse_from(["llm-proxy", "models", "--write-catalog"]);
         result.unwrap_err();
     }

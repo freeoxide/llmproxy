@@ -9,8 +9,7 @@ use anyhow::{Context, Result};
 
 /// Set owner-only read/write permissions (0600) on a file.
 ///
-/// Used for config and autostart files that reference API keys via
-/// environment variables. On non-Unix platforms this is a no-op.
+/// No-op on non-Unix platforms.
 pub fn set_private_permissions(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -27,8 +26,7 @@ pub fn set_private_permissions(path: &std::path::Path) -> Result<()> {
 
 /// Set owner-only permissions (0700) on a directory.
 ///
-/// Used for the config directory which contains provider TOML files with
-/// API key references. On non-Unix platforms this is a no-op.
+/// No-op on non-Unix platforms.
 pub fn set_private_dir_permissions(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -45,9 +43,8 @@ pub fn set_private_dir_permissions(path: &std::path::Path) -> Result<()> {
 
 /// Create a new file with restrictive permissions (0600) and write `content`.
 ///
-/// On Unix, uses `OpenOptions` with `mode(0o600)` to set permissions atomically
-/// at creation time, avoiding a window where the file exists with default umask
-/// permissions. Falls back to create-then-chmod on non-Unix.
+/// On Unix the 0600 mode is applied atomically at creation; non-Unix falls
+/// back to create-then-chmod.
 pub fn create_private_file(path: &std::path::Path, content: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
@@ -72,15 +69,10 @@ pub fn create_private_file(path: &std::path::Path, content: &[u8]) -> Result<()>
     Ok(())
 }
 
-/// Open a file for appending, creating it if absent, with owner-only (0600)
-/// permissions.
+/// Open (or create) a file for appending with owner-only (0600) permissions.
 ///
-/// Unlike [`create_private_file`] this uses `create(true)` (not `create_new`)
-/// so it is suitable for append-mode sinks such as the daemon log file. On
-/// Unix the 0600 mode is applied atomically at creation via `OpenOptionsExt`,
-/// avoiding the create-then-chmod TOCTOU window where the file briefly exists
-/// under the process umask (typically 0644, world-readable). On non-Unix it
-/// falls back to create-then-chmod.
+/// Unlike [`create_private_file`] this succeeds when the file exists (append
+/// sinks such as the daemon log). Atomic 0600 at creation on Unix.
 pub fn open_private_append(path: &std::path::Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -139,14 +131,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.log");
-        // New file: must be created owner-only (no umask window).
         {
             let mut f = open_private_append(&path).unwrap();
             writeln!(f, "first line").unwrap();
         }
         let mode = path.metadata().unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "log file must be born 0600");
-        // Re-open (append to existing): must still succeed and keep appending.
         {
             let mut f = open_private_append(&path).unwrap();
             writeln!(f, "second line").unwrap();

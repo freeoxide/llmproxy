@@ -1,10 +1,6 @@
-//! Integration tests for the `stop` command.
-//!
-//! Drives `cmd_stop` / `cmd_stop_with_timing` directly against a tempdir-backed
-//! [`CommandPaths`], covering every branch the audit flagged as uncovered
-//! (audit MEDIUM-6): the "no PID file found" path, stale-PID cleanup, the
-//! graceful SIGTERM shutdown of a live process, and the full SIGTERM→poll→SIGKILL
-//! escalation when SIGTERM is ignored.
+//! Integration tests for the `stop` command, driven against a tempdir-backed
+//! [`CommandPaths`]: no PID file, stale-PID cleanup, graceful SIGTERM, and the
+//! SIGKILL escalation.
 
 #[cfg(test)]
 mod tests {
@@ -16,15 +12,12 @@ mod tests {
     use llm_proxy_app::paths::CommandPaths;
     use llm_proxy_core::PidManager;
 
-    /// Build a [`CommandPaths`] whose PID file and config path both live under
-    /// `dir` (the config path is a sibling of the PID file, never written here).
     fn tempdir_paths(dir: &Path) -> CommandPaths {
         CommandPaths::new(PidManager::new(dir), dir.join("config.toml"))
     }
 
     #[cfg(unix)]
     mod unix {
-        //! On Unix, every `cmd_stop` branch is exercised end-to-end.
         use super::*;
         use std::process::Command;
 
@@ -45,7 +38,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = tempdir_paths(dir.path());
 
-            // 299_999_999 is effectively never a live PID -> "stale" branch.
             std::fs::write(paths.pid_manager().pid_file(), "299999999").unwrap();
 
             cmd_stop(&paths).expect("stale PID -> Ok + cleanup");
@@ -60,7 +52,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = tempdir_paths(dir.path());
 
-            // `sleep` exits on SIGTERM by default -> exercises the graceful branch.
             let mut child = Command::new("sleep").arg("30").spawn().unwrap();
             std::fs::write(paths.pid_manager().pid_file(), child.id().to_string()).unwrap();
 
@@ -83,10 +74,6 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let paths = tempdir_paths(dir.path());
 
-            // Child ignores SIGTERM and keeps running -> survives the poll loop and
-            // is force-killed with SIGKILL. `sleep 30 & wait` keeps the recorded
-            // shell PID alive (the shell, not `sleep`, owns the PID file) and
-            // holding the SIGTERM trap so the shell is not replaced by exec.
             let mut child = Command::new("sh")
                 .arg("-c")
                 .arg("trap '' TERM; sleep 30 & wait")
@@ -110,7 +97,6 @@ mod tests {
 
     #[cfg(not(unix))]
     mod non_unix {
-        //! `stop` is unsupported off-Unix; the command must bail cleanly.
         use super::*;
 
         #[test]
