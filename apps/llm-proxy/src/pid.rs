@@ -1,8 +1,7 @@
 //! PID file management helpers.
 //!
-//! Delegates to `llm_proxy_core::PidManager` for the core PID file operations
-//! and adds validation (reject PID 0, overflow checks) and restrictive
-//! file permissions.
+//! Delegates to `llm_proxy_core::PidManager` and adds PID validation
+//! (reject 0, overflow) plus restrictive file permissions.
 
 use std::io::Write;
 
