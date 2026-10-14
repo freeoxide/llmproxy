@@ -1,5 +1,3 @@
-//! Admin bearer-token authentication for the `/usage` surface.
-
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -9,21 +7,12 @@ use sha2::{Digest, Sha256};
 
 use crate::routes::UsageState;
 
-/// Guard for the admin token: stores only its SHA-256 digest.
-///
-/// The configured token is hashed once at construction and never retained,
-/// so neither the plaintext nor anything it could be compared against
-/// directly survives in memory. Presented tokens are hashed the same way and
-/// the two fixed-length digests are compared in constant time, which also
-/// removes any length-dependence from the comparison.
 #[derive(Clone)]
 pub(crate) struct AdminAuth {
     expected_digest: [u8; 32],
 }
 
 impl std::fmt::Debug for AdminAuth {
-    // The digest is offline-brute-forceable for low-entropy tokens (SHA-256
-    // preimage search), so it is treated as sensitive and never printed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminAuth")
             .field("token", &"[REDACTED]")
@@ -32,15 +21,12 @@ impl std::fmt::Debug for AdminAuth {
 }
 
 impl AdminAuth {
-    /// Build the guard from the configured admin token.
     pub(crate) fn new(token: &str) -> Self {
         Self {
             expected_digest: Sha256::digest(token.as_bytes()).into(),
         }
     }
 
-    /// Whether `presented` (a bearer token already extracted from the
-    /// Authorization header) is the configured admin token.
     pub(crate) fn accepts(&self, presented: Option<&str>) -> bool {
         let Some(token) = presented else {
             return false;
@@ -50,11 +36,6 @@ impl AdminAuth {
     }
 }
 
-/// Constant-time equality of two equal-length byte strings.
-///
-/// Compares all bytes unconditionally so the runtime does not depend on
-/// where the first difference appears. Both inputs here are fixed 32-byte
-/// digests, so the length branch is not secret-dependent.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -66,10 +47,6 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Extract the bearer token from `Authorization: Bearer <token>`.
-///
-/// The scheme is matched case-insensitively (RFC 7235). Returns `None` when
-/// the header is absent, uses another scheme, or carries an empty token.
 fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?;
     let header_value = value.to_str().ok()?;
@@ -83,8 +60,6 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     }
 }
 
-/// Body of every admin-auth rejection: static text that never echoes any
-/// part of the presented credentials.
 #[derive(Serialize)]
 struct UnauthorizedBody {
     error: UnauthorizedError,
@@ -96,11 +71,6 @@ struct UnauthorizedError {
     message: &'static str,
 }
 
-/// Middleware requiring the admin token on every `/usage` route.
-///
-/// Every rejection produces the same uniform 401 body, so the response does
-/// not reveal whether a token was missing, malformed, or merely wrong. The
-/// token is never logged and never appears in any response.
 pub(crate) async fn require_admin(
     State(state): State<UsageState>,
     req: axum::extract::Request,

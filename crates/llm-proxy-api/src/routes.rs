@@ -1,5 +1,3 @@
-//! Axum handlers and router for the `/usage` query surface.
-
 use std::path::PathBuf;
 
 use axum::Json;
@@ -17,23 +15,17 @@ use tower_http::trace::TraceLayer;
 use crate::auth::{AdminAuth, require_admin};
 use crate::reader::{GroupBy, MAX_PAGE_LIMIT, RequestFilter, UsageReader, now_unix_millis};
 
-/// Default summary window when `?window=` is absent: 24 hours.
 const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
-/// Shared state for the `/usage` routes: the ledger reader and the admin
-/// token guard.
 #[derive(Clone, Debug)]
 pub(crate) struct UsageState {
     pub(crate) reader: UsageReader,
     pub(crate) admin: AdminAuth,
 }
 
-/// The `/usage` query surface: a read-only, admin-authenticated router.
-///
-/// Build one with [`UsageApi::new`] and either serve it on its own listener
-/// (the dedicated admin listener) or merge it into another router (the
-/// opt-in main-listener mount). There is no write path: every route is a
-/// `GET` backed by read-only SQLite connections.
+/// Read-only, admin-authenticated `/usage` query surface over the usage
+/// ledger: every route is a `GET` behind the admin bearer token, and no
+/// response carries request bodies.
 #[derive(Debug)]
 pub struct UsageApi {
     state: UsageState,
@@ -52,12 +44,8 @@ impl UsageApi {
         }
     }
 
-    /// The `/usage` router with state applied, ready to serve or merge.
-    ///
-    /// Every route sits behind the admin-token middleware. The outer layers
-    /// (`nosniff`, panic catching, tracing) are installed here so the same
-    /// protections apply on both the dedicated listener and any merged
-    /// mount, independent of the surrounding router's own layers.
+    /// The `/usage` router with state applied, ready to serve or merge; admin
+    /// middleware and `nosniff`/panic-catch/trace layers are already applied.
     #[must_use = "the Router must be used with a server or merged into one"]
     pub fn router(self) -> axum::Router {
         let state = self.state;
@@ -76,13 +64,9 @@ impl UsageApi {
     }
 }
 
-/// Handler error: invalid query parameters (400) or a ledger failure (500,
-/// with the detail logged server-side only).
 #[derive(Debug)]
 pub(crate) enum UsageApiError {
-    /// A query parameter failed validation; the message is safe to return.
     InvalidParam(String),
-    /// The ledger query failed; the response carries a generic message.
     Query(crate::reader::UsageQueryError),
 }
 
@@ -141,7 +125,6 @@ struct SummaryBody {
     groups: Vec<crate::reader::SummaryGroup>,
 }
 
-/// `GET /usage/summary?window=1h&group_by=provider|model|caller`.
 async fn summary(
     State(state): State<UsageState>,
     Query(params): Query<SummaryParams>,
@@ -200,7 +183,6 @@ struct RequestsBody {
     next_cursor: Option<String>,
 }
 
-/// Parse an RFC 3339 timestamp parameter into Unix epoch milliseconds.
 fn parse_rfc3339_ms(name: &str, raw: &str) -> Result<i64, UsageApiError> {
     use time::format_description::well_known::Rfc3339;
     time::OffsetDateTime::parse(raw, &Rfc3339)
@@ -216,7 +198,6 @@ fn parse_rfc3339_ms(name: &str, raw: &str) -> Result<i64, UsageApiError> {
         })
 }
 
-/// Parse an opaque `cursor` (`<timestamp_ms>:<request_id>`).
 fn parse_cursor(raw: &str) -> Result<(i64, String), UsageApiError> {
     let Some((ts, id)) = raw.split_once(':') else {
         return Err(UsageApiError::InvalidParam(
@@ -236,12 +217,6 @@ fn parse_cursor(raw: &str) -> Result<(i64, String), UsageApiError> {
     Ok((ts, id.to_owned()))
 }
 
-/// `GET /usage/requests?since=…&until=…&provider=…&limit=…&cursor=…`.
-///
-/// Rows come back newest first, bounded by `limit` (default 100, maximum
-/// 1000), paged via the returned `next_cursor`. `since` is inclusive,
-/// `until` exclusive; both are RFC 3339. Responses never contain request
-/// bodies — the ledger stores only the body digest.
 async fn requests(
     State(state): State<UsageState>,
     Query(params): Query<RequestsParams>,
@@ -293,8 +268,6 @@ struct KeysBody {
     callers: Vec<crate::reader::CallerSummary>,
 }
 
-/// `GET /usage/keys` — caller list with request counts, error counts, and
-/// last-seen times.
 async fn keys(State(state): State<UsageState>) -> Result<Json<KeysBody>, UsageApiError> {
     let callers = state.reader.callers().await.map_err(UsageApiError::Query)?;
     Ok(Json(KeysBody { callers }))
