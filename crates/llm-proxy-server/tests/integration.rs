@@ -21,7 +21,6 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    /// Build AppState in TOML mode for integration testing.
     fn state() -> AppState {
         let app_config = AppConfig {
             server: ServerConfig {
@@ -57,10 +56,6 @@ mod tests {
         )
     }
 
-    /// Build AppState with a single "mock-provider" registered so that provider-based
-    /// routing can resolve. The provider has an `anthropic_messages` adapter with a
-    /// dummy endpoint. This is used by tests that send valid JSON past the parsing
-    /// layer and need the request to reach the core pipeline.
     fn state_with_provider() -> AppState {
         let provider = ProviderConfig {
             name: "mock-provider".to_owned(),
@@ -180,16 +175,9 @@ mod tests {
         assert_eq!(body["git_sha"], "test");
     }
 
-    /// Messages route accepts requests without x-api-key header.
-    ///
-    /// The proxy does not enforce authentication itself -- it forwards the
-    /// configured provider API key to the upstream. The upstream is unreachable
-    /// (dummy endpoint), so the response is a 502 Bad Gateway, not a 404 (route
-    /// is registered) or a 401 (the proxy does not check auth headers).
     #[tokio::test]
     async fn messages_without_auth_header_reaches_upstream() {
         let app = build_router(state_with_provider());
-        // Minimal Anthropic-shaped request without x-api-key.
         let body = json!({
             "model": "claude-sonnet-4-6",
             "messages": [{ "role": "user", "content": "hi" }],
@@ -202,15 +190,9 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // The route is registered (not 404) and the proxy forwards the request
-        // using its configured API key. The upstream is unreachable, so we get
-        // 502 Bad Gateway (or 500 for a routing error).
         let status = resp.status();
         assert_ne!(status, StatusCode::NOT_FOUND, "route must be registered");
-        let valid_statuses = [
-            StatusCode::BAD_GATEWAY,           // 502 - upstream unreachable
-            StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
-        ];
+        let valid_statuses = [StatusCode::BAD_GATEWAY, StatusCode::INTERNAL_SERVER_ERROR];
         assert!(
             valid_statuses.contains(&status),
             "expected downstream error for unreachable upstream without auth header, got {status}"
@@ -228,18 +210,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // -- Route guardrails (Phase 0 characterization) ---------------------------
-
-    /// Phase 0 guardrail: POST /v1/messages with valid Anthropic JSON must parse
-    /// and validate the request shape. This test verifies that the route is
-    /// registered and the request body parses successfully. Any failure must be
-    /// an upstream or auth error -- never a bad-JSON or request-shape error.
-    ///
-    /// Note: The assertion on `error_type != "invalid_request_error"` when status
-    /// is 400 is a best-effort guard, not a guarantee. The Anthropic API itself
-    /// returns `invalid_request_error` for valid JSON with semantic issues. The
-    /// test specifically checks that the request parses and routes without a
-    /// JSON/shape error, not that no 400 can ever occur.
     #[tokio::test]
     async fn messages_valid_json_parses_and_validates() {
         let app = build_router(state_with_provider());
@@ -256,7 +226,6 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
-        // Parse response body to verify it is valid JSON.
         let _resp_body: Value = serde_json::from_slice(
             &axum::body::to_bytes(resp.into_body(), 64 * 1024)
                 .await
@@ -264,21 +233,16 @@ mod tests {
         )
         .unwrap();
 
-        // Route must be registered (not 404).
         assert_ne!(status, StatusCode::NOT_FOUND, "route must be registered");
 
-        // The request body is valid Anthropic JSON, so it must parse and route
-        // successfully. With an empty routing table, the model is unknown so
-        // 400 is returned. With a real routing table, downstream errors are:
-        // 502 (upstream), 500 (routing), 401 (auth), 429 (rate limit), 409 (duplicate).
         let valid_statuses = [
-            StatusCode::BAD_REQUEST, // 400 - unknown model (empty routing table)
-            StatusCode::BAD_GATEWAY, // 502 - upstream failure
-            StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
-            StatusCode::UNAUTHORIZED, // 401 - auth failure
-            StatusCode::TOO_MANY_REQUESTS, // 429 - rate limit
-            StatusCode::CONFLICT,    // 409 - duplicate
-            StatusCode::OK,          // 200 - success (unlikely without real upstream)
+            StatusCode::BAD_REQUEST,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::CONFLICT,
+            StatusCode::OK,
         ];
         assert!(
             valid_statuses.contains(&status),
@@ -286,8 +250,6 @@ mod tests {
         );
     }
 
-    /// Phase 0 guardrail: POST /v1/messages with invalid (non-JSON) body returns
-    /// 400 with invalid_request_error (bad JSON parse).
     #[tokio::test]
     async fn messages_invalid_json_returns_bad_request() {
         let app = build_router(state_with_provider());
@@ -315,8 +277,6 @@ mod tests {
         );
     }
 
-    /// Phase 0 guardrail: POST /v1/messages with valid JSON but missing required
-    /// fields (no messages) returns 400 with invalid_request_error.
     #[tokio::test]
     async fn messages_valid_json_missing_fields_returns_validation_error() {
         let app = build_router(state_with_provider());
@@ -339,8 +299,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp_body["error"]["type"], "invalid_request_error");
-        // The missing field triggers a serde deserialization error, which is
-        // reported as "invalid JSON: missing field `messages`".
         assert!(
             resp_body["error"]["message"]
                 .as_str()
@@ -349,11 +307,6 @@ mod tests {
             "should report missing messages field"
         );
     }
-
-    /// Phase 9 guardrail: POST /v1/chat/completions route is mounted and tested
-    /// comprehensively in tests/chat_completions.rs. The removed chat_echo test that
-    /// was here has been removed since its single assertion (not-404) is a subset
-    /// of the `route_is_mounted_no_longer_404` test in that file.
 
     #[tokio::test]
     async fn count_tokens_returns_estimate() {
@@ -377,14 +330,9 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        // Heuristic counter should return a positive token count.
         assert!(body["input_tokens"].as_u64().unwrap() > 0);
     }
 
-    // -- Phase 0: Additional characterization tests -----------------------------
-
-    /// Phase 0: not_found returns a JSON error envelope matching the Anthropic
-    /// error format, not plain text.
     #[tokio::test]
     async fn not_found_returns_json_error_envelope() {
         let app = build_router(state());
@@ -404,8 +352,6 @@ mod tests {
         assert_eq!(body["error"]["type"], "not_found_error");
     }
 
-    /// Phase 0: POST /v1/messages with wrong types in JSON fields (e.g. max_tokens
-    /// as a string) returns 400 with invalid_request_error.
     #[tokio::test]
     async fn messages_wrong_field_type_returns_bad_request() {
         let app = build_router(state_with_provider());
@@ -431,8 +377,6 @@ mod tests {
         assert_eq!(resp_body["error"]["type"], "invalid_request_error");
     }
 
-    /// Phase 0: POST /v1/messages with unknown fields returns 400 since
-    /// MessageRequest now uses deny_unknown_fields.
     #[tokio::test]
     async fn messages_unknown_fields_returns_bad_request() {
         let app = build_router(state_with_provider());
@@ -459,12 +403,9 @@ mod tests {
         assert_eq!(resp_body["error"]["type"], "invalid_request_error");
     }
 
-    /// Phase 0: POST /v1/messages with invalid UTF-8 bytes returns 400.
-    /// The server must not panic when receiving binary/non-UTF-8 body data.
     #[tokio::test]
     async fn messages_invalid_utf8_returns_bad_request() {
         let app = build_router(state());
-        // Raw non-UTF-8 bytes.
         let req = Request::builder()
             .method("POST")
             .uri("/providers/mock-provider/v1/messages")
@@ -472,7 +413,6 @@ mod tests {
             .body(Body::from(vec![0x80, 0x81, 0x82]))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // The server should return a 400-level error, not panic (5xx).
         assert!(
             resp.status().is_client_error(),
             "expected 4xx for invalid UTF-8, got {}",
@@ -480,7 +420,6 @@ mod tests {
         );
     }
 
-    /// Phase 0: POST /v1/messages with empty body (0 bytes) returns 400.
     #[tokio::test]
     async fn messages_empty_body_returns_bad_request() {
         let app = build_router(state_with_provider());
@@ -501,11 +440,9 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 
-    /// Phase 0: POST /v1/messages with oversized body (> 32 MiB) returns 413.
     #[tokio::test]
     async fn messages_oversized_body_returns_payload_too_large() {
         let app = build_router(state());
-        // 33 MiB body (exceeds the 32 MiB limit).
         let oversized_body = "X".repeat(33 * 1024 * 1024);
         let req = Request::builder()
             .method("POST")
@@ -516,9 +453,6 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        // MEDIUM-7: the body-limit 413 is normalised into a protocol-shaped JSON
-        // envelope (not axum's default plain-text rejection) and carries an
-        // `x-request-id` header, matching every handler-produced error.
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
             "application/json"
@@ -539,9 +473,6 @@ mod tests {
         );
     }
 
-    // -- TOML mode integration tests -------------------------------------------
-
-    /// TOML mode: /health returns ok with server name from AppConfig.
     #[tokio::test]
     async fn toml_health_returns_ok() {
         let app = build_router(state());
@@ -558,11 +489,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["status"], "ok");
-        // server_name comes from AppConfig.
         assert_eq!(body["service"], "test-proxy");
     }
 
-    /// TOML mode: /version returns build info with AppConfig server name.
     #[tokio::test]
     async fn toml_version_returns_app_config_server_name() {
         let app = build_router(state());
@@ -584,7 +513,6 @@ mod tests {
         assert_eq!(body["git_sha"], "test");
     }
 
-    /// TOML mode: /ready returns ready.
     #[tokio::test]
     async fn toml_ready_returns_ready() {
         let app = build_router(state());
@@ -603,10 +531,6 @@ mod tests {
         assert_eq!(body["status"], "ready");
     }
 
-    /// TOML mode: POST /providers/{provider}/v1/messages with a registered provider passes the
-    /// request through to the upstream adapter. The model name is forwarded as-is, so
-    /// an unknown model results in a downstream error (502) rather than a 400, because
-    /// the proxy no longer validates model names locally.
     #[tokio::test]
     async fn toml_messages_passes_through_to_upstream() {
         let app = build_router(state_with_provider());
@@ -622,27 +546,19 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // With provider-based routing, the model is passed through to the upstream
-        // adapter. The dummy endpoint refuses connections, so we get a 502 Bad Gateway
-        // (or 500 internal error), not a 400 for unknown model.
         let status = resp.status();
         assert_ne!(
             status,
             StatusCode::NOT_FOUND,
             "provider is registered, route must resolve"
         );
-        // The upstream is unreachable so downstream error is expected.
-        let valid_statuses = [
-            StatusCode::BAD_GATEWAY,           // 502 - upstream failure
-            StatusCode::INTERNAL_SERVER_ERROR, // 500 - routing error
-        ];
+        let valid_statuses = [StatusCode::BAD_GATEWAY, StatusCode::INTERNAL_SERVER_ERROR];
         assert!(
             valid_statuses.contains(&status),
             "expected downstream error for unreachable upstream, got {status}"
         );
     }
 
-    /// POST /providers/{provider}/v1/messages/count_tokens works with provider state.
     #[tokio::test]
     async fn toml_count_tokens_returns_estimate() {
         let app = build_router(state_with_provider());
@@ -668,12 +584,6 @@ mod tests {
         assert!(resp_body["input_tokens"].as_u64().unwrap() > 0);
     }
 
-    // ---------------------------------------------------------------------------
-    // Additional integration tests for edge cases (findings 113, 114, 115, 117, 119)
-    // ---------------------------------------------------------------------------
-
-    /// GET on POST-only messages route returns a protocol-shaped 405 (finding 115,
-    /// audit LOW-27): Anthropic envelope body, not axum's empty 405.
     #[tokio::test]
     async fn get_on_messages_route_returns_405() {
         let app = build_router(state_with_provider());
@@ -695,8 +605,6 @@ mod tests {
         assert_eq!(body["error"]["message"], "method not allowed");
     }
 
-    /// GET on POST-only chat completions route returns a protocol-shaped 405
-    /// (finding 115, audit LOW-27): OpenAI envelope body.
     #[tokio::test]
     async fn get_on_chat_completions_route_returns_405() {
         let app = build_router(state_with_provider());
@@ -715,7 +623,6 @@ mod tests {
         assert!(body["error"]["code"].is_null());
     }
 
-    /// POST on GET-only health route returns 405 (finding 115).
     #[tokio::test]
     async fn post_on_health_route_returns_405() {
         let app = build_router(state());
@@ -728,7 +635,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    /// Invalid provider name on messages route returns 400 (finding 113).
     #[tokio::test]
     async fn invalid_provider_name_on_messages_returns_400() {
         let app = build_router(state());
@@ -744,8 +650,6 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // axum URL-decodes the path, so "../.." becomes the actual path segment.
-        // Either way it should be rejected.
         assert!(
             resp.status() == StatusCode::BAD_REQUEST || resp.status() == StatusCode::NOT_FOUND,
             "expected 400 or 404 for path traversal provider name, got {}",
@@ -753,7 +657,6 @@ mod tests {
         );
     }
 
-    /// count_tokens with invalid JSON returns 400 (finding 114).
     #[tokio::test]
     async fn count_tokens_invalid_json_returns_400() {
         let app = build_router(state_with_provider());
@@ -767,7 +670,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// count_tokens with empty body returns 400 (finding 114).
     #[tokio::test]
     async fn count_tokens_empty_body_returns_400() {
         let app = build_router(state_with_provider());
@@ -781,7 +683,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// count_tokens with unknown provider returns 404 (finding 114).
     #[tokio::test]
     async fn count_tokens_unknown_provider_returns_404() {
         let app = build_router(state());
@@ -800,10 +701,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Health endpoint never exposes operational metrics, even when the caller opts
-    /// in via the legacy `?metrics=true` query (LOW-13): the route is
-    /// unauthenticated, so the query parameter is now ignored and the body is
-    /// always the trivial `{status, service}` liveness probe.
     #[tokio::test]
     async fn health_never_exposes_metrics_even_with_opt_in_query() {
         let app = build_router(state());
@@ -824,13 +721,10 @@ mod tests {
             "/health must not include 'metrics' even with ?metrics=true \
          (unauthenticated endpoint, LOW-13); got: {body}"
         );
-        // The trivial body still carries status + service.
         assert_eq!(body["status"], "ok");
         assert!(body["service"].is_string());
     }
 
-    /// Health endpoint omits operational metrics by default (LOW-13): the route is
-    /// unauthenticated, so a bare probe must not leak operational counters.
     #[tokio::test]
     async fn health_omits_metrics_by_default() {
         let app = build_router(state());
@@ -850,12 +744,10 @@ mod tests {
             body.get("metrics").is_none(),
             "bare /health must not include 'metrics' (unauthenticated endpoint); got: {body}"
         );
-        // The minimal body still carries status + service.
         assert_eq!(body["status"], "ok");
         assert!(body["service"].is_string());
     }
 
-    /// count_tokens response has correct JSON shape (finding 119).
     #[tokio::test]
     async fn count_tokens_response_has_correct_shape() {
         let app = build_router(state_with_provider());
@@ -872,7 +764,6 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        // Verify Content-Type is application/json.
         let ct = resp
             .headers()
             .get("content-type")
@@ -886,19 +777,12 @@ mod tests {
         .unwrap();
         assert!(resp_body["input_tokens"].is_number());
         assert!(resp_body["input_tokens"].as_u64().unwrap() > 0);
-        // Verify only the expected field is present.
         assert!(
             resp_body.as_object().unwrap().len() == 1,
             "count_tokens response should only have input_tokens field"
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // CORS (audit LOW-12)
-    // ---------------------------------------------------------------------------
-
-    /// Build AppState whose `server.allowed_origins` is set to `origins` (audit
-    /// LOW-12). Mirrors [`state`] but installs an explicit cross-origin allow list.
     fn state_with_origins(origins: Vec<String>) -> AppState {
         let app_config = AppConfig {
             server: ServerConfig {
@@ -934,8 +818,6 @@ mod tests {
         )
     }
 
-    /// A configured origin is echoed on a CORS preflight, and the permitted
-    /// method/headers are advertised (audit LOW-12).
     #[tokio::test]
     async fn cors_preflight_echoes_configured_origin() {
         let app = build_router(state_with_origins(vec![
@@ -957,7 +839,6 @@ mod tests {
                 .expect("allow-origin echoed on preflight"),
             "https://app.example.com"
         );
-        // The advertised methods must be the curated set, not "*" (LOW-12).
         let allow_methods = resp
             .headers()
             .get("access-control-allow-methods")
@@ -969,13 +850,8 @@ mod tests {
         assert!(!allow_methods.contains('*'));
     }
 
-    /// With no `allowed_origins` configured, no CORS layer is installed and a
-    /// browser preflight is not answered with an allow-origin echo (audit LOW-12).
-    /// This is the regression guard: the old `CorsLayer::very_permissive()` admitted
-    /// every origin by default; the new default must not.
     #[tokio::test]
     async fn cors_absent_when_origins_unset() {
-        // `state()` builds with `allowed_origins: None`.
         let app = build_router(state());
         let req = Request::builder()
             .method("OPTIONS")
@@ -992,32 +868,14 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // Event-log coverage for early-gate failures (audit eventlog-early-gates)
-    // ---------------------------------------------------------------------------
-    //
-    // Each inference handler emits ResponseFailed exactly once per failed request:
-    // early-gate failures (unknown provider, bad content-type, rate-limit, conflict,
-    // malformed JSON, decode failure) emit inside the inner function, and failures
-    // INSIDE the core pipeline emit inside the pipeline (which also returns Err).
-    // The outer wrapper renders only -- it must NOT re-emit, or a pipeline failure
-    // would be double-counted. These tests wire a RecordingBus into AppState and
-    // assert the event counts so a regression (double-emit, or a dropped early-gate)
-    // is caught (audit route-responsefailed-gaps).
-
     use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus};
 
-    /// Build a provider-backed AppState whose event bus is a [`RecordingBus`],
-    /// returning both the state and the bus so the test can snapshot emitted
-    /// events. Mirrors [`state_with_provider`] but injects the recording sink.
     fn state_with_provider_and_bus() -> (AppState, Arc<RecordingBus>) {
         let bus = Arc::new(RecordingBus::new());
         let state = state_with_provider().with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
         (state, bus)
     }
 
-    /// Count recorded events of a given variant by name ("request_received",
-    /// "response_completed", "response_failed").
     fn count_events(bus: &RecordingBus, kind: &str) -> usize {
         bus.snapshot()
             .iter()
@@ -1032,8 +890,6 @@ mod tests {
             .count()
     }
 
-    /// The single ResponseFailed emitted for a malformed-JSON early gate carries
-    /// http_status 400 and is emitted exactly once (audit eventlog-early-gates).
     #[tokio::test]
     async fn malformed_json_emits_one_response_failed_with_400() {
         let (state, bus) = state_with_provider_and_bus();
@@ -1052,7 +908,6 @@ mod tests {
             1,
             "malformed JSON must emit exactly one ResponseFailed"
         );
-        // The emitted event must carry the rendered HTTP status (400).
         let failed = bus
             .snapshot()
             .into_iter()
@@ -1065,9 +920,6 @@ mod tests {
         assert_eq!(failed.http_status, 400);
     }
 
-    /// An unknown-provider request emits exactly ONE ResponseFailed (not two) after
-    /// the centralized wrapper replaced the per-site UnknownProvider emit
-    /// (audit eventlog-early-gates regression guard).
     #[tokio::test]
     async fn unknown_provider_emits_exactly_one_response_failed() {
         let (state, bus) = state_with_provider_and_bus();
@@ -1093,9 +945,6 @@ mod tests {
         );
     }
 
-    /// A duplicate request within the dedup window hits the Conflict early gate and
-    /// emits exactly one ResponseFailed carrying http_status 409. This covers the
-    /// RateLimited/Conflict branch of the centralized emit (audit eventlog-early-gates).
     #[tokio::test]
     async fn duplicate_request_emits_one_response_failed_with_409() {
         let (state, bus) = state_with_provider_and_bus();
@@ -1113,20 +962,10 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        // First request consumes the dedup slot (it will fail downstream at 502 and
-        // emit its own pipeline-level ResponseFailed; that is expected and distinct
-        // from the Conflict gate emission under test).
         let _ = app.clone().oneshot(make_req()).await.unwrap();
-        // Second identical request within the dedup window is rejected as a Conflict
-        // at the prepare_request early gate, before any upstream call. That early
-        // gate emits exactly one ResponseFailed for THIS request.
         let resp = app.oneshot(make_req()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 
-        // Exactly one ResponseFailed carries the Conflict's 409 status: the
-        // early-gate emit fired once for the dedup rejection. (The first request's
-        // downstream failure emits a 502 ResponseFailed, which is a separate,
-        // expected event and is excluded by the status filter.)
         let conflicts: Vec<_> = bus
             .snapshot()
             .into_iter()
@@ -1141,11 +980,6 @@ mod tests {
             "dedup Conflict must emit exactly one 409 ResponseFailed"
         );
 
-        // Direct per-request count: the first request's downstream failure must also
-        // have emitted exactly ONE ResponseFailed (no double-emit from a pipeline
-        // failure re-emitting at the wrapper). Both requests share the bus, so
-        // confirm the total ResponseFailed count is exactly 2 (one per request),
-        // not more (audit route-responsefailed-gaps regression).
         assert_eq!(
             count_events(&bus, "response_failed"),
             2,
@@ -1153,9 +987,6 @@ mod tests {
         );
     }
 
-    /// token_count success emits RequestReceived + ResponseCompleted (token_count
-    /// previously emitted NO events; it now logs like any other route)
-    /// (audit eventlog-early-gates).
     #[tokio::test]
     async fn token_count_success_emits_request_received_and_completed() {
         let (state, bus) = state_with_provider_and_bus();
@@ -1191,8 +1022,6 @@ mod tests {
         );
     }
 
-    /// token_count failure emits exactly one ResponseFailed (token_count previously
-    /// emitted NO events on failure) (audit eventlog-early-gates).
     #[tokio::test]
     async fn token_count_failure_emits_one_response_failed() {
         let (state, bus) = state_with_provider_and_bus();
@@ -1213,9 +1042,6 @@ mod tests {
         );
     }
 
-    /// /models emits exactly one ResponseFailed on an unknown-provider error, for
-    /// consistency with the rest of the API (audit eventlog-early-gates). /models is
-    /// a listing endpoint so it carries no RequestReceived/ResponseCompleted pair.
     #[tokio::test]
     async fn models_unknown_provider_emits_one_response_failed() {
         let (state, bus) = state_with_provider_and_bus();
@@ -1235,12 +1061,6 @@ mod tests {
         );
     }
 
-    /// A failure INSIDE the core pipeline (unreachable upstream -> 502) emits
-    /// exactly ONE ResponseFailed for the request, not two. The core pipeline emits
-    /// its own ResponseFailed on the upstream failure AND returns Err; the route
-    /// handler must NOT re-emit at the wrapper (regression guard for
-    /// route-responsefailed-gaps). Only one request hits this bus, so the count is a
-    /// direct per-request assertion.
     #[tokio::test]
     async fn upstream_failure_inside_pipeline_emits_one_response_failed() {
         let (state, bus) = state_with_provider_and_bus();
@@ -1257,9 +1077,6 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        // The mock provider points at an unreachable endpoint, so the request
-        // fails INSIDE the core pipeline (upstream send) and the client gets a 502
-        // (or 500 routing error), proving the failure occurred past the early gates.
         let status = resp.status();
         let valid_statuses = [StatusCode::BAD_GATEWAY, StatusCode::INTERNAL_SERVER_ERROR];
         assert!(
@@ -1274,9 +1091,6 @@ mod tests {
         );
     }
 
-    /// Same regression guard for the OpenAI chat-completions route: an
-    /// inside-pipeline failure emits exactly one ResponseFailed
-    /// (audit route-responsefailed-gaps).
     #[tokio::test]
     async fn upstream_failure_inside_pipeline_chat_emits_one_response_failed() {
         let (state, bus) = state_with_provider_and_bus();

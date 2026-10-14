@@ -15,8 +15,6 @@ mod tests {
 
     const ADMIN_TOKEN: &str = "integration-admin-token";
 
-    /// Seed a ledger with one completed laptop/prov-a request and return its
-    /// path.
     async fn seeded_ledger_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
         let path = dir.path().join("usage.db");
         let bus = SqliteEventBus::open(

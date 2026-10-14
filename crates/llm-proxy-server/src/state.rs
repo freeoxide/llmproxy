@@ -22,110 +22,30 @@ pub struct BuildInfo {
     pub git_sha: &'static str,
 }
 
-// ---------------------------------------------------------------------------
-// AppState
-// ---------------------------------------------------------------------------
-
 /// Application state shared with every handler.
 ///
-/// Cheap to clone: nearly all fields are `Arc`-wrapped so cloning only bumps
-/// reference counts. `token_counter` is a non-ZST `Counter` stored inline, but
-/// its lazily-loaded BPE cache is held in an inner `Arc`, so cloning `Counter`
-/// is a refcount bump and every `AppState` clone shares the same loaded BPE
-/// encodings. Required by axum's `State` extractor.
-///
-/// # Security note
-///
-/// Manual `Debug` impl is provided to ensure `api_key` in nested config types
-/// is never leaked through debug formatting (e.g. in error logs).
-///
-/// The transitive redaction chain for Debug is:
-/// - `AppState` -> `app_config` field: `AppConfig` has no secrets (safe).
-/// - `AppState` -> `providers` field: `ProviderRegistry` -> `ProviderConfig`,
-///   whose `api_key` is a `secrecy::SecretString`; `ProviderConfig` derives
-///   `Debug` and the key is redacted by `SecretString`'s own impl. Safe.
-/// - `AppState` -> `provider_adapters` field: `ProviderAdapterRegistry` ->
-///   `ProviderAdapter` types whose `api_key` is `SecretString`; the adapter
-///   config/target types keep a *manual* `Debug` that additionally redacts the
-///   endpoint query string and auth-header *values* (not just the key). Safe.
-/// - `AppState` -> `client_auth` field: `ClientAuth` holds **hashed argon2id
-///   verifiers only, never plaintext client secrets**; its manual `Debug`
-///   prints the mode and key ids and never the verifier strings (a PHC hash
-///   is offline-crackable, so it is treated as sensitive). Safe.
-/// - `AppState` -> remaining fields: `BuildInfo`, `proxy_client`,
-///   `egress_clients`, `Counter`, `Metrics`, `RateLimiter`,
-///   `RequestDeduplicator`, `RequestIdGenerator`, `model_catalogs`,
-///   `event_bus` -- none hold secrets (the egress map keys are provider
-///   names and `ProxyClient`'s Debug prints no URLs). Safe.
-///
-/// **Maintenance note:** Secret-backed fields use `secrecy::SecretString`, which
-/// redacts in `Debug`/`Display` regardless of whether the containing type
-/// derives or hand-writes `Debug`. The remaining risk is non-`SecretString`
-/// sensitive data (e.g. endpoint query strings, raw header values): those still
-/// rely on the manual `Debug` impls on the adapter config/target types. If such
-/// a field is added to a type that derives `Debug`, audit it. The test
-/// `app_state_debug_does_not_leak_api_key` provides regression coverage.
+/// Cheap to clone (`Arc`-shared fields); the manual `Debug` impl never emits
+/// secrets (regression-tested by `app_state_debug_does_not_leak_api_key`).
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AppState {
-    /// TOML application config.
     pub(crate) app_config: Arc<AppConfig>,
-    /// Provider registry loaded from TOML provider files.
     pub(crate) providers: Arc<ProviderRegistry>,
-    /// Provider adapter registry (always present).
     pub(crate) provider_adapters: Arc<ProviderAdapterRegistry>,
-    /// Protocol-neutral HTTP transport client.
     pub(crate) proxy_client: Arc<ProxyClient>,
-    /// Per-provider egress clients for providers with `[provider.egress]`
-    /// configured, keyed by provider name. Empty by default, in which case
-    /// every provider uses `proxy_client` -- exactly the behavior from before
-    /// egress support existed. The serve path builds this map from the
-    /// provider registry before the listener binds, so an unusable proxy URL
-    /// is a startup error, not a runtime fallback.
     pub(crate) egress_clients: Arc<HashMap<String, Arc<ProxyClient>>>,
-    /// Build identifier reported by `/version`.
     pub(crate) build: Arc<BuildInfo>,
-    /// Token counter for estimating token usage.
-    ///
-    /// `Counter` dispatches to a real BPE tokenizer (tiktoken) for known OpenAI
-    /// models and a character heuristic otherwise. It holds a lazily-populated,
-    /// `Arc`-shared cache of loaded BPE encodings behind a `Mutex`, so cloning
-    /// the counter via `AppState: Clone` is a cheap refcount bump that shares
-    /// the cache across handlers.
     pub(crate) token_counter: Counter,
-    /// Runtime metrics collector.
     pub(crate) metrics: Arc<Metrics>,
-    /// Per-IP rate limiter.
     pub(crate) rate_limiter: Arc<RateLimiter>,
-    /// Request deduplicator for idempotent request handling.
     pub(crate) request_dedup: Arc<RequestDeduplicator>,
-    /// Request ID generator.
     pub(crate) request_id_gen: Arc<RequestIdGenerator>,
-    /// Mutable provider model catalog cache and discovery coordinator.
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
-    /// Structured request/response event sink. Defaults to [`NoopBus`]; a real
-    /// persisted backend lands in a later phase.
     pub(crate) event_bus: Arc<dyn EventBus>,
-    /// Client-key authentication state: hashed argon2id verifiers plus a
-    /// digest cache. Built from `[auth]` config; construction from an invalid
-    /// auth config fails closed (enforced, nothing can authenticate) rather
-    /// than silently downgrading to no-auth, because the constructors are
-    /// infallible. `cmd_serve` surfaces invalid verifiers as a startup error
-    /// via `ClientAuth::from_config` before the state is built.
     pub(crate) client_auth: Arc<ClientAuth>,
 }
 
 impl std::fmt::Debug for AppState {
-    // SECURITY: This manual Debug impl delegates through Arc to each field's
-    // Debug. The redaction chain documented on the struct must be maintained.
-    // The test `app_state_debug_does_not_leak_api_key` provides regression
-    // coverage. See struct-level doc comment for the full chain.
-    //
-    // NOTE: A `redacted_debug!()` macro could reduce boilerplate for types
-    // with sensitive fields, but would add a procedural-macro dependency.
-    // The manual impl is preferred for now because: (a) AppState has few
-    // fields, (b) the redaction chain is explicitly documented and tested,
-    // and (c) a macro would obscure the security-critical delegation paths.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field("app_config", &self.app_config)
@@ -177,17 +97,8 @@ impl AppState {
         catalog_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let rate_limit_rpm = app_config.server.rate_limit_rpm;
-        // A dedup window whose millis do not fit u64 (Duration::MAX) cannot
-        // meaningfully be represented; fall back to 0, which disables dedup,
-        // matching the documented "0s disables deduplication" contract.
         let dedup_window_ms =
             u64::try_from(app_config.server.dedup_window.as_millis()).unwrap_or(0);
-        // Auth state from `[auth]` config. Construction is infallible, so an
-        // invalid auth config (e.g. an unparseable verifier) fails CLOSED --
-        // enforced with zero verifiers, rejecting every proxied request -- and
-        // logs the error, rather than silently downgrading to no-auth. The
-        // serve path validates the auth config first (`ClientAuth::from_config`
-        // in `load_toml_state`) and turns this into a startup error.
         let client_auth = match ClientAuth::from_config(&app_config.auth) {
             Ok(auth) => Arc::new(auth),
             Err(error) => {
@@ -216,10 +127,7 @@ impl AppState {
         }
     }
 
-    /// Replace the client-auth state (builder-style). Used by `cmd_serve`
-    /// (after `ClientAuth::from_config` succeeds, so an invalid verifier is a
-    /// startup error rather than a runtime fail-closed) and by tests that
-    /// exercise authenticated routing.
+    /// Replace the client-auth state (builder-style).
     #[must_use]
     pub fn with_client_auth(mut self, client_auth: Arc<ClientAuth>) -> Self {
         self.client_auth = client_auth;
@@ -228,11 +136,8 @@ impl AppState {
 
     /// Replace the per-provider egress clients (builder-style).
     ///
-    /// `cmd_serve` builds this map from `[provider.egress]` entries in the
-    /// provider registry before the listener binds, so a proxy URL reqwest
-    /// cannot use is a startup error; tests inject proxied clients the same
-    /// way. An empty map (the default) keeps every provider on the shared
-    /// `proxy_client`, exactly as before egress support existed.
+    /// An empty map (the default) keeps every provider on the shared
+    /// `proxy_client`.
     #[must_use]
     pub fn with_egress_clients(
         mut self,
@@ -242,9 +147,7 @@ impl AppState {
         self
     }
 
-    /// Replace the event bus (builder-style). Used by tests to inject a
-    /// [`RecordingBus`](llm_proxy_storage::RecordingBus); production wires the
-    /// real bus in `cmd_serve` (still `NoopBus` for now).
+    /// Replace the event bus (builder-style).
     #[must_use]
     pub fn with_event_bus(mut self, event_bus: Arc<dyn EventBus>) -> Self {
         self.event_bus = event_bus;
@@ -274,11 +177,9 @@ impl AppState {
         self.app_config.server.trust_forwarded_headers
     }
 
-    /// Configured CORS allow-origin list, if any (audit LOW-12).
-    ///
-    /// `None` means cross-origin requests are not permitted: no `CorsLayer` is
-    /// installed and browsers enforce a same-origin default. `Some(origins)`
-    /// are the exact origins a restrictive `CorsLayer` will echo.
+    /// Configured CORS allow-origin list, if any. `None` permits no
+    /// cross-origin requests (no `CorsLayer` installed); `Some(origins)` are
+    /// the exact origins the `CorsLayer` echoes.
     pub fn allowed_origins(&self) -> Option<&[String]> {
         self.app_config.server.allowed_origins.as_deref()
     }
@@ -293,19 +194,9 @@ impl AppState {
         &self.providers
     }
 
-    /// The transport client to use for an upstream request to `provider`.
-    ///
-    /// Providers with a wired `[provider.egress]` client get that client;
-    /// every other provider gets the shared default client. When no provider
-    /// has egress configured (the common case) this returns the shared client
-    /// for every lookup, preserving the single-client behavior from before
-    /// egress support existed.
-    ///
-    /// If a provider's config carries an egress section but no client was
-    /// wired for it, that is a wiring bug: the request still goes out, but a
-    /// loud warning names the provider on every affected request so the
-    /// mis-wiring cannot silently turn into direct egress. The serve path
-    /// builds the map from the same registry, so production cannot hit this.
+    /// The transport client for an upstream request to `provider`: its wired
+    /// `[provider.egress]` client, or the shared default client otherwise.
+    /// An egress-configured-but-unwired provider logs a loud warning per request.
     pub fn upstream_client_for(&self, provider: &str) -> &ProxyClient {
         if let Some(client) = self.egress_clients.get(provider) {
             return client;
@@ -353,7 +244,6 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
 
-    /// Helper: build a minimal TOML AppConfig for tests.
     fn make_app_config() -> AppConfig {
         use llm_proxy_core::ServerConfig;
         AppConfig {
@@ -377,7 +267,6 @@ mod tests {
         }
     }
 
-    /// Helper: build a minimal ProviderRegistry for tests.
     fn make_provider_registry() -> ProviderRegistry {
         ProviderRegistry::from_providers(vec![]).expect("empty registry")
     }
@@ -390,8 +279,6 @@ mod tests {
             git_sha: "test",
         }
     }
-
-    // -- AppState construction ------------------------------------------------
 
     #[test]
     fn app_state_construction() {
@@ -407,8 +294,6 @@ mod tests {
         assert_eq!(state.shutdown_timeout(), Duration::from_secs(30));
     }
 
-    // -- Per-provider egress client selection ---------------------------------
-
     #[test]
     fn upstream_client_for_returns_the_shared_client_without_egress() {
         let state = AppState::new(
@@ -418,8 +303,6 @@ mod tests {
             ProxyClient::new(),
             make_build_info(),
         );
-        // Same object for every provider: the single-client behavior from
-        // before egress support existed.
         for provider in ["opencode-go", "opencode-zen", "anything-else"] {
             assert!(
                 std::ptr::eq(
@@ -465,8 +348,6 @@ mod tests {
         );
     }
 
-    // -- Helper methods -------------------------------------------------------
-
     #[test]
     fn helpers_return_app_config_values() {
         let state = AppState::new(
@@ -479,8 +360,6 @@ mod tests {
         assert_eq!(state.server_name(), "test-proxy");
         assert_eq!(state.request_timeout(), Duration::from_secs(300));
     }
-
-    // -- Debug does not leak API keys -----------------------------------------
 
     #[test]
     fn app_state_debug_does_not_leak_api_key() {
@@ -519,9 +398,6 @@ mod tests {
 
     #[test]
     fn app_state_debug_covers_all_fields() {
-        // Regression test: verify that the Debug impl actually outputs all
-        // field names. If a field is added to AppState but missing from the
-        // manual Debug impl, this test catches it.
         let state = AppState::new(
             make_app_config(),
             make_provider_registry(),
@@ -530,7 +406,6 @@ mod tests {
             make_build_info(),
         );
         let debug_output = format!("{:?}", state);
-        // All fields that should appear in the Debug output.
         for field in [
             "app_config",
             "providers",
@@ -553,8 +428,6 @@ mod tests {
         }
     }
 
-    // -- Provider adapters are populated --------------------------------------
-
     #[test]
     fn provider_adapters_are_populated() {
         let state = AppState::new(
@@ -564,15 +437,12 @@ mod tests {
             ProxyClient::new(),
             make_build_info(),
         );
-        // Use >= 4 rather than == 4 so adding new builtin adapters does not
-        // break this test (the intent is to verify adapters are populated).
         let protocol_names = state.provider_adapters.protocol_names();
         assert!(
             protocol_names.len() >= 4,
             "expected at least 4 builtin adapters, got {len}",
             len = protocol_names.len()
         );
-        // Verify specific known protocol names are present for stronger coverage.
         assert!(
             protocol_names.contains(&"openai_chat_completions"),
             "missing openai_chat_completions adapter"
@@ -582,8 +452,6 @@ mod tests {
             "missing anthropic_messages adapter"
         );
     }
-
-    // -- TOML provider protocol validation against builtin -------------------
 
     #[test]
     fn toml_provider_protocol_validation_against_builtin() {
@@ -628,8 +496,6 @@ mod tests {
         assert!(result.is_ok(), "all protocols are builtin, got: {result:?}");
     }
 
-    // -- TOML unknown protocol fails validation against builtin ---------------
-
     #[test]
     fn toml_unknown_protocol_fails_validation_against_builtin() {
         use llm_proxy_core::{
@@ -670,12 +536,8 @@ mod tests {
         );
     }
 
-    // -- Config extension dispatch logic -------------------------------------
-
     #[test]
     fn config_extension_dispatch_classifies_correctly() {
-        /// Mimics the match arm logic from cmd_serve to verify extension
-        /// classification without requiring a full integration test.
         fn classify(path: &std::path::Path) -> &'static str {
             match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
                 "toml" => "toml",
@@ -692,15 +554,11 @@ mod tests {
         assert_eq!(classify(std::path::Path::new("config.YAML")), "unsupported");
     }
 
-    // -- Send + Sync static assertion for AppState ---------------------------
-
     #[test]
     fn app_state_is_send_sync() {
         fn check<T: Send + Sync>() {}
         check::<AppState>();
     }
-
-    // -- bind_address() tests ------------------------------------------------
 
     #[test]
     fn bind_address_returns_configured_bind() {
@@ -718,8 +576,6 @@ mod tests {
             "10.0.0.1:8080".parse::<SocketAddr>().unwrap()
         );
     }
-
-    // -- Clone shares Arc references -----------------------------------------
 
     #[test]
     fn clone_shares_arc_references() {
@@ -739,15 +595,7 @@ mod tests {
             Arc::ptr_eq(&state.build, &cloned.build),
             "cloned AppState should share the same Arc<BuildInfo>"
         );
-        // NOTE: `token_counter` is an inline `Counter` (not `Arc<Counter>`), so
-        // there is no outer `Arc<Counter>` to compare with `Arc::ptr_eq`. It is
-        // intentionally excluded from the Arc-sharing assertions above. The
-        // loaded BPE cache is still shared: `Counter` holds its cache in an
-        // inner `Arc<Mutex<HashMap<..>>>`, so this `cloned` state reuses the
-        // same loaded encodings as the original.
     }
-
-    // -- Multi-provider TOML validation --------------------------------------
 
     #[test]
     fn multi_provider_toml_mixed_protocols() {
@@ -755,7 +603,6 @@ mod tests {
             AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRoutesConfig,
         };
 
-        // Provider with valid protocols
         let good = ProviderConfig {
             name: "good".to_owned(),
             api_key: secrecy::SecretString::from("key"),
@@ -781,7 +628,6 @@ mod tests {
             pricing: Default::default(),
         };
 
-        // Provider with invalid protocol
         let bad = ProviderConfig {
             name: "bad".to_owned(),
             api_key: secrecy::SecretString::from("key"),
@@ -816,16 +662,8 @@ mod tests {
         );
     }
 
-    // -- Boundary values for helpers -----------------------------------------
-
     #[test]
     fn zero_duration_timeout_is_returned() {
-        // AppState is a dependency-injection container: request_timeout() is a
-        // pure passthrough accessor and performs no validation. Zero/sub-second
-        // timeouts are rejected earlier, at config load, in `load_app_config`
-        // (see `llm-proxy-core` `validate_*` — HIGH-2 / LOW-10). This test
-        // documents the accessor's faithfulness to whatever ServerConfig it is
-        // handed, not an endorsement of `request_timeout = "0s"` as valid config.
         let mut cfg = make_app_config();
         cfg.server.request_timeout = Duration::ZERO;
         let state = AppState::new(
@@ -851,8 +689,6 @@ mod tests {
         );
         assert_eq!(state.server_name(), "");
     }
-
-    // -- Unicode server_name ---------------------------------------------------
 
     #[test]
     fn unicode_server_name_is_returned_verbatim() {
@@ -883,13 +719,8 @@ mod tests {
         assert_eq!(state.server_name(), long_name);
     }
 
-    // -- Client auth state ------------------------------------------------------
-
     #[test]
     fn invalid_auth_config_fails_closed() {
-        // An unparseable verifier cannot be allowed to downgrade the server to
-        // no-auth: the state must come up enforced with zero verifiers, so
-        // every proxied request is rejected.
         let mut cfg = make_app_config();
         cfg.auth.mode = llm_proxy_core::AuthMode::ClientKeys;
         cfg.auth.clients.insert(
@@ -912,9 +743,6 @@ mod tests {
 
     #[test]
     fn app_state_debug_does_not_leak_client_verifiers() {
-        // The client verifier hash must never surface through Debug, matching
-        // the api_key discipline. Use a real (cheap-parameter) argon2id hash
-        // so the verifier parses.
         use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
         let params = Params::new(8, 1, 1, None).expect("valid test params");
         let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());

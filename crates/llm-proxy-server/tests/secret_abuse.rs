@@ -1,13 +1,6 @@
-//! Secret-abuse family (PRX-06): secret material must never be observable.
-//!
-//! Every test drives the real surfaces — [`build_router`], [`admin_router`],
-//! the client-auth layer, the SQLite ledger, the `/usage` endpoints — and
-//! asserts that client tokens, the admin token, provider keys, and request
-//! bodies never appear in events, tracing output, error responses, the raw
-//! ledger file bytes, or anything another caller can observe. Negative
-//! assertions are always paired with a positive control (content that *is*
-//! expected to appear), so a passing scan proves the scan itself worked
-//! rather than reading the wrong file.
+//! Secret-abuse family: secret material must never be observable. Every test
+//! drives the real surfaces (router, admin router, client-auth, ledger,
+//! `/usage`) and pairs each negative scan with a positive control.
 
 #[cfg(test)]
 mod tests {
@@ -29,8 +22,6 @@ mod tests {
     use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus, SqliteEventBus};
     use tower::ServiceExt;
 
-    /// Distinctive secret material, each unique to this family so a hit can
-    /// never be a coincidence with unrelated content.
     const LAPTOP_TOKEN: &str = "prx6-laptop-client-token-4f1a9c73";
     const PHONE_TOKEN: &str = "prx6-phone-client-token-b27e03d1";
     const ADMIN_TOKEN: &str = "prx6-admin-token-9d5c48ea";
@@ -38,8 +29,6 @@ mod tests {
     const STRAY_TOKEN: &str = "prx6-stray-bearer-under-noauth-77c1";
     const PROVIDER_KEY: &str = "prx6-provider-upstream-key-6b8f2e45";
     const BODY_MARKER: &str = "PRX6-BODY-MARKER-never-persist-me";
-    /// Every string that must never appear in events, logs, responses, or the
-    /// ledger file bytes.
     const SECRETS: &[&str] = &[
         LAPTOP_TOKEN,
         PHONE_TOKEN,
@@ -52,7 +41,6 @@ mod tests {
     const KEY_ID_LAPTOP: &str = "laptop";
     const KEY_ID_PHONE: &str = "phone";
 
-    /// Canned Anthropic Messages success response for the mock upstream.
     const ANTHROPIC_SUCCESS: &str = concat!(
         r#"{"id":"msg_prx6","type":"message","role":"assistant","content":"#,
         r#"[{"type":"text","text":"prx6-mock-reply"}],"model":"claude-sonnet-4-6","#,
@@ -60,13 +48,6 @@ mod tests {
         r#""usage":{"input_tokens":10,"output_tokens":5}}"#
     );
 
-    // -----------------------------------------------------------------------
-    // Fixtures
-    // -----------------------------------------------------------------------
-
-    /// Hash `token` with deliberately cheap argon2id parameters so tests run
-    /// fast; verification reads the cost from the PHC string, so these
-    /// verifiers behave exactly like production-cost ones.
     fn cheap_phc(token: &str, salt: &[u8]) -> String {
         use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
         let params = Params::new(8, 1, 1, None).expect("valid cheap test params");
@@ -82,8 +63,6 @@ mod tests {
             .to_string()
     }
 
-    /// Enforced [`ClientAuth`] for the given (key id, token) pairs, plus the
-    /// verifier strings so tests can assert they never leak either.
     fn client_auth(pairs: &[(&str, &str)]) -> (ClientAuth, Vec<String>) {
         let mut clients = HashMap::new();
         let mut phcs = Vec::new();
@@ -111,9 +90,6 @@ mod tests {
         }
     }
 
-    /// AppState with one Anthropic-protocol provider routed at
-    /// `mock_endpoint`. `storage_path`/`admin` wire the `/usage` surface;
-    /// `on_main` also mounts it on the main listener (the opt-in posture).
     fn base_state(
         mock_endpoint: &str,
         storage_path: Option<PathBuf>,
@@ -189,7 +165,6 @@ mod tests {
         )
     }
 
-    /// A messages request body whose user content carries `marker`.
     fn marked_body(marker: &str) -> String {
         serde_json::json!({
             "model": "claude-sonnet-4-6",
@@ -226,8 +201,6 @@ mod tests {
             .expect("request builds")
     }
 
-    /// Drive one request through the router, returning status, body text, and
-    /// the `x-request-id` response header.
     async fn send(app: Router, request: Request<Body>) -> (StatusCode, String, Option<String>) {
         let response = app.oneshot(request).await.expect("oneshot completes");
         let status = response.status();
@@ -262,7 +235,6 @@ mod tests {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Serialized forms of every recorded event that belongs to `request_id`.
     fn events_for_request(bus: &RecordingBus, request_id: &str) -> Vec<String> {
         bus.snapshot()
             .iter()
@@ -291,9 +263,6 @@ mod tests {
             .expect("close joins");
     }
 
-    /// Concatenated raw bytes of the ledger database and any WAL/SHM sidecar
-    /// files still on disk — everything an attacker with filesystem access
-    /// (or a copied backup) could read.
     fn ledger_bytes(db: &Path) -> Vec<u8> {
         let mut all = Vec::new();
         for suffix in ["", "-wal", "-shm"] {
@@ -319,7 +288,6 @@ mod tests {
         }
     }
 
-    /// Mock upstream answering every POST with a canned Anthropic response.
     async fn spawn_anthropic_mock() -> String {
         let app = Router::new().route(
             "/{*path}",
@@ -344,9 +312,6 @@ mod tests {
         format!("http://{addr}/providers/mock-provider/v1/messages")
     }
 
-    /// Pathological mock upstream that reflects the request body verbatim:
-    /// the worst case for body confidentiality, since everything the client
-    /// sent comes back through the proxy.
     async fn spawn_echo_mock() -> String {
         let app = Router::new().route(
             "/{*path}",
@@ -371,20 +336,6 @@ mod tests {
         format!("http://{addr}/providers/mock-provider/v1/messages")
     }
 
-    // -----------------------------------------------------------------------
-    // Tracing capture (process-global, installed once per test binary)
-    // -----------------------------------------------------------------------
-
-    /// Captured tracing output for the whole test binary.
-    ///
-    /// A process-global subscriber instead of a thread-local default: with
-    /// parallel tests, callsites first emitted on a thread that has no
-    /// subscriber can keep a stale "never" interest cache, silently dropping
-    /// later events from a thread-local capture — observed as flaky partial
-    /// captures during development. The shared buffer therefore contains
-    /// every test's traffic; tests that need per-caller isolation assert on
-    /// lines correlated with their own request ids (see the caller-isolation
-    /// test), and the secret scans simply scan more traffic.
     struct TraceCapture {
         buffer: Arc<Mutex<Vec<u8>>>,
     }
@@ -414,7 +365,6 @@ mod tests {
         }
     }
 
-    /// `MakeWriter` backed by the shared capture buffer.
     #[derive(Clone)]
     struct BufferWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -439,10 +389,6 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 1. Tokens never appear in events, tracing output, or error responses
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn client_and_admin_tokens_never_reach_events_tracing_or_responses() {
         let mock_url = spawn_anthropic_mock().await;
@@ -454,9 +400,6 @@ mod tests {
             .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
         let app = build_router(state.clone());
 
-        // The admin token is presented to the PROXY surface and a client key
-        // plus a garbage guess to the auth gate: both auth realms and both
-        // failure modes flow through the same observable surfaces.
         let traffic: [(Option<&str>, StatusCode); 5] = [
             (Some(LAPTOP_TOKEN), StatusCode::OK),
             (Some(PHONE_TOKEN), StatusCode::OK),
@@ -482,7 +425,6 @@ mod tests {
             }
         }
 
-        // Events: every recorded event serialized whole must be secret-free.
         let events = bus.snapshot();
         assert!(
             events.len() >= 6,
@@ -499,7 +441,6 @@ mod tests {
                 );
             }
         }
-        // Control: attribution itself survived — both key ids are on events.
         let callers: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
@@ -510,9 +451,6 @@ mod tests {
         assert!(callers.contains(&KEY_ID_LAPTOP), "callers: {callers:?}");
         assert!(callers.contains(&KEY_ID_PHONE), "callers: {callers:?}");
 
-        // Tracing: the capture must be live (control — the buffer receives
-        // debug-level request traffic from this binary's authenticated
-        // calls) and secret-free across everything it collected.
         let captured = capture.text();
         assert!(
             captured.contains("client authenticated"),
@@ -526,8 +464,6 @@ mod tests {
             );
         }
 
-        // The state's own Debug render (panic messages, error logs) is a leak
-        // vector for the verifiers it holds.
         let state_debug = format!("{state:?}");
         assert!(
             !state_debug.contains(LAPTOP_TOKEN) && !state_debug.contains(PHONE_TOKEN),
@@ -540,10 +476,6 @@ mod tests {
             );
         }
     }
-
-    // -----------------------------------------------------------------------
-    // 2. Tokens, verifiers, and bodies never appear in the raw ledger bytes
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn secrets_absent_from_raw_ledger_file_bytes() {
@@ -558,8 +490,6 @@ mod tests {
             .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
         let app = build_router(state);
 
-        // Client traffic with both secrets and body content in flight, plus
-        // admin traffic (authenticated and rejected) against the same state.
         let body = marked_body(BODY_MARKER);
         let digest = hex_sha256(body.as_bytes());
         let (status, response, _) =
@@ -585,9 +515,6 @@ mod tests {
         let raw = ledger_bytes(&db);
         assert!(!raw.is_empty(), "the ledger file must exist on disk");
 
-        // Positive controls: content that IS persisted (key id, provider,
-        // body digest) proves the scan reads real rows, so the negative
-        // assertions below are not vacuous.
         let text = String::from_utf8_lossy(&raw);
         for expected in [KEY_ID_LAPTOP, "mock-provider", digest.as_str()] {
             assert!(
@@ -604,17 +531,10 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 3. /usage responses carry the digest but never the body content
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn usage_serves_the_body_digest_but_never_the_body_content() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("abuse.db");
-        // The upstream REFLECTS the request body: the marker round-trips
-        // through the proxy's response handling, so the assertions below
-        // hold even in the worst case for body confidentiality.
         let mock_url = spawn_echo_mock().await;
         let (auth, _phcs) = client_auth(&[(KEY_ID_LAPTOP, LAPTOP_TOKEN)]);
         let bus = Arc::new(open_ledger(&db));
@@ -681,15 +601,10 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // 4. Admin routes refuse non-admin credentials on BOTH mounts
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn admin_surface_refuses_non_admin_credentials_on_both_mounts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("abuse.db");
-        // Seed one row so the authenticated calls have something to serve.
         let bus = Arc::new(open_ledger(&db));
         bus.emit(&ProxyEvent::RequestReceived(
             llm_proxy_storage::RequestReceived {
@@ -746,8 +661,6 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{mount}: the admin token serves");
         }
 
-        // Realm separation in the other direction: the admin token is not a
-        // client key and must not ride the proxy surface.
         let (proxy_auth, _phcs) = client_auth(&[(KEY_ID_LAPTOP, LAPTOP_TOKEN)]);
         let proxy_state = base_state("http://127.0.0.1:9", None, None, false)
             .with_client_auth(Arc::new(proxy_auth));
@@ -764,15 +677,8 @@ mod tests {
         assert_free_of_secrets("proxy-surface rejection of the admin token", &body);
     }
 
-    // -----------------------------------------------------------------------
-    // 5. One caller's key id is never observable by another caller
-    // -----------------------------------------------------------------------
-
     #[tokio::test]
     async fn one_callers_key_id_is_never_observable_by_another_caller() {
-        // Key ids unique to this test: the capture buffer is process-global
-        // (see TraceCapture), so ids shared with the other tests would make
-        // parallel traffic indistinguishable from a leak.
         const ALPHA_ID: &str = "prx6-iso-alpha";
         const BETA_ID: &str = "prx6-iso-beta";
         const ALPHA_TOKEN: &str = "prx6-iso-alpha-token-3d5e";
@@ -786,8 +692,6 @@ mod tests {
             .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
         let app = build_router(state);
 
-        // alpha's traffic first, so both callers' material is in flight in
-        // the process before beta's request is observed.
         let (status, _, _) = send(
             app.clone(),
             post_messages(Some(ALPHA_TOKEN), &marked_body("alpha traffic")),
@@ -795,9 +699,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // Everything beta can observe: its HTTP response, the events its
-        // request emits, and the log lines its request produces. None of
-        // them may name alpha.
         let capture = TraceCapture::install();
         let (status, body, request_id) = send(
             app.clone(),
@@ -810,8 +711,6 @@ mod tests {
             "beta's response names alpha's key id: {body}"
         );
 
-        // Log lines correlated with beta's request (its request id in the
-        // span, or its own caller attribution) must never name alpha.
         let request_id = request_id.expect("x-request-id header present");
         let captured = capture.text();
         let correlated: Vec<&str> = captured
@@ -837,8 +736,6 @@ mod tests {
                 "an event for beta's request names alpha's key id: {json}"
             );
         }
-        // Self-attribution intact: the received event names beta, and only
-        // beta, as the caller.
         let beta_callers: Vec<String> = bus
             .snapshot()
             .into_iter()
@@ -854,15 +751,7 @@ mod tests {
             vec![BETA_ID.to_owned()],
             "self-attribution intact"
         );
-
-        // beta's client key must not open the attribution-bearing admin
-        // surface (both mounts refuse it — see
-        // `admin_surface_refuses_non_admin_credentials_on_both_mounts`).
     }
-
-    // -----------------------------------------------------------------------
-    // 6. Attribution survives the loopback no-auth exemption
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn anonymous_attribution_survives_the_loopback_exemption() {
@@ -874,9 +763,6 @@ mod tests {
             .with_event_bus(Arc::clone(&bus) as Arc<dyn EventBus>);
         let app = build_router(state.clone());
 
-        // Under auth mode "none" the client still sends a bearer token (LLM
-        // SDKs do habitually). The proxy must neither attribute the request
-        // to that token nor let it leak anywhere.
         let body = marked_body(BODY_MARKER);
         let (status, response, _) =
             send(app.clone(), post_messages(Some(STRAY_TOKEN), &body)).await;
