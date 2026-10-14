@@ -1,16 +1,5 @@
-//! Google Gemini GenerateContent API provider adapter.
-//!
-//! Translates between core types and the Gemini wire format:
-//!
-//! ```text
-//! CoreRequest  -> GeminiRequest
-//! GeminiResponse -> CoreResponse
-//! GeminiStreamChunk stream -> CoreEvent stream
-//! ```
-//!
-//! The stream decoder emits the following [`CoreEvent`] variants:
-//! `MessageStart`, `ContentStart`, `TextDelta`, `ContentStop` (implicit),
-//! `ToolCallStart`, `ToolCallDelta`, `ToolCallStop`, `UsageDelta`, `MessageStop`.
+//! Google Gemini GenerateContent API provider adapter: translates core
+//! requests, responses, and event streams to and from the Gemini wire format.
 
 use std::collections::HashMap;
 
@@ -30,45 +19,19 @@ use super::{
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Adapter for the Google Gemini GenerateContent API.
 #[derive(Debug, Clone, Default)]
 pub struct GeminiAdapter;
 
-// ---------------------------------------------------------------------------
-// Stream decoder
-// ---------------------------------------------------------------------------
-
-/// Stateful stream decoder for Gemini SSE frames.
-///
-/// ## CoreEvent variants emitted
-///
-/// - `MessageStart` -- on the first chunk received
-/// - `ContentStart` -- on the first text delta
-/// - `TextDelta` -- on text parts
-/// - `ToolCallStart` -- on function_call parts
-/// - `ToolCallDelta` -- on function_call arguments
-/// - `ToolCallStop` -- immediately after each function_call part
-/// - `UsageDelta` -- on usage-only chunks or final chunks with usage
-/// - `MessageStop` -- on finish_reason or stream end
-///
-/// Intentionally never emitted: `Ping` (Gemini has no heartbeat), `ThinkingDelta`
-/// (Gemini thinking is not streamed as deltas in the current API), `Error`
-/// (Gemini errors are handled at the transport level, not in stream decoding).
+/// Stateful stream decoder translating Gemini SSE frames into `CoreEvent`s.
 #[derive(Debug)]
 pub struct GeminiStreamDecoder {
     model_ref: ModelRef,
     started: bool,
     content_index: usize,
     content_started: bool,
-    /// Maps Gemini candidate index to tool content block index.
     tool_blocks: Vec<usize>,
-    /// Whether each tool block has already received a ToolCallStop during decode_frame.
     tool_blocks_closed: Vec<bool>,
-    /// Monotonically increasing counter for generating unique tool use IDs.
     tool_id_counter: usize,
     stop_sent: bool,
 }
@@ -99,7 +62,6 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
             });
         }
 
-        // Usage-only chunk (no candidates).
         if chunk.candidates.is_empty() {
             if let Some(ref usage) = chunk.usage_metadata {
                 events.push(CoreEvent::UsageDelta {
@@ -111,10 +73,6 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
         let candidate = &chunk.candidates[0];
 
-        // Process parts. A candidate may omit `content` entirely (e.g. for
-        // SAFETY/RECITATION-blocked responses or prompt-feedback-only
-        // candidates); treat a missing/empty content as producing no parts and
-        // rely on `finish_reason`/`usage_metadata` below for the stop/usage.
         let parts: &[GeminiPart] = candidate
             .content
             .as_ref()
@@ -127,13 +85,11 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
                 self.push_text_delta(text, &mut events);
             }
 
-            // Handle function call parts.
             if let Some(ref function_call) = part.function_call {
                 self.push_function_call(function_call, &mut events);
             }
         }
 
-        // Handle finish reason.
         if let Some(ref reason) = candidate.finish_reason {
             if !reason.is_empty() && !self.stop_sent {
                 self.close_content_if_open();
@@ -170,7 +126,6 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 
         self.close_content_if_open();
 
-        // Emit ToolCallStop for any tool blocks that were not closed during decode_frame().
         for (&idx, &closed) in self.tool_blocks.iter().zip(&self.tool_blocks_closed) {
             if !closed {
                 events.push(CoreEvent::ToolCallStop { index: idx });
@@ -194,7 +149,6 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
 }
 
 impl GeminiStreamDecoder {
-    /// Emits a text delta, opening a text content block first if none is open.
     fn push_text_delta(&mut self, text: &str, events: &mut Vec<CoreEvent>) {
         if !self.content_started {
             self.content_started = true;
@@ -209,10 +163,6 @@ impl GeminiStreamDecoder {
         });
     }
 
-    /// Emits the start/delta/stop triple for one Gemini `functionCall` part.
-    ///
-    /// Gemini delivers function calls whole rather than as argument deltas, so
-    /// the block is opened and closed within this call.
     fn push_function_call(
         &mut self,
         function_call: &GeminiFunctionCall,
@@ -248,7 +198,6 @@ impl GeminiStreamDecoder {
         }
 
         events.push(CoreEvent::ToolCallStop { index: block_idx });
-        // Mark this tool block as closed so finish() does not emit a duplicate.
         if let Some(last) = self.tool_blocks_closed.last_mut() {
             *last = true;
         }
@@ -263,15 +212,6 @@ impl GeminiStreamDecoder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GeminiAdapter impl
-// ---------------------------------------------------------------------------
-
-/// Encodes one core content block into zero or more Gemini parts.
-///
-/// Content Gemini cannot represent is dropped with a warning; an unresolvable
-/// `tool_use_id` is an error because a guessed function name is rejected
-/// upstream with an opaque 400.
 fn encode_content_part(
     c: &CoreContent,
     tool_name_map: &HashMap<String, String>,
@@ -302,17 +242,7 @@ fn encode_content_part(
             }
             let response_val = encode_tool_result_payload(tool_use_id, result_content);
 
-            // The name field must match the function name from the original
-            // call.  Gemini uses it to correlate the response with the function
-            // declaration, and the map was built from the ToolUse blocks in the
-            // conversation history.
             let Some(fn_name) = tool_name_map.get(tool_use_id) else {
-                // The lookup missed because the ToolUse block is absent from the
-                // request being encoded (truncated/pruned history) or the id is
-                // foreign (e.g. an Anthropic `toolu_...` id round-tripping
-                // through Gemini). Guessing a name only ever produced an invalid
-                // one that Gemini rejects with a confusing 400, so return a
-                // clear error instead.
                 return Err(ProviderError::InvalidConfig(format!(
                     "Gemini: cannot resolve function name for tool_use_id \
                      \"{tool_use_id}\"; the corresponding ToolUse block was \
@@ -331,10 +261,6 @@ fn encode_content_part(
     Ok(())
 }
 
-/// Flattens tool-result content into Gemini's string-only `functionResponse`.
-///
-/// Non-text blocks are dropped with a warning: the wire format carries a single
-/// string `result`.
 fn encode_tool_result_payload(
     tool_use_id: &str,
     result_content: &[CoreContent],
@@ -373,26 +299,14 @@ impl GeminiAdapter {
     ) -> Result<super::ProxyRequest, ProviderError> {
         let mut contents = Vec::new();
 
-        // Pre-build a tool-id-to-name map for O(1) lookups during tool result
-        // encoding, instead of scanning all messages for each tool result.
         let tool_name_map = build_tool_name_map(core);
-
-        // System instructions are handled via generation config or prepended.
-        // Gemini does not have a dedicated system field in the basic request.
 
         for msg in &core.messages {
             let role = match msg.role {
                 CoreRole::User => "user",
                 CoreRole::Assistant => "model",
-                // Gemini has no system role; user is the standard mapping per
-                // Gemini's documentation for injecting system instructions.
                 CoreRole::System => "user",
-                // Gemini's API requires tool results to be in "user" role
-                // messages with functionResponse parts.  This is the canonical
-                // mapping per Gemini's documentation.
                 CoreRole::Tool => "user",
-                // Future CoreRole variants are mapped to "user" as a safe default.
-                // Update this match when new variants are added to CoreRole.
                 _ => "user",
             };
 
@@ -409,20 +323,7 @@ impl GeminiAdapter {
             }
         }
 
-        // Prepend system prompt as user message if present.
-        // NOTE: A synthetic "Understood." model acknowledgment is inserted
-        // immediately after the system prompt.  Gemini requires the conversation
-        // to start with a user turn followed by a model turn, so this dummy
-        // acknowledgment satisfies that constraint.  It does not affect model
-        // behavior.
-        //
-        // DESIGN DECISION: If both `core.system` and `CoreRole::System` messages
-        // are present, both are included.  The prepended system prompt comes first,
-        // followed by CoreRole::System messages mapped to "user" role.  This may
-        // create duplicate system content, but deduplication is deferred to a
-        // the caller typically provides one or the other.
         if !core.system.is_empty() {
-            // Warn about non-text system content blocks (consistent with other adapters).
             for c in &core.system {
                 if !matches!(c, CoreContent::Text { .. }) {
                     tracing::warn!(
@@ -453,15 +354,6 @@ impl GeminiAdapter {
                         parts: vec![GeminiPart::text(system_text)],
                     },
                 );
-                // Synthetic model acknowledgment (see NOTE above).
-                //
-                // Only insert when the turn immediately following the system
-                // prompt is NOT already a "model" turn.  Gemini requires the
-                // conversation to start with a user turn followed by a model
-                // turn; if the first real message is already a model turn
-                // (e.g. an Assistant-first conversation), inserting a synthetic
-                // one would produce two consecutive model turns, which Gemini
-                // rejects.
                 let next_is_model = contents.get(1).is_some_and(|c| c.role == "model");
                 if !next_is_model {
                     contents.insert(
@@ -509,11 +401,6 @@ impl GeminiAdapter {
                 .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) }),
         };
 
-        // Forward tool_choice if present.
-        // Note: Gemini supports `tool_config.function_calling_config` for
-        // controlling tool choice, but the wire types don't model it yet.
-        // Per the plan's lossy translation rules, emit a warning since the
-        // omission is safe but potentially impactful.
         if core.tool_choice.is_some() {
             tracing::warn!(
                 tool_choice = ?core.tool_choice,
@@ -522,7 +409,6 @@ impl GeminiAdapter {
             );
         }
 
-        // Warn about fields that Gemini cannot forward.
         if core.sampling.reasoning_effort.is_some() {
             tracing::warn!(
                 "Gemini: reasoning_effort specified but not forwarded; \
@@ -567,10 +453,6 @@ impl GeminiAdapter {
         let mut content = Vec::new();
         let mut tool_id_counter = 0usize;
 
-        // A candidate may omit `content` entirely (e.g. for SAFETY/RECITATION-
-        // blocked responses or prompt-feedback-only candidates). Treat a
-        // missing/empty content as producing no parts; `finish_reason` still
-        // drives the stop reason and `content` is back-filled below if empty.
         let parts: &[GeminiPart] = candidate
             .content
             .as_ref()
@@ -586,8 +468,6 @@ impl GeminiAdapter {
                 }
             }
             if let Some(ref function_call) = part.function_call {
-                // Lazily build the empty object only on the `None` path so the
-                // common tool-calling happy path avoids a heap allocation (MEDIUM-4).
                 let input = function_call
                     .args
                     .clone()
@@ -601,7 +481,6 @@ impl GeminiAdapter {
             }
         }
 
-        // Guarantee at least one content block.
         if content.is_empty() {
             content.push(CoreContent::Text {
                 text: String::new(),
@@ -619,8 +498,6 @@ impl GeminiAdapter {
             .unwrap_or(if has_tool_use {
                 StopReason::ToolUse
             } else {
-                // Provider omitted `finish_reason`; record that it was absent
-                // rather than unmapped so the diagnostic is unambiguous.
                 StopReason::Unknown("absent".to_owned())
             });
 
@@ -657,14 +534,6 @@ impl GeminiAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Look up the original function name for a tool_use_id by searching ToolUse
-/// content blocks in the conversation messages.  This is needed because Gemini
-/// requires the `function_response.name` to match the original function
-/// declaration, but the core `ToolResult` type only carries `tool_use_id`.
 fn build_tool_name_map(core: &CoreRequest) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for msg in &core.messages {
@@ -677,7 +546,6 @@ fn build_tool_name_map(core: &CoreRequest) -> HashMap<String, String> {
     map
 }
 
-/// Build usage from Gemini usage metadata.
 fn build_gemini_usage(usage: &GeminiUsage) -> Usage {
     Usage {
         input_tokens: usage.prompt_token_count,
@@ -688,10 +556,6 @@ fn build_gemini_usage(usage: &GeminiUsage) -> Usage {
         provenance: UsageProvenance::ProviderReported,
     }
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -731,8 +595,6 @@ mod tests {
         }
     }
 
-    // -- Encode tests --------------------------------------------------------
-
     #[test]
     fn encode_text_request() {
         let core = make_core_request(vec![CoreMessage {
@@ -770,7 +632,6 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        // System prompt should be prepended as user + model acknowledgment.
         assert_eq!(body.contents[0].role, "user");
         assert_eq!(
             body.contents[0].parts[0].text,
@@ -781,10 +642,6 @@ mod tests {
 
     #[test]
     fn encode_system_prompt_no_double_model_when_assistant_first() {
-        // Regression for gemini.rs:416 -- when a system prompt is present AND
-        // the first real message is already a model/assistant turn, the
-        // synthetic "Understood." model turn must NOT be inserted (it would
-        // create two consecutive model turns, which Gemini rejects).
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::Assistant,
             content: vec![CoreContent::Text {
@@ -801,12 +658,8 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        // contents[0] = system prompt as user.
         assert_eq!(body.contents[0].role, "user");
-        // contents[1] must be the real Assistant message (model), NOT the
-        // synthetic "Understood." turn.
         assert_eq!(body.contents[1].role, "model");
-        // No synthetic "Understood." text anywhere.
         let has_understood = body.contents.iter().any(|c| {
             c.parts
                 .iter()
@@ -816,7 +669,6 @@ mod tests {
             !has_understood,
             "synthetic Understood. turn must be suppressed when the next turn is already model"
         );
-        // And no two consecutive model turns.
         for pair in body.contents.windows(2) {
             assert!(
                 !(pair[0].role == "model" && pair[1].role == "model"),
@@ -892,8 +744,6 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
         );
     }
-
-    // -- Decode tests --------------------------------------------------------
 
     #[test]
     fn decode_text_response() {
@@ -996,8 +846,6 @@ mod tests {
         assert_eq!(core_resp.model.requested, "my-gemini");
     }
 
-    // -- Streaming tests -----------------------------------------------------
-
     #[test]
     fn stream_text_decoding() {
         let target = make_target();
@@ -1069,8 +917,6 @@ mod tests {
         );
     }
 
-    // -- Streaming tests: tool call, malformed frame, usage -------------------
-
     #[test]
     fn stream_tool_call_decoding() {
         let target = make_target();
@@ -1117,7 +963,6 @@ mod tests {
 
         let frame = make_frame("not valid json {{{");
         let events = decoder.decode_frame(&frame).unwrap();
-        // Malformed JSON is silently skipped; no events emitted at all.
         assert!(
             events.is_empty(),
             "malformed frame should produce no events"
@@ -1135,7 +980,6 @@ mod tests {
         );
         let events = decoder.decode_frame(&frame).unwrap();
 
-        // Should emit MessageStart + UsageDelta.
         assert!(
             events
                 .iter()
@@ -1149,14 +993,8 @@ mod tests {
         );
     }
 
-    // -- Encode tests: tool_result, tool_use, top_p, input_schema ------------
-
     #[test]
     fn encode_tool_result_as_function_response() {
-        // The function name for a functionResponse is resolved from the
-        // matching ToolUse block in the conversation history (audit
-        // gemini-tool-result-name-heuristic). A bare ToolResult without the
-        // preceding ToolUse is now a hard error, so include the call.
         let core = make_core_request(vec![
             CoreMessage {
                 role: CoreRole::Assistant,
@@ -1183,15 +1021,11 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        // The assistant ToolUse and the tool ToolResult produce their own
-        // contents entries (one function_call, one function_response). Find the
-        // function_response across the contents.
         let fr = body
             .contents
             .iter()
             .find_map(|c| c.parts.iter().find_map(|p| p.function_response.clone()))
             .expect("ToolResult must be encoded as a functionResponse");
-        // Name is the real function name from the ToolUse, not a guessed id.
         assert_eq!(fr.name, "get_weather");
     }
 
@@ -1265,8 +1099,6 @@ mod tests {
         assert_eq!(params["type"], "object");
     }
 
-    // -- Usage mapping test ---------------------------------------------------
-
     #[test]
     fn usage_mapping() {
         let usage = GeminiUsage {
@@ -1279,8 +1111,6 @@ mod tests {
         assert_eq!(core_usage.output_tokens, 50);
         assert_eq!(core_usage.provenance, UsageProvenance::ProviderReported);
     }
-
-    // -- Full lifecycle ordering test -----------------------------------------
 
     #[test]
     fn stream_full_lifecycle_ordering() {
@@ -1302,7 +1132,6 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        // Verify lifecycle ordering: MessageStart before everything else.
         let start_idx = all_events
             .iter()
             .position(|e| matches!(e, CoreEvent::MessageStart { .. }))
@@ -1333,8 +1162,6 @@ mod tests {
             "TextDelta must precede MessageStop"
         );
     }
-
-    // -- Additional missing tests ----------------------------------------------
 
     #[test]
     fn encode_stop_sequences_forwarded() {
@@ -1386,8 +1213,6 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        // The ToolResult should be encoded as a function_response with the
-        // correct function name (looked up from the ToolUse block).
         let fr = body
             .contents
             .iter()
@@ -1404,7 +1229,6 @@ mod tests {
 
         let frame = make_frame(r#"{"candidates":[],"usageMetadata":null}"#);
         let events = decoder.decode_frame(&frame).unwrap();
-        // Only MessageStart should be emitted (first chunk), no content events.
         assert!(
             events
                 .iter()
@@ -1478,14 +1302,12 @@ mod tests {
         let adapter = GeminiAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        // Simulate receiving a function call chunk but no explicit finish.
         let frame = make_frame(
             r#"{"candidates":[{"content":{"role":"model","parts":[{"function_call":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":null}],"usageMetadata":null}"#,
         );
         decoder.decode_frame(&frame).unwrap();
 
         let events = decoder.finish().unwrap();
-        // finish() should emit ToolCallStop for the unclosed block and infer ToolUse.
         let msg_stop = events
             .iter()
             .find(|e| matches!(e, CoreEvent::MessageStop { .. }));
@@ -1497,7 +1319,6 @@ mod tests {
 
     #[test]
     fn encode_reasoning_effort_omitted() {
-        // Gemini does not forward reasoning_effort; verify no panic.
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
             content: vec![CoreContent::Text {
@@ -1511,7 +1332,6 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        // Gemini generation_config should not have reasoning_effort.
         let config = body.generation_config.unwrap();
         assert_eq!(config.temperature, None);
     }
@@ -1549,8 +1369,6 @@ mod tests {
         }
     }
 
-    // -- Additional tests: upstream model alias, stream flag, malformed, etc --
-
     #[test]
     fn encode_uses_upstream_model() {
         let mut target = make_target();
@@ -1564,7 +1382,6 @@ mod tests {
         }]);
         let adapter = GeminiAdapter;
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
-        // The URL should contain the upstream model name.
         assert!(proxy_req.url.contains("gemini-2.5-flash-preview-05-20"));
     }
 
@@ -1594,7 +1411,6 @@ mod tests {
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
-        // Should produce a valid request with empty contents array.
         assert_eq!(body["contents"].as_array().unwrap().len(), 0);
     }
 
@@ -1630,7 +1446,6 @@ mod tests {
         }
         all_events.extend(decoder.finish().unwrap());
 
-        // Count ToolCallStop events -- should be exactly 1.
         let tool_call_stop_count = all_events
             .iter()
             .filter(|e| matches!(e, CoreEvent::ToolCallStop { .. }))
@@ -1640,8 +1455,6 @@ mod tests {
             "ToolCallStop should be emitted exactly once"
         );
     }
-
-    // -- Source guard ---------------------------------------------------------
 
     #[test]
     fn adapter_source_no_forbidden_imports() {
@@ -1659,8 +1472,6 @@ mod tests {
             "adapter must not import server crate"
         );
     }
-
-    // -- Helpers --------------------------------------------------------------
 
     fn make_frame(data: &str) -> SseFrame {
         SseFrame {

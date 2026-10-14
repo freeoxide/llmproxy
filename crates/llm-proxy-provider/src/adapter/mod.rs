@@ -1,18 +1,5 @@
-//! Provider protocol adapters:
-//! [`llm_proxy_protocol::core::CoreRequest`] -> provider wire format and back.
-//!
-//! Each adapter handles exactly one provider protocol:
-//!
-//! - [`OpenAiChatAdapter`] -- OpenAI Chat Completions API
-//! - [`AnthropicAdapter`]  -- Anthropic Messages API
-//! - [`ResponsesAdapter`]  -- OpenAI Responses API
-//! - [`GeminiAdapter`]     -- Google Gemini GenerateContent API
-//!
-//! Adapters translate between the normalized core types
-//! ([`llm_proxy_protocol::core::CoreRequest`],
-//! [`llm_proxy_protocol::core::CoreResponse`],
-//! [`llm_proxy_protocol::core::CoreEvent`]) and the provider-specific wire
-//! types. They never import client adapters, route handlers, or server state.
+//! Provider protocol adapters: translate `llm_proxy_protocol::core` request,
+//! response, and event types to and from provider-specific wire formats.
 
 pub mod anthropic;
 pub mod gemini;
@@ -38,12 +25,7 @@ use crate::error::ProviderError;
 use crate::sse::SseFrame;
 use crate::transport::{AuthHeaders, ProxyRequest};
 
-/// Anthropic API version header value used when the caller does not supply one.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-
-// ---------------------------------------------------------------------------
-// ProviderProtocol
-// ---------------------------------------------------------------------------
 
 /// Identifies a provider protocol family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,10 +42,8 @@ pub enum ProviderProtocol {
 }
 
 impl ProviderProtocol {
-    /// Returns the canonical string name for this protocol.
-    ///
-    /// Names use snake_case to match the provider TOML convention
-    /// (e.g. `openai_chat_completions`, `anthropic_messages`).
+    /// Returns the canonical snake_case name for this protocol, matching the
+    /// provider TOML convention (e.g. `openai_chat_completions`, `anthropic_messages`).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
@@ -74,9 +54,7 @@ impl ProviderProtocol {
         }
     }
 
-    /// Parse a protocol name string (case-insensitive).
-    ///
-    /// Accepts canonical snake_case protocol names.
+    /// Parses a protocol name (case-insensitive); accepts canonical snake_case names.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
@@ -89,14 +67,8 @@ impl ProviderProtocol {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ProviderAdapterTarget
-// ---------------------------------------------------------------------------
-
 /// Everything an adapter needs to encode a request for a specific provider.
-///
-/// The `api_key` field is redacted in [`fmt::Debug`] output so that
-/// `tracing::debug!(?target)` or snapshot output never leaks the secret.
+/// The `api_key` field is redacted in [`fmt::Debug`] output so logs never leak it.
 #[derive(Clone)]
 pub struct ProviderAdapterTarget {
     /// Logical provider name (for logging/metrics).
@@ -115,12 +87,8 @@ pub struct ProviderAdapterTarget {
     pub requested_model: String,
     /// The model to send upstream (may differ due to aliasing).
     pub upstream_model: String,
-    /// Optional static headers from the adapter config (e.g. `anthropic-version`).
-    ///
-    /// `Arc`-shared from the registry so constructing this target is a refcount
-    /// bump, not a `HashMap` clone (LOW-5). Mutation (defaulting the
-    /// `anthropic-version` header) materializes an owned copy via
-    /// `(*target.headers).clone()` in `build_proxy_request`.
+    /// Optional static headers from the adapter config (e.g. `anthropic-version`),
+    /// `Arc`-shared so building a target is a refcount bump, not a map clone.
     pub headers: Arc<std::collections::HashMap<String, String>>,
 }
 
@@ -142,14 +110,7 @@ impl fmt::Debug for ProviderAdapterTarget {
 
 pub(crate) use crate::transport::endpoint_without_query;
 
-// ---------------------------------------------------------------------------
-// ProviderAdapter enum
-// ---------------------------------------------------------------------------
-
 /// Enum-dispatched provider adapter.
-///
-/// Each variant wraps a concrete adapter that knows how to translate between
-/// core types and its provider-specific wire format.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ProviderAdapter {
@@ -181,10 +142,6 @@ impl ProviderAdapter {
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
     ) -> Result<ProxyRequest, ProviderError> {
-        // Log non-empty provider_hints so they are not silently ignored.
-        // Downgraded to debug since this fires on every request when clients
-        // consistently send hints -- which is expected behavior. If a specific
-        // adapter adds hint support, only truly unsupported hints should warn.
         if !core.provider_hints.raw.is_empty() {
             tracing::debug!(
                 protocol = %target.protocol.name(),
@@ -213,12 +170,8 @@ impl ProviderAdapter {
         }
     }
 
-    /// Create a new stream decoder for this adapter.
-    ///
-    /// Returns a stack-resident [`ProviderStreamDecoderKind`] enum rather than
-    /// a boxed trait object: the decoder set is closed (4 impls), so an enum
-    /// avoids the per-stream heap allocation and lets `decode_frame`/`finish`
-    /// static-dispatch instead of going through a vtable per frame (GAP-LOW-1).
+    /// Create a new stream decoder for this adapter, returned as a
+    /// stack-resident [`ProviderStreamDecoderKind`].
     pub fn new_stream_decoder(&self, target: &ProviderAdapterTarget) -> ProviderStreamDecoderKind {
         match self {
             Self::OpenAiChat(a) => {
@@ -235,14 +188,8 @@ impl ProviderAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ProviderStreamDecoder trait
-// ---------------------------------------------------------------------------
-
-/// Decodes already-framed SSE events from an upstream provider into core events.
-///
-/// The decoder receives parsed [`SseFrame`] objects from [`SseFramer`](crate::sse::SseFramer).
-/// It must not parse raw network chunks.
+/// Decodes already-framed SSE events from an upstream provider into core
+/// events; must not parse raw network chunks.
 pub trait ProviderStreamDecoder: fmt::Debug + Send {
     /// Decode a single SSE frame into zero or more core events.
     fn decode_frame(&mut self, frame: &SseFrame) -> Result<Vec<CoreEvent>, ProviderError>;
@@ -251,13 +198,8 @@ pub trait ProviderStreamDecoder: fmt::Debug + Send {
     fn finish(&mut self) -> Result<Vec<CoreEvent>, ProviderError>;
 }
 
-/// Owned, stack-resident stream decoder covering the closed 4-adapter set.
-///
-/// Replaces `Box<dyn ProviderStreamDecoder + Send>` so that a provider stream
-/// no longer heap-allocates its decoder and so `decode_frame`/`finish` calls
-/// static-dispatch (and inline) instead of going through a vtable on every
-/// SSE frame (GAP-LOW-1). [`ProviderAdapter::new_stream_decoder`] constructs
-/// the appropriate variant directly.
+/// Owned, stack-resident stream decoder covering the closed 4-adapter set;
+/// `decode_frame`/`finish` static-dispatch instead of going through a vtable.
 #[derive(Debug)]
 pub enum ProviderStreamDecoderKind {
     /// OpenAI Chat Completions stream decoder.
@@ -289,10 +231,6 @@ impl ProviderStreamDecoder for ProviderStreamDecoderKind {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// ProviderAdapterRegistry
-// ---------------------------------------------------------------------------
 
 /// Registry of available provider adapters, keyed by protocol.
 #[derive(Debug, Clone)]
@@ -342,26 +280,6 @@ impl ProviderAdapterRegistry {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers used by multiple adapters
-// ---------------------------------------------------------------------------
-
-/// Expand URL template placeholders.
-///
-/// Currently supports `{model}` -> `upstream_model`.
-///
-/// Validates that the model name contains only safe characters. Gemini resource
-/// names may contain one leading `models/` segment; all other slashes are
-/// rejected.
-///
-/// # Path canonicalization
-///
-/// The expanded URL is **not** canonicalized (no `..` resolution, no double-slash
-/// collapse). This is acceptable because the model name validation above rejects
-/// `..` and `/`, so the only way `..` can appear in the URL is via the template
-/// itself, which is a static config value controlled by the operator. If user-
-/// controlled input is ever interpolated into URLs beyond the model name, path
-/// canonicalization must be added here.
 pub(crate) fn expand_url_template(
     template: &str,
     target: &ProviderAdapterTarget,
@@ -371,15 +289,11 @@ pub(crate) fn expand_url_template(
     };
 
     let configured_model = &target.upstream_model;
-    // When the template uses "models/{model}", strip the "models/" prefix
-    // from the configured model name to avoid "models/models/..." in the URL.
     let has_models_prefix = template[..model_pos].ends_with("models/");
     let model = configured_model
         .strip_prefix("models/")
         .filter(|_| has_models_prefix)
         .unwrap_or(configured_model);
-    // Reject model names containing path traversal or other unsafe characters.
-    // Additionally reject `.` and `..` exactly (path traversal patterns).
     if model == ".." || model == "." {
         return Err(ProviderError::InvalidConfig(format!(
             "upstream_model {:?} is a path traversal pattern; refusing to interpolate into URL",
@@ -395,7 +309,6 @@ pub(crate) fn expand_url_template(
             model
         )));
     }
-    // Single-pass replacement using the position found above.
     let mut result = String::with_capacity(template.len() + model.len());
     result.push_str(&template[..model_pos]);
     result.push_str(model);
@@ -412,25 +325,16 @@ fn is_safe_model_component(model: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
-/// Map a finish reason string from OpenAI-compatible providers to a core StopReason.
 pub(crate) fn map_openai_finish_reason(reason: &str) -> StopReason {
     match reason {
         "stop" => StopReason::EndTurn,
         "length" => StopReason::MaxTokens,
         "tool_calls" | "tool_use" => StopReason::ToolUse,
         "content_filter" => StopReason::Refusal,
-        // Preserve the unmapped provider value so it is visible in diagnostics
-        // (the encoder logs it) rather than silently discarded.
         _ => StopReason::Unknown(reason.to_owned()),
     }
 }
 
-/// Map a Gemini finish reason string to a core StopReason.
-///
-/// SAFETY and RECITATION indicate content was filtered by safety systems.
-/// These map to `StopReason::Refusal` because the model refused to complete
-/// the response due to content policy, which is semantically closer to a
-/// refusal than a normal end-of-turn.
 pub(crate) fn map_gemini_finish_reason(reason: &str) -> StopReason {
     match reason {
         "STOP" => StopReason::EndTurn,
@@ -440,7 +344,6 @@ pub(crate) fn map_gemini_finish_reason(reason: &str) -> StopReason {
     }
 }
 
-/// Build usage from OpenAI-style usage info, accounting for cache tokens.
 pub(crate) fn build_usage_from_openai(
     prompt_tokens: i32,
     completion_tokens: i32,
@@ -449,12 +352,6 @@ pub(crate) fn build_usage_from_openai(
 ) -> Usage {
     let cache_hit_i64 = cache_hit.unwrap_or(0) as i64;
     let cache_miss_i64 = cache_miss.unwrap_or(0) as i64;
-    // OpenAI's `prompt_tokens` is INCLUSIVE of cached tokens (both cache-hit and
-    // cache-creation/miss contributions are counted within it), whereas the core
-    // `input_tokens` field is EXCLUSIVE of cache tokens (which are reported
-    // separately via `cache_read_input_tokens` / `cache_creation_input_tokens`).
-    // Subtract the cache contributions here so the core total does not
-    // double-count them.
     let input = (prompt_tokens as i64) - cache_hit_i64 - cache_miss_i64;
     let input_tokens = i32::try_from(input.max(0)).unwrap_or(i32::MAX);
 
@@ -468,16 +365,12 @@ pub(crate) fn build_usage_from_openai(
     }
 }
 
-/// Build a `ProxyRequest` from the adapter's encoded JSON body and target info.
 pub(crate) fn build_proxy_request(
     body: Vec<u8>,
     target: &ProviderAdapterTarget,
     stream: bool,
     url: String,
 ) -> ProxyRequest {
-    // Materialize an owned copy of the shared adapter headers so we can default
-    // `anthropic-version`; this is the only per-request clone of the headers map
-    // (the registry → target hand-off is an `Arc` refcount bump, LOW-5).
     let mut extra_headers = (*target.headers).clone();
     if target.protocol == ProviderProtocol::AnthropicMessages
         && !extra_headers
@@ -499,7 +392,6 @@ pub(crate) fn build_proxy_request(
     }
 }
 
-/// Build the response ModelRef preserving the client-facing requested model.
 pub(crate) fn response_model_ref(target: &ProviderAdapterTarget) -> ModelRef {
     let upstream = if target.upstream_model != target.requested_model {
         Some(target.upstream_model.clone())
@@ -512,11 +404,6 @@ pub(crate) fn response_model_ref(target: &ProviderAdapterTarget) -> ModelRef {
     }
 }
 
-/// Truncate a string to `max_len` bytes, respecting UTF-8 char boundaries.
-///
-/// If the string is longer than `max_len`, finds the nearest char boundary at
-/// or before `max_len`. This prevents panics when slicing strings containing
-/// multi-byte UTF-8 characters (e.g. CJK text, emoji).
 pub(crate) fn truncate_str_safe(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         s
@@ -529,15 +416,9 @@ pub(crate) fn truncate_str_safe(s: &str, max_len: usize) -> &str {
     }
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -- ProviderProtocol name/parse -----------------------------------------
 
     #[test]
     fn protocol_name_roundtrip() {
@@ -574,8 +455,6 @@ mod tests {
         assert_eq!(ProviderProtocol::parse(""), None);
     }
 
-    // -- Registry -----------------------------------------------------------
-
     #[test]
     fn registry_builtin_has_all_protocols() {
         let reg = ProviderAdapterRegistry::builtin();
@@ -609,8 +488,6 @@ mod tests {
         assert!(!reg.has_protocol_name("anthropic"));
     }
 
-    // -- Adapter protocol method ---------------------------------------------
-
     #[test]
     fn adapter_protocol_dispatch() {
         let reg = ProviderAdapterRegistry::builtin();
@@ -639,8 +516,6 @@ mod tests {
             ProviderProtocol::GeminiGenerateContent
         );
     }
-
-    // -- URL template expansion ----------------------------------------------
 
     #[test]
     fn url_template_expands_model() {
@@ -755,8 +630,6 @@ mod tests {
         assert!(!debug.contains("query-secret"));
     }
 
-    // -- Finish reason mapping -----------------------------------------------
-
     #[test]
     fn openai_finish_reason_mappings() {
         assert_eq!(map_openai_finish_reason("stop"), StopReason::EndTurn);
@@ -767,7 +640,6 @@ mod tests {
             map_openai_finish_reason("content_filter"),
             StopReason::Refusal
         );
-        // Unmapped values are preserved in Unknown(String) (GAP-LOW-9).
         assert_eq!(
             map_openai_finish_reason("unknown"),
             StopReason::Unknown("unknown".to_owned())
@@ -783,19 +655,16 @@ mod tests {
         );
         assert_eq!(map_gemini_finish_reason("SAFETY"), StopReason::Refusal);
         assert_eq!(map_gemini_finish_reason("RECITATION"), StopReason::Refusal);
-        // Unmapped values are preserved in Unknown(String) (GAP-LOW-9).
         assert_eq!(
             map_gemini_finish_reason("other"),
             StopReason::Unknown("other".to_owned())
         );
     }
 
-    // -- Usage building ------------------------------------------------------
-
     #[test]
     fn usage_from_openai_basic() {
         let usage = build_usage_from_openai(100, 50, Some(10), Some(20));
-        assert_eq!(usage.input_tokens, 70); // 100 - 10 - 20
+        assert_eq!(usage.input_tokens, 70);
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.cache_read_input_tokens, Some(10));
         assert_eq!(usage.cache_creation_input_tokens, Some(20));
@@ -814,8 +683,6 @@ mod tests {
         let usage = build_usage_from_openai(5, 10, Some(80), Some(20));
         assert_eq!(usage.input_tokens, 0);
     }
-
-    // -- Response model ref --------------------------------------------------
 
     #[test]
     fn response_model_ref_no_alias() {
@@ -853,8 +720,6 @@ mod tests {
         assert_eq!(mr.upstream.as_deref(), Some("gpt-4o-2024-08-06"));
     }
 
-    // -- Source guard ---------------------------------------------------------
-
     #[test]
     fn adapter_source_no_forbidden_imports() {
         let source = include_str!("mod.rs");
@@ -872,8 +737,6 @@ mod tests {
         );
     }
 
-    // -- truncate_str_safe ---------------------------------------------------
-
     #[test]
     fn truncate_str_safe_ascii_within_limit() {
         assert_eq!(truncate_str_safe("hello", 10), "hello");
@@ -886,12 +749,9 @@ mod tests {
 
     #[test]
     fn truncate_str_safe_multibyte_no_panic() {
-        // Japanese 'あ' is 3 bytes.  If max_len lands mid-character, we must
-        // back up to the previous char boundary.
-        let s = "あいうえお"; // 15 bytes total
-        // max_len=4 lands inside 'い' (bytes 3-5), so we back up to byte 3.
+        let s = "あいうえお";
         let truncated = truncate_str_safe(s, 4);
-        assert_eq!(truncated, "あ"); // Only first char (bytes 0-2) fits
+        assert_eq!(truncated, "あ");
         assert!(truncated.len() <= 4);
     }
 
@@ -929,8 +789,6 @@ mod tests {
         );
         assert!(!request.extra_headers.contains_key("anthropic-version"));
     }
-
-    // -- Helpers --------------------------------------------------------------
 
     fn make_target(protocol: ProviderProtocol) -> ProviderAdapterTarget {
         let (endpoint, auth_style) = match protocol {

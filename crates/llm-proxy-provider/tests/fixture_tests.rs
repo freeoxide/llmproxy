@@ -1,9 +1,5 @@
-//! Fixture-driven integration tests for provider protocol adapters.
-//!
-//! Loads each fixture's input JSON, runs encode/decode against the adapter,
-//! and compares the result with the expected output JSON. For stream fixtures,
-//! parses SSE input, feeds through the decoder, and compares events with
-//! core-events.json.
+//! Fixture-driven integration tests: run adapter encode/decode against JSON
+//! and SSE fixtures and compare with the expected outputs.
 
 #[cfg(test)]
 mod tests {
@@ -21,26 +17,13 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    // ---------------------------------------------------------------------------
-    // Constants
-    // ---------------------------------------------------------------------------
-
     const FIXTURE_ROOT: &str = "tests/fixtures";
-
-    // ---------------------------------------------------------------------------
-    // Adapter names
-    // ---------------------------------------------------------------------------
 
     const OPENAI_CHAT: &str = "openai_chat";
     const ANTHROPIC: &str = "anthropic";
     const RESPONSES: &str = "responses";
     const GEMINI: &str = "gemini";
 
-    // ---------------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------------
-
-    /// Read a fixture file as a parsed JSON value.
     fn read_fixture(dir: &Path, name: &str) -> serde_json::Value {
         let path = dir.join(name);
         let content = fs::read_to_string(&path)
@@ -49,14 +32,12 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to parse {} as JSON: {e}", path.display()))
     }
 
-    /// Read a fixture file as raw string.
     fn read_fixture_raw(dir: &Path, name: &str) -> String {
         let path = dir.join(name);
         fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
     }
 
-    /// Build a default ProviderAdapterTarget for the given protocol.
     fn make_target(protocol: ProviderProtocol) -> ProviderAdapterTarget {
         let (endpoint, auth_style, model): (String, AuthStyle, String) = match protocol {
             ProviderProtocol::OpenAiChatCompletions => (
@@ -99,7 +80,6 @@ mod tests {
         }
     }
 
-    /// Get the ProviderAdapter for the given name.
     fn get_adapter(name: &str) -> ProviderAdapter {
         match name {
             OPENAI_CHAT => ProviderAdapter::OpenAiChat(OpenAiChatAdapter),
@@ -110,7 +90,6 @@ mod tests {
         }
     }
 
-    /// Get the protocol for the given adapter name.
     fn get_protocol(name: &str) -> ProviderProtocol {
         match name {
             OPENAI_CHAT => ProviderProtocol::OpenAiChatCompletions,
@@ -121,18 +100,11 @@ mod tests {
         }
     }
 
-    /// Build a CoreRequest from the human-readable core.json fixture format.
-    ///
-    /// The fixture format uses shorthand conventions:
-    /// - `"model": "gpt-4o"` -> `ModelRef { requested: "gpt-4o", upstream: None }`
-    /// - `"tool_choice": "auto"` -> `CoreToolChoice::Auto`
-    /// - `"tool_choice": null` -> `None`
     fn build_core_request(core_json: &serde_json::Value) -> CoreRequest {
         let obj = core_json
             .as_object()
             .expect("core.json must be a JSON object");
 
-        // Model
         let model = match obj.get("model") {
             Some(v) if v.is_string() => ModelRef {
                 requested: v.as_str().unwrap().to_owned(),
@@ -144,28 +116,24 @@ mod tests {
             _ => panic!("core.json missing 'model' field"),
         };
 
-        // System
         let system: Vec<CoreContent> = obj
             .get("system")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().map(parse_core_content).collect())
             .unwrap_or_default();
 
-        // Messages
         let messages: Vec<CoreMessage> = obj
             .get("messages")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().map(parse_core_message).collect())
             .unwrap_or_default();
 
-        // Tools
         let tools: Vec<CoreTool> = obj
             .get("tools")
             .and_then(|v| v.as_array())
             .map(|arr| arr.iter().map(parse_core_tool).collect())
             .unwrap_or_default();
 
-        // Tool choice
         let tool_choice = obj.get("tool_choice").and_then(|v| match v {
             serde_json::Value::Null => None,
             serde_json::Value::String(s) => Some(parse_tool_choice_string(s)),
@@ -175,10 +143,8 @@ mod tests {
             _ => None,
         });
 
-        // Sampling
         let sampling: SamplingOptions = obj.get("sampling").map(parse_sampling).unwrap_or_default();
 
-        // Stream
         let stream = obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         CoreRequest {
@@ -194,7 +160,6 @@ mod tests {
         }
     }
 
-    /// Parse a CoreContent from JSON.
     fn parse_core_content(v: &serde_json::Value) -> CoreContent {
         let obj = v.as_object().expect("content must be a JSON object");
         match obj.get("type").and_then(|t| t.as_str()).unwrap_or("") {
@@ -290,7 +255,6 @@ mod tests {
         }
     }
 
-    /// Parse a CoreMessage from JSON.
     fn parse_core_message(v: &serde_json::Value) -> CoreMessage {
         let obj = v.as_object().expect("message must be a JSON object");
         let role = match obj.get("role").and_then(|r| r.as_str()).unwrap_or("user") {
@@ -311,7 +275,6 @@ mod tests {
         CoreMessage { role, content }
     }
 
-    /// Parse a CoreTool from JSON.
     fn parse_core_tool(v: &serde_json::Value) -> CoreTool {
         let obj = v.as_object().expect("tool must be a JSON object");
         CoreTool {
@@ -331,7 +294,6 @@ mod tests {
         }
     }
 
-    /// Parse a tool_choice string value.
     fn parse_tool_choice_string(s: &str) -> CoreToolChoice {
         match s {
             "auto" => CoreToolChoice::Auto,
@@ -341,7 +303,6 @@ mod tests {
         }
     }
 
-    /// Parse SamplingOptions from JSON.
     fn parse_sampling(v: &serde_json::Value) -> SamplingOptions {
         let obj = v
             .as_object()
@@ -384,7 +345,6 @@ mod tests {
         }
     }
 
-    /// Parse SSE text into a list of SseFrame values.
     fn parse_sse_frames(sse_text: &str) -> Vec<SseFrame> {
         let mut frames = Vec::new();
         let mut current_data = String::new();
@@ -393,7 +353,6 @@ mod tests {
         for line in sse_text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                // End of event
                 if !current_data.is_empty() {
                     frames.push(SseFrame {
                         event: current_event.take(),
@@ -410,10 +369,8 @@ mod tests {
             } else if let Some(event) = trimmed.strip_prefix("event:") {
                 current_event = Some(event.trim_start().to_owned());
             }
-            // Ignore other SSE fields (id:, retry:, comments)
         }
 
-        // Handle last event if file doesn't end with blank line
         if !current_data.is_empty() {
             frames.push(SseFrame {
                 event: current_event,
@@ -425,8 +382,6 @@ mod tests {
         frames
     }
 
-    /// Normalize a stop reason string to PascalCase for comparison.
-    /// Accepts both snake_case ("end_turn") and PascalCase ("EndTurn").
     fn normalize_stop_reason(s: &str) -> &'static str {
         match s {
             "end_turn" | "EndTurn" => "EndTurn",
@@ -440,8 +395,6 @@ mod tests {
         }
     }
 
-    /// Extract the variant key from an externally-tagged CoreContent JSON value.
-    /// E.g., `{"Text": {...}}` returns "Text".
     fn extract_content_variant(v: &serde_json::Value) -> String {
         v.as_object()
             .and_then(|obj| {
@@ -466,19 +419,6 @@ mod tests {
             .unwrap_or_else(|| "Unknown".to_owned())
     }
 
-    // ---------------------------------------------------------------------------
-    // Provider request encode tests
-    // ---------------------------------------------------------------------------
-
-    /// Test that encoding a CoreRequest produces valid provider wire format.
-    ///
-    /// Verifies the adapter successfully encodes the request and the output
-    /// matches key fields from output.json.  The output.json fixture serves
-    /// both as documentation and as a structural comparison target.
-    /// Flattens a wire `content` field to plain text.
-    ///
-    /// Provider formats allow either a bare string or an array of content
-    /// blocks; only `text` blocks contribute.
     fn json_text_content(v: &serde_json::Value) -> String {
         if let Some(text) = v.as_str() {
             return text.to_owned();
@@ -494,7 +434,6 @@ mod tests {
             .join("")
     }
 
-    /// Asserts one encoded message matches the fixture's expected message.
     fn assert_encoded_message(
         adapter_name: &str,
         case: &str,
@@ -512,9 +451,6 @@ mod tests {
             let Some(act_content) = act_msg.get("content") else {
                 panic!("{adapter_name}/{case}: messages[{i}] missing content field");
             };
-            // A string expectation accepts either a matching string or an array
-            // whose text blocks concatenate to the same string; anything else
-            // must match exactly.
             if exp_content.is_string() {
                 assert_eq!(
                     json_text_content(act_content),
@@ -587,14 +523,11 @@ mod tests {
                 panic!("encoded body is not valid JSON for {adapter_name}/{case}: {e}")
             });
 
-        // The adapter must produce a JSON object.
         assert!(
             actual.is_object(),
             "{adapter_name}/{case}: encoded body is not a JSON object"
         );
 
-        // Adapter must include the target model somewhere -- either in the request
-        // body or in the URL (Gemini puts the model in the URL path).
         let model_str = target.upstream_model.as_str();
         let body_str = actual.to_string();
         let has_model = body_str.contains(model_str) || proxy_req.url.contains(model_str);
@@ -604,8 +537,6 @@ mod tests {
             proxy_req.url
         );
 
-        // Compare key structural fields from output.json against the encoded body.
-        // Messages/system/tools/sampling fields are compared when present in output.json.
         if let Some(expected_msgs) = output_json.get("messages").and_then(|v| v.as_array()) {
             let actual_msgs = actual.get("messages").and_then(|v| v.as_array());
             let actual_msgs = actual_msgs.map(|a| a.as_slice()).unwrap_or(&[]);
@@ -621,7 +552,6 @@ mod tests {
             }
         }
 
-        // Compare system prompt content if present in output.json.
         if let Some(expected_sys) = output_json.get("system") {
             assert_eq!(
                 actual.get("system"),
@@ -630,15 +560,6 @@ mod tests {
             );
         }
 
-        // Compare model field if present in output.json.
-        // Verify that the encoded body or URL contains a model name. The exact
-        // value comes from the test target's upstream_model, which may differ
-        // from the fixture's expected model, so we only check presence.
-        if output_json.get("model").and_then(|v| v.as_str()).is_some() {
-            // Model presence already verified by the has_model assertion above.
-        }
-
-        // Compare tools count and key fields if present in output.json.
         if let Some(expected_tools) = output_json.get("tools").and_then(|v| v.as_array()) {
             let actual_tools = actual
                 .get("tools")
@@ -652,13 +573,11 @@ mod tests {
             );
             for (i, exp_tool) in expected_tools.iter().enumerate() {
                 let act_tool = &actual_tools[i];
-                // Compare tool name
                 assert_eq!(
                     act_tool.get("name"),
                     exp_tool.get("name"),
                     "{adapter_name}/{case}: tools[{i}].name mismatch"
                 );
-                // Compare tool description if present in expected
                 if exp_tool.get("description").is_some() {
                     assert_eq!(
                         act_tool.get("description"),
@@ -666,7 +585,6 @@ mod tests {
                         "{adapter_name}/{case}: tools[{i}].description mismatch"
                     );
                 }
-                // Compare tool input_schema if present in expected
                 if exp_tool.get("input_schema").is_some() || exp_tool.get("parameters").is_some() {
                     let act_schema = act_tool
                         .get("input_schema")
@@ -682,13 +600,9 @@ mod tests {
             }
         }
 
-        // Compare sampling fields if present in output.json.
-        // Adapters omit fields when they are null (serde skip_serializing_if),
-        // so we treat `None` (absent) and `Some(Null)` as equivalent.
         for field in &["temperature", "top_p", "max_tokens"] {
             if let Some(expected_val) = output_json.get(*field) {
                 let actual_val = actual.get(*field);
-                // If expected is null, accept either absent or null in actual.
                 if expected_val.is_null() {
                     assert!(
                         actual_val.is_none_or(|v| v.is_null()),
@@ -697,7 +611,6 @@ mod tests {
                 } else if let Some(av) = actual_val {
                     assert_eq!(av, expected_val, "{adapter_name}/{case}: {field} mismatch");
                 } else {
-                    // expected is non-null but actual is absent
                     panic!(
                         "{adapter_name}/{case}: {field} expected {expected_val} but field is absent in encoded body"
                     );
@@ -706,11 +619,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Provider response decode tests
-    // ---------------------------------------------------------------------------
-
-    /// Test that decoding a provider response produces the expected output.json fields.
     #[expect(
         clippy::too_many_lines,
         reason = "walks one fixture's decoded response field by field (content \
@@ -737,8 +645,6 @@ mod tests {
             panic!("failed to serialize CoreResponse for {adapter_name}/{case}: {e}")
         });
 
-        // Compare stop_reason (normalize to PascalCase for comparison since
-        // CoreResponse serializes with default serde).
         let actual_stop = actual
             .get("stop_reason")
             .cloned()
@@ -747,7 +653,6 @@ mod tests {
             .get("stop_reason")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        // Normalize both to PascalCase for comparison
         let actual_stop_str = normalize_stop_reason(actual_stop.as_str().unwrap_or(""));
         let expected_stop_str = normalize_stop_reason(expected_stop.as_str().unwrap_or(""));
         assert_eq!(
@@ -755,7 +660,6 @@ mod tests {
             "{adapter_name}/{case}: stop_reason mismatch (actual: {actual_stop}, expected: {expected_stop})"
         );
 
-        // Compare id if present in output.json
         if let Some(expected_id) = output_json.get("id") {
             assert_eq!(
                 actual.get("id"),
@@ -764,19 +668,12 @@ mod tests {
             );
         }
 
-        // Compare model if present in output.json.
-        // Adapters may override the model with the target's upstream_model, so
-        // we only verify that the model field exists and has a non-empty
-        // requested value. Direct string comparison is skipped because the
-        // decoded model depends on ProviderAdapterTarget configuration.
         if let Some(expected_str) = output_json.get("model").and_then(|m| m.as_str())
             && let Some(am_req) = actual
                 .get("model")
                 .and_then(|am| am.get("requested"))
                 .and_then(|v| v.as_str())
         {
-            // Verify both are non-empty; the actual model may be overridden by
-            // the adapter's target configuration.
             assert!(
                 !expected_str.is_empty() || am_req.is_empty(),
                 "{adapter_name}/{case}: expected model is empty but actual is '{am_req}'"
@@ -787,7 +684,6 @@ mod tests {
             );
         }
 
-        // Compare stop_sequence if present in output.json
         if let Some(expected_ss) = output_json.get("stop_sequence") {
             assert_eq!(
                 actual.get("stop_sequence"),
@@ -796,15 +692,6 @@ mod tests {
             );
         }
 
-        // Compare content blocks structurally.
-        // CoreContent serializes as externally-tagged enum, e.g.:
-        //   {"Text": {"text": "...", "cache": null}}
-        //   {"ToolUse": {"id": "...", "name": "...", "input": {...}}}
-        //   {"Thinking": {"text": "...", "signature": null}}
-        // The fixture output.json uses a more human-readable format:
-        //   {"type": "text", "text": "..."}
-        //   {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
-        // So we extract the actual variant from the serde key and compare.
         let actual_content = actual
             .get("content")
             .and_then(|v| v.as_array())
@@ -827,11 +714,8 @@ mod tests {
             .zip(expected_content.iter())
             .enumerate()
         {
-            // Actual: externally-tagged serde, extract the key (e.g. "Text", "ToolUse")
             let actual_key = extract_content_variant(ac);
-            // Expected: human-readable "type" field (e.g. "text", "tool_use")
             let expected_type = ec.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
-            // Normalize both to PascalCase for comparison
             let actual_normalized = match actual_key.as_str() {
                 "Text" => "text",
                 "ToolUse" => "tool_use",
@@ -849,12 +733,10 @@ mod tests {
                 actual_normalized, expected_type,
                 "{adapter_name}/{case}: content[{i}] type mismatch"
             );
-            // Get the inner object from the actual serde format
             let inner = ac
                 .get(&actual_key)
                 .cloned()
                 .unwrap_or(serde_json::Value::Object(Default::default()));
-            // For text blocks, compare text
             if expected_type == "text" {
                 assert_eq!(
                     inner.get("text"),
@@ -862,14 +744,12 @@ mod tests {
                     "{adapter_name}/{case}: content[{i}] text mismatch"
                 );
             }
-            // For thinking blocks, compare text and optionally signature
             if expected_type == "thinking" {
                 assert_eq!(
                     inner.get("text"),
                     ec.get("text"),
                     "{adapter_name}/{case}: content[{i}] thinking text mismatch"
                 );
-                // Compare signature if present in expected output
                 if ec.get("signature").is_some() {
                     assert_eq!(
                         inner.get("signature"),
@@ -878,7 +758,6 @@ mod tests {
                     );
                 }
             }
-            // For tool_use blocks, compare id, name, and input
             if expected_type == "tool_use" {
                 assert_eq!(
                     inner.get("name"),
@@ -890,7 +769,6 @@ mod tests {
                     ec.get("input"),
                     "{adapter_name}/{case}: content[{i}] tool_use input mismatch"
                 );
-                // Compare id if present in expected output
                 if ec.get("id").is_some() {
                     assert_eq!(
                         inner.get("id"),
@@ -899,7 +777,6 @@ mod tests {
                     );
                 }
             }
-            // For refusal blocks, compare text
             if expected_type == "refusal" {
                 assert_eq!(
                     inner.get("text"),
@@ -907,7 +784,6 @@ mod tests {
                     "{adapter_name}/{case}: content[{i}] refusal text mismatch"
                 );
             }
-            // For redacted_thinking blocks, compare data if present
             if expected_type == "redacted_thinking" && ec.get("data").is_some() {
                 assert_eq!(
                     inner.get("data"),
@@ -917,7 +793,6 @@ mod tests {
             }
         }
 
-        // Compare usage token counts
         let actual_usage = actual
             .get("usage")
             .cloned()
@@ -937,7 +812,6 @@ mod tests {
             "{adapter_name}/{case}: usage.output_tokens mismatch"
         );
 
-        // Compare extended usage fields if present in output.json
         if expected_usage.get("reasoning_tokens").is_some() {
             assert_eq!(
                 actual_usage.get("reasoning_tokens"),
@@ -961,16 +835,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Provider stream decode tests
-    // ---------------------------------------------------------------------------
-
-    /// Test that decoding a provider SSE stream produces events matching core-events.json.
-    ///
-    /// The core-events.json file uses a human-readable format with a `"type"` field
-    /// per event (e.g., `{"type": "message_start", ...}`). The test compares:
-    /// 1. Event counts must match.
-    /// 2. Each event's variant kind (from the `"type"` field) must match.
     #[expect(
         clippy::too_many_lines,
         reason = "walks one fixture's expected SSE event sequence frame by \
@@ -997,19 +861,16 @@ mod tests {
             all_events.extend(events);
         }
 
-        // Flush remaining state
         let remaining = decoder
             .finish()
             .unwrap_or_else(|e| panic!("finish failed for {adapter_name}/{case}: {e}"));
         all_events.extend(remaining);
 
-        // Parse expected event types from the fixture file.
         let expected_raw: Vec<serde_json::Value> = serde_json::from_str(&core_events_raw)
             .unwrap_or_else(|e| {
                 panic!("failed to parse core-events.json for {adapter_name}/{case}: {e}")
             });
 
-        // Compare event counts.
         assert_eq!(
             all_events.len(),
             expected_raw.len(),
@@ -1018,7 +879,6 @@ mod tests {
             expected_raw.len()
         );
 
-        // Compare each event's variant kind with the fixture's "type" field.
         for (i, (actual, expected)) in all_events.iter().zip(expected_raw.iter()).enumerate() {
             let actual_kind = event_variant_name(actual);
             let expected_type = expected
@@ -1030,7 +890,6 @@ mod tests {
                 "{adapter_name}/{case}: event[{i}] variant mismatch"
             );
 
-            // Compare key event field values based on variant type.
             match actual {
                 CoreEvent::TextDelta { index, text } => {
                     if let Some(exp_text) = expected.get("text") {
@@ -1113,7 +972,6 @@ mod tests {
                 } => {
                     if let Some(exp_sr) = expected.get("stop_reason") {
                         let actual_sr = format!("{stop_reason:?}");
-                        // Normalize: serde serializes PascalCase, fixture may use either
                         let expected_sr = normalize_stop_reason(exp_sr.as_str().unwrap_or(""));
                         let actual_normalized = normalize_stop_reason(&actual_sr);
                         assert_eq!(
@@ -1180,9 +1038,6 @@ mod tests {
                         );
                     }
                     if let Some(exp_kind) = expected.get("kind").and_then(|v| v.as_str()) {
-                        // Use an explicit match on ContentKind to produce the expected
-                        // string, rather than relying on Debug formatting which could
-                        // change if the Debug impl is modified.
                         let actual_kind = match kind {
                             llm_proxy_protocol::core::ContentKind::Text => "text",
                             llm_proxy_protocol::core::ContentKind::ToolUse => "tool_use",
@@ -1205,21 +1060,12 @@ mod tests {
                         );
                     }
                 }
-                // Ping -- variant-only comparison is sufficient.
                 CoreEvent::Ping => {}
-                // #[non_exhaustive] requires a wildcard arm.  New variants should
-                // get explicit match arms above for field-level validation.
                 _ => {}
             }
         }
     }
 
-    /// Get the variant name of a CoreEvent for comparison.
-    ///
-    /// This match explicitly handles every known CoreEvent variant.  Because
-    /// CoreEvent is `#[non_exhaustive]`, a wildcard arm is required, but it
-    /// panics so that any new variant introduced in the protocol crate is
-    /// caught immediately during test execution.
     fn event_variant_name(event: &CoreEvent) -> &'static str {
         match event {
             CoreEvent::MessageStart { .. } => "message_start",
@@ -1233,18 +1079,12 @@ mod tests {
             CoreEvent::MessageStop { .. } => "message_stop",
             CoreEvent::Error { .. } => "error",
             CoreEvent::Ping => "ping",
-            // #[non_exhaustive] requires a wildcard arm.  This will panic if a
-            // new CoreEvent variant is introduced without updating this match.
             _ => panic!(
                 "event_variant_name: unknown CoreEvent variant. \
              Add an explicit match arm for the new variant."
             ),
         }
     }
-
-    // ---------------------------------------------------------------------------
-    // OpenAI Chat provider fixtures
-    // ---------------------------------------------------------------------------
 
     #[test]
     fn openai_chat_encode_text_request() {
@@ -1331,10 +1171,6 @@ mod tests {
             "malformed response should produce an error"
         );
     }
-
-    // ---------------------------------------------------------------------------
-    // Anthropic provider fixtures
-    // ---------------------------------------------------------------------------
 
     #[test]
     fn anthropic_encode_text_request() {
@@ -1432,10 +1268,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // Responses provider fixtures
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn responses_encode_text_request() {
         run_encode_request_fixture(RESPONSES, "text_request");
@@ -1522,10 +1354,6 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // Gemini provider fixtures
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn gemini_encode_text_request() {
         run_encode_request_fixture(GEMINI, "text_request");
@@ -1607,15 +1435,6 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Coverage-matrix completeness test
-    // ===========================================================================
-
-    /// Fixture cases required for every provider adapter (request encode direction).
-    /// Format: (case_name, required_files)
-    ///
-    /// Universal cases apply to all adapters.  Adapter-specific extras are handled
-    /// in the `coverage_matrix_all_required_fixtures_exist` match block below.
     fn required_encode_request_cases() -> Vec<(&'static str, Vec<&'static str>)> {
         vec![
             ("text_request", vec!["core.json", "output.json"]),
@@ -1623,16 +1442,9 @@ mod tests {
             ("tool_request", vec!["core.json", "output.json"]),
             ("tool_result_request", vec!["core.json", "output.json"]),
             ("thinking_request", vec!["core.json", "output.json"]),
-            // Additional cases from the plan's 'Minimum fixture cases' section.
-            // These are not yet enforced as hard requirements (fixtures may not
-            // exist yet) but are listed here as a TODO for the next audit round:
-            //   multiple_messages, tool_choice, refusal, image/document/audio/video
-            //   content, cache_marker, sampling preservation, model_mapping,
-            //   stop_sequence, unsupported core content, malformed client request.
         ]
     }
 
-    /// Fixture cases required for every provider adapter (response decode direction).
     fn required_decode_response_cases() -> Vec<(&'static str, Vec<&'static str>)> {
         vec![
             ("text_response", vec!["input.json", "output.json"]),
@@ -1640,29 +1452,18 @@ mod tests {
             ("thinking_response", vec!["input.json", "output.json"]),
             ("stop_reason_response", vec!["input.json", "output.json"]),
             ("malformed_response", vec!["input.json"]),
-            // Additional cases planned for next audit round:
-            //   redacted_thinking, refusal, usage_mapping, stop_sequence_mapping,
-            //   unsupported provider fields, lossy translation warning/provider_meta.
         ]
     }
 
-    /// Fixture cases required for every provider adapter (stream decode direction).
     fn required_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> {
         vec![
             ("stream_text", vec!["input.sse", "core-events.json"]),
             ("stream_tool", vec!["input.sse", "core-events.json"]),
             ("stream_usage", vec!["input.sse", "core-events.json"]),
             ("stream_malformed", vec!["input.sse", "core-events.json"]),
-            // Additional cases planned for next audit round:
-            //   stream_thinking (adapter-specific -- see match block below),
-            //   stream_error (adapter-specific -- see match block below),
-            //   stream_ping (adapter-specific -- see match block below),
-            //   partial-tool-call-buffering, upstream-disconnect,
-            //   unknown-provider-events.
         ]
     }
 
-    /// Records every required fixture file that is absent on disk.
     fn push_missing_files(
         adapter: &str,
         cases: &[(&'static str, Vec<&'static str>)],
@@ -1678,25 +1479,11 @@ mod tests {
         }
     }
 
-    /// Records missing fixtures for the stream cases only some adapters support.
-    ///
-    /// Each adapter documents which extra streaming cases it supports; an
-    /// adapter that cannot produce a given event (e.g. Gemini and
-    /// `ThinkingDelta`) documents the exclusion here rather than omitting it
-    /// silently.
     fn push_missing_adapter_specific(adapter: &str, missing: &mut Vec<String>) {
         let extra_cases: &[&str] = match adapter {
-            // Anthropic supports ping, error, and thinking SSE events.
             ANTHROPIC => &["stream_error", "stream_ping", "stream_thinking"],
-            // OpenAI Chat supports thinking (reasoning) streaming. It emits
-            // neither Ping (no such SSE event) nor Error (upstream errors are
-            // HTTP status codes, handled at the transport level).
             OPENAI_CHAT => &["stream_thinking"],
-            // Responses supports error SSE events, but produces neither
-            // ThinkingDelta nor Ping.
             RESPONSES => &["stream_error"],
-            // Gemini's streaming tool calls are covered by the universal
-            // stream_tool case; it emits no thinking, error, or ping events.
             _ => &[],
         };
         let cases: Vec<(&str, Vec<&str>)> = extra_cases
@@ -1729,10 +1516,6 @@ mod tests {
         );
     }
 
-    /// Asserts every `.json` fixture present for these cases parses.
-    ///
-    /// `skip_malformed` exempts `malformed_response/input.json`, which is
-    /// invalid on purpose.
     fn assert_json_fixtures_parse(
         adapter: &str,
         cases: &[(&'static str, Vec<&'static str>)],
@@ -1754,8 +1537,6 @@ mod tests {
         }
     }
 
-    /// Asserts each stream case's `core-events.json` parses and its `input.sse`
-    /// is non-empty.
     fn assert_stream_fixtures_parse(adapter: &str, cases: &[(&'static str, Vec<&'static str>)]) {
         for (case, _) in cases {
             let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
@@ -1780,7 +1561,6 @@ mod tests {
         let adapters = [OPENAI_CHAT, ANTHROPIC, RESPONSES, GEMINI];
 
         for adapter in &adapters {
-            // `malformed_response/input.json` is intentionally invalid JSON.
             assert_json_fixtures_parse(adapter, &required_encode_request_cases(), false);
             assert_json_fixtures_parse(adapter, &required_decode_response_cases(), true);
             assert_stream_fixtures_parse(adapter, &required_stream_cases());

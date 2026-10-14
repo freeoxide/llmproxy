@@ -1,22 +1,12 @@
-//! Buffered SSE parser for upstream provider streams.
-//!
-//! Provider streams can split a single SSE frame across multiple TCP chunks,
-//! and some providers emit comments, event names, ids, or multi-line `data:`
-//! fields. This module handles those edge cases so that route handlers and
-//! adapters never need to split raw HTTP byte chunks with `str::lines()`.
+//! Buffered SSE parser for upstream provider streams: reassembles frames split
+//! across TCP chunks and handles comments, event/id fields, and multi-line data.
 
 use std::str;
 
 use crate::error::ProviderError;
 
-// ---------------------------------------------------------------------------
-// SseFrame
-// ---------------------------------------------------------------------------
-
-/// A parsed SSE frame.
-///
-/// Emitted only after a blank line boundary or when [`SseFramer::finish`] is
-/// called.
+/// A parsed SSE frame, emitted only after a blank line boundary or when
+/// [`SseFramer::finish`] is called.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseFrame {
     /// Optional `event:` field value.
@@ -27,53 +17,20 @@ pub struct SseFrame {
     pub data: String,
 }
 
-// ---------------------------------------------------------------------------
-// SseFramer
-// ---------------------------------------------------------------------------
+/// Default ceiling on the framer's byte buffer and on a single frame's
+/// accumulated `data:` payload; exceeding either yields [`ProviderError::SseFraming`].
+pub const DEFAULT_MAX_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// Default ceiling on the framer's internal byte buffer and on the size of a
-/// single in-progress frame's accumulated `data:` payload.
-///
-/// A real SSE line or frame is tiny (a JSON event is at most a few KiB). The
-/// framer drains complete lines as they arrive, so `buffer` only holds bytes
-/// between newlines; if a single line (no `\n`) exceeds this cap the upstream
-/// is dribbling non-terminated bytes and we fail fast instead of growing the
-/// buffer toward OOM. Likewise a `data:` frame that accumulates beyond this cap
-/// without a blank-line boundary is rejected. See audit GAP-MED-2.
-pub const DEFAULT_MAX_BUFFER_BYTES: usize = 1024 * 1024; // 1 MiB
-
-/// Buffered SSE frame parser.
-///
-/// Call [`SseFramer::push_chunk`] with raw bytes as they arrive from the
-/// upstream. Call [`SseFramer::finish`] when the stream ends to emit any
-/// trailing partial frame.
-///
-/// Both the raw byte buffer and an in-progress frame's `data:` payload are
-/// capped at `max_buffer_bytes` (default [`DEFAULT_MAX_BUFFER_BYTES`]); an
-/// upstream that would grow either beyond the cap yields
-/// [`ProviderError::SseFraming`] instead of unbounded allocation (audit
-/// GAP-MED-2).
+/// Buffered SSE frame parser: feed raw bytes via [`SseFramer::push_chunk`] as
+/// they arrive; call [`SseFramer::finish`] at stream end to flush a partial frame.
 #[derive(Debug)]
 pub struct SseFramer {
-    /// Buffered raw bytes. Stores partial UTF-8 sequences that arrived split
-    /// across TCP chunks so that multi-byte characters (CJK, emoji) are not
-    /// rejected by an intermediate `str::from_utf8` call.
     buffer: Vec<u8>,
-    /// Ceiling on `buffer` and on the accumulated `data:` frame payload.
     max_buffer_bytes: usize,
-    /// Current frame being assembled.
     current_event: Option<String>,
     current_id: Option<String>,
     current_data_lines: Vec<String>,
-    /// Running byte length of the strings in `current_data_lines` (the join
-    /// separators are negligible against `max_buffer_bytes`). Reset whenever a
-    /// frame is taken.
     current_data_bytes: usize,
-    /// Whether a leading UTF-8 BOM (U+FEFF, bytes `EF BB BF`) has been stripped
-    /// from the start of the stream. The WHATWG SSE spec mandates stripping one
-    /// leading BOM; without it a first line of `\u{FEFF}data: ...` parses the
-    /// field as `\u{FEFF}data`, matches no known field, and is silently
-    /// dropped, losing the first frame (audit sse-no-bom-strip).
     bom_checked: bool,
 }
 
@@ -84,10 +41,8 @@ impl SseFramer {
         Self::with_max_buffer_bytes(DEFAULT_MAX_BUFFER_BYTES)
     }
 
-    /// Create a new empty framer with a custom buffer/frame cap.
-    ///
-    /// `max_buffer_bytes` bounds both a single unterminated line (the raw
-    /// buffer) and the accumulated `data:` payload of a single frame.
+    /// Create a new empty framer with a custom cap bounding both a single
+    /// unterminated line and the accumulated `data:` payload of a single frame.
     pub fn with_max_buffer_bytes(max_buffer_bytes: usize) -> Self {
         Self {
             buffer: Vec::new(),
@@ -100,35 +55,16 @@ impl SseFramer {
         }
     }
 
-    /// Feed a raw byte chunk and return any completed frames.
-    ///
-    /// The chunk may contain partial lines or partial UTF-8 sequences.
-    /// Completed frames are emitted only when a blank line boundary is
-    /// encountered. Returns an error if the accumulated buffer (after appending
-    /// the chunk) contains invalid UTF-8 that cannot be explained by a partial
-    /// multi-byte sequence at the tail, or if the buffer exceeds
-    /// `max_buffer_bytes` (a misbehaving upstream dribbling non-newline bytes).
+    /// Feed a raw byte chunk (possibly partial lines/UTF-8) and return frames
+    /// completed at a blank-line boundary; errors on invalid UTF-8 or cap overrun.
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseFrame>, ProviderError> {
         self.buffer.extend_from_slice(chunk);
 
-        // Strip a single leading UTF-8 BOM (U+FEFF, bytes `EF BB BF`) once at
-        // the start of the stream, per the WHATWG SSE spec. A deferred
-        // decision is needed when the buffer holds only a *prefix* of the BOM
-        // (e.g. just `EF`): we cannot yet tell whether it is the start of a BOM
-        // or the first byte of real content, so we wait for more bytes. As soon
-        // as a non-matching byte arrives (or the full BOM is present) the
-        // decision is final and `bom_checked` is set so this never runs again
-        // (audit sse-no-bom-strip).
         if !self.bom_checked {
             const BOM: &[u8; 3] = &[0xEF, 0xBB, 0xBF];
             if self.buffer.starts_with(BOM) {
-                // Full BOM present at the very start: strip it.
                 self.buffer.drain(..BOM.len());
             }
-            // Decide whether the leading bytes can still grow into a BOM. If
-            // the buffer is a strict prefix of the BOM (and nothing more),
-            // defer: wait for the next chunk to disambiguate. Otherwise the
-            // leading byte(s) cannot be a BOM, so the check is final.
             let still_prefix = (1..BOM.len())
                 .any(|n| self.buffer.len() == n && BOM.starts_with(&self.buffer[..n]));
             if !still_prefix {
@@ -146,20 +82,14 @@ impl SseFramer {
         self.drain_buffer()
     }
 
-    /// Flush any remaining buffered data as a final frame.
-    ///
-    /// Call this when the upstream stream ends. If there is partial data in the
-    /// buffer, it is emitted as a frame.
+    /// Flush remaining buffered data as a final frame; call when the upstream
+    /// stream ends, emitting any trailing partial frame.
     pub fn finish(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
         let mut frames = Vec::new();
 
         if !self.buffer.is_empty() {
-            // Process any complete lines first (up to the last newline).
-            // This avoids UTF-8 decode failures from partial multi-byte
-            // sequences that may appear after the last newline.
             self.flush_complete_lines(&mut frames)?;
 
-            // Handle any remaining bytes after the last newline (no trailing newline).
             if !self.buffer.is_empty() {
                 let text = str::from_utf8(&self.buffer).map_err(ProviderError::from)?;
                 let line = text.trim_end_matches('\r').to_owned();
@@ -174,22 +104,12 @@ impl SseFramer {
         Ok(frames)
     }
 
-    // -----------------------------------------------------------------------
-    // Internal
-    // -----------------------------------------------------------------------
-
-    /// Drains the buffer through its last newline, emitting any frames it
-    /// completes.
-    ///
-    /// Stopping at a newline boundary keeps a multi-byte UTF-8 character that
-    /// straddles two chunks intact.
     fn flush_complete_lines(&mut self, frames: &mut Vec<SseFrame>) -> Result<(), ProviderError> {
         let Some(last_nl) = self.buffer.iter().rposition(|&b| b == b'\n') else {
             return Ok(());
         };
         let complete = self.buffer[..last_nl + 1].to_vec();
         self.buffer.drain(..last_nl + 1);
-        // Complete lines ending at a newline boundary are valid UTF-8.
         let text = str::from_utf8(&complete).map_err(ProviderError::from)?;
         for line in text.lines() {
             let trimmed = line.trim_end_matches('\r');
@@ -202,38 +122,22 @@ impl SseFramer {
         Ok(())
     }
 
-    /// Parse as many complete lines as possible from the buffer.
-    ///
-    /// Handles the case where a multi-byte UTF-8 character is split across
-    /// two TCP chunks: we only decode up to the last newline, keeping any
-    /// trailing bytes (which may be an incomplete UTF-8 sequence) in the
-    /// buffer for the next chunk.
     fn drain_buffer(&mut self) -> Result<Vec<SseFrame>, ProviderError> {
         let mut frames = Vec::new();
 
         while let Some(nl_pos) = self.buffer.iter().position(|&b| b == b'\n') {
-            // Find the last non-\r byte in the line (before the newline).
-            // This lets us trim trailing \r bytes using a slice reference
-            // instead of allocating a separate Vec.
             let trimmed_end = match self.buffer[..nl_pos].iter().rposition(|&b| b != b'\r') {
-                Some(pos) => pos + 1, // exclusive end
-                None => 0,            // Line was all \r characters.
+                Some(pos) => pos + 1,
+                None => 0,
             };
 
-            // Decode the trimmed line as UTF-8 and convert to an owned string
-            // so we release the immutable borrow on self.buffer before draining.
-            // The line is guaranteed to be valid UTF-8 because it ends at a \n
-            // boundary which is a single byte; any partial multi-byte UTF-8
-            // sequence would not contain \n.
             let line = str::from_utf8(&self.buffer[..trimmed_end])
                 .map_err(ProviderError::from)?
                 .to_owned();
 
-            // Remove the line + newline from the buffer.
             self.buffer.drain(..nl_pos + 1);
 
             if line.is_empty() {
-                // Blank line = frame boundary.
                 if let Some(frame) = self.take_current_frame() {
                     frames.push(frame);
                 }
@@ -245,17 +149,13 @@ impl SseFramer {
         Ok(frames)
     }
 
-    /// Process a single non-blank SSE line.
     fn process_line(&mut self, line: &str) -> Result<(), ProviderError> {
-        // Ignore comments.
         if line.starts_with(':') {
             return Ok(());
         }
 
-        // Parse field:value or field: value (space after colon is optional).
         if let Some(colon_pos) = line.find(':') {
             let field = &line[..colon_pos];
-            // Skip the optional single space after the colon.
             let value = &line[colon_pos + 1..];
             let value = value.strip_prefix(' ').unwrap_or(value);
 
@@ -269,12 +169,9 @@ impl SseFramer {
                 "data" => {
                     self.push_data(value)?;
                 }
-                // Ignore unknown fields per spec.
                 _ => {}
             }
         } else {
-            // A field with no colon and no value (e.g. just "data" with no ":").
-            // Per SSE spec, this is a field with an empty value.
             match line {
                 "event" => {
                     self.current_event = Some(String::new());
@@ -291,9 +188,6 @@ impl SseFramer {
         Ok(())
     }
 
-    /// Append a `data:` value to the in-progress frame, enforcing the frame
-    /// cap so a misbehaving upstream emitting an unbounded multi-line `data:`
-    /// frame (no blank-line boundary) cannot grow the frame without bound.
     fn push_data(&mut self, value: &str) -> Result<(), ProviderError> {
         let next = self.current_data_bytes.saturating_add(value.len());
         if next > self.max_buffer_bytes {
@@ -309,7 +203,6 @@ impl SseFramer {
         Ok(())
     }
 
-    /// Take the current accumulated frame if it has any data.
     fn take_current_frame(&mut self) -> Option<SseFrame> {
         let data_lines = std::mem::take(&mut self.current_data_lines);
         self.current_data_bytes = 0;
@@ -332,10 +225,6 @@ impl Default for SseFramer {
     }
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,7 +233,6 @@ mod tests {
     fn sse_framer_handles_partial_frames_split_across_chunks() {
         let mut framer = SseFramer::new();
 
-        // First chunk has a partial frame.
         let frames = framer.push_chunk(b"data: hel").unwrap();
         assert!(frames.is_empty(), "No complete frame yet");
 
@@ -401,11 +289,9 @@ mod tests {
     fn sse_framer_emits_trailing_frame_from_finish() {
         let mut framer = SseFramer::new();
 
-        // Push data without a trailing blank line.
         let frames = framer.push_chunk(b"data: partial").unwrap();
         assert!(frames.is_empty());
 
-        // Finish should emit the trailing frame.
         let frames = framer.finish().unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "partial");
@@ -439,13 +325,11 @@ mod tests {
     fn sse_framer_rejects_invalid_utf8() {
         let mut framer = SseFramer::new();
 
-        // Invalid UTF-8 bytes buffered (no newline, so drain_buffer finds nothing).
         let result = framer.push_chunk(&[0xFF, 0xFE]);
         assert!(
             result.is_ok(),
             "push_chunk should buffer raw bytes without error"
         );
-        // The error surfaces when finish() tries to decode the buffer as UTF-8.
         let result = framer.finish();
         assert!(
             result.is_err(),
@@ -461,8 +345,6 @@ mod tests {
     fn sse_framer_rejects_invalid_utf8_at_newline() {
         let mut framer = SseFramer::new();
 
-        // Invalid UTF-8 followed by a newline: drain_buffer will try to decode
-        // the line and fail.
         let result = framer.push_chunk(&[0xFF, 0xFE, b'\n']);
         assert!(
             result.is_err(),
@@ -523,15 +405,10 @@ mod tests {
         assert_eq!(frames[0].event.as_deref(), Some("msg1"));
         assert_eq!(frames[0].id.as_deref(), Some("1"));
         assert_eq!(frames[0].data, "hello");
-        // Second frame has no event or id.
         assert!(frames[1].event.is_none());
         assert!(frames[1].id.is_none());
         assert_eq!(frames[1].data, "world");
     }
-
-    // -----------------------------------------------------------------------
-    // Edge case tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn sse_framer_empty_input_returns_no_frames() {
@@ -596,12 +473,10 @@ mod tests {
     fn sse_framer_finish_after_complete_stream_is_empty() {
         let mut framer = SseFramer::new();
 
-        // Push a complete frame (terminated by blank line).
         let frames = framer.push_chunk(b"data: hello\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "hello");
 
-        // Calling finish() again should return empty.
         let frames = framer.finish().unwrap();
         assert!(
             frames.is_empty(),
@@ -616,7 +491,6 @@ mod tests {
         let frames = framer.push_chunk(b"retry: 5000\ndata: hello\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "hello");
-        // The retry field is silently ignored per SSE spec.
     }
 
     #[test]
@@ -634,32 +508,27 @@ mod tests {
     fn sse_framer_finish_trims_trailing_cr() {
         let mut framer = SseFramer::new();
 
-        // Simulate a stream ending with 'data: hello\r' (no trailing \n).
         let frames = framer.push_chunk(b"data: hello\r").unwrap();
         assert!(frames.is_empty());
 
         let frames = framer.finish().unwrap();
         assert_eq!(frames.len(), 1);
-        // The trailing \r must be trimmed, not preserved in the data.
         assert_eq!(frames[0].data, "hello");
     }
 
     #[test]
     fn sse_framer_multibyte_utf8_split_across_chunks() {
-        // The character 'あ' is 3 bytes in UTF-8: 0xE3 0x81 0x82.
         let full_char = "あ";
         let full_bytes = full_char.as_bytes();
         assert_eq!(full_bytes.len(), 3);
 
         let mut framer = SseFramer::new();
 
-        // First chunk: "data: " + first 2 bytes of あ.
         let mut chunk1 = b"data: ".to_vec();
         chunk1.extend_from_slice(&full_bytes[..2]);
         let frames = framer.push_chunk(&chunk1).unwrap();
         assert!(frames.is_empty(), "No complete frame yet");
 
-        // Second chunk: remaining 1 byte of あ + "\n\n".
         let mut chunk2 = full_bytes[2..].to_vec();
         chunk2.extend_from_slice(b"\n\n");
         let frames = framer.push_chunk(&chunk2).unwrap();
@@ -672,9 +541,6 @@ mod tests {
 
     #[test]
     fn sse_framer_data_newline_then_finish() {
-        // "data: hello\n" (newline-terminated line but no blank line after it)
-        // push_chunk drains the line but doesn't emit a frame; finish() should
-        // emit it.
         let mut framer = SseFramer::new();
         let frames = framer.push_chunk(b"data: hello\n").unwrap();
         assert!(frames.is_empty(), "No blank line yet, no frame");
@@ -686,11 +552,8 @@ mod tests {
 
     #[test]
     fn sse_framer_reusable_after_finish() {
-        // Verify the framer is in a clean state after finish() so it can be
-        // reused for a second stream.
         let mut framer = SseFramer::new();
 
-        // First round.
         let frames = framer.push_chunk(b"data: first\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "first");
@@ -698,20 +561,13 @@ mod tests {
         let frames = framer.finish().unwrap();
         assert!(frames.is_empty(), "Nothing left after complete stream");
 
-        // Second round -- framer should be clean.
         let frames = framer.push_chunk(b"data: second\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "second");
     }
 
-    // -----------------------------------------------------------------------
-    // Bounded-buffer / bounded-frame protections (audit GAP-MED-2)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn sse_framer_rejects_unterminated_line_exceeding_cap() {
-        // A single unterminated line (no newline) larger than the cap must
-        // error instead of growing the buffer without bound.
         let mut framer = SseFramer::with_max_buffer_bytes(64);
         let big = b"x".repeat(65);
         let err = framer.push_chunk(&big).unwrap_err();
@@ -724,15 +580,10 @@ mod tests {
 
     #[test]
     fn sse_framer_rejects_oversized_data_frame_exceeding_cap() {
-        // Many `data:` lines without a blank-line boundary must trip the frame
-        // cap rather than accumulating without bound.
         let mut framer = SseFramer::with_max_buffer_bytes(64);
-        // Each line is "data: aaa..." (8 bytes of payload) repeated until the
-        // accumulated frame payload exceeds 64 bytes.
         let line = b"data: aaaaaaaa\n"; // 8 payload bytes, no blank line
         let mut last_ok = true;
         for _ in 0..16 {
-            // 8 * 16 = 128 > 64, so this must eventually error.
             let res = framer.push_chunk(line);
             match res {
                 Ok(_) => last_ok = true,
@@ -755,9 +606,6 @@ mod tests {
 
     #[test]
     fn sse_framer_resets_data_byte_counter_after_frame_boundary() {
-        // After a blank-line boundary the per-frame byte counter resets, so a
-        // stream of many small legitimate frames (each under the cap) parses
-        // fine even though their total exceeds the cap.
         let mut framer = SseFramer::with_max_buffer_bytes(32);
         for i in 0..50 {
             let chunk = format!("data: item{i}\n\n");
@@ -769,18 +617,11 @@ mod tests {
 
     #[test]
     fn sse_framer_default_cap_is_one_mebibyte() {
-        // Sanity: the public default matches the documented constant.
         assert_eq!(DEFAULT_MAX_BUFFER_BYTES, 1024 * 1024);
     }
 
-    // -----------------------------------------------------------------------
-    // Leading UTF-8 BOM stripping (audit sse-no-bom-strip)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn sse_framer_strips_single_leading_bom() {
-        // U+FEFF as UTF-8 is EF BB BF. A BOM-prefixed first data line must
-        // parse the field as `data`, not `\u{FEFF}data`.
         let mut framer = SseFramer::new();
         let mut input = vec![0xEF, 0xBB, 0xBF];
         input.extend_from_slice(b"data: hello\n\n");
@@ -791,8 +632,6 @@ mod tests {
 
     #[test]
     fn sse_framer_strips_bom_split_across_chunks() {
-        // The BOM arrives split across two chunks; the first data line must
-        // still parse correctly.
         let mut framer = SseFramer::new();
         let frames = framer.push_chunk(&[0xEF, 0xBB]).unwrap();
         assert!(frames.is_empty(), "no complete frame yet");
@@ -805,11 +644,8 @@ mod tests {
 
     #[test]
     fn sse_framer_strips_only_one_bom() {
-        // Only one leading BOM is stripped; a second BOM in-stream is content
-        // that survives into the data field (it is valid UTF-8).
         let mut framer = SseFramer::new();
         let mut input = vec![0xEF, 0xBB, 0xBF];
-        // "data: \u{FEFF}hello\n\n" — the BOM inside the data value is kept.
         input.extend_from_slice(b"data: ");
         input.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
         input.extend_from_slice(b"hello\n\n");
@@ -820,16 +656,11 @@ mod tests {
 
     #[test]
     fn sse_framer_no_bom_preserves_leading_content() {
-        // No BOM present: the first byte is real content and must survive.
         let mut framer = SseFramer::new();
         let frames = framer.push_chunk(b"data: hello\n\n").unwrap();
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "hello");
     }
-
-    // -----------------------------------------------------------------------
-    // Source guard: sse.rs must not import forbidden types
-    // -----------------------------------------------------------------------
 
     #[test]
     fn sse_source_no_forbidden_imports() {

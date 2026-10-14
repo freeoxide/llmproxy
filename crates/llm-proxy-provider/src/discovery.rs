@@ -16,12 +16,6 @@ use crate::ProviderError;
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 
-/// Maximum number of bytes streamed from a discovery error body before it is
-/// passed to [`ProviderError::api`].
-///
-/// Streamed (not buffered-then-truncated) so an adversarial discovery endpoint
-/// returning a large error body cannot spike transient memory (audit
-/// discovery-error-body-full-read).
 const MAX_DISCOVERY_ERROR_BODY_BYTES: usize = 2048;
 
 /// GET-capable HTTP client for provider model discovery.
@@ -31,11 +25,8 @@ pub struct DiscoveryClient {
 }
 
 impl DiscoveryClient {
-    /// Build a discovery client with short, independent timeouts.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP client cannot be constructed.
+    /// Build a discovery client with short, independent timeouts; errors if the
+    /// HTTP client cannot be constructed.
     pub fn try_new() -> Result<Self, ProviderError> {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -48,13 +39,6 @@ impl DiscoveryClient {
                 if !matches!(next.scheme(), "http" | "https") {
                     return attempt.stop();
                 }
-                // SSRF / credential-disclosure guard: reqwest strips
-                // `Authorization` on cross-host redirects, but it does NOT strip
-                // custom auth headers such as `x-api-key` / `x-goog-api-key`
-                // (the credentials used by Anthropic and Gemini discovery).
-                // Refuse to follow a redirect whose host/port/scheme differs from
-                // the original request's so a compromised or MITM discovery
-                // endpoint cannot replay the provider API key to an attacker host.
                 if let Some(origin) = attempt.previous().first() {
                     let cross_host = next.host_str() != origin.host_str()
                         || next.port_or_known_default() != origin.port_or_known_default()
@@ -69,12 +53,8 @@ impl DiscoveryClient {
         Ok(Self { http })
     }
 
-    /// Fetch and normalize the configured provider model list.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for missing discovery config, invalid responses,
-    /// pagination failures, or transport errors.
+    /// Fetch and normalize the configured provider model list; errors on missing
+    /// discovery config, invalid responses, pagination, or transport failures.
     pub async fn discover(
         &self,
         provider: &ProviderConfig,
@@ -91,11 +71,6 @@ impl DiscoveryClient {
         })?;
         let mut models = Vec::new();
         let mut dropped = 0usize;
-        // Track the previous pagination token so a non-advancing token (the
-        // upstream returns the same `nextPageToken` / `after_id` every page) is
-        // detected and pagination stops early with a warning, instead of
-        // fetching the same page up to `max_pages` times (audit
-        // discovery-nonadvancing-pagination-token).
         let mut previous_token: Option<String> = None;
 
         for _ in 0..discovery.max_pages {
@@ -111,10 +86,6 @@ impl DiscoveryClient {
             let Some((name, token)) = next_page(discovery.kind, &value) else {
                 models.sort_by(|a, b| a.id.cmp(&b.id));
                 models.dedup_by(|a, b| a.id == b.id);
-                // Surface the aggregate count of records dropped across all
-                // pages so a silently partial catalog is observable in the
-                // success path (GAP-LOW-6). Logged at `info!` only when
-                // non-zero to avoid noise on clean responses.
                 if dropped > 0 {
                     tracing::info!(
                         provider = %provider.name,
@@ -126,12 +97,6 @@ impl DiscoveryClient {
                 return Ok(models);
             };
 
-            // Stop early if the upstream returned a token identical to the one
-            // we just used: feeding it back would re-fetch the same page in a
-            // tight loop until `max_pages`. Sort/dedup the (possibly partial)
-            // catalog and return it rather than treating this as a hard error,
-            // since the records gathered so far are valid (audit
-            // discovery-nonadvancing-pagination-token).
             if previous_token.as_deref() == Some(token.as_str()) {
                 tracing::warn!(
                     provider = %provider.name,
@@ -163,12 +128,6 @@ impl DiscoveryClient {
             ProviderError::InvalidConfig("missing discovery configuration".to_owned())
         })?;
 
-        // Bounded retry with fixed backoff for transient failures (GAP-LOW-4):
-        // a single 5xx or transport hiccup (TLS reset, connection reset,
-        // timeout) mid-pagination would otherwise abort the whole catalog
-        // refresh for a provider. Only server-side / transport errors are
-        // retried — 4xx and parse errors are surfaced immediately. The total
-        // extra wall-clock is bounded by `MAX_TRANSIENT_RETRIES * BACKOFF`.
         let mut last_error = None;
         for attempt in 0..=Self::MAX_TRANSIENT_RETRIES {
             if attempt > 0 {
@@ -191,34 +150,17 @@ impl DiscoveryClient {
                 Err(error) => return Err(error),
             }
         }
-        // All retries exhausted; surface the last transient error.
         Err(last_error.expect("retry loop ran at least once"))
     }
 
-    /// Upper bound on the number of retries after the first attempt for a
-    /// transient discovery failure.
-    ///
-    /// Exposed (`pub`) so callers and tests can reason about the total
-    /// worst-case probe count for a persistently-failing endpoint, which is
-    /// `1 + MAX_TRANSIENT_RETRIES`.
+    /// Upper bound on retries after the first attempt for a transient failure;
+    /// worst-case probe count is `1 + MAX_TRANSIENT_RETRIES`.
     pub const MAX_TRANSIENT_RETRIES: u32 = 2;
 
-    /// Fixed backoff applied before each retry of a transient discovery
-    /// failure. Intentionally constant (no jitter) because discovery is an
-    /// infrequent background refresh, not a fan-out request hot path.
     const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
-    /// Classify a [`ProviderError`] as transient (worth retrying).
-    ///
-    /// Returns `true` for transport-level failures (`Http`, including TLS
-    /// resets, connection resets, and timeouts) and `Api` responses with a
-    /// server-side 5xx status code. Client-side 4xx errors, parse failures,
-    /// and configuration errors are non-transient.
     fn is_transient(error: &ProviderError) -> bool {
         match error {
-            // Redirect-policy violations (e.g. too many redirects, or a
-            // cross-host redirect refused by the custom policy) are
-            // deterministic: retrying just re-runs the same redirect chain.
             ProviderError::Http { redirect: true, .. } => false,
             ProviderError::Http { .. } => true,
             ProviderError::Api { status, .. } => (500..600).contains(status),
@@ -233,8 +175,6 @@ impl DiscoveryClient {
         url: &Url,
     ) -> RequestBuilder {
         let mut request = self.http.get(url.clone());
-        // Transport boundary (discovery bypasses `AuthHeaders`): the secret is
-        // exposed only here to build the reqwest auth header(s).
         let api_key: &str = provider.api_key.expose_secret();
         request = match provider.auth_style {
             AuthStyle::Bearer => request.bearer_auth(api_key),
@@ -256,8 +196,6 @@ impl DiscoveryClient {
         request
     }
 
-    /// Execute a single discovery request attempt: send, validate status, and
-    /// stream the body up to `max_response_bytes`, then parse as JSON.
     async fn send_once(
         &self,
         request: RequestBuilder,
@@ -266,10 +204,6 @@ impl DiscoveryClient {
         let response = request.send().await?;
         let status = response.status();
         if !status.is_success() {
-            // Stream only a small prefix of the error body for diagnostics,
-            // mirroring the success path's bounded read, so a misbehaving
-            // discovery endpoint returning a large error body cannot spike
-            // transient memory (audit discovery-error-body-full-read).
             let body_prefix =
                 crate::error::read_error_body_bounded(response, MAX_DISCOVERY_ERROR_BODY_BYTES)
                     .await;
@@ -309,9 +243,6 @@ fn parse_models(
             "discovery response has an invalid top-level model list".to_owned(),
         ));
     };
-    // Count of records dropped this page (no id / empty id, or a Gemini model
-    // lacking generateContent support). Surfaced as an aggregate by `discover`
-    // in the success path so a silent partial catalog is observable (GAP-LOW-6).
     let mut dropped = 0usize;
     for record in records {
         let id = record
@@ -360,19 +291,6 @@ fn parse_models(
 }
 
 fn set_query_parameter(url: &mut Url, name: &str, value: &str) {
-    // Single-pass query rebuild (audit GAP-LOW-5).
-    //
-    // Snapshot the existing query string once (a single allocation of the whole
-    // query), clear it, then re-append every pair except the one named `name`,
-    // and finally append the new value. `form_urlencoded::parse` yields
-    // `Cow<str>` borrowed from the snapshot, so no per-pair `into_owned()` is
-    // needed -- the prior implementation allocated two owned `String`s per pair
-    // (one for the key, one for the value) solely to detach them from `url`'s
-    // read borrow before the mutable `query_pairs_mut` borrow began. Parsing the
-    // snapshot sidesteps that borrow conflict with a single allocation.
-    //
-    // All existing pairs keyed `name` are dropped and exactly one new pair is
-    // appended, matching the prior behavior.
     let snapshot = url.query().unwrap_or("").to_owned();
     url.set_query(None);
     let mut serializer = url.query_pairs_mut();
@@ -419,21 +337,8 @@ fn next_page(kind: ProviderDiscoveryKind, value: &Value) -> Option<(&'static str
 }
 
 impl Default for DiscoveryClient {
-    /// Returns a default discovery client.
-    ///
-    /// # Lint expectation
-    ///
-    /// The `expect` below is deliberate: this is the infallible-in-practice
-    /// convenience constructor (no custom TLS backend), with [`Self::try_new`]
-    /// as the fallible alternative -- mirroring the convention established for
-    /// `ProxyClient::new` in `transport.rs` (audit LOW-2). `#[expect]` makes the
-    /// deliberate use compile-time-checked.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the underlying `reqwest::Client` cannot be constructed (e.g.
-    /// due to a TLS backend initialization failure). Use [`DiscoveryClient::try_new`]
-    /// for a fallible constructor.
+    /// Returns a default discovery client; panics if the HTTP client cannot be
+    /// constructed — use [`DiscoveryClient::try_new`] for the fallible form.
     #[expect(
         clippy::expect_used,
         reason = "Default is infallible in practice; try_new is the fallible constructor"
@@ -621,10 +526,6 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_stops_on_non_advancing_pagination_token() {
-        // A Gemini-style endpoint that always returns the SAME nextPageToken
-        // must be detected: pagination stops early after the second identical
-        // token instead of fetching the same page up to `max_pages` times
-        // (audit discovery-nonadvancing-pagination-token).
         async fn static_token_models(State(calls): State<Arc<AtomicUsize>>) -> Json<Value> {
             calls.fetch_add(1, Ordering::SeqCst);
             Json(json!({
@@ -654,14 +555,11 @@ mod tests {
             .await
             .expect("non-advancing token should stop early, not error");
 
-        // Exactly two pages fetched: the first yields the token, the second
-        // returns the identical token and trips the non-advancing guard.
         assert_eq!(
             calls.load(Ordering::SeqCst),
             2,
             "pagination should stop after detecting the repeated token"
         );
-        // The catalog gathered so far is valid and deduplicated.
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "models/gemini-pro");
     }
@@ -683,8 +581,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["a", "z"]
         );
-        // GAP-LOW-6: the aggregate dropped-count must be surfaced from the
-        // success path; the malformed `{"missing": "id"}` record is counted.
         assert_eq!(dropped, 1);
     }
 
@@ -725,10 +621,6 @@ mod tests {
         );
     }
 
-    // -- discovery auth: secret is used on the wire AND redacted from Debug --
-
-    /// Build a discovery provider with an explicit api key and auth style, so
-    /// tests can prove each auth style places the exposed secret on the wire.
     fn discovery_provider_with_auth(
         endpoint: String,
         auth_style: AuthStyle,
@@ -756,10 +648,6 @@ mod tests {
         }
     }
 
-    /// Test-server handler that echoes the received auth header value back as
-    /// the single model id, so the test can assert which credential reached the
-    /// wire. Configured via `EchoAuthConfig` state (the header name to read and
-    /// an optional prefix to strip, e.g. the `Bearer ` scheme prefix).
     #[derive(Clone)]
     struct EchoAuthConfig {
         header_name: String,
@@ -781,11 +669,6 @@ mod tests {
         Json(json!({ "data": [{ "id": value }] }))
     }
 
-    /// The discovery auth path exposes the secret ONLY to build the reqwest
-    /// auth header(s); each auth style must place the configured key on the
-    /// wire (proving the secret IS used), while the ProviderConfig Debug output
-    /// must never contain the raw key (proving redaction). Parameterized over
-    /// the three auth styles the discovery builder supports.
     async fn run_discovery_auth_on_the_wire_and_redacted(
         auth_style: AuthStyle,
         header_name: &'static str,
@@ -805,9 +688,6 @@ mod tests {
         .await;
         let provider = discovery_provider_with_auth(endpoint, auth_style, SECRET);
 
-        // (a) The exposed secret must reach the wire: the echo handler returns
-        // the received auth-header value as the model id, which must equal the
-        // configured key.
         let models = DiscoveryClient::default()
             .discover(&provider)
             .await
@@ -822,7 +702,6 @@ mod tests {
             "the configured api key must be sent on the wire as the auth header"
         );
 
-        // (b) The ProviderConfig Debug output must NOT leak the raw key.
         let debug = format!("{provider:?}");
         assert!(
             !debug.contains(SECRET),
@@ -861,8 +740,6 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_both_auth_uses_secret_on_wire_and_redacts_debug() {
-        // AuthStyle::Both sets Bearer + x-api-key; assert the Bearer side lands
-        // on the wire (the x-api-key side is covered by the XApiKey test).
         run_discovery_auth_on_the_wire_and_redacted(
             AuthStyle::Both,
             "authorization",

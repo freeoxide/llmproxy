@@ -1,15 +1,7 @@
 //! Provider error types shared across transport, adapters, and routes.
-//!
-//! Extracted so that the transport layer and provider adapters can depend on
-//! [`ProviderError`] without coupling to any specific client implementation.
 
-// ---------------------------------------------------------------------------
-// Provider error
-// ---------------------------------------------------------------------------
-
-/// Errors produced by provider transport and adapter operations.
-///
-/// This enum is non-exhaustive; downstream code should include a catch-all arm.
+/// Errors produced by provider transport and adapter operations; the enum is
+/// non-exhaustive, so downstream match arms must include a catch-all.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ProviderError {
@@ -17,29 +9,21 @@ pub enum ProviderError {
     #[error("failed to marshal request: {0}")]
     Serialize(#[from] serde_json::Error),
 
-    /// The HTTP request failed at the transport level.
-    ///
-    /// The message is stored without the request URL so query credentials
-    /// cannot leak through logs, CLI output, or downstream responses.
+    /// The HTTP request failed at the transport level; the message is stored
+    /// without the request URL so query credentials cannot leak through logs.
     #[error("request failed: {message}")]
     Http {
         /// URL-free transport error text.
         message: String,
         /// Whether reqwest classified the failure as a timeout.
         timeout: bool,
-        /// Whether reqwest classified the failure as a redirect-policy
-        /// violation (e.g. too many redirects, or a cross-host redirect refused
-        /// by a custom policy). Redirect-policy failures are deterministic, so
-        /// [`DiscoveryClient::is_transient`] must not retry them.
+        /// Whether reqwest classified the failure as a redirect-policy violation;
+        /// deterministic, so [`DiscoveryClient::is_transient`] must not retry it.
         redirect: bool,
     },
 
-    /// The upstream API returned an error status code.
-    ///
-    /// The `body` field is truncated to the internal maximum error body length
-    /// (512 bytes) and stripped of common API key patterns at construction time
-    /// so that `Display` output (used in `warn!()` / `error!()` logging) never
-    /// contains full key material.
+    /// The upstream API returned an error status code; `body` is truncated and
+    /// stripped of API-key patterns so `Display` output never leaks key material.
     #[error("API error {status}: {body}")]
     Api {
         /// HTTP status code.
@@ -52,10 +36,8 @@ pub enum ProviderError {
     #[error("invalid UTF-8 in stream: {0}")]
     Utf8(#[from] std::str::Utf8Error),
 
-    /// SSE framing error (malformed frame structure, unexpected stream termination).
-    ///
-    /// Constructed by [`SseFramer`](crate::sse::SseFramer) when it detects
-    /// malformed SSE structure such as unterminated frames after stream end.
+    /// SSE framing error (malformed frame structure, unexpected stream
+    /// termination), constructed by [`SseFramer`](crate::sse::SseFramer).
     #[error("SSE framing error: {0}")]
     SseFraming(String),
 
@@ -80,17 +62,6 @@ impl From<reqwest::Error> for ProviderError {
     }
 }
 
-/// Read at most `cap` bytes of an upstream error body via a byte stream.
-///
-/// Rather than calling `Response::text()`/`bytes()` (which buffer the entire
-/// body) and truncating after the fact, this streams `bytes_stream()` and stops
-/// as soon as `cap` bytes have accumulated. A read error is rendered as a
-/// placeholder so the caller still gets a usable error body (audit
-/// transport-unbounded-error-body-read / discovery-error-body-full-read).
-///
-/// Shared by the request transport ([`crate::transport`]) and the discovery
-/// client ([`crate::discovery`]); the cap is larger than the final sanitization
-/// truncation so the most diagnostic prefix is retained for logging.
 pub(crate) async fn read_error_body_bounded(resp: reqwest::Response, cap: usize) -> String {
     use futures::TryStreamExt;
     let mut stream = resp.bytes_stream();
@@ -102,8 +73,6 @@ pub(crate) async fn read_error_body_bounded(resp: reqwest::Response, cap: usize)
                 if remaining == 0 {
                     break;
                 }
-                // Multi-byte safe: only append whole bytes up to the cap; never
-                // slice a &str at a raw byte offset.
                 let take = bytes.len().min(remaining);
                 buf.extend_from_slice(&bytes[..take]);
                 if buf.len() >= cap {
@@ -117,133 +86,48 @@ pub(crate) async fn read_error_body_bounded(resp: reqwest::Response, cap: usize)
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Maximum length for upstream API error bodies stored in [`ProviderError::Api`].
-///
-/// After truncation the string is at most `MAX_API_ERROR_BODY_LEN` bytes long
-/// (the `...[truncated]` suffix is included within this budget).
 pub(crate) const MAX_API_ERROR_BODY_LEN: usize = 512;
 
-/// Suffix appended when a body exceeds the truncation limit.
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
 
-/// Truncate a string to `max_len` bytes, appending `suffix` if truncation occurs.
-///
-/// Delegates to the shared implementation in `llm_proxy_protocol::util`.
 fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
     llm_proxy_protocol::util::truncate_with_suffix(s, max_len, suffix)
 }
 
-/// Redaction patterns compiled once via `LazyLock`.
-///
-/// Each pattern matches a known API-key prefix followed by enough token
-/// characters to be a real key (10–20+). This avoids false positives on short
-/// substrings like `sk-` that appear in ordinary words (e.g. "desk-area").
 static REDACTION_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| {
-        // Character class covering the URL/JSON-safe punctuation real tokens
-        // carry: `.` (dotted OpenAI restricted keys, JWT segment separators),
-        // `-`, `_`, `/`, `+`, `=` (base64). Delimiters — quotes, braces,
-        // brackets, commas, whitespace — are deliberately excluded so a
-        // trailing delimiter adjacent to the token is never consumed into the
-        // redaction. Prior to GAP-MED-1 this class stopped at `.`/`/`/`+`/`=`,
-        // so a dotted key or JWT was only redacted up to its first dot and the
-        // secret-bearing suffix leaked to the client.
         const C: &str = r"A-Za-z0-9_.\-/+=";
-        // Order matters only for intent-documentation: every pattern runs a
-        // full `replace_all` pass over the body, and `***` is inert, so the
-        // final output is the union of all matches regardless of order.
-        // Longer/more-specific patterns are listed first.
         [
-            // OpenAI restricted (dotted) keys: sk-proj-XXXX.YYYY
             format!(r"sk-proj-[{C}]{{10,}}"),
-            // Anthropic keys: sk-ant-api03-XXXXX
             format!(r"sk-ant-api03-[{C}]{{10,}}"),
-            // Anthropic keys: sk-ant-XXXXX
             format!(r"sk-ant-[{C}]{{10,}}"),
-            // OpenAI keys: sk-live-XXXXX (hyphen form)
             format!(r"sk-live-[{C}]{{10,}}"),
-            // OpenAI keys: sk-test-XXXXX (hyphen form)
             format!(r"sk-test-[{C}]{{10,}}"),
-            // OpenAI keys: sk_live_XXXXX (underscore form)
             format!(r"sk_live_[{C}]{{10,}}"),
-            // OpenAI keys: sk_test_XXXXX (underscore form)
             format!(r"sk_test_[{C}]{{10,}}"),
-            // Generic sk- prefix with enough trailing chars to look like a key
             format!(r"sk-[{C}]{{20,}}"),
-            // Google API keys: AIza followed by 30+ token chars
             format!(r"AIza[{C}]{{30,}}"),
-            // Generic key- prefix with enough trailing chars
             format!(r"key-[{C}]{{20,}}"),
-            // JWT-shaped Bearer tokens: Bearer eyJ....body.sig (lowered bar so
-            // even a partially-echoed JWT fragment is caught).
             format!(r"Bearer eyJ[{C}]{{10,}}"),
-            // Bearer token values echoed in error responses
             format!(r"Bearer [{C}]{{20,}}"),
-            // Generic key= assignment patterns (key=VALUE with 20+ chars)
             format!(r"(?i)key=[{C}]{{20,}}"),
-            // Generic token= assignment patterns (token=VALUE with 20+ chars)
             format!(r"(?i)token=[{C}]{{20,}}"),
         ]
         .iter()
-        // SAFETY: every pattern is built from a static string literal (via
-        // format! with a compile-time constant char class), so the resulting
-        // regex is known valid and `Regex::new` cannot fail here.
         .map(|pat| regex::Regex::new(pat).expect("invalid redaction regex"))
         .collect()
     });
 
-/// Sanitize an upstream API error body: strip common key patterns and
-/// truncate to [`MAX_API_ERROR_BODY_LEN`].
-///
-/// # Ordering rationale
-///
-/// Redaction runs BEFORE truncation. This means if a key pattern appears in
-/// the portion that would be truncated away, the pattern survives because
-/// truncation happens after redaction. This is acceptable because:
-/// 1. The truncation limit (512 bytes) is large enough to cover the vast
-///    majority of real error messages.
-/// 2. The redaction patterns target key *prefixes* (e.g. `sk-ant-`) which
-///    typically appear near the start of error bodies, not near the end.
-/// 3. Even if a partial key survives in the truncated tail, the key is
-///    incomplete and unlikely to be the full secret.
-///
-/// # Covered patterns
-///
-/// - OpenAI keys: `sk-live-...`, `sk-test-...`, `sk_live_...`, `sk_test_...`,
-///   `sk-proj-...` (dotted restricted keys), generic `sk-...` (only when
-///   followed by 20+ token chars).
-/// - Anthropic keys: `sk-ant-api03-...`, `sk-ant-...`
-/// - Google API keys: `AIza...` (only when followed by 30+ chars)
-/// - Generic key prefixes: `key-...` (only when followed by 20+ chars)
-/// - Generic assignment patterns: `key=...`, `token=...` (case-insensitive,
-///   only when followed by 20+ chars)
-/// - Bearer token values: `Bearer ...` (only when followed by 20+ chars) and
-///   JWT-shaped `Bearer eyJ....body.sig`
-///
-/// The token character class includes `.`/`/`/`+`/`=` so dotted keys and JWTs
-/// are redacted whole rather than only up to their first `.` (audit GAP-MED-1).
-///
-/// Uses regex-based matching to avoid false-positive redaction of short
-/// substrings like `sk-` or `key-` that appear in ordinary words.
 pub(crate) fn sanitize_api_error_body(mut body: String) -> String {
-    // Redact API key patterns (regex-based, avoids false positives on short substrings).
     for re in REDACTION_PATTERNS.iter() {
         body = re.replace_all(&body, "***").into_owned();
     }
 
-    // Truncate if the sanitized body exceeds the limit.
-    // Uses the same truncate-with-suffix logic as
-    // `llm_proxy_server::routes::error_response::truncate_with_suffix`.
-    // Both implementations must stay in sync.
     if body.len() > MAX_API_ERROR_BODY_LEN {
         body = truncate_with_suffix(&body, MAX_API_ERROR_BODY_LEN, TRUNCATED_SUFFIX);
     }
     body
 }
-
-// ---------------------------------------------------------------------------
-// ProviderError convenience constructors
-// ---------------------------------------------------------------------------
 
 impl ProviderError {
     /// Return whether this is an HTTP timeout.
@@ -253,9 +137,6 @@ impl ProviderError {
     }
 
     /// Construct a [`ProviderError::Api`] with automatic body sanitization.
-    ///
-    /// Encapsulates the sanitization call so callers never need to remember
-    /// to call the internal `sanitize_api_error_body` function manually.
     pub fn api(status: u16, body_text: String) -> Self {
         Self::Api {
             status,
@@ -263,10 +144,8 @@ impl ProviderError {
         }
     }
 
-    /// Classify the HTTP status code of a [`ProviderError::Api`] into a
-    /// [`llm_proxy_protocol::core::CoreStreamErrorKind`].
-    ///
-    /// Returns `None` for non-`Api` variants.
+    /// Classify the HTTP status of a [`ProviderError::Api`] into a
+    /// [`llm_proxy_protocol::core::CoreStreamErrorKind`]; `None` for non-`Api`.
     pub fn api_error_kind(&self) -> Option<llm_proxy_protocol::core::CoreStreamErrorKind> {
         match self {
             Self::Api { status, .. } => Some(match *status {
@@ -275,9 +154,6 @@ impl ProviderError {
                 403 => llm_proxy_protocol::core::CoreStreamErrorKind::Permission,
                 429 => llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit,
                 500 | 502 | 503 => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
-                // All remaining status codes (including 4xx not listed above)
-                // are classified as Upstream errors. This is intentional since
-                // ProviderError::Api is only constructed for status >= 400.
                 _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
             }),
             _ => None,
@@ -285,17 +161,9 @@ impl ProviderError {
     }
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // -----------------------------------------------------------------------
-    // sanitize_api_error_body tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn sanitize_body_under_limit_is_unchanged() {
@@ -313,12 +181,10 @@ mod tests {
 
     #[test]
     fn sanitize_body_truncation_exact_length() {
-        // Exactly at the limit should NOT be truncated.
         let body = "a".repeat(MAX_API_ERROR_BODY_LEN);
         let result = sanitize_api_error_body(body.clone());
         assert_eq!(result, body);
 
-        // One over the limit should be truncated.
         let body = "a".repeat(MAX_API_ERROR_BODY_LEN + 1);
         let result = sanitize_api_error_body(body);
         assert!(result.ends_with("...[truncated]"));
@@ -327,11 +193,8 @@ mod tests {
 
     #[test]
     fn sanitize_body_multibyte_char_at_boundary_does_not_panic() {
-        // Japanese characters are 3 bytes each in UTF-8.
-        // Build a body whose byte length straddles the truncation boundary.
-        let body = "あ".repeat(200); // 600 bytes, exceeds 512
+        let body = "あ".repeat(200);
         let result = sanitize_api_error_body(body);
-        // Must not panic and must be valid UTF-8.
         assert!(result.len() <= MAX_API_ERROR_BODY_LEN);
         assert!(result.ends_with("...[truncated]"));
     }
@@ -402,7 +265,6 @@ mod tests {
 
     #[test]
     fn sanitize_does_not_redact_short_sk_substring() {
-        // "desk-area" should NOT be redacted -- `sk-` only matches with 20+ trailing chars.
         let body = "the desk-area is reserved".to_owned();
         let result = sanitize_api_error_body(body.clone());
         assert_eq!(result, body);
@@ -410,7 +272,6 @@ mod tests {
 
     #[test]
     fn sanitize_does_not_redact_short_key_substring() {
-        // "key-value store" should NOT be redacted.
         let body = "key-value store".to_owned();
         let result = sanitize_api_error_body(body.clone());
         assert_eq!(result, body);
@@ -418,7 +279,6 @@ mod tests {
 
     #[test]
     fn sanitize_does_not_redact_short_aiza_substring() {
-        // "AIza" alone without 30+ trailing chars should not be redacted.
         let body = "The area is at AIza Lane".to_owned();
         let result = sanitize_api_error_body(body.clone());
         assert_eq!(result, body);
@@ -426,8 +286,6 @@ mod tests {
 
     #[test]
     fn sanitize_redacts_bearer_token_in_error_body() {
-        // If an upstream API echoes the Authorization header value back in its
-        // error response, the Bearer prefix + token must be redacted.
         let body = r#"error: invalid key Bearer sk-ant-api03-abc123def456ghi789jkl012"#.to_owned();
         let result = sanitize_api_error_body(body);
         assert!(
@@ -480,7 +338,6 @@ mod tests {
 
     #[test]
     fn sanitize_does_not_redact_short_key_assignment() {
-        // "key=short" should NOT be redacted -- under 20 chars.
         let body = "error: key=shortvalue".to_owned();
         let result = sanitize_api_error_body(body.clone());
         assert_eq!(result, body);
@@ -488,22 +345,11 @@ mod tests {
 
     #[test]
     fn redaction_patterns_all_compile_successfully() {
-        // Verify every regex in REDACTION_PATTERNS compiles without panicking.
-        // This is a regression guard: if a pattern is edited to be invalid,
-        // the LazyLock would panic at first use in production. This test
-        // exercises the initialization path explicitly.
         let _ = &*REDACTION_PATTERNS;
     }
 
-    // -----------------------------------------------------------------------
-    // GAP-MED-1: dotted keys / JWTs must redact whole (no suffix leak)
-    // -----------------------------------------------------------------------
-
     #[test]
     fn sanitize_redacts_dotted_openai_proj_key_with_no_suffix_leak() {
-        // OpenAI restricted key echoed in a dotted format. The pre-GAP-MED-1
-        // char class stopped at `.` so only `sk-proj-AbCd...` matched and the
-        // `.T3BlbkFJ...` suffix leaked. The whole token must now redact.
         let body = "invalid key: sk-proj-AbCdEfGh1234567890.T3BlbkFJabc123def456".to_owned();
         let result = sanitize_api_error_body(body);
         assert!(
@@ -515,9 +361,6 @@ mod tests {
 
     #[test]
     fn sanitize_redacts_jwt_bearer_token_with_no_suffix_leak() {
-        // A `Bearer <JWT>` is three dot-separated base64url segments. The
-        // pre-GAP-MED-1 class stopped at `.` so only the header segment
-        // matched and the payload + signature leaked.
         let jwt = concat!(
             "Bearer eyJhbGciOiJIUzI1NiJ9.",
             "eyJzdWIiOiIxMjM0NTY3ODkwIn0.",
@@ -532,10 +375,6 @@ mod tests {
 
     #[test]
     fn sanitize_redacts_legacy_dotted_key_with_no_suffix_leak() {
-        // A legacy dotted key (no recognized prefix) is still caught by the
-        // broadened generic `key=` / `sk-` patterns as long as it carries a
-        // known prefix; here the `key=` assignment form redacts the dotted
-        // value whole.
         let body = "error: key=abCdEf.1234567890abcdefghij.KLuMnO".to_owned();
         let result = sanitize_api_error_body(body);
         assert!(
@@ -547,9 +386,6 @@ mod tests {
 
     #[test]
     fn sanitize_does_not_consume_trailing_delimiter_after_token() {
-        // A token immediately followed by a quote/brace must redact the token
-        // but leave the delimiter in place — the char class excludes `"` `}`
-        // etc. so the suffix cannot be swallowed.
         let body = r#"{"error":"key sk-ant-abc123def456ghi789jkl012mno345pqr"}"#.to_owned();
         let result = sanitize_api_error_body(body);
         assert!(

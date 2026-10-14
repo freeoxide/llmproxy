@@ -1,12 +1,5 @@
-//! OpenAI Chat Completions provider adapter.
-//!
-//! Translates between core types and the OpenAI Chat Completions wire format:
-//!
-//! ```text
-//! CoreRequest  -> ChatCompletionRequest
-//! ChatCompletionResponse -> CoreResponse
-//! ChatCompletionChunk stream -> CoreEvent stream
-//! ```
+//! OpenAI Chat Completions provider adapter: translates core requests,
+//! responses, and event streams to and from the Chat Completions wire format.
 
 use std::collections::HashMap;
 
@@ -26,35 +19,11 @@ use super::{
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Adapter for the OpenAI Chat Completions API.
 #[derive(Debug, Clone, Default)]
 pub struct OpenAiChatAdapter;
 
-// ---------------------------------------------------------------------------
-// Stream decoder
-// ---------------------------------------------------------------------------
-
-/// Stateful stream decoder for OpenAI Chat Completions SSE frames.
-///
-/// ## CoreEvent variants emitted
-///
-/// - `MessageStart` -- on the first chunk received
-/// - `ContentStart` -- on first text or reasoning delta
-/// - `TextDelta` -- on `delta.content`
-/// - `ThinkingDelta` -- on `delta.reasoning_content` (or `delta.reasoning`)
-/// - `ToolCallStart` -- on new tool calls in `delta.tool_calls`
-/// - `ToolCallDelta` -- on tool call argument deltas
-/// - `ToolCallStop` -- on stream end for unclosed tool blocks
-/// - `UsageDelta` -- on usage-only chunks or final chunks with usage
-/// - `MessageStop` -- on `finish_reason` or stream end
-///
-/// Intentionally never emitted: `Ping` (OpenAI Chat has no ping mechanism),
-/// `Error` (OpenAI errors are handled at the transport level, not in stream
-/// decoding).
+/// Stateful stream decoder translating OpenAI Chat Completions SSE frames into `CoreEvent`s.
 #[derive(Debug)]
 pub struct OpenAiChatStreamDecoder {
     model_ref: ModelRef,
@@ -62,7 +31,6 @@ pub struct OpenAiChatStreamDecoder {
     content_index: usize,
     content_started: bool,
     reasoning_started: bool,
-    /// Maps OpenAI tool-call index to our content block index.
     tool_blocks: HashMap<usize, usize>,
     stop_sent: bool,
 }
@@ -93,7 +61,6 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
             });
         }
 
-        // Usage-only chunk (no choices).
         if chunk.choices.is_empty() {
             if let Some(ref usage) = chunk.usage {
                 events.push(CoreEvent::UsageDelta {
@@ -110,13 +77,6 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
 
         let choice = &chunk.choices[0];
 
-        // Handle reasoning content (both `reasoning_content` and `reasoning`).
-        // The serde alias on ChatMessage ensures both field names deserialize
-        // into `reasoning_content`.
-        //
-        // Empty-string reasoning deltas are intentionally skipped: OpenAI sends
-        // them as keep-alives with no semantic meaning, and usage-only /
-        // finish-reason-only chunks are handled in separate code paths below.
         if let Some(reasoning) = choice
             .delta
             .as_ref()
@@ -138,12 +98,6 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
             }
         }
 
-        // Handle text content deltas.
-        //
-        // Empty-string content deltas are intentionally skipped: OpenAI sends
-        // them as keep-alives with no semantic meaning.  The finish_reason and
-        // usage are handled in separate code paths, so this truthy check does not
-        // drop meaningful events.
         if let Some(ref delta) = choice.delta {
             if !delta.content_is_empty() {
                 self.close_reasoning_if_open();
@@ -161,7 +115,6 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
             }
         }
 
-        // Handle tool call deltas.
         if let Some(ref delta) = choice.delta
             && !delta.tool_calls.is_empty()
         {
@@ -169,7 +122,6 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
             self.push_tool_call_deltas(&delta.tool_calls, &mut events);
         }
 
-        // Handle finish reason.
         if let Some(ref reason) = choice.finish_reason {
             if !reason.is_empty() && !self.stop_sent {
                 self.close_content_if_open();
@@ -231,7 +183,6 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
 }
 
 impl OpenAiChatStreamDecoder {
-    /// Close any open text content block.  Reserved for future ContentStop emission.
     fn close_text_if_open(&mut self) {
         if self.content_started {
             self.content_started = false;
@@ -239,7 +190,6 @@ impl OpenAiChatStreamDecoder {
         }
     }
 
-    /// Close any open reasoning content block.  Reserved for future ContentStop emission.
     fn close_reasoning_if_open(&mut self) {
         if self.reasoning_started {
             self.reasoning_started = false;
@@ -247,7 +197,6 @@ impl OpenAiChatStreamDecoder {
         }
     }
 
-    /// Close any open text or reasoning content blocks.
     fn close_content_if_open(&mut self) {
         if self.content_started {
             self.content_started = false;
@@ -259,18 +208,8 @@ impl OpenAiChatStreamDecoder {
         }
     }
 
-    /// Translates a chunk's `tool_calls` array into core tool-call events.
-    ///
-    /// Opens a block the first time an upstream index is seen and routes
-    /// argument fragments to the block that index owns, so parallel calls stay
-    /// separated.
     fn push_tool_call_deltas(&mut self, tool_calls: &[ToolCall], events: &mut Vec<CoreEvent>) {
         for tc in tool_calls {
-            // The wire `index` is `Option<i32>`; negative values are
-            // semantically meaningless but a malformed/malicious chunk could
-            // carry one.  An unchecked `as usize` would wrap (e.g. `-1` ->
-            // `usize::MAX`), producing phantom tool blocks with huge indices.
-            // Validate before casting: negatives fall back to 0 and are logged.
             let oi = tc
                 .index
                 .and_then(|i| usize::try_from(i).ok())
@@ -284,7 +223,6 @@ impl OpenAiChatStreamDecoder {
                     0
                 });
 
-            // New tool call?
             if !self.tool_blocks.contains_key(&oi) {
                 let func_name = tc
                     .function
@@ -316,7 +254,6 @@ impl OpenAiChatStreamDecoder {
                 self.content_index += 1;
             }
 
-            // Argument delta.
             if let Some(ref func) = tc.function
                 && let Some(ref args) = func.arguments
                 && !args.is_empty()
@@ -339,13 +276,6 @@ impl OpenAiChatStreamDecoder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// OpenAiChatAdapter impl
-// ---------------------------------------------------------------------------
-
-/// Folds one assistant content block into the outgoing tool calls / reasoning.
-///
-/// Blocks the Chat Completions schema cannot carry are dropped with a warning.
 fn encode_assistant_content(
     content: &CoreContent,
     tool_calls: &mut Vec<ToolCall>,
@@ -381,10 +311,6 @@ fn encode_assistant_content(
     }
 }
 
-/// Appends one `role: "tool"` message per tool result in `content`.
-///
-/// Chat Completions carries tool results as standalone messages rather than as
-/// content blocks on the user turn.
 fn push_tool_result_messages(content: &[CoreContent], messages: &mut Vec<ChatMessage>) {
     for c in content {
         let CoreContent::ToolResult {
@@ -473,7 +399,6 @@ impl OpenAiChatAdapter {
                         });
                     }
 
-                    // Tool results become separate tool messages.
                     push_tool_result_messages(&msg.content, &mut messages);
                 }
                 CoreRole::Assistant => {
@@ -485,13 +410,6 @@ impl OpenAiChatAdapter {
                         encode_assistant_content(content, &mut tool_calls, &mut reasoning_content);
                     }
 
-                    // When an assistant turn carries only tool calls (no text),
-                    // emit `content: null` rather than `content: ""`.  The
-                    // OpenAI Chat Completions API tolerates both, but some
-                    // strict OpenAI-compatible upstreams (e.g. Ollama) treat an
-                    // empty string differently from null/absent and drop out of
-                    // tool-calling mode.  `null` is the conventionally-correct
-                    // representation and is accepted by both OpenAI and Ollama.
                     let content = if text.is_empty() && !tool_calls.is_empty() {
                         serde_json::Value::Null
                     } else {
@@ -556,7 +474,6 @@ impl OpenAiChatAdapter {
                     });
                 }
                 _ => {
-                    // Handle future CoreRole variants as user messages.
                     let text = collect_text(&msg.content);
                     if !text.is_empty() {
                         messages.push(ChatMessage {
@@ -595,7 +512,6 @@ impl OpenAiChatAdapter {
             })
             .collect();
 
-        // Tool choice -- omit (None) for unknown variants instead of sending null.
         let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
             CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
             CoreToolChoice::Any => Some(serde_json::json!({"type": "required"})),
@@ -626,8 +542,6 @@ impl OpenAiChatAdapter {
                 if v.len() == 1 {
                     serde_json::Value::String(v[0].clone())
                 } else {
-                    // Manual serialization avoids an infallible expect.
-                    // Vec<String> always serializes to a JSON array of strings.
                     serde_json::Value::Array(
                         v.iter()
                             .map(|s| serde_json::Value::String(s.clone()))
@@ -640,8 +554,6 @@ impl OpenAiChatAdapter {
             extra: serde_json::Map::new(),
         };
 
-        // Propagate the client's include_usage preference to the upstream request.
-        // If the client didn't request usage, we don't ask upstream for it either.
         if core.stream {
             let include_usage = core
                 .provider_hints
@@ -684,7 +596,6 @@ impl OpenAiChatAdapter {
 
         let mut content = Vec::new();
 
-        // Reasoning -> Thinking (typically comes first from the provider).
         if let Some(ref reasoning) = msg.reasoning_content {
             if !reasoning.is_empty() {
                 content.push(CoreContent::Thinking {
@@ -694,7 +605,6 @@ impl OpenAiChatAdapter {
             }
         }
 
-        // Text content (may appear before or after tool calls).
         if !msg.content_is_empty() {
             content.push(CoreContent::Text {
                 text: msg.content_text(),
@@ -702,7 +612,6 @@ impl OpenAiChatAdapter {
             });
         }
 
-        // Refusal.
         if let Some(ref refusal) = msg.refusal {
             if !refusal.is_empty() {
                 content.push(CoreContent::Refusal {
@@ -711,7 +620,6 @@ impl OpenAiChatAdapter {
             }
         }
 
-        // Tool calls -> ToolUse.
         for tc in &msg.tool_calls {
             let raw_args = tc.function.as_ref().and_then(|f| f.arguments.as_ref());
             let input = raw_args
@@ -742,7 +650,6 @@ impl OpenAiChatAdapter {
             });
         }
 
-        // Guarantee at least one content block.
         if content.is_empty() {
             content.push(CoreContent::Text {
                 text: String::new(),
@@ -754,8 +661,6 @@ impl OpenAiChatAdapter {
             .finish_reason
             .as_deref()
             .map(map_openai_finish_reason)
-            // Provider omitted `finish_reason`; record that it was absent
-            // rather than unmapped so the diagnostic is unambiguous.
             .unwrap_or(StopReason::Unknown("absent".to_owned()));
 
         let usage = build_usage_from_openai(
@@ -791,15 +696,6 @@ impl OpenAiChatAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Collect all text from a list of content blocks.
-///
-/// Non-text blocks are silently omitted, but a warning is logged since this
-/// means data is being dropped.  Per the plan's lossy translation rules, every
-/// dropped feature must be either rejected, warned, or preserved opaquely.
 fn collect_text(content: &[CoreContent]) -> String {
     let mut text = String::new();
     for c in content {
@@ -822,10 +718,6 @@ fn collect_text(content: &[CoreContent]) -> String {
     }
     text
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -864,8 +756,6 @@ mod tests {
             provider_hints: Default::default(),
         }
     }
-
-    // -- encode_request tests ------------------------------------------------
 
     #[test]
     fn encode_text_request() {
@@ -1013,7 +903,6 @@ mod tests {
             }],
         }]);
         core.stream = true;
-        // Simulate the client requesting usage via provider_hints.
         core.provider_hints.raw.insert(
             "stream_options".into(),
             serde_json::json!({"include_usage": true}),
@@ -1039,7 +928,6 @@ mod tests {
             }],
         }]);
         core.stream = true;
-        // No provider_hints set -- include_usage should default to false.
         let adapter = OpenAiChatAdapter;
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
@@ -1093,8 +981,6 @@ mod tests {
         assert_eq!(body.max_tokens, Some(1024));
         assert_eq!(body.stop, Some(serde_json::json!("END")));
     }
-
-    // -- decode_response tests -----------------------------------------------
 
     #[test]
     fn decode_text_response() {
@@ -1245,8 +1131,6 @@ mod tests {
         assert_eq!(core_resp.model.requested, "gpt-4o");
     }
 
-    // -- Streaming tests -----------------------------------------------------
-
     #[test]
     fn stream_text_decoding() {
         let target = make_target();
@@ -1337,9 +1221,6 @@ mod tests {
 
     #[test]
     fn stream_negative_tool_index_clamped() {
-        // A malformed/malicious chunk carrying a negative `index` must not wrap
-        // to usize::MAX and create a phantom tool block.  It should be clamped
-        // to 0 and still produce a valid ToolCallStart at index 0.
         let target = make_target();
         let adapter = OpenAiChatAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
@@ -1349,8 +1230,6 @@ mod tests {
         );
         let events = decoder.decode_frame(&frame).unwrap();
 
-        // Exactly one ToolCallStart, and its content_index is 0 (not a wrapped
-        // huge value).
         let starts: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -1365,9 +1244,6 @@ mod tests {
 
     #[test]
     fn encode_assistant_only_tool_calls_emits_null_content() {
-        // An assistant turn with only ToolUse blocks (no text) must serialize
-        // `content: null`, not `content: ""`, for compatibility with strict
-        // OpenAI-compatible upstreams.
         let core = make_core_request(vec![CoreMessage {
             role: CoreRole::Assistant,
             content: vec![CoreContent::ToolUse {
@@ -1392,8 +1268,6 @@ mod tests {
 
     #[test]
     fn encode_assistant_with_text_keeps_string_content() {
-        // An assistant turn with real text must keep `content` as the string
-        // (regression guard for the null-content fix).
         let core = make_core_request(vec![CoreMessage {
             role: CoreRole::Assistant,
             content: vec![
@@ -1452,8 +1326,6 @@ mod tests {
         assert_has_event(&events, "MessageStop");
     }
 
-    // -- Missing tests -------------------------------------------------------
-
     #[test]
     fn decode_thinking_response() {
         let target = make_target();
@@ -1500,7 +1372,6 @@ mod tests {
 
     #[test]
     fn decode_reasoning_alias_field() {
-        // Verify that the `reasoning` field alias works via serde.
         let json = r#"{"role":"assistant","content":"hi","reasoning":"thinking tokens"}"#;
         let msg: ChatMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.reasoning_content, Some("thinking tokens".to_owned()));
@@ -1604,7 +1475,6 @@ mod tests {
 
     #[test]
     fn stream_reasoning_alias() {
-        // Verify that streaming chunks with `reasoning` (not `reasoning_content`) work.
         let target = make_target();
         let adapter = OpenAiChatAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
@@ -1620,8 +1490,6 @@ mod tests {
             "reasoning alias must produce ThinkingDelta"
         );
     }
-
-    // -- Additional missing tests ----------------------------------------------
 
     #[test]
     fn encode_reasoning_effort_forwarded() {
@@ -1699,7 +1567,6 @@ mod tests {
 
     #[test]
     fn encode_tool_choice_none_omitted() {
-        // Verify that unknown tool_choice variants produce None (omitted).
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
             content: vec![CoreContent::Text {
@@ -1707,7 +1574,6 @@ mod tests {
                 cache: None,
             }],
         }]);
-        // Raw null is a valid variant, but we can test with Auto to ensure it's Some.
         core.tool_choice = Some(CoreToolChoice::Auto);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
@@ -1742,7 +1608,6 @@ mod tests {
 
     #[test]
     fn decode_preserves_content_order_thinking_before_text() {
-        // Verify that Thinking appears before Text (provider order).
         let target = make_target();
         let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
             id: "test".into(),
@@ -1778,7 +1643,6 @@ mod tests {
         let adapter = OpenAiChatAdapter;
         let core_resp = adapter.decode_response(&bytes, &target).unwrap();
 
-        // Thinking must come before Text.
         let thinking_idx = core_resp
             .content
             .iter()
@@ -1851,7 +1715,6 @@ mod tests {
 
     #[test]
     fn stream_finish_reason_only_chunk() {
-        // Test a chunk that only has finish_reason with no prior content.
         let target = make_target();
         let adapter = OpenAiChatAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
@@ -1879,8 +1742,6 @@ mod tests {
         )));
     }
 
-    // -- Source guard ---------------------------------------------------------
-
     #[test]
     fn adapter_source_no_forbidden_imports() {
         let source = include_str!("openai_chat.rs");
@@ -1897,8 +1758,6 @@ mod tests {
             "adapter must not import server crate"
         );
     }
-
-    // -- Helpers --------------------------------------------------------------
 
     fn make_frame(data: &str) -> crate::sse::SseFrame {
         crate::sse::SseFrame {
