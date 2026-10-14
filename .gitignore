@@ -29,4 +29,5 @@
 .playwright-mcp
 
 .z-proflow/
+.z-flashflow/
 .zcode/
