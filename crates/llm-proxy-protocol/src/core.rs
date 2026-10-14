@@ -890,7 +890,6 @@ pub enum ContentKind {
 pub struct CoreStreamError {
     /// Category of the error.
     pub kind: CoreStreamErrorKind,
-    /// Human-readable error message (sanitized by the constructor).
     #[serde(skip_serializing, default)]
     pub(crate) message: String,
 }
