@@ -1,6 +1,4 @@
 //! Shared utility functions for the protocol crate.
-//!
-//! Contains small helper functions used internally by the protocol adapters.
 
 /// Truncate `s` to at most `max_bytes` bytes on a UTF-8 char boundary,
 /// returning it unchanged if it fits; the result may be up to 3 bytes

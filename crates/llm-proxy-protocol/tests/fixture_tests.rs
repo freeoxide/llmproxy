@@ -63,14 +63,14 @@ mod tests {
                 let req: AnthropicMessageRequest = match serde_json::from_value(input_json.clone())
                 {
                     Ok(r) => r,
-                    Err(_) => return, // serde parse failure is also a valid error
+                    Err(_) => return,
                 };
                 anthropic_adapter::decode_request(req)
             }
             "openai_chat" => {
                 let req: ChatCompletionRequest = match serde_json::from_value(input_json.clone()) {
                     Ok(r) => r,
-                    Err(_) => return, // serde parse failure is also a valid error
+                    Err(_) => return,
                 };
                 openai_adapter::decode_request(req)
             }
@@ -580,7 +580,7 @@ mod tests {
         );
     }
 
-    #[ignore = "client StreamDecoder (input.sse -> CoreEvents) not yet implemented; see doc comment"]
+    #[ignore = "client StreamDecoder (input.sse -> CoreEvents) not yet implemented"]
     #[test]
     fn streaming_decode_round_trip() {
         panic!(

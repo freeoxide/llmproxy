@@ -522,8 +522,6 @@ pub(crate) fn json_type_name(val: &serde_json::Value) -> &'static str {
     }
 }
 
-impl SamplingOptions {}
-
 impl fmt::Debug for SamplingOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SamplingOptions")
@@ -1543,11 +1541,7 @@ mod tests {
 
     #[test]
     fn core_request_rejects_malformed_json() {
-        let cases = vec![
-            "not json at all",
-            "{",
-            r#"{"model": 123}"#, // model should be object, not number
-        ];
+        let cases = vec!["not json at all", "{", r#"{"model": 123}"#];
         for bad in cases {
             assert!(
                 serde_json::from_str::<CoreRequest>(bad).is_err(),
@@ -1558,11 +1552,7 @@ mod tests {
 
     #[test]
     fn core_response_rejects_malformed_json() {
-        let cases = vec![
-            "not json at all",
-            "{",
-            r#"{"id": 123}"#, // id should be string or null
-        ];
+        let cases = vec!["not json at all", "{", r#"{"id": 123}"#];
         for bad in cases {
             assert!(
                 serde_json::from_str::<CoreResponse>(bad).is_err(),
