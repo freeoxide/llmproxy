@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_storage::{EventBus, NoopBus};
 
 use crate::ModelCatalogService;
-use crate::middleware::{RateLimiter, RequestDeduplicator, RequestIdGenerator};
+use crate::middleware::{ClientAuth, RateLimiter, RequestDeduplicator, RequestIdGenerator};
 
 /// Static information about this binary.
 #[derive(Debug, Clone)]
@@ -47,9 +48,15 @@ pub struct BuildInfo {
 ///   `ProviderAdapter` types whose `api_key` is `SecretString`; the adapter
 ///   config/target types keep a *manual* `Debug` that additionally redacts the
 ///   endpoint query string and auth-header *values* (not just the key). Safe.
-/// - `AppState` -> remaining fields: `BuildInfo`, `proxy_client`, `Counter`,
-///   `Metrics`, `RateLimiter`, `RequestDeduplicator`, `RequestIdGenerator`,
-///   `model_catalogs`, `event_bus` -- none hold secrets. Safe.
+/// - `AppState` -> `client_auth` field: `ClientAuth` holds **hashed argon2id
+///   verifiers only, never plaintext client secrets**; its manual `Debug`
+///   prints the mode and key ids and never the verifier strings (a PHC hash
+///   is offline-crackable, so it is treated as sensitive). Safe.
+/// - `AppState` -> remaining fields: `BuildInfo`, `proxy_client`,
+///   `egress_clients`, `Counter`, `Metrics`, `RateLimiter`,
+///   `RequestDeduplicator`, `RequestIdGenerator`, `model_catalogs`,
+///   `event_bus` -- none hold secrets (the egress map keys are provider
+///   names and `ProxyClient`'s Debug prints no URLs). Safe.
 ///
 /// **Maintenance note:** Secret-backed fields use `secrecy::SecretString`, which
 /// redacts in `Debug`/`Display` regardless of whether the containing type
@@ -69,6 +76,13 @@ pub struct AppState {
     pub(crate) provider_adapters: Arc<ProviderAdapterRegistry>,
     /// Protocol-neutral HTTP transport client.
     pub(crate) proxy_client: Arc<ProxyClient>,
+    /// Per-provider egress clients for providers with `[provider.egress]`
+    /// configured, keyed by provider name. Empty by default, in which case
+    /// every provider uses `proxy_client` -- exactly the behavior from before
+    /// egress support existed. The serve path builds this map from the
+    /// provider registry before the listener binds, so an unusable proxy URL
+    /// is a startup error, not a runtime fallback.
+    pub(crate) egress_clients: Arc<HashMap<String, Arc<ProxyClient>>>,
     /// Build identifier reported by `/version`.
     pub(crate) build: Arc<BuildInfo>,
     /// Token counter for estimating token usage.
@@ -92,6 +106,13 @@ pub struct AppState {
     /// Structured request/response event sink. Defaults to [`NoopBus`]; a real
     /// persisted backend lands in a later phase.
     pub(crate) event_bus: Arc<dyn EventBus>,
+    /// Client-key authentication state: hashed argon2id verifiers plus a
+    /// digest cache. Built from `[auth]` config; construction from an invalid
+    /// auth config fails closed (enforced, nothing can authenticate) rather
+    /// than silently downgrading to no-auth, because the constructors are
+    /// infallible. `cmd_serve` surfaces invalid verifiers as a startup error
+    /// via `ClientAuth::from_config` before the state is built.
+    pub(crate) client_auth: Arc<ClientAuth>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -111,6 +132,7 @@ impl std::fmt::Debug for AppState {
             .field("providers", &self.providers)
             .field("provider_adapters", &self.provider_adapters)
             .field("proxy_client", &self.proxy_client)
+            .field("egress_clients", &self.egress_clients)
             .field("build", &self.build)
             .field("token_counter", &self.token_counter)
             .field("metrics", &self.metrics)
@@ -119,6 +141,7 @@ impl std::fmt::Debug for AppState {
             .field("request_id_gen", &self.request_id_gen)
             .field("model_catalogs", &self.model_catalogs)
             .field("event_bus", &self.event_bus)
+            .field("client_auth", &self.client_auth)
             .finish()
     }
 }
@@ -159,11 +182,28 @@ impl AppState {
         // matching the documented "0s disables deduplication" contract.
         let dedup_window_ms =
             u64::try_from(app_config.server.dedup_window.as_millis()).unwrap_or(0);
+        // Auth state from `[auth]` config. Construction is infallible, so an
+        // invalid auth config (e.g. an unparseable verifier) fails CLOSED --
+        // enforced with zero verifiers, rejecting every proxied request -- and
+        // logs the error, rather than silently downgrading to no-auth. The
+        // serve path validates the auth config first (`ClientAuth::from_config`
+        // in `load_toml_state`) and turns this into a startup error.
+        let client_auth = match ClientAuth::from_config(&app_config.auth) {
+            Ok(auth) => Arc::new(auth),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "invalid [auth] config; failing closed (all proxy requests will be rejected)"
+                );
+                Arc::new(ClientAuth::fail_closed())
+            }
+        };
         Self {
             app_config: Arc::new(app_config),
             providers: Arc::new(providers),
             provider_adapters: Arc::new(provider_adapters),
             proxy_client: Arc::new(proxy_client),
+            egress_clients: Arc::new(HashMap::new()),
             build: Arc::new(build),
             token_counter: Counter::new(),
             metrics: Arc::new(Metrics::new()),
@@ -172,7 +212,34 @@ impl AppState {
             request_id_gen: Arc::new(RequestIdGenerator::new()),
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
+            client_auth,
         }
+    }
+
+    /// Replace the client-auth state (builder-style). Used by `cmd_serve`
+    /// (after `ClientAuth::from_config` succeeds, so an invalid verifier is a
+    /// startup error rather than a runtime fail-closed) and by tests that
+    /// exercise authenticated routing.
+    #[must_use]
+    pub fn with_client_auth(mut self, client_auth: Arc<ClientAuth>) -> Self {
+        self.client_auth = client_auth;
+        self
+    }
+
+    /// Replace the per-provider egress clients (builder-style).
+    ///
+    /// `cmd_serve` builds this map from `[provider.egress]` entries in the
+    /// provider registry before the listener binds, so a proxy URL reqwest
+    /// cannot use is a startup error; tests inject proxied clients the same
+    /// way. An empty map (the default) keeps every provider on the shared
+    /// `proxy_client`, exactly as before egress support existed.
+    #[must_use]
+    pub fn with_egress_clients(
+        mut self,
+        egress_clients: HashMap<String, Arc<ProxyClient>>,
+    ) -> Self {
+        self.egress_clients = Arc::new(egress_clients);
+        self
     }
 
     /// Replace the event bus (builder-style). Used by tests to inject a
@@ -226,9 +293,48 @@ impl AppState {
         &self.providers
     }
 
+    /// The transport client to use for an upstream request to `provider`.
+    ///
+    /// Providers with a wired `[provider.egress]` client get that client;
+    /// every other provider gets the shared default client. When no provider
+    /// has egress configured (the common case) this returns the shared client
+    /// for every lookup, preserving the single-client behavior from before
+    /// egress support existed.
+    ///
+    /// If a provider's config carries an egress section but no client was
+    /// wired for it, that is a wiring bug: the request still goes out, but a
+    /// loud warning names the provider on every affected request so the
+    /// mis-wiring cannot silently turn into direct egress. The serve path
+    /// builds the map from the same registry, so production cannot hit this.
+    pub fn upstream_client_for(&self, provider: &str) -> &ProxyClient {
+        if let Some(client) = self.egress_clients.get(provider) {
+            return client;
+        }
+        if self
+            .providers
+            .get(provider)
+            .is_some_and(|config| config.egress.is_some())
+        {
+            tracing::warn!(
+                provider,
+                "provider has [provider.egress] configured but no egress client was wired; \
+                 its upstream traffic is leaving directly, not through the configured proxy"
+            );
+        }
+        &self.proxy_client
+    }
+
     /// Access the provider model catalog service.
     pub fn model_catalogs(&self) -> &ModelCatalogService {
         &self.model_catalogs
+    }
+
+    /// Access the request/response event sink.
+    ///
+    /// Holds the bus so the serve path can [`EventBus::close`] it (flush the
+    /// usage ledger) after the HTTP server has stopped.
+    pub fn event_bus(&self) -> &Arc<dyn EventBus> {
+        &self.event_bus
     }
 
     /// Return the bind address the server should listen on.
@@ -245,7 +351,6 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::net::SocketAddr;
 
     /// Helper: build a minimal TOML AppConfig for tests.
@@ -264,7 +369,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         }
     }
 
@@ -298,6 +407,64 @@ mod tests {
         assert_eq!(state.shutdown_timeout(), Duration::from_secs(30));
     }
 
+    // -- Per-provider egress client selection ---------------------------------
+
+    #[test]
+    fn upstream_client_for_returns_the_shared_client_without_egress() {
+        let state = AppState::new(
+            make_app_config(),
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        );
+        // Same object for every provider: the single-client behavior from
+        // before egress support existed.
+        for provider in ["opencode-go", "opencode-zen", "anything-else"] {
+            assert!(
+                std::ptr::eq(
+                    state.upstream_client_for(provider),
+                    state.proxy_client.as_ref()
+                ),
+                "provider {provider} without egress must use the shared client"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_client_for_returns_the_wired_client_only_for_that_provider() {
+        let egress_client = Arc::new(
+            ProxyClient::try_with_egress_proxy("socks5h://127.0.0.1:1080")
+                .expect("egress proxy client builds"),
+        );
+        let state = AppState::new(
+            make_app_config(),
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        )
+        .with_egress_clients(HashMap::from([(
+            "opencode-go".to_owned(),
+            Arc::clone(&egress_client),
+        )]));
+
+        assert!(
+            std::ptr::eq(
+                state.upstream_client_for("opencode-go"),
+                egress_client.as_ref()
+            ),
+            "the provider with egress must use its wired client"
+        );
+        assert!(
+            std::ptr::eq(
+                state.upstream_client_for("opencode-zen"),
+                state.proxy_client.as_ref()
+            ),
+            "providers without egress must keep the shared client"
+        );
+    }
+
     // -- Helper methods -------------------------------------------------------
 
     #[test]
@@ -323,6 +490,7 @@ mod tests {
             api_key: secrecy::SecretString::from("sk-secret-key-99999"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -376,6 +544,7 @@ mod tests {
             "request_id_gen",
             "model_catalogs",
             "event_bus",
+            "client_auth",
         ] {
             assert!(
                 debug_output.contains(field),
@@ -426,6 +595,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -470,6 +640,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -590,6 +761,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -615,6 +787,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -708,5 +881,74 @@ mod tests {
             make_build_info(),
         );
         assert_eq!(state.server_name(), long_name);
+    }
+
+    // -- Client auth state ------------------------------------------------------
+
+    #[test]
+    fn invalid_auth_config_fails_closed() {
+        // An unparseable verifier cannot be allowed to downgrade the server to
+        // no-auth: the state must come up enforced with zero verifiers, so
+        // every proxied request is rejected.
+        let mut cfg = make_app_config();
+        cfg.auth.mode = llm_proxy_core::AuthMode::ClientKeys;
+        cfg.auth.clients.insert(
+            "laptop".to_owned(),
+            secrecy::SecretString::from("not-a-phc-string"),
+        );
+        let state = AppState::new(
+            cfg,
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        );
+        assert!(
+            state.client_auth.is_enforced(),
+            "invalid auth config must fail closed, not open"
+        );
+        assert_eq!(state.client_auth.client_count(), 0);
+    }
+
+    #[test]
+    fn app_state_debug_does_not_leak_client_verifiers() {
+        // The client verifier hash must never surface through Debug, matching
+        // the api_key discipline. Use a real (cheap-parameter) argon2id hash
+        // so the verifier parses.
+        use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
+        let params = Params::new(8, 1, 1, None).expect("valid test params");
+        let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+        let phc = hasher
+            .hash_password_customized(
+                b"leakable-secret-tail",
+                b"0123456789abcdef",
+                Some(&argon2::ARGON2ID_IDENT),
+                None,
+                params,
+            )
+            .expect("hash token")
+            .to_string();
+
+        let mut cfg = make_app_config();
+        cfg.auth.mode = llm_proxy_core::AuthMode::ClientKeys;
+        cfg.auth
+            .clients
+            .insert("laptop".to_owned(), secrecy::SecretString::from(phc));
+        let client_auth =
+            crate::middleware::ClientAuth::from_config(&cfg.auth).expect("valid verifier");
+        let state = AppState::new(
+            cfg,
+            make_provider_registry(),
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            make_build_info(),
+        )
+        .with_client_auth(Arc::new(client_auth));
+        let debug = format!("{state:?}");
+        assert!(
+            !debug.contains("leakable-secret-tail"),
+            "client secret/verifier must not appear in Debug, got: {debug}"
+        );
+        assert!(debug.contains("laptop"), "key id may appear: {debug}");
     }
 }

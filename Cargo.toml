@@ -25,7 +25,7 @@ llm-proxy-core = { path = "crates/llm-proxy-core" }
 llm-proxy-server = { path = "crates/llm-proxy-server" }
 
 # Async / runtime
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # Web
@@ -50,12 +50,18 @@ anyhow = "1"
 
 # Secrets
 secrecy = { version = "0.10", features = ["serde"] }
+# Password hashing KDF for client-key verifiers (PHC strings)
+argon2 = "0.6"
 
 # Tokenization
 tiktoken-rs = "0.6"
 
 # Money (cost/pricing) -- fixed-point, never float
 rust_decimal = "1"
+
+# Persistence (usage ledger). "bundled" compiles SQLite in-tree so no
+# system libsqlite3 is needed on deploy targets.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Observability
 tracing = "0.1"
@@ -161,3 +167,8 @@ literal_string_with_formatting_args = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# The profile that 'dist' will build with (cargo-dist passes --profile dist)
+[profile.dist]
+inherits = "release"
+lto = "thin"

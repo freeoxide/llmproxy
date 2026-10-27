@@ -785,6 +785,13 @@ impl StreamEncoder {
     }
 
     /// Encode a single [`CoreEvent`] into zero or more Anthropic [`MessageEvent`]s.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match arm per CoreEvent variant: the Anthropic Messages SSE \
+                 wire shape is a single translation table, and splitting the arms \
+                 into helpers would separate each event's field mapping from the \
+                 frame layout it produces"
+    )]
     pub fn encode_event(&mut self, event: CoreEvent) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
             tracing::trace!(

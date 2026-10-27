@@ -1,0 +1,8 @@
+# The usage ledger builds SQLite in-tree (rusqlite "bundled"), which needs a
+# C compiler. cargo-dist's release CI builds aarch64-unknown-linux-musl on
+# GitHub's arm64 runners with only `musl-tools` installed, whose compiler is
+# `musl-gcc`; the cc crate defaults to `aarch64-linux-musl-gcc` for that
+# target, which musl-tools does not provide. Point it at musl-gcc, the same
+# compiler the x86_64-unknown-linux-musl build already uses.
+[env]
+CC_aarch64_unknown_linux_musl = "musl-gcc"

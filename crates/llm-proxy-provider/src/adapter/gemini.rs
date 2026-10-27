@@ -360,6 +360,12 @@ fn encode_tool_result_payload(
 
 impl GeminiAdapter {
     /// Encode a core request into a Gemini GenerateContent request.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "field-by-field wire encode of the Gemini GenerateContent request \
+                 shape, kept in one place so the mapping can be audited against \
+                 the API schema without jumping between helpers"
+    )]
     pub fn encode_request(
         &self,
         core: &CoreRequest,

@@ -18,7 +18,9 @@ llm-proxy-core = { workspace = true }
 llm-proxy-protocol = { path = "../llm-proxy-protocol" }
 bytes = "1"
 form_urlencoded = "1"
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+# "socks" enables socks5/socks5h forward-proxy support for [provider.egress]
+# (verified against docs.rs/reqwest 0.12 and empirically in transport.rs tests).
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "socks"] }
 futures = "0.3"
 tokio = { workspace = true }
 serde_json = { workspace = true }
@@ -30,4 +32,5 @@ secrecy = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true, features = ["macros", "json"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# io-util: read_exact/write_all for the in-test SOCKS5 handshake server.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }

@@ -1,7 +1,8 @@
 //! Middleware components for the LLM proxy server.
 //!
 //! Provides request deduplication, rate limiting, request ID generation,
-//! and client IP extraction.
+//! client IP extraction, and client-key authentication state
+//! ([`ClientAuth`], [`CallerId`]).
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -12,7 +13,11 @@ use std::time::Instant;
 
 use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::request::Parts;
+use llm_proxy_core::{ANONYMOUS_CALLER, AuthConfig, AuthMode};
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
+
+use argon2::PasswordVerifier;
 
 // ---------------------------------------------------------------------------
 // RequestDeduplicator
@@ -278,6 +283,37 @@ impl RateLimiter {
 
         bucket.try_consume(refill_rate)
     }
+
+    /// Whether a request from `client_ip` would currently be allowed,
+    /// **without consuming a token**.
+    ///
+    /// Pure read of the peer's current refilled balance: a peer with no
+    /// bucket yet would start full, so it reports `true`. Used by the
+    /// client-auth gate to reject peers whose failure budget is already
+    /// exhausted *before* running the CPU-costly argon2 verification; the
+    /// actual token consumption still happens on the failure path via
+    /// [`Self::is_allowed`], so successful authentications are never charged.
+    #[must_use]
+    pub fn would_allow(&self, client_ip: &str) -> bool {
+        if self.max_requests_per_minute == 0.0 {
+            return true;
+        }
+        let buckets = self.buckets.lock().unwrap_or_else(|e| {
+            tracing::warn!("rate limiter mutex poisoned; recovering from panic");
+            e.into_inner()
+        });
+        let Some(bucket) = buckets.get(client_ip) else {
+            return true;
+        };
+        // Same refill math as `try_consume`, but without mutating the bucket:
+        // compute the balance as of now and check it holds at least one token.
+        let elapsed = Instant::now()
+            .duration_since(bucket.last_refill)
+            .as_secs_f64();
+        let refill_rate = self.max_requests_per_minute / 60.0;
+        let tokens = (bucket.tokens + elapsed * refill_rate).min(bucket.max_tokens);
+        tokens >= 1.0
+    }
 }
 
 impl Default for RateLimiter {
@@ -432,12 +468,603 @@ pub fn get_client_ip(
 }
 
 // ---------------------------------------------------------------------------
+// Client-key authentication
+// ---------------------------------------------------------------------------
+
+/// One configured client key: its id and its PHC-format argon2 verifier.
+///
+/// The verifier is the *hashed* secret only; the plaintext client key exists
+/// solely in the operator's records and the client's `Authorization` header,
+/// never in this process's long-lived state.
+struct ClientVerifier {
+    /// Operator-chosen key id used for caller attribution and rate-limit keys.
+    key_id: String,
+    /// PHC-format argon2 hash of the client key (e.g.
+    /// `$argon2id$v=19$m=19456,t=2,p=1$...`). Parsed (and therefore
+    /// validated) whenever the verifier is checked; the raw string is kept
+    /// because `PasswordHash` borrows its input.
+    phc: SecretString,
+}
+
+/// SHA-256 digest of an authenticated client key, with the key id it matched.
+struct CachedDigest {
+    digest: [u8; 32],
+    key_id: String,
+}
+
+/// Constant-time equality of two equal-length byte strings.
+///
+/// Compares all bytes unconditionally so the runtime does not depend on where
+/// the first difference appears. Length mismatch returns `false` immediately;
+/// digest lengths are fixed at 32 bytes here, so that branch is not secret
+/// dependent.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Errors raised while building [`ClientAuth`] from configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientAuthError {
+    /// `auth.mode = "none"` was combined with configured client keys.
+    #[error("auth.mode is \"none\" but [auth.clients] is non-empty")]
+    ModeNoneWithClients,
+    /// `auth.mode = "client-keys"` had no client keys configured.
+    #[error("auth.mode is \"client-keys\" but [auth.clients] is empty")]
+    ClientKeysWithoutClients,
+    /// A key id was empty or the reserved `anonymous` name.
+    #[error("client key id \"{0}\" is empty or reserved")]
+    InvalidKeyId(String),
+    /// A verifier string is not a parseable PHC argon2 hash.
+    ///
+    /// The error carries the key id, never the hash string itself.
+    #[error("client key \"{key_id}\" has an invalid PHC verifier: {source}")]
+    InvalidVerifier {
+        /// The key id whose verifier failed to parse.
+        key_id: String,
+        /// The underlying parse error.
+        source: argon2::password_hash::Error,
+    },
+}
+
+/// Client-key authentication state: the configured verifiers plus a digest
+/// cache for verified keys.
+///
+/// Holds hashed verifiers only, never plaintext secrets. A presented bearer
+/// token is verified with argon2 (constant-time tag comparison inside the
+/// KDF); after a first successful verification the SHA-256 digest of the
+/// token is cached and compared in constant time, so steady-state requests
+/// skip the (CPU-heavy) KDF entirely. Only digests of tokens that already
+/// verified are cached, so the cache holds at most one entry per configured
+/// key id.
+///
+/// Manual `Debug`: prints the mode and the key ids, never the verifier
+/// strings (a leaked PHC hash enables offline brute-force of the key).
+pub struct ClientAuth {
+    /// Whether proxy routes must present a valid client key. True whenever
+    /// verifiers were configured (`auth.mode = "client-keys"`).
+    enforced: bool,
+    /// Configured verifiers, sorted by key id for deterministic iteration.
+    verifiers: Vec<ClientVerifier>,
+    /// Digest cache: SHA-256(token) -> key id for tokens that verified.
+    cache: Mutex<Vec<CachedDigest>>,
+}
+
+impl std::fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAuth")
+            .field("enforced", &self.enforced)
+            .field(
+                "client_key_ids",
+                &self
+                    .verifiers
+                    .iter()
+                    .map(|v| v.key_id.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl ClientAuth {
+    /// Build authentication state from the `[auth]` config section.
+    ///
+    /// Validates mode consistency, key ids, and that every verifier parses as
+    /// a PHC argon2 string. `auth.mode = "none"` builds a disabled
+    /// (not enforced) authenticator; the caller is responsible for the
+    /// loopback-bind rule that `load_app_config` enforces for that mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientAuthError`] on contradictory mode/client combinations,
+    /// reserved or empty key ids, or an unparseable verifier string.
+    pub fn from_config(config: &AuthConfig) -> Result<Self, ClientAuthError> {
+        match config.mode {
+            AuthMode::None if !config.clients.is_empty() => {
+                return Err(ClientAuthError::ModeNoneWithClients);
+            }
+            AuthMode::ClientKeys if config.clients.is_empty() => {
+                return Err(ClientAuthError::ClientKeysWithoutClients);
+            }
+            AuthMode::None | AuthMode::ClientKeys => {}
+        }
+        let mut verifiers = Vec::with_capacity(config.clients.len());
+        for (key_id, phc) in &config.clients {
+            if key_id.is_empty() || key_id == ANONYMOUS_CALLER {
+                return Err(ClientAuthError::InvalidKeyId(key_id.clone()));
+            }
+            // Validate parseability now so a malformed verifier fails startup
+            // (via `load_toml_state`) instead of failing every request later.
+            if let Err(source) = argon2::password_hash::phc::PasswordHash::new(phc.expose_secret())
+            {
+                return Err(ClientAuthError::InvalidVerifier {
+                    key_id: key_id.clone(),
+                    source: source.into(),
+                });
+            }
+            verifiers.push(ClientVerifier {
+                key_id: key_id.clone(),
+                phc: SecretString::from(phc.expose_secret().to_owned()),
+            });
+        }
+        verifiers.sort_by(|a, b| a.key_id.cmp(&b.key_id));
+        Ok(Self {
+            enforced: matches!(config.mode, AuthMode::ClientKeys),
+            verifiers,
+            cache: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Fail-closed authenticator: enforcement on, nothing can authenticate.
+    ///
+    /// Used when config is invalid at construction time so every proxied
+    /// request is rejected rather than silently downgraded to no-auth.
+    #[must_use]
+    pub fn fail_closed() -> Self {
+        Self {
+            enforced: true,
+            verifiers: Vec::new(),
+            cache: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Whether proxy routes require a valid client key.
+    #[must_use]
+    pub fn is_enforced(&self) -> bool {
+        self.enforced
+    }
+
+    /// Number of configured client keys (0 when not enforced).
+    #[must_use]
+    pub fn client_count(&self) -> usize {
+        self.verifiers.len()
+    }
+
+    /// Look up a cached match for `digest` in constant time.
+    fn cached_key_id(&self, digest: &[u8; 32]) -> Option<String> {
+        let cache = self.cache.lock().unwrap_or_else(|e| {
+            tracing::warn!("client auth digest cache poisoned; recovering from panic");
+            e.into_inner()
+        });
+        cache
+            .iter()
+            .find(|entry| constant_time_eq(&entry.digest, digest))
+            .map(|entry| entry.key_id.clone())
+    }
+
+    /// Verify a presented bearer token against every configured verifier.
+    ///
+    /// Runs the argon2 KDFs on the blocking pool (a single verification with
+    /// default parameters costs tens of milliseconds; running it on the async
+    /// executor would stall every other future on the worker). Returns the
+    /// matching key id, or `None` for unknown/invalid tokens. The token is
+    /// never logged.
+    async fn verify_uncached(&self, token: &str) -> Option<String> {
+        // Digest before the move into the blocking task; needed for the
+        // cache insert when verification succeeds.
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let verifiers: Vec<(String, String)> = self
+            .verifiers
+            .iter()
+            .map(|v| (v.key_id.clone(), v.phc.expose_secret().to_owned()))
+            .collect();
+        let token = token.to_owned();
+        let matched = tokio::task::spawn_blocking(move || {
+            let argon2 = argon2::Argon2::default();
+            for (key_id, phc) in &verifiers {
+                // `verify_password` derives the tag with the parameters
+                // embedded in the PHC string and compares in constant time.
+                if let Ok(hash) = argon2::password_hash::phc::PasswordHash::new(phc)
+                    && argon2.verify_password(token.as_bytes(), &hash).is_ok()
+                {
+                    return Some(key_id.clone());
+                }
+            }
+            None
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "client auth verification task failed");
+            error
+        })
+        .ok()
+        .flatten();
+        if let Some(key_id) = &matched {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| {
+                tracing::warn!("client auth digest cache poisoned; recovering from panic");
+                e.into_inner()
+            });
+            if !cache
+                .iter()
+                .any(|entry| constant_time_eq(&entry.digest, &digest))
+            {
+                cache.push(CachedDigest {
+                    digest,
+                    key_id: key_id.clone(),
+                });
+            }
+        }
+        matched
+    }
+
+    /// Authenticate a bearer token, returning the matching key id.
+    ///
+    /// Cache hits skip the KDF; misses verify against every configured key on
+    /// the blocking pool. `None` means the token is not a configured client
+    /// key (or auth is not enforced, in which case nothing authenticates).
+    pub(crate) async fn authenticate(&self, token: &str) -> Option<String> {
+        if !self.enforced || self.verifiers.is_empty() {
+            return None;
+        }
+        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        if let Some(key_id) = self.cached_key_id(&digest) {
+            return Some(key_id);
+        }
+        self.verify_uncached(token).await
+    }
+}
+
+/// Extract the bearer token from `Authorization: Bearer <token>`.
+///
+/// The scheme is matched case-insensitively (RFC 7235). Returns `None` when
+/// the header is absent, uses another scheme, or carries an empty token. The
+/// returned secret is never logged; holders use it only for verification.
+pub(crate) fn extract_bearer_token(headers: &axum::http::HeaderMap) -> Option<SecretString> {
+    let value = headers.get(axum::http::header::AUTHORIZATION)?;
+    let header = value.to_str().ok()?;
+    let mut parts = header.splitn(2, ' ');
+    match (parts.next(), parts.next()) {
+        (Some(scheme), Some(token)) if scheme.eq_ignore_ascii_case("bearer") => {
+            let token = token.trim();
+            if token.is_empty() {
+                None
+            } else {
+                Some(SecretString::from(token.to_owned()))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Typed caller identity carried in request extensions.
+///
+/// Inserted by the client-auth middleware on proxy routes: the authenticated
+/// key id when client keys are enforced, or [`CallerId::anonymous`] under the
+/// loopback no-auth exemption. Handlers read it for caller attribution on
+/// events and for rate-limit keying.
+#[derive(Debug, Clone)]
+pub struct CallerId {
+    /// Authenticated client key id; `None` when unauthenticated (no-auth
+    /// mode).
+    key_id: Option<String>,
+}
+
+impl CallerId {
+    /// The unauthenticated caller used under the loopback no-auth exemption.
+    #[must_use]
+    pub fn anonymous() -> Self {
+        Self { key_id: None }
+    }
+
+    /// An authenticated caller identified by `key_id`.
+    #[must_use]
+    pub fn authenticated(key_id: impl Into<String>) -> Self {
+        Self {
+            key_id: Some(key_id.into()),
+        }
+    }
+
+    /// Whether a client key authenticated this request.
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.key_id.is_some()
+    }
+
+    /// The attribution string for events and logs: the key id, or
+    /// `"anonymous"` when unauthenticated.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.key_id.as_deref().unwrap_or(ANONYMOUS_CALLER)
+    }
+}
+
+impl std::fmt::Display for CallerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Extractor bundling the per-request identity stamped by the outer middleware
+/// layers: the injected [`RequestId`], the [`CallerId`] from the client-auth
+/// layer, and the peer address (when connection info is available).
+///
+/// One extractor replaces three in every proxy handler signature, and the
+/// owned struct is passed whole into inner handlers and
+/// [`prepare_request`](crate::routes::core_pipeline::prepare_request).
+///
+/// Absent extensions degrade the same way the individual extractors would:
+/// a missing request id becomes `"unknown"` and a missing caller becomes
+/// [`CallerId::anonymous`] (defense-in-depth for routers built without the
+/// usual layers; through [`crate::routes::router`] both are always present).
+#[derive(Debug, Clone)]
+pub(crate) struct RequestMeta {
+    /// Request id minted by the outermost `inject_request_id` layer.
+    pub(crate) request_id: RequestId,
+    /// Caller identity stamped by the client-auth layer.
+    pub(crate) caller: CallerId,
+    /// Peer socket address, when the server was built with connection info.
+    pub(crate) connect_info: Option<SocketAddr>,
+}
+
+impl<S> FromRequestParts<S> for RequestMeta
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let request_id = parts
+            .extensions
+            .get::<RequestId>()
+            .cloned()
+            .unwrap_or_else(|| RequestId("unknown".to_owned()));
+        let caller = parts
+            .extensions
+            .get::<CallerId>()
+            .cloned()
+            .unwrap_or_else(CallerId::anonymous);
+        let connect_info = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|connect_info| connect_info.0);
+        async move {
+            Ok(Self {
+                request_id,
+                caller,
+                connect_info,
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- ClientAuth ------------------------------------------------------------
+
+    /// Hash a token with deliberately cheap argon2id parameters (8 KiB, one
+    /// pass) so tests run in microseconds; `ClientAuth` verification reads the
+    /// cost parameters from the PHC string, so verification is equally cheap.
+    fn cheap_phc(token: &str, salt: &[u8]) -> String {
+        let params = argon2::Params::new(8, 1, 1, None).expect("valid test params");
+        let hasher = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            params.clone(),
+        );
+        use argon2::CustomizedPasswordHasher;
+        hasher
+            .hash_password_customized(
+                token.as_bytes(),
+                salt,
+                Some(&argon2::ARGON2ID_IDENT),
+                None,
+                params,
+            )
+            .expect("hash token")
+            .to_string()
+    }
+
+    fn auth_config_with(phc: &str) -> llm_proxy_core::AuthConfig {
+        let mut clients = HashMap::new();
+        clients.insert("laptop".to_owned(), SecretString::from(phc.to_owned()));
+        llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+        }
+    }
+
+    #[test]
+    fn client_auth_from_config_rejects_mode_contradictions() {
+        let none_with_clients = {
+            let mut clients = HashMap::new();
+            clients.insert(
+                "laptop".to_owned(),
+                SecretString::from(cheap_phc("secret", b"0123456789abcdef")),
+            );
+            llm_proxy_core::AuthConfig {
+                mode: llm_proxy_core::AuthMode::None,
+                clients,
+                admin: None,
+            }
+        };
+        assert!(matches!(
+            ClientAuth::from_config(&none_with_clients),
+            Err(ClientAuthError::ModeNoneWithClients)
+        ));
+
+        let keys_without_clients = llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients: HashMap::new(),
+            admin: None,
+        };
+        assert!(matches!(
+            ClientAuth::from_config(&keys_without_clients),
+            Err(ClientAuthError::ClientKeysWithoutClients)
+        ));
+    }
+
+    #[test]
+    fn client_auth_from_config_rejects_bad_key_ids_and_hashes() {
+        for bad_id in ["", "anonymous"] {
+            let mut config = auth_config_with(&cheap_phc("secret", b"0123456789abcdef"));
+            config.clients.remove("laptop");
+            config
+                .clients
+                .insert(bad_id.to_owned(), SecretString::from("x".to_owned()));
+            assert!(
+                matches!(
+                    ClientAuth::from_config(&config),
+                    Err(ClientAuthError::InvalidKeyId(id)) if id == bad_id
+                ),
+                "key id {bad_id:?} must be rejected"
+            );
+        }
+
+        let config = auth_config_with("not-a-phc-string");
+        let error = ClientAuth::from_config(&config).expect_err("malformed verifier rejected");
+        assert!(
+            error.to_string().contains("laptop"),
+            "error names the key id, got: {error}"
+        );
+        assert!(
+            !error.to_string().contains("not-a-phc-string"),
+            "error must not echo the verifier, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_auth_authenticates_a_configured_key_and_rejects_others() {
+        let secret = cheap_phc("the-real-secret", b"0123456789abcdef");
+        let auth = ClientAuth::from_config(&auth_config_with(&secret)).expect("valid config");
+
+        let matched = auth.authenticate("the-real-secret").await;
+        assert_eq!(matched.as_deref(), Some("laptop"));
+        // Repeat hits the digest cache and must still resolve.
+        assert_eq!(
+            auth.authenticate("the-real-secret").await.as_deref(),
+            Some("laptop")
+        );
+        assert_eq!(auth.authenticate("wrong-secret").await, None);
+        assert_eq!(auth.authenticate("").await, None);
+    }
+
+    #[tokio::test]
+    async fn client_auth_picks_the_matching_key_among_many() {
+        let mut clients = HashMap::new();
+        for (id, token) in [("alpha", "one"), ("beta", "two"), ("gamma", "three")] {
+            clients.insert(
+                id.to_owned(),
+                SecretString::from(cheap_phc(token, b"0123456789abcdef")),
+            );
+        }
+        let config = llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+        };
+        let auth = ClientAuth::from_config(&config).expect("valid config");
+        assert_eq!(auth.authenticate("two").await.as_deref(), Some("beta"));
+        assert_eq!(auth.authenticate("three").await.as_deref(), Some("gamma"));
+        assert_eq!(auth.authenticate("four").await, None);
+    }
+
+    #[test]
+    fn client_auth_none_mode_is_not_enforced() {
+        let auth =
+            ClientAuth::from_config(&llm_proxy_core::AuthConfig::default()).expect("valid config");
+        assert!(!auth.is_enforced());
+    }
+
+    #[test]
+    fn client_auth_debug_shows_key_ids_but_never_verifiers() {
+        let secret = cheap_phc("the-real-secret", b"0123456789abcdef");
+        let auth = ClientAuth::from_config(&auth_config_with(&secret)).expect("valid config");
+        let debug = format!("{auth:?}");
+        assert!(debug.contains("laptop"), "got: {debug}");
+        assert!(
+            !debug.contains("argon2id") && !debug.contains(&secret),
+            "verifier string must not appear in Debug, got: {debug}"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_behaves_as_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    // -- extract_bearer_token --------------------------------------------------
+
+    #[test]
+    fn bearer_token_extracts_case_insensitive_scheme_and_trims() {
+        use axum::http::HeaderMap;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer abc123".parse().unwrap());
+        assert_eq!(
+            extract_bearer_token(&headers).map(|t| t.expose_secret().to_owned()),
+            Some("abc123".to_owned())
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "bearer abc123 ".parse().unwrap());
+        assert_eq!(
+            extract_bearer_token(&headers).map(|t| t.expose_secret().to_owned()),
+            Some("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn bearer_token_rejects_missing_other_scheme_and_empty() {
+        use axum::http::HeaderMap;
+        // SecretString has no PartialEq (deliberately); assert via Option::is_none.
+        assert!(extract_bearer_token(&HeaderMap::new()).is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+        assert!(extract_bearer_token(&headers).is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer   ".parse().unwrap());
+        assert!(extract_bearer_token(&headers).is_none());
+    }
+
+    // -- CallerId ---------------------------------------------------------------
+
+    #[test]
+    fn caller_id_attribution_strings() {
+        assert_eq!(CallerId::anonymous().as_str(), "anonymous");
+        assert_eq!(CallerId::authenticated("laptop").as_str(), "laptop");
+        assert!(!CallerId::anonymous().is_authenticated());
+        assert!(CallerId::authenticated("laptop").is_authenticated());
+        assert_eq!(CallerId::authenticated("laptop").to_string(), "laptop");
+    }
 
     // -- RequestDeduplicator ---------------------------------------------------
 
@@ -578,6 +1205,54 @@ mod tests {
         for _ in 0..1_000 {
             assert!(limiter.is_allowed("127.0.0.1"));
         }
+    }
+
+    // -- RateLimiter::would_allow (auth flood gate) -----------------------------
+
+    #[test]
+    fn would_allow_is_false_once_the_peer_bucket_is_drained() {
+        let limiter = RateLimiter::new(1);
+        assert!(
+            limiter.is_allowed("10.0.0.9"),
+            "first request consumes the only token"
+        );
+        // Refill is 1 token/minute, so within the test's lifetime the drained
+        // bucket stays empty and the peek must report denial.
+        assert!(
+            !limiter.would_allow("10.0.0.9"),
+            "drained peer must be denied by the peek"
+        );
+        // Other peers are unaffected: a fresh bucket starts full.
+        assert!(limiter.would_allow("10.0.0.8"));
+    }
+
+    #[test]
+    fn would_allow_reports_true_for_unknown_peer_and_disabled_limiter() {
+        let limiter = RateLimiter::new(100);
+        assert!(
+            limiter.would_allow("10.0.0.7"),
+            "unknown peer starts with a full bucket"
+        );
+
+        let disabled = RateLimiter::new(0);
+        for _ in 0..50 {
+            assert!(disabled.is_allowed("10.0.0.7"));
+        }
+        assert!(
+            disabled.would_allow("10.0.0.7"),
+            "a disabled limiter never denies"
+        );
+    }
+
+    #[test]
+    fn would_allow_does_not_consume_tokens() {
+        let limiter = RateLimiter::new(1);
+        assert!(limiter.is_allowed("10.0.0.6"));
+        // Repeated peeks must neither drain nor refill the bucket: the peer
+        // stays denied and a subsequent consume attempt is also denied.
+        assert!(!limiter.would_allow("10.0.0.6"));
+        assert!(!limiter.would_allow("10.0.0.6"));
+        assert!(!limiter.is_allowed("10.0.0.6"));
     }
 
     #[test]

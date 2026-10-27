@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,12 +24,62 @@ use crate::error::CoreError;
 
 /// Top-level TOML application configuration.
 ///
-/// Loaded from the main `config.toml`, which contains server settings only.
+/// Loaded from the main `config.toml`, which contains server and auth
+/// settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Server bind and operational settings.
     pub server: ServerConfig,
+    /// Client authentication settings (`[auth]` section).
+    #[serde(default)]
+    pub auth: AuthConfig,
+    /// Usage-ledger persistence settings (`[storage]` section). Absent keeps
+    /// the in-memory no-op event bus (nothing is persisted).
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+}
+
+/// Named security postures for where the admin `/usage` API is reachable.
+///
+/// Selected by config; the serve path logs the posture name loudly at startup
+/// so operators can see which surface they configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminMountPosture {
+    /// Default: `/usage` is served only on the dedicated
+    /// [`ServerConfig::admin_bind`] listener (loopback unless configured
+    /// otherwise); the main listener has no admin surface at all.
+    DedicatedListener,
+    /// Opt-in (`server.admin_on_main_listener = true`): `/usage` is also
+    /// served on the main `bind` listener behind the same admin token, so
+    /// the admin surface reaches every network the main listener does.
+    MainListener,
+}
+
+impl AdminMountPosture {
+    /// Stable name used in startup logs so operators can grep the posture
+    /// their config selected.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DedicatedListener => "dedicated-admin-listener",
+            Self::MainListener => "admin-on-main-listener",
+        }
+    }
+}
+
+impl AppConfig {
+    /// The admin `/usage` mount posture, or `None` when no
+    /// `[auth.admin]` token is configured (no admin surface anywhere).
+    #[must_use]
+    pub fn admin_posture(&self) -> Option<AdminMountPosture> {
+        let posture = if self.server.admin_on_main_listener {
+            AdminMountPosture::MainListener
+        } else {
+            AdminMountPosture::DedicatedListener
+        };
+        self.auth.admin.as_ref().map(|_| posture)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,10 +181,126 @@ pub struct ServerConfig {
     /// header value are skipped (with a warning) when the router is built.
     #[serde(default)]
     pub allowed_origins: Option<Vec<String>>,
+    /// Dedicated listener bind for the admin `/usage` API. Only read when
+    /// `[auth.admin]` is configured; the default is `127.0.0.1` on the port
+    /// after `bind`'s port (see [`ServerConfig::effective_admin_bind`]), so
+    /// the admin surface stays loopback-only unless deliberately pointed at
+    /// a tunnel interface or removed port.
+    #[serde(default)]
+    pub admin_bind: Option<SocketAddr>,
+    /// Also serve `/usage` on the main listener behind the same admin token.
+    ///
+    /// Opt-in; selects the [`AdminMountPosture::MainListener`] posture, which
+    /// the serve path announces with a loud startup warning: the admin
+    /// surface then reaches every network the main listener does. With no
+    /// explicit `admin_bind` this posture serves `/usage` on the main
+    /// listener ONLY — no dedicated socket is attempted, which is exactly
+    /// what setups without a second available port need.
+    #[serde(default)]
+    pub admin_on_main_listener: bool,
+}
+
+impl ServerConfig {
+    /// Whether the dedicated admin listener binds at all.
+    ///
+    /// An explicit `admin_bind` always binds one. With none set, the
+    /// default loopback listener binds unless the main-listener opt-in
+    /// took over — `admin_on_main_listener = true` without an explicit
+    /// `admin_bind` is exactly the posture for setups where a second port
+    /// is not available, so no dedicated socket is attempted there.
+    #[must_use]
+    pub fn dedicated_admin_listener(&self) -> bool {
+        self.admin_bind.is_some() || !self.admin_on_main_listener
+    }
+
+    /// Bind address for the dedicated admin listener.
+    ///
+    /// `admin_bind` when configured; otherwise the default: `127.0.0.1` on
+    /// the port after `bind`'s port. `None` when that default port cannot be
+    /// derived (`bind` on port 65535) — `load_app_config` rejects that
+    /// combination whenever the dedicated listener would bind the default,
+    /// so validated configs that consult this while
+    /// [`ServerConfig::dedicated_admin_listener`] is true always resolve to
+    /// an address.
+    #[must_use]
+    pub fn effective_admin_bind(&self) -> Option<SocketAddr> {
+        match self.admin_bind {
+            Some(addr) => Some(addr),
+            None => self
+                .bind
+                .port()
+                .checked_add(1)
+                .map(|port| SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), port)),
+        }
+    }
 }
 
 const fn default_rate_limit_rpm() -> u32 {
     100
+}
+
+// ---------------------------------------------------------------------------
+// AuthConfig
+// ---------------------------------------------------------------------------
+
+/// Client authentication mode for proxy routes.
+///
+/// Serialized in TOML as `"none"` / `"client-keys"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthMode {
+    /// No client authentication: every request is attributed to the
+    /// `"anonymous"` caller. Only permitted while the server binds loopback;
+    /// `load_app_config` rejects a non-loopback bind in this mode.
+    #[default]
+    None,
+    /// Requests to proxy routes must present
+    /// `Authorization: Bearer <client-key>` matching a secret hashed under
+    /// `[auth.clients]`.
+    ClientKeys,
+}
+
+/// Client authentication configuration (`[auth]` section of `config.toml`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Authentication mode. Defaults to [`AuthMode::None`].
+    #[serde(default)]
+    pub mode: AuthMode,
+    /// Key id to hashed client secret, under `[auth.clients]`.
+    ///
+    /// Each value is a PHC-format password-hashing string (argon2id), never a
+    /// plaintext secret. Wrapped in [`SecretString`] so the value is redacted
+    /// in `Debug` output.
+    ///
+    /// `skip_serializing` (mirroring `ProviderConfig::api_key`) prevents the
+    /// hashes from leaking through any `Serialize` path; deserializing a
+    /// config that was serialized will therefore fail on this field, which is
+    /// intentional.
+    #[serde(default, skip_serializing)]
+    pub clients: HashMap<String, SecretString>,
+    /// Admin API authentication (`[auth.admin]` section). When present, the
+    /// read-only `/usage` query surface is enabled and every `/usage` route
+    /// on every mount requires its bearer token.
+    #[serde(default)]
+    pub admin: Option<AdminAuthConfig>,
+}
+
+/// Admin API configuration (`[auth.admin]` section of `config.toml`).
+///
+/// A single bearer token guarding every `/usage` route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminAuthConfig {
+    /// The admin bearer token, presented as `Authorization: Bearer <token>`.
+    ///
+    /// Compared in constant time against a SHA-256 digest of the configured
+    /// token, so the plaintext never needs to be retained in memory. Wrapped
+    /// in [`SecretString`] so it is redacted in `Debug` output;
+    /// `skip_serializing` (mirroring `ProviderConfig::api_key`) keeps it out
+    /// of every `Serialize` path.
+    #[serde(skip_serializing)]
+    pub token: SecretString,
 }
 
 /// Default graceful-shutdown hard deadline (30 seconds).
@@ -147,6 +313,88 @@ const fn default_shutdown_timeout() -> Duration {
 
 const fn default_dedup_window() -> Duration {
     Duration::ZERO
+}
+
+// ---------------------------------------------------------------------------
+// StorageConfig
+// ---------------------------------------------------------------------------
+
+/// Default retention-pruning interval (1 hour).
+const fn default_prune_interval() -> Duration {
+    Duration::from_secs(3600)
+}
+
+/// Usage-ledger persistence configuration (`[storage]` section of
+/// `config.toml`).
+///
+/// When present, every proxied request is persisted to a SQLite ledger by the
+/// storage crate's event bus. When absent, the in-memory no-op bus is used and
+/// nothing is written to disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Path to the SQLite database file. Parent directories are created on
+    /// startup.
+    pub path: PathBuf,
+    /// Delete ledger rows older than this age. Absent means rows are kept
+    /// forever. Must be positive when present.
+    #[serde(default, with = "humantime_serde")]
+    pub max_age: Option<Duration>,
+    /// Keep at most this many ledger rows; the oldest rows are deleted when
+    /// the cap is exceeded. Absent means unlimited. Must be at least 1 when
+    /// present.
+    #[serde(default)]
+    pub max_rows: Option<u64>,
+    /// How often the retention pruning pass runs. Defaults to 1 hour. Must be
+    /// at least 1 second (the pruning timer rejects a zero period).
+    #[serde(default = "default_prune_interval", with = "humantime_serde")]
+    pub prune_interval: Duration,
+}
+
+/// Validate `[storage]`.
+///
+/// Rules:
+/// - `path` must not be empty.
+/// - `max_age`, when set, must be positive: a zero age would delete every row
+///   on every pass and indicates a unit mistake rather than intent.
+/// - `max_rows`, when set, must be at least 1 (zero would keep nothing).
+/// - `prune_interval` must be at least 1 second; the pruning timer in the
+///   storage crate panics on a zero period, and a sub-second prune cadence
+///   serves no purpose.
+fn validate_storage_config(storage: &StorageConfig) -> Result<(), CoreError> {
+    if storage.path.as_os_str().is_empty() {
+        return Err(CoreError::ConfigValidation {
+            message: "storage.path must not be empty".to_owned(),
+            source: None,
+        });
+    }
+    if storage.max_age == Some(Duration::ZERO) {
+        return Err(CoreError::ConfigValidation {
+            message: "storage.max_age must be a positive duration; a zero age would \
+                      delete every ledger row on every pruning pass"
+                .to_owned(),
+            source: None,
+        });
+    }
+    if storage.max_rows == Some(0) {
+        return Err(CoreError::ConfigValidation {
+            message: "storage.max_rows must be at least 1; a cap of zero would keep \
+                      no rows at all"
+                .to_owned(),
+            source: None,
+        });
+    }
+    const MIN_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
+    if storage.prune_interval < MIN_PRUNE_INTERVAL {
+        return Err(CoreError::ConfigValidation {
+            message: format!(
+                "storage.prune_interval must be at least 1 second, but is {:?}",
+                storage.prune_interval
+            ),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +472,59 @@ pub struct ProviderConfig {
     /// the key is the upstream model id. Defaults to empty (no cost accounting).
     #[serde(default)]
     pub pricing: HashMap<ModelId, ModelPricing>,
+    /// Upstream egress (network exit) configuration. When present, this
+    /// provider's upstream requests are sent through the configured forward
+    /// proxy instead of a direct connection. Absent means direct egress,
+    /// exactly as before the section existed.
+    #[serde(default)]
+    pub egress: Option<ProviderEgressConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// ProviderEgressConfig
+// ---------------------------------------------------------------------------
+
+/// Per-provider forward-proxy egress configuration (`[provider.egress]`).
+///
+/// The proxy URL scheme must be one of `socks5h://`, `socks5://`, `http://`,
+/// or `https://`; anything else is rejected at config load, never silently
+/// ignored. `socks5h://` resolves upstream hostnames at the proxy (the exit
+/// point's DNS view); `socks5://` resolves them locally.
+///
+/// The URL may carry userinfo (`http://user:pass@host:port`), which is passed
+/// to the transport as proxy authentication. [`Debug`] redacts the userinfo;
+/// only `scheme://host:port` is ever printed.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderEgressConfig {
+    /// Forward proxy URL (`socks5h://host:port`, `socks5://`, `http://`, or
+    /// `https://`). Supports `${ENV_VAR}` interpolation like other string
+    /// fields. The port is optional and defaults per scheme (1080 for socks).
+    pub proxy: String,
+}
+
+impl std::fmt::Debug for ProviderEgressConfig {
+    // SECURITY: the raw URL may carry proxy credentials as userinfo; print
+    // only the credential-free form.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderEgressConfig")
+            .field("proxy", &redacted_proxy_url(&self.proxy))
+            .finish()
+    }
+}
+
+/// Render `scheme://host:port` from a proxy URL, dropping any userinfo.
+///
+/// URLs without a `://` separator print as `<unparsed>` rather than echoing a
+/// string that has not been through validation.
+fn redacted_proxy_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<unparsed>".to_owned();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let after_authority = rest.strip_prefix(authority).unwrap_or_default();
+    format!("{scheme}://{host}{after_authority}")
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +1039,18 @@ pub enum ConfigValidationError {
         /// The endpoint URL that has an invalid scheme.
         endpoint: String,
     },
+    /// The `[provider.egress]` proxy URL is not usable as a forward proxy.
+    #[error(
+        "provider \"{provider}\": [provider.egress] proxy URL is invalid ({reason}): \"{proxy}\""
+    )]
+    InvalidEgressProxy {
+        /// Provider name.
+        provider: String,
+        /// The rejected proxy URL.
+        proxy: String,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
     /// An adapter header name or value contains CR or LF characters.
     #[error("provider \"{provider}\": adapter \"{adapter}\" header contains CR/LF characters")]
     HeaderContainsCrlf {
@@ -880,6 +1193,7 @@ pub enum ConfigValidationError {
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     passthrough_auth: false,
+///     egress: None,
 ///     adapters: HashMap::from([(
 ///         "chat".to_owned(),
 ///         ProviderAdapterConfig {
@@ -912,6 +1226,7 @@ pub enum ConfigValidationError {
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     passthrough_auth: false,
+///     egress: None,
 ///     adapters: HashMap::new(),
 ///     routes: ProviderRoutesConfig::default(),
 ///     model_aliases: HashMap::new(),
@@ -935,6 +1250,7 @@ pub fn validate_provider_config(
     validate_pricing(provider, name)?;
     validate_adapters(provider, name, known_protocols)?;
     validate_discovery(provider, name)?;
+    validate_egress(provider, name)?;
 
     // Both the catalog and the model aliases reject unsafe model IDs, but only
     // when an adapter interpolates `{model}` into a Gemini endpoint URL.
@@ -1247,6 +1563,70 @@ fn scheme_region(endpoint: &str) -> &str {
     }
 }
 
+/// Egress proxy schemes accepted in `[provider.egress]`.
+///
+/// `socks5h` resolves hostnames at the proxy; `socks5` resolves locally.
+/// SOCKS support is the reason the provider crate enables reqwest's `socks`
+/// cargo feature. Schemes outside this list are rejected at config load
+/// rather than silently ignored.
+const EGRESS_PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "http", "https"];
+
+/// An egress proxy URL, when configured, must name an accepted scheme and a
+/// non-empty host.
+///
+/// reqwest itself is deliberately lenient (it accepts scheme-less URLs by
+/// prefixing `http://`, and `socks4`/unknown schemes without complaint), so
+/// this check is the real gate: anything outside the accepted schemes is a
+/// config error, never a silently different proxy.
+fn validate_egress(provider: &ProviderConfig, name: &str) -> Result<(), ConfigValidationError> {
+    let Some(egress) = &provider.egress else {
+        return Ok(());
+    };
+    let url = egress.proxy.trim();
+    if url.is_empty() {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "empty proxy URL",
+        });
+    }
+    let scheme = scheme_region(url);
+    if scheme.is_empty() {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "no URL scheme; expected socks5h://, socks5://, http://, or https://",
+        });
+    }
+    if !EGRESS_PROXY_SCHEMES
+        .iter()
+        .any(|accepted| scheme.eq_ignore_ascii_case(accepted))
+    {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "unsupported scheme; expected socks5h://, socks5://, http://, or https://",
+        });
+    }
+    // Everything after the scheme must hold a host. Cut the authority region
+    // at the first path/query/fragment separator, then drop any userinfo
+    // (`user:pass@`) so only the host portion is checked.
+    let authority = url
+        .strip_prefix(scheme)
+        .and_then(|after_scheme| after_scheme.strip_prefix("://"))
+        .unwrap_or_default();
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.trim().is_empty() {
+        return Err(ConfigValidationError::InvalidEgressProxy {
+            provider: name.to_owned(),
+            proxy: egress.proxy.clone(),
+            reason: "no proxy host",
+        });
+    }
+    Ok(())
+}
+
 /// Validate a map of static headers for CRLF injection and forbidden header names.
 ///
 /// Shared between adapter header validation and discovery header validation
@@ -1398,7 +1778,151 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             source: None,
         });
     }
+    validate_auth_config(&cfg.auth, cfg.server.bind)?;
+    if let Some(storage) = cfg.storage.as_ref() {
+        validate_storage_config(storage)?;
+    }
+    validate_admin_mount(&cfg)?;
     Ok(cfg)
+}
+
+/// Validate the admin `/usage` mount against the rest of the config.
+///
+/// Rules:
+/// - `[auth.admin]` requires `[storage]`: without the usage ledger there is
+///   nothing to query, so serving `/usage` would only produce errors.
+/// - The admin token must not be empty (an empty token can never match a
+///   bearer token, so the section would be dead config hiding a mistake).
+/// - `server.admin_bind` must differ from `server.bind`: two listeners cannot
+///   share one socket.
+/// - Without `[auth.admin]`, `server.admin_bind` and
+///   `server.admin_on_main_listener` are dead config and are rejected.
+/// - The derived default admin port (`bind` port + 1) must exist: a `bind`
+///   on port 65535 with no explicit `admin_bind` has no distinct port to
+///   default to.
+fn validate_admin_mount(cfg: &AppConfig) -> Result<(), CoreError> {
+    let Some(admin) = cfg.auth.admin.as_ref() else {
+        if cfg.server.admin_bind.is_some() {
+            return Err(CoreError::ConfigValidation {
+                message: "server.admin_bind is configured but [auth.admin] is not; \
+                          set [auth.admin] token or remove server.admin_bind"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        if cfg.server.admin_on_main_listener {
+            return Err(CoreError::ConfigValidation {
+                message: "server.admin_on_main_listener = true but [auth.admin] is not \
+                          configured; there would be no admin token to guard /usage"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        return Ok(());
+    };
+    if admin.token.expose_secret().is_empty() {
+        return Err(CoreError::ConfigValidation {
+            message: "[auth.admin] token must not be empty".to_owned(),
+            source: None,
+        });
+    }
+    if cfg.storage.is_none() {
+        return Err(CoreError::ConfigValidation {
+            message: "[auth.admin] requires the [storage] usage ledger; configure \
+                      [storage] or remove [auth.admin]"
+                .to_owned(),
+            source: None,
+        });
+    }
+    if let Some(admin_bind) = cfg.server.admin_bind {
+        if admin_bind == cfg.server.bind {
+            return Err(CoreError::ConfigValidation {
+                message: format!(
+                    "server.admin_bind {admin_bind} must differ from server.bind; \
+                     the admin listener needs its own socket"
+                ),
+                source: None,
+            });
+        }
+    } else if !cfg.server.admin_on_main_listener && cfg.server.bind.port() == u16::MAX {
+        // The default admin port (bind port + 1) is only consulted when the
+        // dedicated listener binds it; under the main-listener opt-in with
+        // no explicit admin_bind, no second socket is attempted.
+        return Err(CoreError::ConfigValidation {
+            message: "server.bind port 65535 leaves no distinct port for the default \
+                      admin listener; set server.admin_bind explicitly or enable \
+                      server.admin_on_main_listener"
+                .to_owned(),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+/// Reserved caller name used for unauthenticated requests under
+/// [`AuthMode::None`]; a client key id must not collide with it or event
+/// attribution becomes ambiguous.
+pub const ANONYMOUS_CALLER: &str = "anonymous";
+
+/// Validate `[auth]` against itself and against the bind address.
+///
+/// Rules:
+/// - `mode = "none"` with a non-empty `[auth.clients]` is contradictory
+///   (configured keys would be silently ignored) and is rejected.
+/// - `mode = "client-keys"` requires at least one `[auth.clients]` entry.
+/// - `mode = "none"` is only permitted on a loopback bind: a non-loopback
+///   bind with no client keys would expose the proxy to every reachable
+///   peer with no authentication, so startup refuses.
+/// - Key ids must be non-empty and must not be [`ANONYMOUS_CALLER`].
+fn validate_auth_config(auth: &AuthConfig, bind: SocketAddr) -> Result<(), CoreError> {
+    let clients_empty = auth.clients.is_empty();
+    match auth.mode {
+        AuthMode::None if !clients_empty => {
+            return Err(CoreError::ConfigValidation {
+                message: "auth.mode = \"none\" but [auth.clients] is non-empty; \
+                          set auth.mode = \"client-keys\" to enforce the configured keys"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        AuthMode::ClientKeys if clients_empty => {
+            return Err(CoreError::ConfigValidation {
+                message: "auth.mode = \"client-keys\" requires at least one entry \
+                          under [auth.clients]"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        AuthMode::None if !bind.ip().is_loopback() => {
+            return Err(CoreError::ConfigValidation {
+                message: format!(
+                    "server.bind {bind} is not loopback and no client keys are \
+                     configured; anonymous auth is only permitted on loopback binds. \
+                     Configure [auth.clients] and set auth.mode = \"client-keys\""
+                ),
+                source: None,
+            });
+        }
+        AuthMode::None | AuthMode::ClientKeys => {}
+    }
+    for key_id in auth.clients.keys() {
+        if key_id.is_empty() {
+            return Err(CoreError::ConfigValidation {
+                message: "[auth.clients] contains an empty key id".to_owned(),
+                source: None,
+            });
+        }
+        if key_id == ANONYMOUS_CALLER {
+            return Err(CoreError::ConfigValidation {
+                message: format!(
+                    "[auth.clients] key id \"{ANONYMOUS_CALLER}\" is reserved for \
+                     unattributed requests; choose a different key id"
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Load and parse a provider [`ProviderFile`] TOML file.
@@ -1652,6 +2176,183 @@ server_name = "test"
         );
     }
 
+    /// Write a config file with the given `bind` and `[auth]` body into a
+    /// fresh temp dir, returning the dir (the config lives at
+    /// `config.toml` inside it). The returned guard keeps the file alive;
+    /// callers run [`load_app_config`] on it directly.
+    fn config_dir_with_auth(bind: &str, auth_body: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "{bind}"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+{auth_body}
+"#
+            ),
+        )
+        .expect("write config file");
+        directory
+    }
+
+    #[test]
+    fn auth_absent_section_defaults_to_none_on_loopback() {
+        let dir = config_dir_with_auth("127.0.0.1:3456", "");
+        let config =
+            load_app_config(dir.path().join("config.toml")).expect("default auth accepted");
+        assert_eq!(config.auth.mode, AuthMode::None);
+        assert!(config.auth.clients.is_empty());
+    }
+
+    #[test]
+    fn auth_none_on_non_loopback_bind_is_rejected() {
+        // The core safety rule of client identity: an anonymous proxy exposed
+        // past loopback must refuse to start, before any listener binds.
+        for bind in ["0.0.0.0:3456", "192.168.1.4:3456", "[::]:3456"] {
+            let dir = config_dir_with_auth(bind, "");
+            let error = load_app_config(dir.path().join("config.toml"))
+                .expect_err("non-loopback none must be rejected");
+            assert!(
+                error.to_string().contains("not loopback"),
+                "bind {bind}: got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_none_on_ipv6_loopback_bind_is_accepted() {
+        // `::1` is loopback; the loopback exemption is about the address, not
+        // the address family.
+        let dir = config_dir_with_auth("[::1]:3456", "");
+        load_app_config(dir.path().join("config.toml")).expect("ipv6 loopback accepted");
+    }
+
+    #[test]
+    fn auth_none_with_configured_clients_is_rejected() {
+        let dir = config_dir_with_auth(
+            "127.0.0.1:3456",
+            r#"
+[auth]
+mode = "none"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let error = load_app_config(dir.path().join("config.toml"))
+            .expect_err("none mode with clients is contradictory");
+        assert!(
+            error.to_string().contains("[auth.clients] is non-empty"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn auth_client_keys_without_clients_is_rejected() {
+        let dir = config_dir_with_auth(
+            "0.0.0.0:3456",
+            r#"
+[auth]
+mode = "client-keys"
+"#,
+        );
+        let error = load_app_config(dir.path().join("config.toml"))
+            .expect_err("client-keys mode needs at least one key");
+        assert!(
+            error
+                .to_string()
+                .contains("requires at least one entry under [auth.clients]"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn auth_client_keys_with_a_client_accepts_any_bind() {
+        // With at least one hashed key configured, a non-loopback bind is a
+        // legitimate deployment and must load.
+        let dir = config_dir_with_auth(
+            "0.0.0.0:3456",
+            r#"
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let config = load_app_config(dir.path().join("config.toml"))
+            .expect("client-keys on non-loopback accepted");
+        assert_eq!(config.auth.mode, AuthMode::ClientKeys);
+        assert_eq!(config.auth.clients.len(), 1);
+    }
+
+    #[test]
+    fn auth_rejects_reserved_and_empty_key_ids() {
+        let reserved_dir = config_dir_with_auth(
+            "127.0.0.1:3456",
+            r#"
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+anonymous = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let reserved = load_app_config(reserved_dir.path().join("config.toml"))
+            .expect_err("reserved key id must be rejected");
+        assert!(reserved.to_string().contains("reserved"), "got: {reserved}");
+
+        let empty_dir = config_dir_with_auth(
+            "127.0.0.1:3456",
+            r#"
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+"" = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hash"
+"#,
+        );
+        let empty = load_app_config(empty_dir.path().join("config.toml"))
+            .expect_err("empty key id must be rejected");
+        assert!(empty.to_string().contains("empty key id"), "got: {empty}");
+    }
+
+    #[test]
+    fn auth_clients_do_not_leak_through_debug() {
+        // The hash (let alone a plaintext secret) must never surface in Debug
+        // output of the config, matching the api_key discipline.
+        let config: AppConfig = toml::from_str(
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$hashvalue"
+"#,
+        )
+        .expect("app config");
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("hashvalue"),
+            "client hash must be redacted in Debug, got: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"), "got: {debug}");
+    }
+
     #[test]
     fn has_valid_http_scheme_is_case_insensitive() {
         // Schemes are case-insensitive per RFC 3986 and reqwest accepts mixed
@@ -1682,6 +2383,192 @@ chat_completion = "chat"
         );
 
         result.unwrap_err();
+    }
+
+    // -----------------------------------------------------------------------
+    // [provider.egress]
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn egress_section_parses_and_absent_section_means_none() {
+        let with_egress: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "socks5h://127.0.0.1:1080"
+"#,
+        )
+        .expect("provider with egress parses");
+        assert_eq!(
+            with_egress.provider.egress,
+            Some(ProviderEgressConfig {
+                proxy: "socks5h://127.0.0.1:1080".to_owned(),
+            })
+        );
+
+        let without_egress: ProviderFile = toml::from_str(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+"#,
+        )
+        .expect("provider without egress parses");
+        assert_eq!(without_egress.provider.egress, None);
+    }
+
+    #[test]
+    fn egress_section_rejects_unknown_fields() {
+        let result = toml::from_str::<ProviderFile>(
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "socks5h://127.0.0.1:1080"
+bind_out = "198.51.100.10"
+"#,
+        );
+        result.unwrap_err();
+    }
+
+    #[test]
+    fn egress_debug_redacts_proxy_userinfo_but_keeps_the_host() {
+        let egress = ProviderEgressConfig {
+            proxy: "http://proxy-user:proxy-pass@proxy.internal:3128".to_owned(),
+        };
+        let debug = format!("{egress:?}");
+        assert!(
+            !debug.contains("proxy-user") && !debug.contains("proxy-pass"),
+            "proxy credentials must never print: {debug}"
+        );
+        assert!(
+            debug.contains("proxy.internal:3128"),
+            "the credential-free host must stay visible for diagnostics: {debug}"
+        );
+        // No-scheme strings (possible only pre-validation) print nothing raw.
+        let raw = ProviderEgressConfig {
+            proxy: "user:pass@host".to_owned(),
+        };
+        assert!(
+            !format!("{raw:?}").contains("user:pass"),
+            "unvalidated URLs must not be echoed: {:?}",
+            raw
+        );
+    }
+
+    #[test]
+    fn validate_accepts_each_supported_egress_proxy_scheme() {
+        for url in [
+            "socks5h://tunnel.example.com:1080",
+            "socks5://127.0.0.1:1080",
+            "http://proxy.internal:3128",
+            "https://proxy.internal:8443",
+            // Schemes are case-insensitive (RFC 3986), like endpoint schemes.
+            "SOCKS5H://tunnel.example.com:1080",
+            // Userinfo is proxy authentication, not part of the host check.
+            "http://user:pass@proxy.internal:3128",
+            // Portless socks: reqwest defaults to 1080.
+            "socks5h://tunnel.example.com",
+        ] {
+            let file: ProviderFile = toml::from_str(&format!(
+                r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "{url}"
+"#
+            ))
+            .expect("parses");
+            assert_eq!(
+                validate_provider_config(&file.provider, None),
+                Ok(()),
+                "egress proxy {url} must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unusable_egress_proxy_urls() {
+        // (url, reason fragment) pairs. Scheme-less URLs matter most: reqwest
+        // would silently prefix `http://` at client build, so config load is
+        // the only gate that can refuse them.
+        for (url, reason_fragment) in [
+            ("ftp://proxy:21", "unsupported scheme"),
+            ("socks4://127.0.0.1:1080", "unsupported scheme"),
+            ("127.0.0.1:1080", "no URL scheme"),
+            ("proxy.internal:3128", "no URL scheme"),
+            ("socks5h://", "no proxy host"),
+            ("http:///path", "no proxy host"),
+            ("", "empty proxy URL"),
+            ("   ", "empty proxy URL"),
+        ] {
+            let file: ProviderFile = toml::from_str(&format!(
+                r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "{url}"
+"#
+            ))
+            .expect("parses");
+            let err = validate_provider_config(&file.provider, None)
+                .expect_err("egress proxy must be rejected");
+            match &err {
+                ConfigValidationError::InvalidEgressProxy {
+                    provider, reason, ..
+                } => {
+                    assert_eq!(provider, "example");
+                    assert!(
+                        reason.contains(reason_fragment),
+                        "reason {reason:?} must name {reason_fragment:?} for {url:?}"
+                    );
+                }
+                other => panic!("expected InvalidEgressProxy for {url:?}, got {other:?}"),
+            }
+            // The operator-facing message names the provider and the URL.
+            let message = err.to_string();
+            assert!(message.contains("example"));
+            assert!(message.contains("[provider.egress]"));
+        }
+    }
+
+    #[test]
+    fn load_provider_config_rejects_invalid_egress_at_load_time() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("bad-egress.toml");
+        std::fs::write(
+            &path,
+            r#"
+[provider]
+name = "example"
+api_key = "key"
+auth_style = "bearer"
+
+[provider.egress]
+proxy = "ftp://proxy.example.com:21"
+"#,
+        )
+        .expect("write provider toml");
+
+        let err = load_provider_config(&path, None).expect_err("load must reject bad egress");
+        assert!(
+            err.to_string().contains("egress"),
+            "error must point at the egress section: {err}"
+        );
     }
 
     #[test]
@@ -2001,6 +2888,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -2028,6 +2916,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -2055,6 +2944,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
                 ProviderAdapterConfig {
@@ -2082,6 +2972,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2102,6 +2993,7 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2167,6 +3059,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2193,6 +3086,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2217,6 +3111,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2251,6 +3146,7 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2297,6 +3193,7 @@ input = 0.0000025
             api_key: SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: true,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2318,6 +3215,7 @@ input = 0.0000025
             api_key: SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
             model_aliases: HashMap::new(),
@@ -2329,5 +3227,381 @@ input = 0.0000025
             validate_provider_config(&provider, None),
             Err(ConfigValidationError::EmptyApiKey { .. })
         ));
+    }
+
+    // -- [storage] -----------------------------------------------------------
+
+    /// Minimal valid main config with a `[storage]` section appended.
+    fn write_app_config(extra_storage: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+{extra_storage}"#
+            ),
+        )
+        .unwrap();
+        (directory, path)
+    }
+
+    #[test]
+    fn storage_section_defaults_to_none_when_absent() {
+        let (_dir, path) = write_app_config("");
+        let config = load_app_config(&path).expect("valid config without [storage]");
+        assert!(
+            config.storage.is_none(),
+            "absent [storage] must keep the no-op event bus"
+        );
+    }
+
+    #[test]
+    fn storage_section_parses_and_applies_defaults() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+"#,
+        );
+        let config = load_app_config(&path).expect("valid [storage]");
+        let storage = config.storage.expect("storage present");
+        assert_eq!(storage.path, std::path::PathBuf::from("/tmp/usage.db"));
+        assert_eq!(storage.max_age, None, "absent max_age keeps rows forever");
+        assert_eq!(storage.max_rows, None, "absent max_rows is unlimited");
+        assert_eq!(
+            storage.prune_interval,
+            Duration::from_secs(3600),
+            "absent prune_interval defaults to 1h"
+        );
+    }
+
+    #[test]
+    fn storage_section_parses_full_retention() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_age = "30d"
+max_rows = 500_000
+prune_interval = "15m"
+"#,
+        );
+        let config = load_app_config(&path).expect("valid [storage]");
+        let storage = config.storage.expect("storage present");
+        assert_eq!(storage.max_age, Some(Duration::from_secs(30 * 24 * 3600)));
+        assert_eq!(storage.max_rows, Some(500_000));
+        assert_eq!(storage.prune_interval, Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn storage_zero_prune_interval_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+prune_interval = "0s"
+"#,
+        );
+        let error = load_app_config(&path).expect_err("zero prune interval rejected");
+        assert!(
+            error.to_string().contains("storage.prune_interval"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn storage_subsecond_prune_interval_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_age = "1d"
+prune_interval = "500ms"
+"#,
+        );
+        assert!(
+            load_app_config(&path).is_err(),
+            "sub-second prune interval must be rejected (timer panics on zero/near-zero)"
+        );
+    }
+
+    #[test]
+    fn storage_zero_max_age_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_age = "0s"
+"#,
+        );
+        let error = load_app_config(&path).expect_err("zero max_age rejected");
+        assert!(
+            error.to_string().contains("storage.max_age"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn storage_zero_max_rows_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+max_rows = 0
+"#,
+        );
+        let error = load_app_config(&path).expect_err("zero max_rows rejected");
+        assert!(
+            error.to_string().contains("storage.max_rows"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn storage_empty_path_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = ""
+"#,
+        );
+        let error = load_app_config(&path).expect_err("empty path rejected");
+        assert!(error.to_string().contains("storage.path"), "got: {error}");
+    }
+
+    #[test]
+    fn storage_unknown_field_is_rejected() {
+        let (_dir, path) = write_app_config(
+            r#"
+[storage]
+path = "/tmp/usage.db"
+db_host = "postgres.example"
+"#,
+        );
+        assert!(
+            load_app_config(&path).is_err(),
+            "deny_unknown_fields must reject unrecognized [storage] keys"
+        );
+    }
+
+    // -- [auth.admin] / admin mount -------------------------------------------
+
+    /// Minimal valid `[storage]` section so admin tests vary only the admin
+    /// fields.
+    const STORAGE_SECTION: &str = "\n[storage]\npath = \"/tmp/usage.db\"\n";
+
+    #[test]
+    fn admin_section_parses_token_and_defaults_off() {
+        let (_dir, path) = write_app_config(&format!(
+            "{STORAGE_SECTION}\n[auth.admin]\ntoken = \"admin-secret\"\n"
+        ));
+        let config = load_app_config(&path).expect("valid [auth.admin]");
+        assert!(
+            config
+                .auth
+                .admin
+                .as_ref()
+                .is_some_and(|a| a.token.expose_secret() == "admin-secret"),
+            "admin token must parse into the SecretString"
+        );
+        assert!(
+            !config.server.admin_on_main_listener,
+            "main-listener mount must be opt-in"
+        );
+        assert_eq!(
+            config.server.effective_admin_bind(),
+            Some("127.0.0.1:3457".parse().unwrap()),
+            "default admin bind is loopback on the port after the main bind"
+        );
+        assert_eq!(
+            config.admin_posture(),
+            Some(AdminMountPosture::DedicatedListener),
+            "the default posture is the dedicated listener"
+        );
+    }
+
+    #[test]
+    fn admin_explicit_bind_and_main_listener_opt_in_parse() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:9900\"\nadmin_on_main_listener = true\n{STORAGE_SECTION}\n\
+             [auth.admin]\ntoken = \"admin-secret\"\n"
+        ));
+        let config = load_app_config(&path).expect("valid admin config");
+        assert_eq!(
+            config.server.effective_admin_bind(),
+            Some("127.0.0.1:9900".parse().unwrap()),
+            "explicit admin_bind wins over the derived default"
+        );
+        assert_eq!(
+            config.admin_posture(),
+            Some(AdminMountPosture::MainListener),
+            "admin_on_main_listener selects the main-listener posture"
+        );
+        assert_eq!(
+            AdminMountPosture::MainListener.name(),
+            "admin-on-main-listener",
+            "posture names are stable for log grepping"
+        );
+    }
+
+    #[test]
+    fn admin_without_storage_is_rejected() {
+        let (_dir, path) = write_app_config("\n[auth.admin]\ntoken = \"admin-secret\"\n");
+        let error = load_app_config(&path).expect_err("admin requires [storage]");
+        assert!(
+            error.to_string().contains("[auth.admin] requires"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_empty_token_is_rejected() {
+        let (_dir, path) =
+            write_app_config(&format!("{STORAGE_SECTION}\n[auth.admin]\ntoken = \"\"\n"));
+        let error = load_app_config(&path).expect_err("empty admin token rejected");
+        assert!(
+            error.to_string().contains("token must not be empty"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_bind_equal_to_main_bind_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:3456\"\n{STORAGE_SECTION}\n[auth.admin]\n\
+             token = \"admin-secret\"\n"
+        ));
+        let error = load_app_config(&path).expect_err("same-socket bind rejected");
+        assert!(
+            error.to_string().contains("must differ from server.bind"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_default_port_underviable_on_65535_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nbind = \"127.0.0.1:65535\"\nrequest_timeout = \"300s\"\n\
+                 log_level = \"info\"\nhot_reload = false\nserver_name = \"t\"\n{STORAGE_SECTION}\n\
+                 \n[auth.admin]\ntoken = \"admin-secret\"\n"
+            ),
+        )
+        .unwrap();
+        let error = load_app_config(&path).expect_err("no derivable admin port");
+        assert!(error.to_string().contains("65535"), "got: {error}");
+    }
+
+    #[test]
+    fn admin_main_listener_optin_needs_no_derivable_port() {
+        // The "no second port available" posture: with the main-listener
+        // opt-in and no explicit admin_bind, no dedicated socket is
+        // attempted, so an underivable default port must not reject the
+        // config.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\nbind = \"127.0.0.1:65535\"\nrequest_timeout = \"300s\"\n\
+                 log_level = \"info\"\nhot_reload = false\nserver_name = \"t\"\n\
+                 admin_on_main_listener = true\n{STORAGE_SECTION}\n\
+                 \n[auth.admin]\ntoken = \"admin-secret\"\n"
+            ),
+        )
+        .unwrap();
+        let config = load_app_config(&path).expect("main-listener posture needs no port");
+        assert!(
+            !config.server.dedicated_admin_listener(),
+            "the opt-in without an explicit admin_bind must not bind a dedicated socket"
+        );
+    }
+
+    #[test]
+    fn explicit_admin_bind_keeps_the_dedicated_listener_under_the_optin() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:9900\"\nadmin_on_main_listener = true\n{STORAGE_SECTION}\n\
+             [auth.admin]\ntoken = \"admin-secret\"\n"
+        ));
+        let config = load_app_config(&path).expect("both mounts are legitimate");
+        assert!(
+            config.server.dedicated_admin_listener(),
+            "an explicit admin_bind always binds the dedicated listener"
+        );
+        assert_eq!(
+            config.admin_posture(),
+            Some(AdminMountPosture::MainListener),
+            "and the main-listener mount is on top of it"
+        );
+    }
+
+    #[test]
+    fn admin_bind_without_admin_section_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_bind = \"127.0.0.1:9900\"\n{STORAGE_SECTION}"
+        ));
+        let error = load_app_config(&path).expect_err("dead admin_bind rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("server.admin_bind is configured"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_main_listener_flag_without_admin_section_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "\nadmin_on_main_listener = true\n{STORAGE_SECTION}"
+        ));
+        let error = load_app_config(&path).expect_err("dead flag rejected");
+        assert!(
+            error.to_string().contains("admin_on_main_listener"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn admin_unknown_field_is_rejected() {
+        let (_dir, path) = write_app_config(&format!(
+            "{STORAGE_SECTION}\n[auth.admin]\ntoken = \"admin-secret\"\nrotates = \"weekly\"\n"
+        ));
+        assert!(
+            load_app_config(&path).is_err(),
+            "deny_unknown_fields must reject unrecognized [auth.admin] keys"
+        );
+    }
+
+    #[test]
+    fn admin_posture_is_none_without_admin_section() {
+        let (_dir, path) = write_app_config(STORAGE_SECTION);
+        let config = load_app_config(&path).expect("valid config");
+        assert_eq!(
+            config.admin_posture(),
+            None,
+            "no [auth.admin] means no admin surface anywhere"
+        );
+    }
+
+    #[test]
+    fn admin_auth_config_debug_redacts_token() {
+        let admin = AdminAuthConfig {
+            token: SecretString::from("super-secret-admin-token"),
+        };
+        let debug = format!("{admin:?}");
+        assert!(
+            !debug.contains("super-secret-admin-token"),
+            "Debug must redact the admin token, got: {debug}"
+        );
     }
 }

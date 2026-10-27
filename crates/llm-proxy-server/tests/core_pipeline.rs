@@ -204,6 +204,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -238,7 +239,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         };
 
         AppState::new(
@@ -1285,6 +1290,185 @@ mod tests {
         );
     }
 
+    // ===========================================================================
+    // Client-key authentication
+    // ===========================================================================
+
+    /// Hash a token with deliberately cheap argon2id parameters so router
+    /// tests run fast; verification reads the cost from the PHC string.
+    fn client_auth_for(key_id: &str, token: &str) -> llm_proxy_server::ClientAuth {
+        use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
+        let params = Params::new(8, 1, 1, None).expect("valid test params");
+        let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+        let phc = hasher
+            .hash_password_customized(
+                token.as_bytes(),
+                b"0123456789abcdef",
+                Some(&argon2::ARGON2ID_IDENT),
+                None,
+                params,
+            )
+            .expect("hash token")
+            .to_string();
+        let mut clients = HashMap::new();
+        clients.insert(key_id.to_owned(), secrecy::SecretString::from(phc));
+        llm_proxy_server::ClientAuth::from_config(&llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+        })
+        .expect("valid client auth")
+    }
+
+    /// Under enforced client keys, a request without a bearer token is
+    /// rejected with a 401 that carries no secret material and still has the
+    /// x-request-id header.
+    #[tokio::test]
+    async fn enforced_client_keys_reject_missing_bearer_with_sanitized_401() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url).with_client_auth(std::sync::Arc::new(
+            client_auth_for("laptop", "sekrit-token"),
+        ));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", false);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            resp.headers().get("x-request-id").is_some(),
+            "401 must carry the request id"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("sekrit-token"),
+            "401 body must not echo any secret material, got: {text}"
+        );
+    }
+
+    /// A wrong bearer token is rejected exactly like a missing one: same 401
+    /// body, and the attempted token never appears in the response.
+    #[tokio::test]
+    async fn enforced_client_keys_reject_wrong_bearer_without_echoing_it() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url).with_client_auth(std::sync::Arc::new(
+            client_auth_for("laptop", "sekrit-token"),
+        ));
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer attacker-guess")
+            .body(Body::from(make_messages_body("claude-sonnet-4-6", false)))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("attacker-guess"),
+            "401 body must not echo the attempted token, got: {text}"
+        );
+    }
+
+    /// A valid bearer token passes the auth gate, and the RequestReceived
+    /// event is attributed to the key id (not "anonymous", not the secret).
+    #[tokio::test]
+    async fn valid_bearer_passes_and_attributes_caller_on_event() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus))
+            .with_client_auth(std::sync::Arc::new(client_auth_for(
+                "laptop",
+                "sekrit-token",
+            )));
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", "bearer sekrit-token")
+            .body(Body::from(make_messages_body("claude-sonnet-4-6", false)))
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = bus.snapshot();
+        let received = events
+            .iter()
+            .find_map(|e| match e {
+                ProxyEvent::RequestReceived(r) => Some(r),
+                _ => None,
+            })
+            .expect("RequestReceived emitted");
+        assert_eq!(received.caller, "laptop");
+        let event_json =
+            serde_json::to_string(&ProxyEvent::RequestReceived(received.clone())).unwrap();
+        assert!(
+            !event_json.contains("sekrit-token"),
+            "client secret must never appear on the event, got: {event_json}"
+        );
+    }
+
+    /// Under the default no-auth mode, requests pass and events attribute the
+    /// caller as "anonymous".
+    #[tokio::test]
+    async fn no_auth_mode_attributes_anonymous_caller() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", false);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = bus.snapshot();
+        let received = events
+            .iter()
+            .find_map(|e| match e {
+                ProxyEvent::RequestReceived(r) => Some(r),
+                _ => None,
+            })
+            .expect("RequestReceived emitted");
+        assert_eq!(received.caller, "anonymous");
+    }
+
+    /// The auth gate is not applied to lightweight routes: /health stays
+    /// open even under enforced client keys (it exposes no model traffic).
+    #[tokio::test]
+    async fn enforced_client_keys_leave_health_open() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url).with_client_auth(std::sync::Arc::new(
+            client_auth_for("laptop", "sekrit-token"),
+        ));
+        let app = build_router(state);
+
+        let request = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// A request for an unknown provider emits `ResponseFailed` with the mapped
     /// HTTP status (404) and the provider name from the URL path.
     #[tokio::test]
@@ -2007,6 +2191,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2043,7 +2228,11 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
+                auth: Default::default(),
+                storage: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -2116,6 +2305,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2152,7 +2342,11 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_secs(60),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
+                auth: Default::default(),
+                storage: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -2449,6 +2643,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2485,7 +2680,11 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
+                auth: Default::default(),
+                storage: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -2705,6 +2904,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -2741,7 +2941,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         };
         AppState::new(
             app_config,

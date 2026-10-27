@@ -140,7 +140,7 @@ pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// Owns a connection-pooled [`reqwest::Client`] and sends [`ProxyRequest`]
 /// instances without any knowledge of protocol names or model IDs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[must_use = "ProxyClient does nothing until send/send_stream is called"]
 pub struct ProxyClient {
     http: reqwest::Client,
@@ -155,6 +155,20 @@ pub struct ProxyClient {
     /// *body* remains under [`Self::stream_idle_timeout`]; this deadline does
     /// not cap a legitimate long token stream (audit transport-no-upstream-timeout).
     upstream_headers_timeout: Duration,
+}
+
+impl fmt::Debug for ProxyClient {
+    // SECURITY: do not delegate to `reqwest::Client`'s Debug. It prints the
+    // configured forward-proxy URI whenever a proxy is set, and an egress
+    // proxy URL is operator infrastructure that does not belong in logs or
+    // `{:?}` output of containing types (e.g. `AppState`).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyClient")
+            .field("http", &"<reqwest::Client>")
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
+            .field("upstream_headers_timeout", &self.upstream_headers_timeout)
+            .finish()
+    }
 }
 
 impl Default for ProxyClient {
@@ -200,11 +214,36 @@ impl ProxyClient {
     /// Use this when configuration may make client construction fallible
     /// (e.g. custom TLS backends, proxy environment validation).
     pub fn try_new() -> Result<Self, ProviderError> {
-        let http = reqwest::Client::builder()
-            .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .connect_timeout(Duration::from_secs(10))
-            .build()?;
+        let http = pooled_http_builder().build()?;
+
+        Ok(Self {
+            http,
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
+            upstream_headers_timeout: DEFAULT_UPSTREAM_HEADERS_TIMEOUT,
+        })
+    }
+
+    /// Creates a transport client that sends every upstream request through a
+    /// forward proxy (per-provider egress, `[provider.egress]`).
+    ///
+    /// The pool, connect-timeout, and default stream/header timeout settings
+    /// are identical to [`Self::try_new`]; only the proxy differs. Providers
+    /// without egress must keep using the shared default client — this
+    /// constructor exists for providers that configure one.
+    ///
+    /// `proxy_url` must be a `socks5h://`, `socks5://`, `http://`, or `https://`
+    /// URL with a host (userinfo allowed as proxy authentication). Anything
+    /// else is an error here as well as at config load, because reqwest would
+    /// otherwise silently accept it: it auto-prefixes `http://` onto scheme-less
+    /// URLs and builds proxies from schemes it cannot actually speak.
+    ///
+    /// SOCKS support requires reqwest's `socks` cargo feature, which this crate
+    /// enables. `socks5h://` resolves upstream hostnames at the proxy;
+    /// `socks5://` resolves them locally.
+    pub fn try_with_egress_proxy(proxy_url: &str) -> Result<Self, ProviderError> {
+        validate_egress_proxy_url(proxy_url)?;
+        let proxy = reqwest::Proxy::all(proxy_url)?;
+        let http = pooled_http_builder().proxy(proxy).build()?;
 
         Ok(Self {
             http,
@@ -449,6 +488,60 @@ impl Stream for IdleTimeoutStream {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The connection-pool defaults shared by every [`ProxyClient`], egress or not.
+///
+/// Extracted so the default client ([`ProxyClient::try_new`]) and the
+/// per-provider egress client ([`ProxyClient::try_with_egress_proxy`]) cannot
+/// drift apart: a provider without egress must behave exactly like today's
+/// single shared client.
+fn pooled_http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(20)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .connect_timeout(Duration::from_secs(10))
+}
+
+/// Egress proxy schemes the transport will route through.
+///
+/// Mirrors the config-level allowlist in `llm-proxy-core`'s
+/// `validate_egress`; both are pinned by tests. reqwest itself accepts far
+/// more (scheme-less URLs, `socks4`, unknown schemes), so this check — not
+/// reqwest — defines what "a configured egress proxy" means.
+const EGRESS_PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "http", "https"];
+
+/// Reject egress proxy URLs outside the supported schemes or without a host.
+///
+/// reqwest's `Proxy::all` silently coerces scheme-less URLs to `http://` and
+/// builds proxies from schemes it cannot speak, so the transport validates
+/// before handing the URL over. Config load applies the same rule earlier;
+/// this is the second, defense-in-depth gate.
+fn validate_egress_proxy_url(proxy_url: &str) -> Result<(), ProviderError> {
+    let url = proxy_url.trim();
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| {
+        ProviderError::InvalidConfig(format!(
+            "egress proxy URL has no scheme (expected socks5h://, socks5://, http://, or https://): {url:?}"
+        ))
+    })?;
+    if !EGRESS_PROXY_SCHEMES
+        .iter()
+        .any(|accepted| scheme.eq_ignore_ascii_case(accepted))
+    {
+        return Err(ProviderError::InvalidConfig(format!(
+            "egress proxy scheme must be socks5h://, socks5://, http://, or https://, got {scheme}://"
+        )));
+    }
+    // The authority region must hold a host; drop userinfo (`user:pass@`)
+    // before checking so proxy credentials do not count as a host.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.is_empty() {
+        return Err(ProviderError::InvalidConfig(format!(
+            "egress proxy URL has no host: {url:?}"
+        )));
+    }
+    Ok(())
+}
 
 /// Apply authentication headers to a request builder based on [`AuthStyle`].
 ///
@@ -1495,6 +1588,247 @@ mod tests {
         assert!(
             !source.contains("llm_proxy_protocol"),
             "transport.rs must not import llm_proxy_protocol"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-provider egress proxy client
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn egress_proxy_client_builds_for_each_supported_scheme() {
+        // This is also the empirical proof that reqwest's `socks` cargo
+        // feature (enabled in this crate) accepts socks5/socks5h proxy URLs:
+        // without the feature these two builds fail.
+        for url in [
+            "socks5h://tunnel.example.com:1080",
+            "socks5://127.0.0.1:1080",
+            "http://proxy.internal:3128",
+            "https://proxy.internal:8443",
+            "SOCKS5H://tunnel.example.com:1080",
+            "http://user:pass@proxy.internal:3128",
+            "socks5h://tunnel.example.com",
+        ] {
+            let client = ProxyClient::try_with_egress_proxy(url)
+                .unwrap_or_else(|e| panic!("egress proxy {url} must build: {e}"));
+            // The egress client carries the same streaming timeouts as the
+            // default client: only the proxy differs.
+            assert_eq!(
+                client.stream_idle_timeout, DEFAULT_STREAM_IDLE_TIMEOUT,
+                "egress client must keep the default stream idle timeout"
+            );
+            assert_eq!(
+                client.upstream_headers_timeout, DEFAULT_UPSTREAM_HEADERS_TIMEOUT,
+                "egress client must keep the default headers timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn egress_proxy_client_rejects_unsupported_or_malformed_urls() {
+        for url in [
+            "ftp://proxy:21",
+            "socks4://127.0.0.1:1080",
+            // Scheme-less: reqwest would silently prefix http:// — the
+            // transport must refuse instead.
+            "127.0.0.1:1080",
+            "socks5h://",
+            "",
+        ] {
+            let err = ProxyClient::try_with_egress_proxy(url)
+                .expect_err(&format!("egress proxy {url:?} must be rejected"));
+            assert!(
+                matches!(err, ProviderError::InvalidConfig(_)),
+                "egress proxy {url:?} must be InvalidConfig, got {err:?}"
+            );
+        }
+    }
+
+    /// Handler for the egress end-to-end test: echoes the request target.
+    ///
+    /// A forward proxy receives the request in absolute form
+    /// (`POST http://upstream/v1/test`), so echoing the URI proves the
+    /// connection landed on the proxy with the upstream target intact.
+    async fn absolute_target_echo_handler(uri: axum::http::Uri) -> String {
+        uri.to_string()
+    }
+
+    #[test]
+    fn egress_proxy_client_debug_does_not_print_the_proxy() {
+        let client = ProxyClient::try_with_egress_proxy("socks5h://debug-secret-host.invalid:1080")
+            .expect("builds");
+        let debug = format!("{client:?}");
+        assert!(
+            !debug.contains("debug-secret-host.invalid"),
+            "ProxyClient Debug must not print the egress proxy: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_client_sends_requests_through_the_proxy() {
+        // "Proxy" = an ordinary HTTP server on an ephemeral loopback port. It
+        // is the only listener in this test; the upstream host does not exist.
+        let app = Router::new().route("/v1/test", post(absolute_target_echo_handler));
+        let proxy_base = start_test_server(app).await;
+
+        let client =
+            ProxyClient::try_with_egress_proxy(&proxy_base).expect("http egress proxy builds");
+        let req = ProxyRequest {
+            // Nonexistent host: only reachable via the proxy, which resolves
+            // nothing for plain-http absolute-form targets.
+            url: "http://egress-upstream.invalid/v1/test".to_owned(),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: SecretString::from("key"),
+            },
+            body: br#"{"hello":"world"}"#.to_vec(),
+            stream: false,
+            extra_headers: std::collections::HashMap::new(),
+        };
+
+        let resp = client.send(req).await.expect("request via proxy succeeds");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.contains("http://egress-upstream.invalid/v1/test"),
+            "the proxy must receive the absolute-form upstream target, got: {text}"
+        );
+    }
+
+    /// Read exactly `buf.len()` bytes (test-side helper for the SOCKS5
+    /// handshake, where every field is fixed-width).
+    async fn read_exact(stream: &mut tokio::net::TcpStream, buf: &mut [u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut filled = 0;
+        while filled < buf.len() {
+            let n = stream.read(&mut buf[filled..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "socks test client closed early",
+                ));
+            }
+            filled += n;
+        }
+        Ok(())
+    }
+
+    /// Serve exactly one no-auth SOCKS5 CONNECT, report the destination the
+    /// client asked to reach on `destination_tx`, then pipe the tunnel to
+    /// `upstream` (the copy loops stay alive until the test runtime drops
+    /// them — reqwest pools the tunneled connection, so waiting for it to
+    /// close would block for the whole pool idle timeout).
+    async fn serve_one_socks5_connect(
+        listener: tokio::net::TcpListener,
+        upstream: std::net::SocketAddr,
+        destination_tx: tokio::sync::oneshot::Sender<String>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let (mut sock, _peer) = listener.accept().await.expect("socks client connects");
+
+        // Client greeting: [VER, NMETHODS, METHODS..]; answer NO AUTH.
+        let mut head = [0u8; 2];
+        read_exact(&mut sock, &mut head).await.expect("greeting");
+        let mut methods = vec![0u8; head[1] as usize];
+        read_exact(&mut sock, &mut methods).await.expect("methods");
+        sock.write_all(&[0x05, 0x00]).await.expect("auth reply");
+
+        // CONNECT request: [VER, CMD=1, RSV, ATYP, ADDR..., PORT].
+        let mut req_head = [0u8; 4];
+        read_exact(&mut sock, &mut req_head)
+            .await
+            .expect("request head");
+        assert_eq!(req_head[1], 0x01, "expected CONNECT");
+        let addr_len = match req_head[3] {
+            0x01 => 4,  // IPv4
+            0x04 => 16, // IPv6
+            0x03 => {
+                // domain: length-prefixed
+                let mut len = [0u8; 1];
+                read_exact(&mut sock, &mut len)
+                    .await
+                    .expect("domain length");
+                len[0] as usize
+            }
+            other => panic!("unknown SOCKS address type {other}"),
+        };
+        let mut addr_bytes = vec![0u8; addr_len];
+        read_exact(&mut sock, &mut addr_bytes)
+            .await
+            .expect("address");
+        let mut port = [0u8; 2];
+        read_exact(&mut sock, &mut port).await.expect("port");
+        let destination = if req_head[3] == 0x03 {
+            String::from_utf8(addr_bytes).expect("domain is UTF-8")
+        } else {
+            format!("{}-byte address", addr_bytes.len())
+        };
+
+        // Reply: succeeded, bound to the real upstream.
+        let up_port = upstream.port().to_be_bytes();
+        sock.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, up_port[0], up_port[1]])
+            .await
+            .expect("connect reply");
+
+        destination_tx
+            .send(destination)
+            .expect("test holds the receiver");
+
+        // Pipe the tunnel to the upstream.
+        let up = tokio::net::TcpStream::connect(upstream)
+            .await
+            .expect("connect to upstream");
+        let (mut client_read, mut client_write) = sock.into_split();
+        let (mut up_read, mut up_write) = up.into_split();
+        let a = tokio::spawn(async move { tokio::io::copy(&mut client_read, &mut up_write).await });
+        let b = tokio::spawn(async move { tokio::io::copy(&mut up_read, &mut client_write).await });
+        let (_, _) = tokio::join!(a, b);
+    }
+
+    #[tokio::test]
+    async fn socks5h_egress_delivers_the_hostname_to_the_proxy_tunnel() {
+        // Upstream: an ordinary echo server; only the SOCKS proxy can reach it.
+        let app = Router::new().route("/socks-test", post(echo_handler));
+        let upstream_base = start_test_server(app).await;
+        let upstream_addr: std::net::SocketAddr = upstream_base
+            .trim_start_matches("http://")
+            .parse()
+            .expect("upstream addr");
+
+        let socks_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let (destination_tx, destination_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(serve_one_socks5_connect(
+            socks_listener,
+            upstream_addr,
+            destination_tx,
+        ));
+
+        let client = ProxyClient::try_with_egress_proxy(&format!("socks5h://{socks_addr}"))
+            .expect("socks5h egress proxy builds");
+        let req = ProxyRequest {
+            // Nonexistent hostname: socks5h must hand the NAME to the proxy
+            // (remote DNS), so the proxy observes it without resolving.
+            url: "http://egress-upstream.invalid/socks-test".to_owned(),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: SecretString::from("key"),
+            },
+            body: br#"{"via":"socks"}"#.to_vec(),
+            stream: false,
+            extra_headers: std::collections::HashMap::new(),
+        };
+
+        let resp = client.send(req).await.expect("request via socks tunnel");
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.contains(r#""via":"socks""#),
+            "the echo upstream must see the body through the tunnel, got: {text}"
+        );
+
+        let destination = destination_rx.await.expect("destination");
+        assert_eq!(
+            destination, "egress-upstream.invalid",
+            "socks5h must deliver the unresolved hostname to the proxy"
         );
     }
 

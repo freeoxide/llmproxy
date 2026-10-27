@@ -16,9 +16,10 @@ use tower_http::{
 };
 use tracing::info_span;
 
-use crate::middleware::{RequestId, RequestIdGenerator};
+use crate::middleware::{CallerId, RequestId, RequestIdGenerator, extract_bearer_token};
 use crate::state::AppState;
 use llm_proxy_storage::EventBus;
+use secrecy::ExposeSecret;
 
 mod chat;
 mod core_pipeline;
@@ -86,6 +87,10 @@ pub fn router(state: AppState) -> Router {
     // rejections produced by the timeout/body-limit layers (audit finding: layer
     // fallbacks emit no terminal event).
     let event_bus = Arc::clone(&state.event_bus);
+    // The client-auth layer needs the full AppState (auth state, rate limiter,
+    // metrics), so the state is cloned once for it before being moved into
+    // `with_state` below.
+    let state_arc = state.clone();
 
     // Span factory shared by both routers: it reads the id injected by the
     // outermost layer so every request span carries `request_id`, matching the
@@ -103,26 +108,31 @@ pub fn router(state: AppState) -> Router {
                 .layer(trace.clone()),
         );
 
-    // API routes: request-id injection, error normalisation, body limit,
-    // tracing, timeout.
+    // API routes: request-id injection, client auth, error normalisation,
+    // body limit, tracing, timeout.
     //
     // Layer order (outermost first):
     //   1. `inject_request_id` -- generates the id and stamps it into extensions
-    //      so the span (step 4) and the handler see the same id.
-    //   2. `normalize_error_responses` -- rewrites the 408 (timeout) and 413
+    //      so the span (step 5) and the handler see the same id.
+    //   2. `require_client_auth` -- under `auth.mode = "client-keys"`, rejects
+    //      requests without a valid `Authorization: Bearer <client-key>` with a
+    //      401 before any body buffering. Under `auth.mode = "none"` it stamps
+    //      the anonymous caller and passes through.
+    //   3. `normalize_error_responses` -- rewrites the 408 (timeout) and 413
     //      (body-limit) rejections emitted by layers below into protocol-shaped
     //      JSON envelopes carrying `x-request-id` (audit MEDIUM-7). It runs
     //      outside the body-limit/timeout layers so their rejections pass
     //      through it on the way out.
-    //   3. `DefaultBodyLimit` -- caps the body the JSON extractors can buffer.
-    //   4. `TraceLayer` -- opens the request span (carrying the request id).
-    //   5. `TimeoutLayer` -- cancels handler work exceeding `request_timeout`.
+    //   4. `DefaultBodyLimit` -- caps the body the JSON extractors can buffer.
+    //   5. `TraceLayer` -- opens the request span (carrying the request id).
+    //   6. `TimeoutLayer` -- cancels handler work exceeding `request_timeout`.
     //
     // Because the timeout and body-limit layers emit non-JSON, header-less
-    // rejections, step 2 normalises their final responses into the same
+    // rejections, step 3 normalises their final responses into the same
     // Anthropic/OpenAI-shaped JSON schema every handler uses.
     let api_middleware = ServiceBuilder::new()
         .layer(from_fn_with_state(id_gen, inject_request_id))
+        .layer(from_fn_with_state(state_arc, require_client_auth))
         .layer(from_fn_with_state(event_bus, normalize_error_responses))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(trace)
@@ -153,6 +163,23 @@ pub fn router(state: AppState) -> Router {
         // (audit LOW-27).
         .method_not_allowed_fallback(method_not_allowed);
 
+    // The admin `/usage` surface joins the MAIN listener only under the
+    // explicit `server.admin_on_main_listener` opt-in — a distinct, named
+    // security posture the serve path warns about loudly at startup. The
+    // default posture serves `/usage` on the dedicated admin listener
+    // ([`crate::admin_router`]) and leaves this listener without any admin
+    // surface. Config validation guarantees the flag implies `[auth.admin]`;
+    // `admin_router` returning `None` here keeps the default closed. The
+    // merge happens after `with_state` below because the usage router is
+    // already stateless.
+    let usage_on_main = match (
+        crate::admin_router(&state),
+        state.app_config.server.admin_on_main_listener,
+    ) {
+        (Some(usage), true) => Some(usage),
+        _ => None,
+    };
+
     // Config-gated CORS (audit LOW-12). A `CorsLayer` is installed only when
     // the operator explicitly lists cross-origin callers, and then only for
     // those exact origins. This replaces a former `CorsLayer::very_permissive()`
@@ -165,7 +192,7 @@ pub fn router(state: AppState) -> Router {
         None => router,
     };
 
-    router
+    let router: Router = router
         // Global, outermost middleware (audit LOW-11, LOW-12) -- applied to the
         // merged router so they cover every route and both fallbacks. CORS sits
         // just inside these so a preflight still receives the headers below and
@@ -182,7 +209,15 @@ pub fn router(state: AppState) -> Router {
             HeaderValue::from_static("nosniff"),
         ))
         .layer(CatchPanicLayer::new())
-        .with_state(state)
+        .with_state(state);
+
+    // Both routers are stateless here, so the opt-in usage surface merges
+    // cleanly (see `usage_on_main` above). It carries its own admin-auth,
+    // nosniff, panic-catch, and tracing layers.
+    match usage_on_main {
+        Some(usage) => router.merge(usage),
+        None => router,
+    }
 }
 
 /// Build a restrictive `CorsLayer` for an explicit allow-origin list, or return
@@ -248,6 +283,117 @@ async fn inject_request_id(
     let id = id_gen.next_id();
     req.extensions_mut().insert(RequestId(id));
     next.run(req).await
+}
+
+/// Client-key authentication for proxy routes.
+///
+/// Under `auth.mode = "client-keys"`, a request must carry
+/// `Authorization: Bearer <client-key>` matching a configured
+/// `[auth.clients]` verifier; the matching key id is stamped into extensions
+/// as [`CallerId`] for event attribution and rate-limit keying. Anything
+/// else — missing header, unknown scheme, wrong token — gets a 401 whose
+/// body carries no secret material (the standard `Unauthorized` envelope).
+///
+/// Under `auth.mode = "none"` (loopback binds only, enforced by config
+/// validation at startup), every request is stamped
+/// [`CallerId::anonymous`] and passes through unchanged.
+///
+/// The bearer token is never logged and never echoed in the response.
+///
+/// # Garbage-token flood bound
+///
+/// Every failed attempt (missing or invalid token) is charged to the peer's
+/// IP rate-limit bucket, and a peer whose bucket is empty is rejected
+/// **before** the CPU-costly argon2 verification runs. A flood of garbage
+/// tokens from one peer therefore pays at most `rate_limit_rpm` verifications
+/// per minute (times the number of configured keys) instead of one per
+/// request, and the blocking pool cannot be pinned by unauthenticated
+/// traffic. Successful authentications are never charged to the IP bucket —
+/// their requests are limited under the key id inside `prepare_request` —
+/// and the response stays a uniform 401 on every rejection path, so the gate
+/// leaks nothing about which check failed. When rate limiting is disabled
+/// (`rate_limit_rpm = 0`) no bound applies; the operator turned the limiter
+/// off. A failed attempt also emits a `ResponseFailed` so rejected requests
+/// stay attributable in the event log, mirroring the 404/405/408/413
+/// layer-rejection pattern.
+async fn require_client_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if !state.client_auth.is_enforced() {
+        let mut req = req;
+        req.extensions_mut().insert(CallerId::anonymous());
+        return next.run(req).await;
+    }
+
+    // Peer identity for the failure-budget gate; captured before the request
+    // is consumed by verification or the inner service.
+    let connect_info = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0);
+    let client_ip = crate::middleware::get_client_ip(
+        req.headers(),
+        connect_info.as_ref(),
+        state.trust_forwarded_headers(),
+    );
+
+    let authenticated = match extract_bearer_token(req.headers()) {
+        Some(token) => {
+            // Flood gate BEFORE verification: a peer that already exhausted
+            // its failure budget is rejected without paying for argon2. The
+            // response is the same uniform 401 the verification failure
+            // produces, so the gate is not observable to the peer.
+            if !state.rate_limiter.would_allow(&client_ip) {
+                state.metrics.record_rate_limited();
+                None
+            } else {
+                state.client_auth.authenticate(token.expose_secret()).await
+            }
+        }
+        None => None,
+    };
+
+    let mut req = req;
+    match authenticated {
+        Some(key_id) => {
+            tracing::debug!(caller = %key_id, "client authenticated");
+            req.extensions_mut().insert(CallerId::authenticated(key_id));
+            next.run(req).await
+        }
+        None => {
+            // Charge the failure to the peer's IP bucket so repeated failures
+            // drain it and trip the pre-verification gate above. When the
+            // bucket is already empty this consumes nothing and records the
+            // limiter metric.
+            if !state.rate_limiter.is_allowed(&client_ip) {
+                state.metrics.record_rate_limited();
+            }
+            let request_id = req
+                .extensions()
+                .get::<RequestId>()
+                .cloned()
+                .unwrap_or_else(|| RequestId("unknown".to_owned()));
+            let path = req.uri().path().to_owned();
+            // Drain the body so a rejected connection is not left half-read.
+            if let Err(e) = axum::body::to_bytes(req.into_body(), NOT_FOUND_BODY_DRAIN_LIMIT).await
+            {
+                tracing::trace!(error = %e, "draining body of auth-rejected request failed");
+            }
+            let error = error_response::RouteError::Unauthorized;
+            core_pipeline::emit_response_failed(
+                &state.event_bus,
+                &request_id.0,
+                None,
+                None,
+                &error,
+                std::time::Instant::now(),
+            );
+            let mut response =
+                error_response::route_error_response(protocol_for_path(&path), &error);
+            if let Ok(value) = request_id.0.parse() {
+                response.headers_mut().insert("x-request-id", value);
+            }
+            response
+        }
+    }
 }
 
 /// Build the per-request tracing span, carrying the injected request id.
@@ -489,5 +635,139 @@ mod tests {
             "https://app.example.com".to_owned(),
         ];
         assert!(cors_layer_for(Some(&origins)).is_some());
+    }
+}
+
+/// Tests for the garbage-token flood gate in [`require_client_auth`].
+///
+/// The gate's purpose: a peer whose failure budget is exhausted is rejected
+/// BEFORE the argon2 verification runs, so an unauthenticated flood cannot
+/// pin the blocking pool. The peer-visible response is the same uniform 401
+/// either way, so the gate is proven here through its one observable
+/// consequence: a peer that burned its budget cannot authenticate even with a
+/// VALID token until the bucket refills.
+#[cfg(test)]
+mod auth_gate_tests {
+    use super::*;
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Build an AppState with enforced client auth for `token` and the given
+    /// per-IP rate limit, plus a minimal router whose probe handler answers
+    /// 200 when a request makes it past the auth layer.
+    fn auth_router(rate_limit_rpm: u32) -> (Router, AppState) {
+        use argon2::{Algorithm, Argon2, CustomizedPasswordHasher, Params, Version};
+
+        let params = Params::new(8, 1, 1, None).expect("valid test params");
+        let hasher = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
+        let phc = hasher
+            .hash_password_customized(
+                b"sekrit-token",
+                b"0123456789abcdef",
+                Some(&argon2::ARGON2ID_IDENT),
+                None,
+                params,
+            )
+            .expect("hash token")
+            .to_string();
+
+        let mut clients = std::collections::HashMap::new();
+        clients.insert("laptop".to_owned(), secrecy::SecretString::from(phc));
+        let app_config = llm_proxy_core::AppConfig {
+            server: llm_proxy_core::ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: std::time::Duration::from_secs(300),
+                shutdown_timeout: std::time::Duration::from_secs(30),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                allowed_origins: None,
+                server_name: "gate-test".to_owned(),
+                rate_limit_rpm,
+                trust_forwarded_headers: false,
+                dedup_window: std::time::Duration::ZERO,
+                log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
+            },
+            auth: llm_proxy_core::AuthConfig {
+                mode: llm_proxy_core::AuthMode::ClientKeys,
+                clients,
+                admin: None,
+            },
+            storage: None,
+        };
+
+        let state = crate::state::AppState::new(
+            app_config,
+            llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry"),
+            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
+            llm_proxy_provider::ProxyClient::new(),
+            crate::state::BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        );
+
+        let router = Router::new()
+            .route(
+                "/providers/x/v1/messages",
+                post(|| async { StatusCode::OK }),
+            )
+            .layer(from_fn_with_state(
+                state.clone(),
+                super::require_client_auth,
+            ));
+        (router, state)
+    }
+
+    fn bearer_request(token: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/x/v1/messages")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_token_passes_when_the_peer_has_budget() {
+        let (app, _state) = auth_router(100);
+        let response = app.oneshot(bearer_request("sekrit-token")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn exhausted_failure_budget_gates_verification_before_argon2() {
+        // rate_limit_rpm = 1: one failed attempt drains the peer's budget.
+        // `oneshot` consumes the router, so each request clones it; the clones
+        // share the same underlying state (one rate-limit bucket).
+        let (app, state) = auth_router(1);
+
+        // Failure #1 pays for verification and charges the last token.
+        let first = app
+            .clone()
+            .oneshot(bearer_request("wrong-token"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(state.metrics.get_snapshot().rate_limited, 0);
+
+        // Failure #2 carries a VALID token: the bucket is empty, so the gate
+        // rejects before verification. If the argon2 check ran first, this
+        // request would authenticate and the probe handler would answer 200.
+        let second = app.oneshot(bearer_request("sekrit-token")).await.unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::UNAUTHORIZED,
+            "a peer with an exhausted failure budget must be gated before verification"
+        );
+        assert!(
+            state.metrics.get_snapshot().rate_limited >= 1,
+            "the gate records a limiter rejection"
+        );
     }
 }

@@ -1,30 +1,25 @@
-//! llm-proxy-api: public API surface for the LLM proxy.
+//! llm-proxy-api: the read-only, admin-authenticated `/usage` query surface
+//! over the proxy's usage ledger.
 //!
-//! This crate is intentionally empty in v1. It reserves the namespace for a
-//! future public HTTP API layer. See `docs/protocol.md` for the implemented
-//! protocol boundaries.
+//! [`UsageApi`] builds a small axum router with three `GET` routes backed by
+//! the SQLite ledger written by `llm-proxy-storage`'s `SqliteEventBus`:
+//!
+//! - `/usage/summary?window=1h&group_by=provider|model|caller` — token,
+//!   request, error, and exact-cost totals grouped over a time window.
+//! - `/usage/requests?since=…&until=…&provider=…&limit=…&cursor=…` —
+//!   bounded, cursor-paged raw ledger rows. Never request bodies; the ledger
+//!   stores only a body digest and so do these responses.
+//! - `/usage/keys` — caller list with request counts and last-seen times.
+//!
+//! Every route requires `Authorization: Bearer <admin-token>`; the token is
+//! compared in constant time against a digest and never appears in logs or
+//! responses. All responses are strictly read-only: queries run on
+//! read-only SQLite connections and there is no write path.
 
-/// Placeholder module to reserve the public API namespace.
-///
-/// Remove this module and replace with real types once implementation
-/// begins. Tracking: <https://github.com/hmziq/llm-proxy/issues>.
-pub mod placeholder {
-    /// Sentinel type indicating this crate has not yet been implemented.
-    ///
-    /// This type exists so that downstream crates can reference
-    /// `llm_proxy_api::placeholder::NotImplemented` in feature-gated
-    /// code without pulling in a fully implemented crate.
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct NotImplemented;
-}
+#![deny(missing_docs)]
 
-// Ensure the crate compiles as a valid library target.
-#[cfg(test)]
-mod tests {
-    use super::placeholder::NotImplemented;
+mod auth;
+mod reader;
+mod routes;
 
-    #[test]
-    fn placeholder_type_exists() {
-        let _ = NotImplemented;
-    }
-}
+pub use routes::UsageApi;

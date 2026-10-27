@@ -20,3 +20,56 @@ trust_forwarded_headers = false
 # Window for rejecting identical path/body requests. "0ms" disables dedup.
 dedup_window = "0ms"
 server_name = "llm-proxy"
+# Dedicated listener for the read-only admin /usage API. Only read when
+# [auth.admin] is configured. Defaults to "127.0.0.1" on the port after
+# `bind` (loopback-only); set it explicitly to point at a tunnel interface
+# or a different port. Must differ from `bind`.
+# admin_bind = "127.0.0.1:3457"
+# Also serve /usage on the main listener behind the same admin token.
+# Off by default; enabling it names a distinct security posture
+# ("admin-on-main-listener") that startup warns about loudly: the admin
+# surface then reaches every network the main listener does. With no
+# explicit admin_bind set, this posture serves /usage on the main listener
+# only (no dedicated socket) — the option for setups where a second port
+# is not available.
+# admin_on_main_listener = false
+
+# Client authentication for proxy routes.
+#
+# mode = "none" (default): no client authentication. Only permitted while
+# [server].bind is a loopback address; the server refuses to start on a
+# non-loopback bind without client keys.
+[auth]
+mode = "none"
+# mode = "client-keys": every proxy request must present
+# "Authorization: Bearer <client-key>". Named keys map key ids to argon2id
+# password hashes in PHC format -- never plaintext secrets. Generate one with
+# e.g. `printf 'my-secret' | argon2 'some-salt' -id -e`.
+# The key id (not the secret) appears in usage events and rate-limit keys.
+#
+# [auth]
+# mode = "client-keys"
+#
+# [auth.clients]
+# laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
+
+# Usage ledger persistence. Absent (the default) disables persistence:
+# usage events go to an in-memory no-op sink and nothing is written to disk.
+#
+# [storage]
+# SQLite database file. Parent directories are created at startup.
+# path = "${HOME}/.local/state/llm-proxy/usage.db"
+# Delete ledger rows older than this age; absent keeps rows forever.
+# max_age = "30d"
+# Keep at most this many rows; the oldest rows are deleted when the cap is
+# exceeded. Absent means unlimited.
+# max_rows = 1000000
+# How often retention pruning runs. Default "1h"; must be at least "1s".
+# prune_interval = "1h"
+
+# Admin API for the usage ledger. Absent (the default) disables the /usage
+# surface entirely. Requires [storage]; every /usage route on every mount
+# demands "Authorization: Bearer <admin-token>" (compared in constant time).
+#
+# [auth.admin]
+# token = "${ADMIN_TOKEN}"

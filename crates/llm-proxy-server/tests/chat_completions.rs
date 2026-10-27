@@ -187,6 +187,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -221,7 +222,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         };
 
         AppState::new(
@@ -415,7 +420,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(
@@ -450,6 +459,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -485,7 +495,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         };
         AppState::new(
             app_config,
@@ -954,6 +968,12 @@ mod tests {
     /// streaming tool-call start/delta/stop maps to choices[].delta.tool_calls
     /// Verifies the full start/delta/stop sequence: start has id + function.name,
     /// delta has function.arguments with partial JSON, and correct index values.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end streaming scenario: the mock feed, the SSE \
+                 consumption, and the start/delta/stop assertions read as a \
+                 single narrative"
+    )]
     #[tokio::test]
     async fn streaming_tool_call_maps_to_delta_tool_calls() {
         // This test uses an Anthropic provider that returns tool call events.
@@ -2008,6 +2028,12 @@ mod tests {
     }
 
     /// Same model name routed to different providers via URL path.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end routing scenario: two provider registries, two \
+                 dispatches, and their divergent assertions read as a single \
+                 narrative"
+    )]
     #[tokio::test]
     async fn same_model_routes_to_different_providers() {
         // Create two providers both supporting chat_completions.
@@ -2025,6 +2051,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key-a"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: adapters_a,
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
@@ -2050,6 +2077,7 @@ mod tests {
             api_key: secrecy::SecretString::from("key-b"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: adapters_b,
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
@@ -2076,7 +2104,11 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
+                auth: Default::default(),
+                storage: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),

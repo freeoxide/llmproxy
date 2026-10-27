@@ -1,19 +1,24 @@
-//! Structured request/response event log surface.
+//! Structured request/response event log surface and persistence.
 //!
-//! The persistence backend (SQLite, etc.) lands in a later phase. This crate
-//! defines the event types and the [`EventBus`] trait that backends implement,
-//! plus a [`NoopBus`] default and a [`RecordingBus`] for tests.
+//! This crate defines the event types and the [`EventBus`] trait that
+//! backends implement: [`NoopBus`] (the default when no `[storage]` config
+//! is present), [`RecordingBus`] for tests, and [`SqliteEventBus`], the
+//! persistent per-request usage ledger.
 //!
-//! Events are emitted at request/response boundaries in the server crate. A
-//! real persisted backend will implement [`EventBus`]; for now [`NoopBus`] is
-//! the production sink and [`RecordingBus`] (behind the `test-utils` cargo
-//! feature) lets integration tests assert on the event sequence.
+//! Events are emitted at request/response boundaries in the server crate.
+//! [`SqliteEventBus`] (behind the storage config) persists them to SQLite;
+//! [`RecordingBus`] (behind the `test-utils` cargo feature) lets integration
+//! tests assert on the event sequence.
 
 #![deny(missing_docs)]
 
 use llm_proxy_protocol::core::{Cost, ModelRef, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+
+mod sqlite;
+
+pub use sqlite::{RetentionPolicy, SqliteEventBus, StorageError, run_retention_pass};
 
 // ---------------------------------------------------------------------------
 // ProxyEvent
@@ -46,6 +51,10 @@ pub struct RequestReceived {
     /// When the request was received (RFC 3339).
     #[serde(with = "time::serde::rfc3339")]
     pub timestamp: OffsetDateTime,
+    /// Authenticated client key id, or `"anonymous"` when the request was
+    /// served under the loopback no-auth exemption. Key ids are operator
+    /// chosen; client secrets never appear on events.
+    pub caller: String,
     /// Provider name from the URL path.
     pub provider: String,
     /// Route kind (`"chat_completions"` or `"messages"`).
@@ -133,8 +142,8 @@ pub struct ResponseFailed {
 
 /// In-process event sink.
 ///
-/// Implementations: [`NoopBus`], [`RecordingBus`] (tests), and the future
-/// SQLite backend.
+/// Implementations: [`NoopBus`], [`RecordingBus`] (tests), and
+/// [`SqliteEventBus`] (persistent ledger).
 ///
 /// `Debug` is a super-trait so that `Arc<dyn EventBus>` can be formatted in
 /// `AppState`'s manual `Debug` impl.
@@ -142,6 +151,16 @@ pub trait EventBus: Send + Sync + std::fmt::Debug {
     /// Emit one event. Must not block the calling task; backends do IO on a
     /// dedicated writer task.
     fn emit(&self, event: &ProxyEvent);
+
+    /// Signal that no further events will be emitted, flush anything still
+    /// queued, and release the writer.
+    ///
+    /// Called once at process shutdown, after the HTTP server has stopped
+    /// serving (so no new events can race the flush). The default is a
+    /// no-op, which is correct for stateless sinks. Implementations must
+    /// stay bounded: give up after a finite wait rather than hang shutdown.
+    /// May block briefly; wrap in `spawn_blocking` from async code.
+    fn close(&self) {}
 }
 
 /// Default no-op sink.
@@ -204,6 +223,7 @@ mod tests {
         RequestReceived {
             request_id: "req-1".to_owned(),
             timestamp: OffsetDateTime::now_utc(),
+            caller: "anonymous".to_owned(),
             provider: "p".to_owned(),
             route_kind: "messages".to_owned(),
             client_protocol: "anthropic".to_owned(),
@@ -275,6 +295,7 @@ mod tests {
         let event = ProxyEvent::RequestReceived(RequestReceived {
             request_id: "req-1".to_owned(),
             timestamp,
+            caller: "anonymous".to_owned(),
             provider: "p".to_owned(),
             route_kind: "messages".to_owned(),
             client_protocol: "anthropic".to_owned(),
@@ -413,6 +434,7 @@ mod tests {
         let req = ProxyEvent::RequestReceived(RequestReceived {
             request_id: SENTINEL.to_owned(),
             timestamp: OffsetDateTime::now_utc(),
+            caller: SENTINEL.to_owned(),
             provider: SENTINEL.to_owned(),
             route_kind: SENTINEL.to_owned(),
             client_protocol: SENTINEL.to_owned(),

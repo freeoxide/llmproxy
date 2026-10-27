@@ -562,6 +562,12 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "walks one fixture's expected wire output field by field \
+                 (messages, tools, sampling); splitting the walk would scatter \
+                 the fixture's assertions across helpers"
+    )]
     fn run_encode_request_fixture(adapter_name: &str, case: &str) {
         let dir = Path::new(FIXTURE_ROOT).join(adapter_name).join(case);
         let core_json = read_fixture(&dir, "core.json");
@@ -705,6 +711,12 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     /// Test that decoding a provider response produces the expected output.json fields.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "walks one fixture's decoded response field by field (content \
+                 blocks, usage, stop reason); splitting the walk would scatter \
+                 the fixture's assertions across helpers"
+    )]
     fn run_decode_response_fixture(adapter_name: &str, case: &str) {
         let dir = Path::new(FIXTURE_ROOT).join(adapter_name).join(case);
         let input_json = read_fixture(&dir, "input.json");
@@ -959,6 +971,12 @@ mod tests {
     /// per event (e.g., `{"type": "message_start", ...}`). The test compares:
     /// 1. Event counts must match.
     /// 2. Each event's variant kind (from the `"type"` field) must match.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "walks one fixture's expected SSE event sequence frame by \
+                 frame; splitting the walk would scatter the fixture's \
+                 assertions across helpers"
+    )]
     fn run_stream_decode_fixture(adapter_name: &str, case: &str) {
         let dir = Path::new(FIXTURE_ROOT).join(adapter_name).join(case);
         let sse_input = read_fixture_raw(&dir, "input.sse");

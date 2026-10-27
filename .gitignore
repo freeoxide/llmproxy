@@ -27,3 +27,6 @@
 !/ref/REFS
 
 .playwright-mcp
+
+.z-proflow/
+.zcode/

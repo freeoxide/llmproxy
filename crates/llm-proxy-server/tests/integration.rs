@@ -36,7 +36,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(
@@ -63,6 +67,7 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            egress: None,
             adapters: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -99,7 +104,11 @@ mod tests {
                     trust_forwarded_headers: false,
                     dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
                 },
+                auth: Default::default(),
+                storage: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -904,7 +913,11 @@ mod tests {
                 trust_forwarded_headers: false,
                 dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
             },
+            auth: Default::default(),
+            storage: None,
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(

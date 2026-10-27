@@ -45,3 +45,11 @@ messages = "anthropic"
 # cache_creation = "0.000003"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
+
+# Route this provider's upstream traffic through a forward proxy.
+# Allowed schemes: socks5h:// (hostnames resolved at the proxy), socks5://,
+# http://, https://. The URL may carry userinfo (proxy authentication).
+# Absent [provider.egress] = direct connection, as before.
+#
+# [provider.egress]
+# proxy = "socks5h://127.0.0.1:1080"
