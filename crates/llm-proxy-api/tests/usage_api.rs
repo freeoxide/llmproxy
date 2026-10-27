@@ -17,14 +17,6 @@ mod tests {
 
     const ADMIN_TOKEN: &str = "test-admin-token";
 
-    /// Fixture: five ledgered requests with fixed, distinct timestamps so
-    /// window/order/cursor behavior is deterministic.
-    ///
-    /// - req-1 (laptop/prov-a/claude-3): completed, exact-decimal cost A.
-    /// - req-2 (laptop/prov-a/gpt-4): completed, exact-decimal cost B.
-    /// - req-3 (phone/prov-b/claude-3): failed upstream.
-    /// - orphan-1 (no caller/provider): failure-only row.
-    /// - old-1 (laptop/prov-old/claude-3): completed, 2 hours old.
     struct Ledger {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
@@ -120,7 +112,6 @@ mod tests {
         let t0 = OffsetDateTime::now_utc().saturating_sub(time::Duration::seconds(60));
         let second = std::time::Duration::from_secs(1);
         let events = [
-            // req-1: laptop / prov-a / claude-3, cost A
             received_event("req-1", "laptop", "prov-a", "claude-3", t0),
             completed_event(
                 "req-1",
@@ -129,7 +120,6 @@ mod tests {
                 t0 + second * 4,
                 "0.1000000000000000000000001",
             ),
-            // req-2: laptop / prov-a / gpt-4, cost B
             received_event("req-2", "laptop", "prov-a", "gpt-4", t0 + second),
             completed_event(
                 "req-2",
@@ -138,12 +128,9 @@ mod tests {
                 t0 + second * 5,
                 "0.2000000000000000000000002",
             ),
-            // req-3: phone / prov-b, failed
             received_event("req-3", "phone", "prov-b", "claude-3", t0 + second * 2),
             failed_event("req-3", Some("prov-b"), t0 + second * 6),
-            // orphan-1: failure-only row (no caller, no provider)
             failed_event("orphan-1", None, t0 + second * 3),
-            // old-1: two hours old, its own provider so window tests stay clean
             received_event(
                 "old-1",
                 "laptop",
@@ -265,7 +252,6 @@ mod tests {
         assert_eq!(prov_b["requests"], 1);
         assert_eq!(prov_b["errors"], 1);
 
-        // The failure-only orphan row groups under a null key.
         let null_group = groups
             .iter()
             .find(|g| g["key"].is_null())
@@ -343,8 +329,6 @@ mod tests {
             "a 4h window covers the two-hour-old row"
         );
 
-        // Day-denominated windows are the natural operator input for
-        // retention horizons; they must parse through the same grammar.
         let (status, _) = get_json(
             app_for(&ledger.path),
             "/usage/summary?window=7d",
@@ -408,7 +392,6 @@ mod tests {
         let cursor = page1["next_cursor"].as_str().expect("cursor present");
         assert_eq!(rows1[1]["request_id"], "req-3");
 
-        // Follow the cursor: the next page must not repeat page-1 rows.
         let (status, page2) = get_json(
             app_for(&ledger.path),
             &format!("/usage/requests?limit=10&cursor={cursor}"),
@@ -424,7 +407,6 @@ mod tests {
             "cursor paging must not repeat rows: {rows2:?}"
         );
 
-        // Provider filter narrows to that provider's rows only.
         let (_, filtered) = get_json(
             app_for(&ledger.path),
             "/usage/requests?provider=prov-a",
@@ -441,8 +423,6 @@ mod tests {
     #[tokio::test]
     async fn requests_honors_since_and_until_bounds() {
         let ledger = seed().await;
-        // until = t0+3s (exclusive): only rows whose ledger timestamp (received
-        // time for normal rows, failure time for orphan rows) is strictly older.
         let until = (ledger.t0 + std::time::Duration::from_secs(3))
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
@@ -464,7 +444,6 @@ mod tests {
             "until is exclusive on the ledger time axis (orphan-1 at t0+3s is out)"
         );
 
-        // since = t0+1s (inclusive): rows at or after t0+1s.
         let since = (ledger.t0 + std::time::Duration::from_secs(1))
             .format(&time::format_description::well_known::Rfc3339)
             .expect("rfc3339");
@@ -497,7 +476,7 @@ mod tests {
             "/usage/requests?since=not-a-time",
             "/usage/requests?until=not-a-time",
             "/usage/requests?cursor=garbage",
-            "/usage/requests?cursor=123:", // empty id half
+            "/usage/requests?cursor=123:",
             "/usage/requests?since=2026-01-02T03:04:05Z&until=2026-01-01T00:00:00Z",
         ];
         for uri in cases {
@@ -552,10 +531,6 @@ mod tests {
         assert_eq!(phone["errors"], 1);
         assert!(laptop["last_seen_ms"].is_u64(), "last_seen_ms is populated");
 
-        // Ordering: most recently seen first. The last-seen value follows the
-        // ledger time axis — the request's received time for normal rows, the
-        // failure time for the caller-less orphan — so with this fixture:
-        // <null> (t0+3s), phone (t0+2s), laptop (t0+1s).
         let dated: Vec<i64> = callers
             .iter()
             .filter_map(|c| c["last_seen_ms"].as_i64())
@@ -586,8 +561,6 @@ mod tests {
 
     #[tokio::test]
     async fn summary_serves_while_the_ledger_writer_is_active() {
-        // Read-only queries must work against a live WAL writer (the steady
-        // state of a running proxy), not only against a closed database.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("usage.db");
         let bus = std::sync::Arc::new(

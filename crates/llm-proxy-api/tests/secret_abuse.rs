@@ -1,9 +1,6 @@
-//! Secret-abuse family (PRX-06) for the `/usage` surface itself: the admin
-//! token never reaches the captured tracing output of usage traffic, and
-//! neither the admin token nor any rejected credential ever lands in the raw
-//! ledger file bytes. Negative assertions carry a positive control (seeded
-//! ledger content that IS findable), so a passing scan proves the scan read
-//! the real file rather than the wrong path.
+//! Secret-abuse checks for the `/usage` surface: no credential reaches the
+//! captured tracing output or the raw ledger bytes, and every negative scan
+//! first asserts seeded ledger content is findable.
 
 #[cfg(test)]
 mod tests {
@@ -20,11 +17,8 @@ mod tests {
     const ADMIN_TOKEN: &str = "prx6-api-admin-token-0a3f5e91";
     const WRONG_TOKEN: &str = "prx6-api-attacker-guess-2c4d";
     const CLIENT_TOKEN: &str = "prx6-api-client-token-7e8f";
-    /// Seeded caller: legitimately persisted, so the byte scan has a positive
-    /// control proving it reads real rows.
     const CALLER_MARKER: &str = "prx6-seeded-caller-marker-4451";
 
-    /// Seed a one-row ledger and close the writer, returning the db path.
     async fn seeded_ledger(dir: &tempfile::TempDir) -> PathBuf {
         let path = dir.path().join("usage.db");
         let bus = SqliteEventBus::open(
@@ -70,8 +64,6 @@ mod tests {
     }
 
     async fn drive_all_outcomes(path: &Path) {
-        // One authenticated call per route, plus every rejection mode, so the
-        // whole surface's traffic flows before the assertions.
         for uri in ["/usage/summary", "/usage/requests", "/usage/keys"] {
             for token in [
                 Some(ADMIN_TOKEN),
@@ -99,8 +91,6 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// Concatenated raw bytes of the ledger database and any WAL/SHM
-    /// sidecars — everything readable on disk.
     fn ledger_bytes(db: &Path) -> Vec<u8> {
         let mut all = Vec::new();
         for suffix in ["", "-wal", "-shm"] {
@@ -112,15 +102,6 @@ mod tests {
         all
     }
 
-    /// Captured tracing output for the whole test binary.
-    ///
-    /// A process-global subscriber (installed exactly once) instead of a
-    /// thread-local default: with parallel tests, callsites first emitted on
-    /// a thread that has no subscriber can keep a stale "never" interest
-    /// cache, silently dropping later events from a thread-local capture —
-    /// observed as flaky partial captures during development. The global
-    /// subscriber receives every test's traffic on every thread, which is
-    /// strictly more content for the secret scans below.
     struct TraceCapture {
         buffer: Arc<Mutex<Vec<u8>>>,
     }

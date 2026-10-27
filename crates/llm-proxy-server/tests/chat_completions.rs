@@ -1,8 +1,6 @@
-//! Integration tests for Phase 9: /v1/chat/completions endpoint.
-//!
-//! These tests exercise the OpenAI Chat Completions route through the axum
-//! router with mock upstream servers, verifying that the full pipeline
-//! (OpenAI decode -> core pipeline -> OpenAI encode) works end-to-end.
+//! Integration tests for the `/v1/chat/completions` route: mock upstreams
+//! driven through the router to verify the OpenAI decode -> core pipeline
+//! -> OpenAI encode path end-to-end.
 
 #[cfg(test)]
 mod tests {
@@ -27,15 +25,6 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    // ---------------------------------------------------------------------------
-    // Mock server readiness helper
-    // ---------------------------------------------------------------------------
-
-    /// Wait for a mock server to be ready by polling its TCP port.
-    ///
-    /// Replaces `tokio::time::sleep(Duration::from_millis(50))` with a
-    /// deterministic readiness check that retries until the server accepts
-    /// a connection or the timeout elapses.
     async fn wait_for_ready(addr: std::net::SocketAddr) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -49,19 +38,8 @@ mod tests {
         }
     }
 
-    /// Spawn a mock axum server on `listener`, returning immediately while the
-    /// server runs in the background.
-    ///
-    /// Unlike a bare `tokio::spawn(async move { axum::serve(..).await })` whose
-    /// `JoinHandle` is dropped (silently swallowing any panic in the mock server
-    /// task — audit `testing-audit:mock-server-joinhandle-swallow`), this wrapper
-    /// catches a panic in the serve future, prints it to stderr, and aborts the
-    /// process. A mock-handler bug therefore surfaces loudly as a test failure
-    /// instead of the connection just closing mid-stream with no diagnostic.
     fn spawn_mock_serve(listener: tokio::net::TcpListener, app: Router) {
         tokio::spawn(async move {
-            // std::panic::catch_unwind requires UnwindSafe; the router/listener
-            // capture is fine for a mock that owns them exclusively.
             let result = std::panic::AssertUnwindSafe(axum::serve(listener, app).into_future())
                 .catch_unwind()
                 .await;
@@ -69,8 +47,6 @@ mod tests {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => eprintln!("mock axum::serve error: {e}"),
                 Err(panic) => {
-                    // Surface the panic payload, then abort so the test binary fails
-                    // rather than continuing with a dead mock.
                     let msg = panic
                         .downcast_ref::<String>()
                         .map(|s| s.as_str())
@@ -83,11 +59,6 @@ mod tests {
         });
     }
 
-    // ---------------------------------------------------------------------------
-    // Mock upstream server helpers
-    // ---------------------------------------------------------------------------
-
-    /// A canned OpenAI Chat Completions API success response.
     fn openai_chat_success_response() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "id": "chatcmpl-test123",
@@ -111,7 +82,6 @@ mod tests {
         .unwrap()
     }
 
-    /// A canned OpenAI Chat Completions API response with tool calls.
     fn openai_chat_tool_call_response() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "id": "chatcmpl-tool123",
@@ -143,8 +113,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Build AppState in TOML mode with a single provider of the given protocol
-    /// routing to the given mock endpoint.
     fn state_with_provider(
         mock_endpoint: &str,
         protocol: &str,
@@ -160,7 +128,6 @@ mod tests {
         )
     }
 
-    /// Like [`state_with_provider`] but with a configurable `request_timeout`.
     fn state_with_provider_timeout(
         mock_endpoint: &str,
         protocol: &str,
@@ -168,8 +135,6 @@ mod tests {
         _model_name: &str,
         request_timeout: Duration,
     ) -> AppState {
-        // Build routes based on protocol so the provider-based routing can resolve.
-        // Anthropic providers also support chat_completions for cross-protocol tests.
         let routes = if protocol == "anthropic_messages" {
             llm_proxy_core::ProviderRoutesConfig {
                 messages: Some(adapter_name.to_owned()),
@@ -243,12 +208,10 @@ mod tests {
         )
     }
 
-    /// Convenience: AppState with an OpenAI Chat provider.
     fn state_with_openai_chat_provider(mock_endpoint: &str) -> AppState {
         state_with_provider(mock_endpoint, "openai_chat_completions", "chat", "gpt-4o")
     }
 
-    /// Convenience: AppState with an Anthropic provider (for cross-protocol tests).
     fn state_with_anthropic_provider(mock_endpoint: &str) -> AppState {
         state_with_provider(
             mock_endpoint,
@@ -258,7 +221,6 @@ mod tests {
         )
     }
 
-    /// Spawn a local mock axum server returning a canned response body.
     async fn spawn_mock_server(response_body: Vec<u8>, content_type: &str) -> String {
         let ct = content_type.to_owned();
         let app = Router::new().route(
@@ -281,25 +243,18 @@ mod tests {
         )
     }
 
-    /// Spawn a local mock axum server returning OpenAI Chat non-streaming response.
     async fn spawn_mock_openai_chat_non_stream() -> String {
         spawn_mock_server(openai_chat_success_response(), "application/json").await
     }
 
-    /// Spawn a local mock axum server returning OpenAI Chat tool call response.
     async fn spawn_mock_openai_chat_tool_call() -> String {
         spawn_mock_server(openai_chat_tool_call_response(), "application/json").await
     }
 
-    /// Spawn a mock server that accepts the connection but never responds, holding
-    /// the upstream call open so the proxy's per-route `TimeoutLayer` fires. Used to
-    /// exercise the 408 normalisation path (audit MEDIUM-7).
     async fn spawn_hanging_mock() -> String {
         let app = Router::new().route(
             "/{*path}",
             post(|| async move {
-                // Sleep well past any short test timeout so the caller's
-                // TimeoutLayer always fires first.
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 StatusCode::OK
             }),
@@ -311,7 +266,6 @@ mod tests {
         format!("http://{addr}/providers/mock-provider/v1/chat/completions")
     }
 
-    /// Spawn a mock server returning OpenAI Chat streaming SSE events.
     async fn spawn_mock_openai_chat_stream() -> String {
         let app = Router::new().route(
         "/{*path}",
@@ -345,7 +299,6 @@ mod tests {
         )
     }
 
-    /// Spawn a mock server that returns HTTP 500.
     async fn spawn_mock_500() -> String {
         let app = Router::new().route(
             "/{*path}",
@@ -369,7 +322,6 @@ mod tests {
         )
     }
 
-    /// Spawn a mock server that records the received request body.
     async fn spawn_mock_with_body_capture(
         response_body: Vec<u8>,
     ) -> (String, std::sync::Arc<tokio::sync::Mutex<Option<Vec<u8>>>>) {
@@ -405,7 +357,6 @@ mod tests {
         )
     }
 
-    /// Build an AppState with empty routing table (for error tests).
     fn empty_state() -> AppState {
         let app_config = AppConfig {
             server: ServerConfig {
@@ -441,18 +392,6 @@ mod tests {
         )
     }
 
-    /// A state that registers `mock-provider` (with an unreachable adapter) for
-    /// validation-path tests.
-    ///
-    /// Tests that assert a malformed body or a missing-field request yields an
-    /// OpenAI-shaped 400 (`empty_body_*`, `wrong_field_types_*`,
-    /// `missing_model_*`, `missing_messages_*`, `invalid_utf8_body_*`) must reach
-    /// the JSON-parsing/decode path. Since LOW-29 reordered the handler to run the
-    /// provider-existence gate *before* JSON parsing, these requests now need a
-    /// registered provider to get past that gate — `empty_state()` (no providers)
-    /// would instead surface `UnknownProvider` (404). The adapter endpoint below is
-    /// never contacted: every one of these requests fails at validation, well
-    /// before any upstream dispatch.
     fn state_with_mock_provider_no_upstream() -> AppState {
         let provider = ProviderConfig {
             name: "mock-provider".to_owned(),
@@ -515,7 +454,6 @@ mod tests {
         )
     }
 
-    /// Build a request to /v1/chat/completions.
     fn chat_request(body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -525,7 +463,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Build a standard OpenAI Chat request body.
     fn make_chat_body(model: &str, stream: bool) -> String {
         json!({
             "model": model,
@@ -535,20 +472,12 @@ mod tests {
         .to_string()
     }
 
-    // ===========================================================================
-    // Route mounting
-    // ===========================================================================
-
-    /// route is mounted, no longer 404
     #[tokio::test]
     async fn route_is_mounted_no_longer_404() {
         let mock_url = spawn_mock_openai_chat_non_stream().await;
         let app = build_router(state_with_openai_chat_provider(&mock_url));
         let body = make_chat_body("gpt-4o", false);
         let resp = app.oneshot(chat_request(&body)).await.unwrap();
-        // The route is now mounted -- should not return 404.
-        // With a valid provider, the request should succeed (200) or fail with
-        // a non-404 error.
         assert_ne!(
             resp.status(),
             StatusCode::NOT_FOUND,
@@ -556,11 +485,6 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Non-streaming tests
-    // ===========================================================================
-
-    /// non-streaming text request returns OpenAI-shaped response
     #[tokio::test]
     async fn non_streaming_text_request_returns_openai_shaped_response() {
         let mock_url = spawn_mock_openai_chat_non_stream().await;
@@ -578,7 +502,6 @@ mod tests {
         )
         .unwrap();
 
-        // Assert the OpenAI response shape.
         assert_eq!(
             resp_body["object"], "chat.completion",
             "object must be chat.completion"
@@ -587,7 +510,6 @@ mod tests {
         assert!(resp_body["model"].is_string(), "model must be a string");
         assert!(resp_body["created"].is_number(), "created must be a number");
 
-        // Assert choices.
         let choices = resp_body["choices"]
             .as_array()
             .expect("choices must be array");
@@ -595,7 +517,6 @@ mod tests {
         assert_eq!(choices[0]["index"], 0);
         assert_eq!(choices[0]["finish_reason"], "stop");
 
-        // Assert message content.
         let message = &choices[0]["message"];
         assert_eq!(message["role"], "assistant");
         assert!(
@@ -606,15 +527,12 @@ mod tests {
             "response should contain translated text"
         );
 
-        // Assert usage.
         let usage = &resp_body["usage"];
         assert_eq!(usage["prompt_tokens"], 10);
         assert_eq!(usage["completion_tokens"], 5);
         assert_eq!(usage["total_tokens"], 15);
     }
 
-    /// non-streaming response asserts object='chat.completion', id, model,
-    /// choices[].finish_reason, text content, and usage
     #[tokio::test]
     async fn non_streaming_response_shape_detailed() {
         let mock_url = spawn_mock_openai_chat_non_stream().await;
@@ -645,7 +563,6 @@ mod tests {
         assert!(resp_body["usage"]["total_tokens"].is_number());
     }
 
-    /// tool-call core response returns tool_calls
     #[tokio::test]
     async fn tool_call_response_returns_tool_calls() {
         let mock_url = spawn_mock_openai_chat_tool_call().await;
@@ -683,8 +600,6 @@ mod tests {
         assert_eq!(tool_calls[0]["function"]["name"], "get_weather");
     }
 
-    /// route preserves temperature, top-p, max tokens, tools, tool choice, metadata,
-    /// stream, stream options/provider hints, reasoning/thinking, and cache markers
     #[tokio::test]
     async fn route_preserves_fields_through_core() {
         let (mock_url, captured_body) =
@@ -723,7 +638,6 @@ mod tests {
         let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Check the upstream received the correct fields.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let guard = captured_body.lock().await;
         let upstream_body = guard
@@ -732,43 +646,24 @@ mod tests {
         let upstream_json: Value =
             serde_json::from_slice(upstream_body).expect("upstream body should be valid JSON");
 
-        // The OpenAI adapter should have preserved these fields.
         assert_eq!(upstream_json["model"], "gpt-4o");
-        // max_tokens serializes as max_completion_tokens per OpenAI API convention
         assert_eq!(upstream_json["max_completion_tokens"], 256);
         assert_eq!(upstream_json["temperature"], 0.7);
         assert_eq!(upstream_json["top_p"], 0.9);
-        // Tools and tool_choice should be preserved.
         assert!(upstream_json["tools"].is_array(), "tools must be preserved");
         assert_eq!(upstream_json["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(upstream_json["tool_choice"]["type"], "auto");
-        // reasoning_effort should be preserved.
         assert_eq!(upstream_json["reasoning_effort"], "high");
-        // user (metadata) should be preserved.
         assert_eq!(upstream_json["user"], "test-user-123");
-        // thinking should be preserved.
         assert_eq!(upstream_json["thinking"]["type"], "enabled");
         assert_eq!(upstream_json["thinking"]["budget_tokens"], 10000);
-        // Note: stream_options is only forwarded to upstream when stream=true,
-        // because the provider adapter only reads provider_hints for streaming
-        // requests. This is expected behavior -- stream_options is a streaming-
-        // specific hint. The cache_control on the system message is decoded into
-        // the core system array but the OpenAI provider adapter does not re-emit
-        // it in the outbound request, which is correct for OpenAI-to-OpenAI
-        // passthrough (OpenAI does not have a native cache_control field).
     }
 
-    // ===========================================================================
-    // Error tests
-    // ===========================================================================
-
-    /// unknown provider returns OpenAI-shaped 404
     #[tokio::test]
     async fn unknown_model_returns_openai_shaped_400() {
         let app = build_router(empty_state());
         let body = make_chat_body("nonexistent-model", false);
         let resp = app.oneshot(chat_request(&body)).await.unwrap();
-        // With provider-based routing, empty state means the provider is unknown -> 404.
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let resp_body: Value = serde_json::from_slice(
@@ -778,20 +673,17 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert_eq!(resp_body["error"]["type"], "invalid_request_error");
         assert!(resp_body["error"]["message"].is_string());
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
-        // Must NOT be Anthropic-shaped.
         assert!(
             !resp_body.as_object().unwrap().contains_key("type"),
             "must not have Anthropic type field"
         );
     }
 
-    /// invalid JSON/client decode failure returns OpenAI-shaped 400
     #[tokio::test]
     async fn invalid_json_returns_openai_shaped_400() {
         let mock_url = spawn_mock_openai_chat_non_stream().await;
@@ -814,7 +706,6 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert_eq!(resp_body["error"]["type"], "invalid_request_error");
         assert!(
@@ -826,14 +717,12 @@ mod tests {
         );
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
-        // Must NOT be Anthropic-shaped.
         assert!(
             !resp_body.as_object().unwrap().contains_key("type"),
             "must not have Anthropic type field"
         );
     }
 
-    /// upstream failure returns OpenAI-shaped 502
     #[tokio::test]
     async fn upstream_failure_returns_openai_shaped_502() {
         let mock_url = spawn_mock_500().await;
@@ -851,18 +740,14 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert_eq!(resp_body["error"]["type"], "api_error");
         assert!(resp_body["error"]["message"].is_string());
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
     }
 
-    /// provider decode failure returns OpenAI-shaped 502
-    /// (sending Anthropic-shaped response to an OpenAI Chat endpoint causes decode failure)
     #[tokio::test]
     async fn provider_decode_failure_returns_openai_shaped_502() {
-        // Use an OpenAI Chat provider but mock returns malformed response.
         let malformed = serde_json::to_vec(&json!({"not": "a valid response"})).unwrap();
         let mock_url = spawn_mock_server(malformed, "application/json").await;
         let state = state_with_openai_chat_provider(&mock_url);
@@ -879,17 +764,11 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert_eq!(resp_body["error"]["type"], "api_error");
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
     }
 
-    // ===========================================================================
-    // Streaming tests
-    // ===========================================================================
-
-    /// streaming response emits chat.completion.chunk
     #[tokio::test]
     async fn streaming_response_emits_chat_completion_chunk() {
         let mock_url = spawn_mock_openai_chat_stream().await;
@@ -905,14 +784,12 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // Must contain chat.completion.chunk objects.
         assert!(
             text.contains("chat.completion.chunk"),
             "must emit chat.completion.chunk objects"
         );
     }
 
-    /// streaming response sets SSE content type
     #[tokio::test]
     async fn streaming_response_sets_sse_content_type() {
         let mock_url = spawn_mock_openai_chat_stream().await;
@@ -935,7 +812,6 @@ mod tests {
         );
     }
 
-    /// stream: true uses shared streaming pipeline
     #[tokio::test]
     async fn stream_true_uses_shared_streaming_pipeline() {
         let mock_url = spawn_mock_openai_chat_stream().await;
@@ -946,7 +822,6 @@ mod tests {
         let resp = app.oneshot(chat_request(&body)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Verify the request ID header is present (set by shared pipeline).
         let request_id = resp.headers().get("x-request-id");
         assert!(
             request_id.is_some(),
@@ -958,16 +833,12 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // Verify text content came through the core pipeline.
         assert!(
             text.contains("Hi from OpenAI!"),
             "expected translated text delta in SSE output, got: {text}"
         );
     }
 
-    /// streaming tool-call start/delta/stop maps to choices[].delta.tool_calls
-    /// Verifies the full start/delta/stop sequence: start has id + function.name,
-    /// delta has function.arguments with partial JSON, and correct index values.
     #[expect(
         clippy::too_many_lines,
         reason = "one end-to-end streaming scenario: the mock feed, the SSE \
@@ -976,9 +847,6 @@ mod tests {
     )]
     #[tokio::test]
     async fn streaming_tool_call_maps_to_delta_tool_calls() {
-        // This test uses an Anthropic provider that returns tool call events.
-        // The core pipeline translates them, and the OpenAI client encoder maps
-        // them to choices[].delta.tool_calls.
         let app = Router::new().route(
         "/{*path}",
         post(|| async move {
@@ -1020,8 +888,6 @@ mod tests {
         wait_for_ready(addr).await;
         let mock_url = format!("http://{}/providers/mock-provider/v1/messages", addr);
 
-        // Use Anthropic provider (which supports tool call events in SSE),
-        // but call the OpenAI chat/completions endpoint.
         let state = state_with_anthropic_provider(&mock_url);
         let app = build_router(state);
 
@@ -1038,15 +904,12 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // Parse the SSE output into structured chunks and verify tool_call mapping.
         let chunks: Vec<Value> = text
             .lines()
             .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
             .filter_map(|l| serde_json::from_str(l.trim_start_matches("data: ")).ok())
             .collect();
 
-        // Find the tool_call start chunk: should have delta.tool_calls[0].id and
-        // delta.tool_calls[0].function.name
         let start_chunk = chunks
             .iter()
             .find(|c| {
@@ -1077,9 +940,6 @@ mod tests {
             "tool_call index must be 0"
         );
 
-        // Find the tool_call delta chunk: should have delta.tool_calls[0].function.arguments
-        // The provider decoder aggregates partial JSON deltas, so the delta chunk may
-        // contain the full or partial arguments string.
         let delta_chunk = chunks
             .iter()
             .find(|c| {
@@ -1096,14 +956,12 @@ mod tests {
 
         let tc_delta = &delta_chunk["choices"][0]["delta"]["tool_calls"][0];
         let args = tc_delta["function"]["arguments"].as_str().unwrap_or("");
-        // The arguments may be a partial or full JSON string containing city/SF data.
         assert!(
             !args.is_empty() || tc_delta["function"].get("arguments").is_some(),
             "tool_call delta must have a function.arguments field (may be empty string for start chunk)"
         );
     }
 
-    /// streaming usage maps when requested
     #[tokio::test]
     async fn streaming_usage_maps_when_requested() {
         let mock_url = spawn_mock_openai_chat_stream().await;
@@ -1126,15 +984,11 @@ mod tests {
 
         assert!(text.contains("[DONE]"), "stream must end with [DONE]");
 
-        // When include_usage is set, the final chunk should have a usage object.
-        // The mock doesn't send usage data, so the encoder emits zero usage --
-        // but the "usage" key must still be present in the output.
         assert!(
             text.contains("\"usage\""),
             "stream with include_usage=true should contain a usage key, got: {text}"
         );
 
-        // Parse chunks and verify the usage chunk has the expected fields.
         let chunks: Vec<Value> = text
             .lines()
             .filter(|l| l.starts_with("data: ") && !l.contains("[DONE]"))
@@ -1157,7 +1011,6 @@ mod tests {
         );
     }
 
-    /// streaming stop reason maps to finish_reason
     #[tokio::test]
     async fn streaming_stop_reason_maps_to_finish_reason() {
         let mock_url = spawn_mock_openai_chat_stream().await;
@@ -1173,14 +1026,12 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // The mock sends finish_reason: "stop", which should appear in the output.
         assert!(
             text.contains("stop"),
             "stream must contain finish_reason: stop"
         );
     }
 
-    /// stream errors become OpenAI-shaped stream errors or route errors
     #[tokio::test]
     async fn stream_error_before_first_byte_returns_http_502() {
         let mock_url = spawn_mock_500().await;
@@ -1202,12 +1053,10 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
     }
 
-    /// streaming response ends with [DONE]
     #[tokio::test]
     async fn streaming_response_ends_with_done() {
         let mock_url = spawn_mock_openai_chat_stream().await;
@@ -1223,20 +1072,17 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // Must end with data: [DONE].
         assert!(
             text.contains("data: [DONE]"),
             "stream must end with data: [DONE], got: {text}"
         );
     }
 
-    /// no Anthropic error envelope appears on this route
     #[tokio::test]
     async fn no_anthropic_error_envelope_on_openai_route() {
         let app = build_router(empty_state());
         let body = make_chat_body("nonexistent-model", false);
         let resp = app.oneshot(chat_request(&body)).await.unwrap();
-        // With provider-based routing, empty state -> UnknownProvider -> 404.
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         let resp_body: Value = serde_json::from_slice(
@@ -1246,7 +1092,6 @@ mod tests {
         )
         .unwrap();
 
-        // Must NOT have Anthropic-shaped error fields.
         assert!(
             !resp_body.as_object().unwrap().contains_key("type"),
             "must not have Anthropic 'type' field at top level"
@@ -1258,18 +1103,11 @@ mod tests {
                 .contains("not_found_error"),
             "must not use Anthropic error types"
         );
-        // Must have OpenAI error shape.
         assert!(resp_body["error"].is_object());
         assert_eq!(resp_body["error"]["type"], "invalid_request_error");
         assert!(resp_body["error"]["code"].is_null());
     }
 
-    // ===========================================================================
-    // Source guard test (integration level)
-    // ===========================================================================
-
-    /// source guard confirms routes/chat.rs respects architecture boundaries,
-    /// endpoint-classifier, fallback, or direct-provider execution path
     #[test]
     fn source_guard_chat_rs_architecture_boundaries() {
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -1312,17 +1150,9 @@ mod tests {
         }
     }
 
-    // ===========================================================================
-    // Protocol-aware 404 tests
-    // ===========================================================================
-
-    /// unmatched /v1/chat/* path returns OpenAI-shaped 404
     #[tokio::test]
     async fn not_found_openai_path_returns_openai_shaped_error() {
         let app = build_router(empty_state());
-        // Use a path that contains the OpenAI chat completions segment but has an
-        // extra suffix so it does NOT match the mounted route. The path still
-        // matches the OpenAI protocol heuristic in the 404 handler.
         let req = Request::builder()
             .method("POST")
             .uri("/providers/mock-provider/v1/chat/completions/extra")
@@ -1339,23 +1169,19 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["message"].is_string());
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
-        // Must NOT be Anthropic-shaped.
         assert!(
             resp_body.get("type").is_none() || resp_body["type"].is_null(),
             "must not have Anthropic 'type' field"
         );
     }
 
-    /// unmatched /v1/messages path returns Anthropic-shaped 404
     #[tokio::test]
     async fn not_found_anthropic_path_returns_anthropic_shaped_error() {
         let app = build_router(empty_state());
-        // Use a path under /v1/messages that does NOT match any mounted route.
         let req = Request::builder()
             .method("POST")
             .uri("/providers/mock-provider/v1/messages/typo")
@@ -1372,16 +1198,10 @@ mod tests {
         )
         .unwrap();
 
-        // Must be Anthropic error shape.
         assert_eq!(resp_body["type"], "error");
         assert!(resp_body["error"]["type"].is_string());
     }
 
-    // ===========================================================================
-    // Edge-case tests
-    // ===========================================================================
-
-    /// empty request body returns OpenAI-shaped 400
     #[tokio::test]
     async fn empty_body_returns_openai_shaped_400() {
         let app = build_router(state_with_mock_provider_no_upstream());
@@ -1401,13 +1221,11 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["message"].is_string());
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
     }
 
-    /// request with wrong field types returns OpenAI-shaped 400
     #[tokio::test]
     async fn wrong_field_types_returns_openai_shaped_400() {
         let app = build_router(state_with_mock_provider_no_upstream());
@@ -1429,13 +1247,11 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["message"].is_string());
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
     }
 
-    /// request missing required 'model' field returns OpenAI-shaped 400
     #[tokio::test]
     async fn missing_model_returns_openai_shaped_400() {
         let app = build_router(state_with_mock_provider_no_upstream());
@@ -1457,11 +1273,9 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
-        // Message should indicate model is required (decode_request checks this).
         let msg = resp_body["error"]["message"].as_str().unwrap();
         assert!(
             msg.to_lowercase().contains("model"),
@@ -1469,7 +1283,6 @@ mod tests {
         );
     }
 
-    /// request missing required 'messages' field returns OpenAI-shaped 400
     #[tokio::test]
     async fn missing_messages_returns_openai_shaped_400() {
         let app = build_router(state_with_mock_provider_no_upstream());
@@ -1489,11 +1302,9 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
-        // Message should indicate messages is required.
         let msg = resp_body["error"]["message"].as_str().unwrap();
         assert!(
             msg.to_lowercase().contains("messages"),
@@ -1501,7 +1312,6 @@ mod tests {
         );
     }
 
-    /// request with invalid UTF-8 bytes returns OpenAI-shaped 400
     #[tokio::test]
     async fn invalid_utf8_body_returns_openai_shaped_400() {
         let app = build_router(state_with_mock_provider_no_upstream());
@@ -1521,13 +1331,11 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["message"].is_string());
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
     }
 
-    /// boundary value for max_tokens (0) is accepted
     #[tokio::test]
     async fn max_tokens_zero_is_accepted() {
         let mock_url = spawn_mock_openai_chat_non_stream().await;
@@ -1541,7 +1349,6 @@ mod tests {
             "stream": false
         });
         let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
-        // Should be accepted (the upstream decides whether to reject max_tokens=0).
         assert_ne!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1549,15 +1356,9 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Missing tests from audit round 2
-    // ===========================================================================
-
-    /// oversized body (> 32 MiB) returns 413 Payload Too Large
     #[tokio::test]
     async fn chat_completions_oversized_body_returns_payload_too_large() {
         let app = build_router(empty_state());
-        // 33 MiB body (exceeds the 32 MiB limit).
         let oversized_body = "X".repeat(33 * 1024 * 1024);
         let req = Request::builder()
             .method("POST")
@@ -1568,8 +1369,6 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        // MEDIUM-7: the 413 is normalised into an OpenAI-shaped JSON envelope
-        // (not plain text) and carries `x-request-id`.
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
             "application/json"
@@ -1587,12 +1386,9 @@ mod tests {
         assert!(json["error"]["code"].is_null());
     }
 
-    /// MEDIUM-7: a request that exceeds the per-route timeout returns a JSON 408
-    /// (not an empty body) carrying an `x-request-id`, matching the protocol schema.
     #[tokio::test]
     async fn timeout_returns_normalised_json_408() {
         let mock_url = spawn_hanging_mock().await;
-        // 50 ms timeout: the hanging upstream holds the handler past it.
         let state = state_with_provider_timeout(
             &mock_url,
             "openai_chat_completions",
@@ -1636,20 +1432,11 @@ mod tests {
         assert!(json["error"]["code"].is_null());
     }
 
-    /// A malformed SSE data frame is silently skipped by the Anthropic provider
-    /// adapter (it returns `Ok(vec![])` on bad JSON, see `decode_frame`), so it does
-    /// NOT drive the in-band error path. This test verifies the stream still
-    /// completes gracefully (`[DONE]`) when a mid-stream frame is unparseable, and
-    /// that the valid events around it are delivered. For a genuine in-band error
-    /// assertion see `in_band_stream_error_emits_openai_error_chunk`.
     #[tokio::test]
     async fn malformed_frame_is_skipped_and_stream_completes() {
-        // Spawn a mock that sends one valid chunk then an invalid/malformed SSE event.
         let app = Router::new().route(
         "/{*path}",
         post(|| async move {
-            // First, send a valid message_start event via Anthropic SSE format
-            // (since we're testing with an Anthropic provider mock).
             let events = vec![
                 Event::default()
                     .event("message_start")
@@ -1657,7 +1444,6 @@ mod tests {
                 Event::default()
                     .event("content_block_delta")
                     .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#),
-                // Then send a malformed event that the Anthropic adapter skips.
                 Event::default()
                     .event("content_block_delta")
                     .data(r#"this is not valid JSON for the provider decoder"#),
@@ -1686,7 +1472,6 @@ mod tests {
             "stream": true
         });
         let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
-        // The first byte was sent successfully, so HTTP status should be 200.
         assert_eq!(resp.status(), StatusCode::OK);
 
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -1694,43 +1479,21 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // The malformed frame is skipped, so the stream completes with [DONE].
         assert!(
             text.contains("[DONE]"),
             "stream must end with [DONE] even when a frame is skipped, got: {text}"
         );
     }
 
-    /// A genuine in-band (post-first-byte) error emits an OpenAI-shaped error chunk
-    /// followed by `[DONE]`.
-    ///
-    /// Drives the real error path (audit `in-band-error-event-path-untested`):
-    /// after a valid `message_start` crosses the first byte (committing HTTP 200),
-    /// the mock sends a chunk that the SSE framer rejects — a "data:" line whose
-    /// payload is invalid UTF-8 (a lone `0xFF` byte). `SseFramer::push_chunk`
-    /// returns `Err(ProviderError::Utf8)` for that line, which is the
-    /// post-first-byte framing-error branch in `build_sse_output_stream`; for an
-    /// OpenAI Chat client that branch calls `emit_stream_error`, emitting an OpenAI
-    /// error JSON chunk (`server_error`) and then terminating with `[DONE]`.
-    ///
-    /// This is deterministic regardless of how reqwest buffers the body: invalid
-    /// UTF-8 inside a drained line is a hard framer error, not silently tolerated
-    /// like malformed JSON (which the Anthropic adapter skips) and not sensitive to
-    /// chunk boundaries like an over-long line.
     #[tokio::test]
     async fn in_band_stream_error_emits_openai_error_chunk() {
         use bytes::Bytes;
 
-        // A valid Anthropic message_start frame (terminated by a blank line) so the
-        // first byte crosses and HTTP 200 is committed.
         let first_frame = Bytes::from(
         "event: message_start\n\
          data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_err\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n"
             .to_owned(),
     );
-        // A second chunk whose "data:" line payload is invalid UTF-8 (a lone
-        // continuation byte `0xFF`), terminated by a blank line so the framer
-        // drains it and hits `str::from_utf8` -> Err.
         let bad_frame = Bytes::from(vec![b'd', b'a', b't', b'a', b':', b' ', 0xFF, b'\n', b'\n']);
 
         let app = Router::new().route(
@@ -1739,10 +1502,6 @@ mod tests {
                 let first = first_frame.clone();
                 let bad = bad_frame.clone();
                 async move {
-                    // Yield the valid frame, then the malformed-UTF-8 frame. The
-                    // proxy's SSE framer reports the second as Err once the first
-                    // byte has crossed, deterministically driving the in-band
-                    // error path.
                     let body_stream = futures::stream::iter(vec![
                         Ok::<Bytes, std::convert::Infallible>(first),
                         Ok::<Bytes, std::convert::Infallible>(bad),
@@ -1770,7 +1529,6 @@ mod tests {
             "stream": true
         });
         let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
-        // The first byte was sent successfully, so HTTP status should be 200.
         assert_eq!(resp.status(), StatusCode::OK);
 
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -1778,23 +1536,18 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // The in-band error must surface as an OpenAI-shaped error chunk with the
-        // `server_error` type (set by emit_stream_error for OpenAI Chat).
         assert!(
             text.contains("\"type\":\"server_error\""),
             "in-band error must emit an OpenAI error chunk, got: {text}"
         );
-        // ...and the stream must still terminate with [DONE].
         assert!(
             text.contains("[DONE]"),
             "stream must end with [DONE] after the in-band error, got: {text}"
         );
     }
 
-    /// upstream disconnect mid-stream completes with synthetic terminal
     #[tokio::test]
     async fn upstream_disconnect_completes_with_synthetic_terminal() {
-        // Spawn a mock that sends partial events then disconnects (no message_stop).
         let app = Router::new().route(
         "/{*path}",
         post(|| async move {
@@ -1805,7 +1558,6 @@ mod tests {
                 Event::default()
                     .event("content_block_delta")
                     .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#),
-                // No message_stop -- simulates upstream disconnect.
             ];
             let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
             let sse = Sse::new(stream).keep_alive(KeepAlive::default());
@@ -1838,19 +1590,16 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
-        // The stream should end with [DONE] even though upstream disconnected.
         assert!(
             text.contains("[DONE]"),
             "stream must end with [DONE] after upstream disconnect, got: {text}"
         );
-        // A synthetic finish_reason should be present.
         assert!(
             text.contains("stop"),
             "stream should contain synthetic finish_reason: stop"
         );
     }
 
-    /// request with only system messages (no user message) does not panic
     #[tokio::test]
     async fn system_only_messages_does_not_panic() {
         let mock_url = spawn_mock_openai_chat_non_stream().await;
@@ -1864,7 +1613,6 @@ mod tests {
             ]
         });
         let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
-        // Should not panic. It may succeed (upstream accepts it) or return an error.
         assert_ne!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1872,14 +1620,6 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Missing tests from audit round 3
-    // ===========================================================================
-
-    /// Unknown model with empty routing table returns 400 Bad Request with
-    /// OpenAI-shaped error envelope (audit round 3 coverage). This exercises
-    /// the core pipeline error path when the model routing table has no matching
-    /// entry, confirming the OpenAI error shape for the chat completions route.
     #[tokio::test]
     async fn unknown_model_empty_routing_table_openai_shaped_400() {
         let app = build_router(empty_state());
@@ -1890,7 +1630,6 @@ mod tests {
         });
         let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
 
-        // Empty routing table -> unknown provider -> 404 Not Found.
         assert_eq!(
             resp.status(),
             StatusCode::NOT_FOUND,
@@ -1904,26 +1643,22 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["message"].is_string());
         assert!(resp_body["error"]["code"].is_null(), "code must be null");
 
-        // Must NOT be Anthropic-shaped (no top-level "type" field).
         assert!(
             resp_body.get("type").is_none() || resp_body["type"].is_null(),
             "must not have Anthropic 'type' field"
         );
     }
 
-    /// Large messages array (1000 messages) is handled without errors.
     #[tokio::test]
     async fn large_messages_array_is_handled() {
         let mock_url = spawn_mock_openai_chat_non_stream().await;
         let state = state_with_openai_chat_provider(&mock_url);
         let app = build_router(state);
 
-        // Build a request with 1000 messages.
         let mut messages = Vec::new();
         for i in 0..1000 {
             messages.push(json!({
@@ -1936,7 +1671,6 @@ mod tests {
             "messages": messages
         });
         let resp = app.oneshot(chat_request(&body.to_string())).await.unwrap();
-        // Should not panic or return an internal server error.
         assert_ne!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1944,13 +1678,6 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Bare route 404 tests (locked decision: bare /v1/* not registered)
-    // ===========================================================================
-
-    /// Bare `/v1/chat/completions` (no provider segment) must return 404 with
-    /// an OpenAI-shaped error envelope. This verifies locked decision #2:
-    /// "Bare /v1/* API routes are not registered."
     #[tokio::test]
     async fn bare_v1_chat_completions_returns_404_openai_shaped() {
         let app = build_router(empty_state());
@@ -1972,13 +1699,10 @@ mod tests {
         )
         .unwrap();
 
-        // Must be OpenAI error shape.
         assert!(resp_body["error"].is_object(), "must have error object");
         assert!(resp_body["error"]["message"].is_string());
     }
 
-    /// Bare `/v1/messages` (no provider segment) must return 404 with
-    /// an Anthropic-shaped error envelope.
     #[tokio::test]
     async fn bare_v1_messages_returns_404_anthropic_shaped() {
         let app = build_router(empty_state());
@@ -2000,14 +1724,12 @@ mod tests {
         )
         .unwrap();
 
-        // Must be Anthropic error shape (has "type" and "error" fields).
         assert!(
             resp_body["type"].is_string(),
             "must have Anthropic 'type' field"
         );
     }
 
-    /// Provider name with invalid characters (uppercase, dots) must return 400.
     #[tokio::test]
     async fn invalid_provider_name_returns_400() {
         let app = build_router(empty_state());
@@ -2027,7 +1749,6 @@ mod tests {
         );
     }
 
-    /// Same model name routed to different providers via URL path.
     #[expect(
         clippy::too_many_lines,
         reason = "one end-to-end routing scenario: two provider registries, two \
@@ -2036,7 +1757,6 @@ mod tests {
     )]
     #[tokio::test]
     async fn same_model_routes_to_different_providers() {
-        // Create two providers both supporting chat_completions.
         let mut adapters_a = HashMap::new();
         adapters_a.insert(
             "chat".to_owned(),
@@ -2124,7 +1844,6 @@ mod tests {
 
         let body = serde_json::json!({"model": "gpt-4o", "messages": []}).to_string();
 
-        // Request to provider-a — should resolve (not 404 for unknown provider).
         let req_a = Request::builder()
             .method("POST")
             .uri("/providers/provider-a/v1/chat/completions")
@@ -2132,15 +1851,12 @@ mod tests {
             .body(Body::from(body.clone()))
             .unwrap();
         let resp_a = app.clone().oneshot(req_a).await.unwrap();
-        // Provider-a doesn't have a real upstream, so we expect an upstream error
-        // (502), NOT 404 unknown provider.
         assert_ne!(
             resp_a.status(),
             StatusCode::NOT_FOUND,
             "provider-a should resolve, not 404"
         );
 
-        // Request to provider-b — same model, different provider.
         let req_b = Request::builder()
             .method("POST")
             .uri("/providers/provider-b/v1/chat/completions")

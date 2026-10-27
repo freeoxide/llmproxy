@@ -23,24 +23,20 @@ pub enum CoreError {
     /// Config validation failed.
     ///
     /// The structured [`ConfigValidationError`] is carried typed (not boxed
-    /// behind `dyn Error`) so callers can match on the concrete variant
-    /// directly via [`CoreError::validation_error`] instead of downcasting
-    /// through a trait object (GAP-LOW-11).
+    /// behind `dyn Error`); match it via [`CoreError::validation_error`].
     #[error("config validation error: {message}")]
     ConfigValidation {
         /// Human-readable description of the validation failure.
         message: String,
-        /// The structured validation error, when this failure originated from a
-        /// typed [`ConfigValidationError`]. `None` for ad-hoc message-only
-        /// validations such as the HIGH-2 request-timeout guard.
+        /// The structured validation error, when this failure originated from
+        /// a typed [`ConfigValidationError`]. `None` for message-only
+        /// validations.
         #[source]
         source: Option<ConfigValidationError>,
     },
     /// Provider registry construction or protocol validation failed.
     ///
-    /// Carries only a message: every provider-resolution failure in this crate
-    /// is an ad-hoc diagnostic (duplicate provider name, unknown protocol), so
-    /// there is no typed source to erase (GAP-LOW-11).
+    /// Carries only a diagnostic message; there is no typed source.
     #[error("provider resolution error: {message}")]
     ProviderResolution {
         /// Human-readable description of the resolution failure.
@@ -66,9 +62,6 @@ impl CoreError {
 
     /// Return the structured validation error when this is a typed
     /// [`CoreError::ConfigValidation`], otherwise `None`.
-    ///
-    /// Callers inspect the concrete [`ConfigValidationError`] variant directly
-    /// — no `dyn Error` downcast required (GAP-LOW-11).
     ///
     /// ```
     /// use llm_proxy_core::{CoreError, provider_config::ConfigValidationError};
@@ -145,21 +138,15 @@ mod tests {
     fn config_validation_from_config_validation_error() {
         let validation_err = crate::provider_config::ConfigValidationError::EmptyProviderName;
         let core_err: CoreError = validation_err.into();
-        // The typed variant is recoverable directly — no `dyn Error` downcast
-        // (GAP-LOW-11). assert_eq! on the structured variant replaces the brittle
-        // `to_string().contains(...)` substring match the old test used (GAP-LOW-12).
         assert_eq!(
             core_err.validation_error(),
             Some(&crate::provider_config::ConfigValidationError::EmptyProviderName),
         );
-        // The source chain still surfaces the typed error for consumers that walk it.
         assert!(core_err.source().is_some());
     }
 
     #[test]
     fn config_validation_preserves_fielded_variant() {
-        // A non-unit (fielded) variant must round-trip through CoreError so callers
-        // can match its fields without downcasting (GAP-LOW-11 / GAP-LOW-12).
         let validation_err = crate::provider_config::ConfigValidationError::EmptyApiKey {
             provider: "my-provider".to_owned(),
         };

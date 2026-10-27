@@ -1,10 +1,3 @@
-//! `GET /providers/{provider}/v1/models` handler.
-//!
-//! Returns the merged static and discovered model catalog for a provider.
-//!
-//! The response is a normalized superset model card that includes both OpenAI
-//! and Anthropic fields so either SDK can consume it.
-
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -20,61 +13,25 @@ use crate::state::AppState;
 
 use super::core_pipeline;
 use super::error_response::{AuthOwner, ClientProtocol, RouteError, route_error_response};
-
-// ---------------------------------------------------------------------------
-// Response types
-// ---------------------------------------------------------------------------
-
-/// Top-level response for the models endpoint.
-///
-/// Follows the OpenAI `/v1/models` response shape as the base, with Anthropic
-/// pagination fields added as a superset.
-///
-/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted because this
-/// is a Serialize-only type (never deserialized from external input).
 #[derive(Serialize)]
 struct ModelsResponse {
-    /// OpenAI-compatible: always `"list"`.
     object: &'static str,
-    /// OpenAI-compatible: the list of model cards.
     data: Vec<ModelCard>,
-    /// Anthropic-compatible: whether more results exist.
     has_more: bool,
-    /// Anthropic-compatible: ID of the first model in the list.
     first_id: Option<String>,
-    /// Anthropic-compatible: ID of the last model in the list.
     last_id: Option<String>,
 }
-
-/// A normalized model card containing both OpenAI and Anthropic fields.
-///
-/// Common SDKs should be able to ignore fields they do not use.
-///
-/// Note: `#[serde(deny_unknown_fields)]` is intentionally omitted because this
-/// is a Serialize-only type (never deserialized from external input).
 #[derive(Serialize)]
 struct ModelCard {
-    /// OpenAI: model identifier.
     id: String,
-    /// OpenAI: always `"model"`.
     object: &'static str,
-    /// OpenAI: Unix timestamp of creation. Set to the epoch (0) as a sentinel
-    /// value because the static catalog entries do not carry a creation timestamp.
-    /// A future improvement should propagate the discovered_at or generated_at
-    /// field from the catalog metadata.
     created: u64,
-    /// OpenAI: owner identifier (provider name).
     owned_by: String,
-    /// Anthropic: always `"model"`.
     #[serde(rename = "type")]
     model_type: &'static str,
-    /// Anthropic: human-readable display name.
     display_name: Option<String>,
-    /// Anthropic-compatible creation timestamp, absent when unknown.
     created_at: Option<String>,
-    /// The route kinds this model supports (non-standard extension).
     supports: Vec<&'static str>,
-    /// Maximum context length in tokens (non-standard extension).
     context_length: Option<u32>,
 }
 
@@ -82,32 +39,11 @@ struct ModelCard {
 pub(super) struct ModelsQuery {
     refresh: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Handler
-// ---------------------------------------------------------------------------
-
-/// `GET /providers/{provider}/v1/models`
-///
-/// Returns the configured catalog, optionally refreshing discovery with
-/// `?refresh=live`. When no catalog is configured, returns an empty list.
-///
-/// The query string is parsed inside the handler (rather than via a
-/// `Query<ModelsQuery>` extractor) so a malformed query string -- e.g. a
-/// duplicate `?refresh=a&refresh=b`, which axum's extractor rejects with a
-/// plain-text 400 -- is mapped into the same OpenAI-shaped JSON envelope every
-/// other status on this route returns, instead of an inconsistent bare-text
-/// rejection that also lacks the `x-request-id` header.
 pub(crate) async fn handle_models(
     State(state): State<AppState>,
     Path(provider): Path<String>,
     req: axum::extract::Request,
 ) -> Response<Body> {
-    // The wrapper only renders: it does NOT emit ResponseFailed. /models has no
-    // core-pipeline dispatch, so each early-gate error return inside the inner
-    // function emits exactly one ResponseFailed itself. A blanket emit here
-    // would double-count, so the wrapper stays emit-free
-    // (audit route-responsefailed-gaps regression).
     match handle_models_inner(&state, &provider, req).await {
         Ok(response) => response,
         Err(error) => {
@@ -116,16 +52,6 @@ pub(crate) async fn handle_models(
         }
     }
 }
-
-/// Inner handler that returns `Result` so errors can be mapped uniformly.
-///
-/// ResponseFailed emission discipline (audit route-responsefailed-gaps): /models
-/// has no core-pipeline dispatch, so each early-gate error return emits exactly
-/// one ResponseFailed here. /models has no request-id extension (it does not
-/// pass through the inference request-id middleware), so a stable sentinel
-/// ("models") correlates the event to this endpoint; the provider path segment
-/// is carried in the event. model is None because /models lists all models and
-/// is not bound to a single ModelRef.
 async fn handle_models_inner(
     state: &AppState,
     provider_name: &str,
@@ -134,10 +60,6 @@ async fn handle_models_inner(
     let start = std::time::Instant::now();
     let event_bus = Arc::clone(&state.event_bus);
     let request_id = "models";
-    // Surface the axum QueryRejection (a plain-text 400) through the shared
-    // JSON envelope so malformed-query responses are consistent with the rest
-    // of the API. Parsed inside the handler (not via a Query extractor) so the
-    // rejection is mapped into RouteError and emits one ResponseFailed.
     let query = Query::<ModelsQuery>::try_from_uri(req.uri())
         .map(|query| query.0)
         .map_err(|rejection| {
@@ -166,7 +88,6 @@ async fn handle_models_inner(
             start,
         )
     })?;
-    // Look up the provider. Returns 404 if not found.
     let provider = state
         .providers()
         .get(provider_name)
@@ -197,11 +118,6 @@ async fn handle_models_inner(
                 start,
             )
         })?;
-
-    // Build model cards from static entries.
-    // `entries` is fully owned (returned by value), so derive the pagination
-    // IDs from the owned Vec first, then consume it with `into_iter()` so
-    // every per-entry field moves into its `ModelCard` with zero clones.
     let first_id = entries.first().map(|m| m.id.clone());
     let last_id = entries.last().map(|m| m.id.clone());
 
@@ -280,15 +196,9 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
         | ProviderError::SseFraming(_)
         | ProviderError::EmptyResponse(_)
         | ProviderError::InvalidConfig(_) => RouteError::Internal(error.to_string()),
-        // ProviderError is #[non_exhaustive] so a wildcard arm is required
-        // to handle future variants added to the enum.
         _ => RouteError::Internal(error.to_string()),
     }
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -298,11 +208,6 @@ mod tests {
         StaticModelCatalogEntry,
     };
     use std::collections::HashMap;
-
-    /// Build a GET request for the models endpoint with an optional query
-    /// suffix. Used so the in-handler query parser exercised by unit tests
-    /// receives a real `axum::extract::Request` (the `Query` extractor reads
-    /// the URI).
     fn models_request(query: &str) -> axum::extract::Request {
         let uri = if query.is_empty() {
             "/v1/models".to_owned()
@@ -315,8 +220,6 @@ mod tests {
             .body(Body::empty())
             .expect("request")
     }
-
-    /// Build a minimal AppState with a provider that has a static catalog.
     fn build_state_with_catalog() -> AppState {
         let provider = ProviderConfig {
             name: "test-provider".to_owned(),
@@ -388,8 +291,6 @@ mod tests {
             },
         )
     }
-
-    /// Build a minimal AppState with a provider that has NO catalog.
     fn build_state_without_catalog() -> AppState {
         let provider = ProviderConfig {
             name: "no-catalog".to_owned(),
@@ -455,22 +356,16 @@ mod tests {
         assert_eq!(json["object"], "list");
         assert_eq!(json["data"].as_array().unwrap().len(), 2);
         assert_eq!(json["has_more"], false);
-
-        // Catalog output is sorted by model ID for deterministic responses.
         let m1 = &json["data"][0];
         assert_eq!(m1["id"], "claude-sonnet-4");
         assert_eq!(m1["object"], "model");
         assert_eq!(m1["owned_by"], "test-provider");
         assert_eq!(m1["display_name"], "Claude Sonnet 4");
         assert_eq!(m1["context_length"], 200000);
-
-        // Second model
         let m2 = &json["data"][1];
         assert_eq!(m2["id"], "deepseek-v3.1");
         assert_eq!(m2["display_name"], "DeepSeek V3.1");
         assert_eq!(m2["context_length"], 131072);
-
-        // Pagination fields
         assert_eq!(json["first_id"], "claude-sonnet-4");
         assert_eq!(json["last_id"], "deepseek-v3.1");
     }

@@ -1,7 +1,3 @@
-//! `models` command implementation.
-//!
-//! Lists provider routes and static, cached, or live model catalogs.
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -15,7 +11,6 @@ use llm_proxy_server::{ModelCatalogService, write_catalog_atomic};
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{providers_dir_for, resolve_config};
 
-/// Print the configured route adapters for a provider.
 fn print_provider_routes(provider: &ProviderConfig) {
     let has_routes =
         provider.routes.chat_completions.is_some() || provider.routes.messages.is_some();
@@ -31,7 +26,6 @@ fn print_provider_routes(provider: &ProviderConfig) {
     }
 }
 
-/// Build the on-disk cache file for a freshly discovered catalog.
 fn discovered_catalog_file(
     provider: &ProviderConfig,
     discovered: Vec<StaticModelCatalogEntry>,
@@ -40,10 +34,6 @@ fn discovered_catalog_file(
         catalog: CatalogFileMetadata {
             provider: provider.name.clone(),
             source: "live".to_owned(),
-            // Rfc3339 formatting of a UTC OffsetDateTime is infallible in
-            // practice, but the time crate models it as fallible. Propagate a
-            // fallback epoch timestamp instead of panicking after a successful
-            // live fetch, mirroring catalog_service::now_rfc3339.
             generated_at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned()),
@@ -52,7 +42,6 @@ fn discovered_catalog_file(
     }
 }
 
-/// Print the resolved model catalog for a provider.
 fn print_model_entries(entries: &[StaticModelCatalogEntry]) {
     println!("    models:");
     if entries.is_empty() {
@@ -76,10 +65,8 @@ pub async fn cmd_models(
 ) -> Result<()> {
     let path = resolve_config(config_path.as_deref());
 
-    // Reject JSON config and non-TOML extensions.
     validate_toml_extension(&path)?;
 
-    // Load providers from the providers/ directory next to the config.
     let providers_dir = providers_dir_for(&path);
     let registry = if providers_dir.exists() {
         ProviderRegistry::load_from_dir(&providers_dir)
@@ -121,7 +108,6 @@ pub async fn cmd_models(
     for provider in &providers {
         println!("  {}:", provider.name);
 
-        // Show routes.
         print_provider_routes(provider);
 
         let catalog_config = provider.catalog.clone().unwrap_or_default();
@@ -132,8 +118,6 @@ pub async fn cmd_models(
                     provider.name
                 );
             }
-            // Built once and only on the live path (avoids a reqwest client
-            // build when --live is not passed).
             let discovery = discovery.get_or_insert_with(DiscoveryClient::default);
             match discovery.discover(provider).await {
                 Ok(discovered) => {

@@ -3,55 +3,19 @@
 //! All counters are lock-free ([`std::sync::atomic::AtomicI64`]). The only
 //! mutex-guarded state is the latency ring-buffer (last 1 000 samples) and
 //! the per-provider-model request counter map.
-//!
-//! # Ordering
-//!
-//! All atomic operations use [`std::sync::atomic::Ordering::Relaxed`] which is correct here
-//! because the counters are monotonically increasing, used only for
-//! observability, and no synchronization invariants depend on their
-//! relative ordering.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-/// Maximum number of latency samples retained in the ring-buffer.
 const LATENCY_CAP: usize = 1000;
 
-/// Maximum number of distinct `"{provider}:{model}"` keys retained in
-/// [`Metrics::model_counts`].
-///
-/// The `model` axis is attacker-controlled (it arrives from the inbound client
-/// request and, when catalog enforcement is off -- the default --, is not
-/// canonicalized before keying). Without a cap, a client sending a unique model
-/// string per request could grow this map without bound for the lifetime of the
-/// process. Once this many distinct keys exist, any further new pair is folded
-/// into the [`MODEL_COUNTS_OVERFLOW`] aggregate bucket instead of allocating a
-/// new entry, bounding memory while still reporting the total request count.
-/// The hard bound on map size is therefore [`MODEL_COUNTS_CAP`] real keys plus
-/// at most one lazily-created overflow bucket.
 const MODEL_COUNTS_CAP: usize = 1024;
 
-/// Aggregate bucket key used once [`MODEL_COUNTS_CAP`] distinct keys have been
-/// recorded. Chosen so it cannot collide with a real `"{provider}:{model}"`
-/// key: the provider segment of a real key is URL-path-validated against
-/// `^[a-z0-9_-]+$`, so a leading `~` (not in that class) makes this key
-/// structurally unreachable from any request input. (A prior sentinel
-/// `__other__:` was collidable because `_` is a legal provider-name character,
-/// so a configured provider literally named `__other__` serving an empty model
-/// would alias the overflow bucket.)
 const MODEL_COUNTS_OVERFLOW: &str = "~overflow:";
 
-/// Separator used in the composite metrics key: `"{provider}:{model}"`.
-///
-/// The `:` delimiter is chosen because provider names are restricted to
-/// `[a-z0-9_-]+` and model IDs cannot contain `:`, preventing key collisions.
 const KEY_SEPARATOR: &str = ":";
-
-// ---------------------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------------------
 
 /// Thread-safe metrics collector.
 ///
@@ -110,12 +74,6 @@ impl Metrics {
         self.requests_success.fetch_add(1, Ordering::Relaxed);
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
 
-        // Store latency sample (ring-buffer), then release the latencies lock
-        // before touching model_counts so the two independent maps are not
-        // serialized by a single held guard. Recover from poison to preserve
-        // data from panicked threads. Renaming the inner binding from `buf` to
-        // `latencies` avoids shadowing the thread-local `buf` in the closure
-        // below (audit LOW-9).
         {
             let mut latencies = self.latencies.lock().unwrap_or_else(|e| e.into_inner());
             if latencies.len() >= LATENCY_CAP {
@@ -124,13 +82,6 @@ impl Metrics {
             latencies.push_back(latency);
         }
 
-        // Bump per-provider-model counter.
-        //
-        // The composite key is built into a thread-local reusable buffer so no
-        // fresh `String` is heap-allocated per call. On the hot path (provider/
-        // model pair already tracked) the buffer is only borrowed for a `get`
-        // lookup; the cold insert path clones the buffer contents into an owned
-        // key exactly once per distinct pair (audit LOW-7).
         thread_local! {
             static KEY_BUF: std::cell::RefCell<String> =
                 std::cell::RefCell::new(String::with_capacity(64));
@@ -145,14 +96,8 @@ impl Metrics {
             if let Some(count) = map.get_mut(buf.as_str()) {
                 *count += 1;
             } else if map.len() < MODEL_COUNTS_CAP {
-                // Cold path: first sighting of this pair — pay for one owned key.
                 *map.entry(buf.clone()).or_insert(0) += 1;
             } else {
-                // The map is at capacity (defending against attacker-controlled,
-                // unbounded model strings -- see [`MODEL_COUNTS_CAP`]). Fold this
-                // and any further distinct pairs into the aggregate overflow
-                // bucket instead of allocating a new key. The bucket itself is
-                // lazily created the first time it is needed.
                 *map.entry(MODEL_COUNTS_OVERFLOW.to_owned()).or_insert(0) += 1;
             }
         });
@@ -160,13 +105,10 @@ impl Metrics {
 
     /// Record a failed request.
     ///
-    /// Increments `requests_failed` and `upstream_calls`.
-    ///
-    /// Reserve this for genuine upstream/decode failures. A client-initiated
-    /// disconnect (the client went away mid-stream, or the timeout layer tore
-    /// the connection down) is **not** a failure of the upstream call and must
-    /// be recorded via [`Metrics::record_client_cancel`] instead, so that the
-    /// error-rate SLO is not corrupted by users pressing "stop" (audit MEDIUM-5).
+    /// Increments `requests_failed` and `upstream_calls`. Reserve this for
+    /// genuine upstream/decode failures: record client-initiated disconnects
+    /// via [`Metrics::record_client_cancel`] instead, so that "stop" presses
+    /// and timeout teardowns do not corrupt the error-rate SLO.
     pub fn record_failure(&self) {
         self.requests_failed.fetch_add(1, Ordering::Relaxed);
         self.upstream_calls.fetch_add(1, Ordering::Relaxed);
@@ -175,8 +117,7 @@ impl Metrics {
     /// Record a client-initiated cancellation.
     ///
     /// Distinct from [`Metrics::record_failure`]: this does not touch
-    /// `requests_failed` or `upstream_calls`, so client "stop" presses and
-    /// timeout teardowns do not inflate the error-rate SLO (audit MEDIUM-5).
+    /// `requests_failed` or `upstream_calls`.
     pub fn record_client_cancel(&self) {
         self.client_cancelled.fetch_add(1, Ordering::Relaxed);
     }
@@ -193,10 +134,9 @@ impl Metrics {
 
     /// Take an approximate point-in-time snapshot of all counters.
     ///
-    /// Individual fields are each loaded atomically, but the overall
-    /// snapshot is **approximately** consistent rather than transactional:
-    /// between loading the first counter and the last, other threads may
-    /// have mutated state. This is acceptable for observability use cases.
+    /// Individual fields are each loaded atomically, but the snapshot is not
+    /// transactional: other threads may mutate state between the first and
+    /// last load.
     pub fn get_snapshot(&self) -> Snapshot {
         let requests_received = self.requests_received.load(Ordering::Relaxed);
         let requests_streamed = self.requests_streamed.load(Ordering::Relaxed);
@@ -244,14 +184,10 @@ impl Default for Metrics {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot
-// ---------------------------------------------------------------------------
-
 /// An approximate point-in-time copy of all metric counters.
 ///
-/// Individual fields are each loaded atomically but the snapshot as a whole
-/// is not a transactional view. This is acceptable for observability.
+/// Each field is loaded atomically, but the snapshot as a whole is not a
+/// transactional view.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Snapshot {
     /// Total requests received (streaming + non-streaming).
@@ -269,8 +205,7 @@ pub struct Snapshot {
     /// Requests that were deduplicated before reaching upstream.
     pub deduplicated: i64,
     /// Requests whose client disconnected (or were torn down by the timeout
-    /// layer) mid-stream. Tracked separately from `requests_failed` so client
-    /// "stop" actions do not corrupt the error-rate SLO (audit MEDIUM-5).
+    /// layer) mid-stream; tracked separately from `requests_failed`.
     pub client_cancelled: i64,
     /// Collected latency samples (up to 1 000 entries).
     pub latencies: Vec<Duration>,
@@ -304,21 +239,7 @@ impl Snapshot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Return the latency at the given percentile (0..=100).
-///
-/// Uses the "exclusive" interpolation method common in monitoring systems:
-/// `rank = pct/100 * (n + 1)`, then clamped to `[0, n-1]`.
-///
-/// Returns [`Duration::ZERO`] for an empty slice.
 fn percentile(samples: &[Duration], pct: f64) -> Duration {
-    // Clamp the input unconditionally so an out-of-range `pct` (e.g. a caller
-    // bug passing 150.0 or a negative) cannot silently yield the wrong sample.
-    // This clamp is the hard guard that survives in both debug and release
-    // builds; `calculate_percentile_clamps_out_of_range_input` exercises it.
     let pct = pct.clamp(0.0, 100.0);
 
     if samples.is_empty() {
@@ -329,9 +250,7 @@ fn percentile(samples: &[Duration], pct: f64) -> Duration {
     sorted.sort();
 
     let n = sorted.len();
-    // Nearest-rank (exclusive) method: rank = pct/100 * (n + 1), 1-based.
     let rank = (pct / 100.0) * (n as f64 + 1.0);
-    // Convert to 0-based index, clamped to valid range.
     #[expect(
         clippy::cast_sign_loss,
         reason = "`pct` is clamped to 0.0..=100.0 and `n >= 1`, so `rank = pct/100 * (n+1)` is always >= 0.0 and the cast cannot lose a sign"
@@ -339,10 +258,6 @@ fn percentile(samples: &[Duration], pct: f64) -> Duration {
     let idx = (rank.floor() as usize).saturating_sub(1).min(n - 1);
     sorted[idx]
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -456,8 +371,6 @@ mod tests {
 
         let snap = m.get_snapshot();
         assert_eq!(snap.latencies.len(), LATENCY_CAP);
-        // The oldest 50 samples should have been evicted; the buffer should
-        // start at sample index 50.
         assert_eq!(snap.latencies[0], Duration::from_millis(50));
         assert_eq!(snap.latencies[LATENCY_CAP - 1], Duration::from_millis(1049));
     }
@@ -471,7 +384,6 @@ mod tests {
 
     #[test]
     fn p95_p99_on_known_samples() {
-        // 100 samples from 0ms..99ms.
         let latencies: Vec<Duration> = (0..100).map(Duration::from_millis).collect();
 
         let snap = Snapshot {
@@ -479,9 +391,7 @@ mod tests {
             ..Snapshot::default()
         };
 
-        // p95: rank = 0.95 * (100+1) = 95.95 -> floor 95 -> idx 94 -> 94ms
         assert_eq!(snap.calculate_p95(), Duration::from_millis(94));
-        // p99: rank = 0.99 * (100+1) = 99.99 -> floor 99 -> idx 98 -> 98ms
         assert_eq!(snap.calculate_p99(), Duration::from_millis(98));
     }
 
@@ -534,7 +444,6 @@ mod tests {
         }
 
         let snap = m.get_snapshot();
-        // 4 threads x 500 iterations = 2000 requests received.
         assert_eq!(snap.requests_received, 2000);
         assert_eq!(snap.requests_success + snap.requests_failed, 2000);
     }
@@ -577,9 +486,7 @@ mod tests {
             latencies: vec![Duration::from_millis(10), Duration::from_millis(100)],
             ..Snapshot::default()
         };
-        // p95: rank = 0.95 * 3 = 2.85 -> floor 2 -> idx 1 -> 100ms
         assert_eq!(snap.calculate_p95(), Duration::from_millis(100));
-        // p99: rank = 0.99 * 3 = 2.97 -> floor 2 -> idx 1 -> 100ms
         assert_eq!(snap.calculate_p99(), Duration::from_millis(100));
     }
 
@@ -594,16 +501,12 @@ mod tests {
 
     #[test]
     fn calculate_percentile_clamps_out_of_range_input() {
-        // Out-of-range `pct` must be clamped to [0, 100] rather than silently
-        // returning the wrong sample (the debug_assert compiles out in release).
         let snap = Snapshot {
             latencies: (0..100).map(Duration::from_millis).collect(),
             ..Snapshot::default()
         };
-        // pct > 100 clamps to 100 -> max sample (99ms).
         assert_eq!(snap.calculate_percentile(150.0), Duration::from_millis(99));
         assert_eq!(snap.calculate_percentile(100.0), Duration::from_millis(99));
-        // pct < 0 clamps to 0 -> min sample (0ms).
         assert_eq!(snap.calculate_percentile(-42.0), Duration::from_millis(0));
         assert_eq!(snap.calculate_percentile(0.0), Duration::from_millis(0));
     }
@@ -642,8 +545,6 @@ mod tests {
 
     #[test]
     fn key_separator_does_not_collide_with_provider_names() {
-        // Provider names are restricted to [a-z0-9_-]+ so `:` separator
-        // cannot appear in provider or model names.
         let m = Metrics::new();
         m.record_success("provider-a", "model-x", Duration::from_millis(10));
         m.record_success("provider-a", "model-y", Duration::from_millis(20));
@@ -655,14 +556,8 @@ mod tests {
 
     #[test]
     fn model_counts_capped_with_overflow_bucket() {
-        // The model axis is attacker-controlled, so the distinct-key map must be
-        // bounded. Once MODEL_COUNTS_CAP distinct pairs have been recorded, any
-        // further new pair is folded into the `~overflow:` aggregate bucket
-        // instead of allocating a new entry. The bound is MODEL_COUNTS_CAP real
-        // keys plus at most one lazily-created overflow bucket.
         let m = Metrics::new();
 
-        // Fill the map to capacity with distinct pairs.
         for i in 0..MODEL_COUNTS_CAP {
             m.record_success("p", &format!("model-{i}"), Duration::from_micros(i as u64));
         }
@@ -677,8 +572,6 @@ mod tests {
             "overflow bucket must not exist before capacity is reached"
         );
 
-        // Further distinct pairs spill into the aggregate bucket. The bucket is
-        // created on first spill, so the map grows by exactly one entry.
         m.record_success("p", "overflow-1", Duration::from_micros(0));
         m.record_success("p", "overflow-2", Duration::from_micros(0));
         let snap = m.get_snapshot();
@@ -693,7 +586,6 @@ mod tests {
             "spilled counts should accumulate in the overflow bucket"
         );
 
-        // More distinct pairs must NOT grow the map further.
         m.record_success("p", "overflow-3", Duration::from_micros(0));
         let snap = m.get_snapshot();
         assert_eq!(
@@ -703,8 +595,6 @@ mod tests {
         );
         assert_eq!(snap.model_counts.get(MODEL_COUNTS_OVERFLOW), Some(&3));
 
-        // An already-tracked pair must still increment its own entry (hot path),
-        // not the overflow bucket.
         m.record_success("p", "model-0", Duration::from_micros(0));
         let snap = m.get_snapshot();
         assert_eq!(

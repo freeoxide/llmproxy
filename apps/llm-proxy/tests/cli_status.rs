@@ -1,8 +1,5 @@
-//! Integration tests for the `status` command.
-//!
-//! Drives `cmd_status` directly against a tempdir-backed [`CommandPaths`],
-//! covering the "no PID file", stale-PID, running-process, and config-display
-//! branches (audit MEDIUM-6).
+//! Integration tests for the `status` command, driven against a tempdir-backed
+//! [`CommandPaths`].
 
 #[cfg(test)]
 mod tests {
@@ -14,8 +11,6 @@ mod tests {
     use llm_proxy_app::paths::CommandPaths;
     use llm_proxy_core::PidManager;
 
-    /// Build a [`CommandPaths`] whose PID file and config path both live under
-    /// `dir`.
     fn tempdir_paths(dir: &Path) -> CommandPaths {
         CommandPaths::new(PidManager::new(dir), dir.join("config.toml"))
     }
@@ -50,16 +45,12 @@ mod tests {
 
             cmd_status(&paths).expect("running process -> Ok");
 
-            // Reap the child so it does not outlive the test.
             child.kill().expect("kill sleep child");
             child.wait().expect("reap sleep child");
         }
 
         #[test]
         fn status_with_present_config_is_ok() {
-            // `cmd_status` reads the config to display the `listen` address. With a
-            // valid config present it hits the parse-success arm; the command
-            // returns Ok either way (parse failures are reported, not propagated).
             let dir = tempfile::tempdir().unwrap();
             let paths = tempdir_paths(dir.path());
 

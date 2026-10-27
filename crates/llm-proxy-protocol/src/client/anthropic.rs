@@ -1,20 +1,5 @@
-//! Anthropic Messages client protocol adapter.
-//!
-//! Translates between Anthropic Messages API wire format and the normalised
-//! core protocol types.  This adapter only knows about Anthropic Messages
-//! and the core types -- it never imports provider, server, or config code.
-//!
-//! ## Scope guardrails
-//!
-//! This module must **not** import or call:
-//! - `llm_proxy_provider`
-//! - `llm_proxy_server`
-//! - core config or routing modules
-//! - endpoint classification helpers
-//! - scenario or fallback code
-//!
-//! The `transformer/` module was removed in Phase 11; the guard test at the
-//! bottom of this file remains as a regression safety net.
+//! Anthropic Messages client protocol adapter: translates between the
+//! Anthropic wire format and the normalised core protocol types.
 
 use crate::anthropic::{
     self, ApiError, CacheControl as AnthropicCacheControl, ContentBlock, Delta, Message,
@@ -26,10 +11,6 @@ use crate::core::{
     CoreResponse, CoreRole, CoreStreamError, CoreStreamErrorKind, CoreTool, CoreToolChoice,
     ModelRef, ProviderHints, RequestMetadata, SamplingOptions, StopReason, Usage,
 };
-
-// ---------------------------------------------------------------------------
-// decode_request
-// ---------------------------------------------------------------------------
 
 /// Decode an Anthropic [`MessageRequest`] into a normalised [`CoreRequest`].
 pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError> {
@@ -116,7 +97,6 @@ fn decode_system(system: Option<serde_json::Value>) -> Vec<CoreContent> {
         }
         Some(serde_json::Value::Array(arr)) => {
             let mut result = Vec::new();
-            // We own `system`, so iterate owned array items without cloning.
             for item in arr {
                 let Ok(block) = serde_json::from_value::<SystemContentBlock>(item) else {
                     tracing::warn!(
@@ -125,12 +105,7 @@ fn decode_system(system: Option<serde_json::Value>) -> Vec<CoreContent> {
                     continue;
                 };
                 if block.r#type != "text" {
-                    // Non-text system blocks (e.g. future image blocks) are not
-                    // yet supported -- log a warning so they are not silently lost.
-                    // Truncate block_type to limit log output from client input.
                     let bt = block.r#type.as_str();
-                    // Char-boundary-safe truncation: avoids panics on
-                    // multi-byte UTF-8 characters in client-supplied data.
                     let truncated = crate::util::truncate_str_safe(bt, 64);
                     tracing::warn!(
                         block_type = truncated,
@@ -147,8 +122,6 @@ fn decode_system(system: Option<serde_json::Value>) -> Vec<CoreContent> {
             }
             result
         }
-        // Non-string, non-array system values (e.g. a bare number) cannot be
-        // represented as system content -- return empty rather than erroring.
         _ => Vec::new(),
     }
 }
@@ -171,23 +144,15 @@ fn decode_message(msg: &Message) -> Result<CoreMessage, ProtocolError> {
     Ok(CoreMessage { role, content })
 }
 
-/// Decodes the `content` array of a `tool_result` block.
-///
-/// Inner blocks that fail to deserialize, or whose type is unknown, are logged
-/// and skipped rather than failing the whole `tool_result`. If nothing survives
-/// decoding, an empty text block is synthesized so the tool result is not lost.
 fn decode_tool_result_blocks(arr: &[serde_json::Value]) -> Result<Vec<CoreContent>, ProtocolError> {
     let mut blocks = Vec::with_capacity(arr.len());
     for item in arr {
         let Ok(cb) = serde_json::from_value::<crate::anthropic::ContentBlock>(item.clone()) else {
             continue;
         };
-        // Recursively decode each inner block. Errors from unknown block types
-        // are logged and skipped rather than failing the entire tool_result decode.
         match decode_content_block(cb) {
             Ok(core) => blocks.push(core),
             Err(ProtocolError::Decode(msg)) => {
-                // Char-boundary-safe truncation for log output.
                 let truncated = crate::util::truncate_str_safe(&msg, 64);
                 tracing::warn!(
                     decode_error = truncated,
@@ -210,21 +175,17 @@ fn decode_tool_result_blocks(arr: &[serde_json::Value]) -> Result<Vec<CoreConten
     Ok(blocks)
 }
 
-/// Decodes a single `tool_result` content block.
 fn decode_tool_result_block(block: ContentBlock) -> Result<CoreContent, ProtocolError> {
     let is_error = block.is_error.unwrap_or(false);
     let inner_content = if let Some(ref content_val) = block.content {
         match content_val {
-            // Plain string content.
             serde_json::Value::String(s) => {
                 vec![CoreContent::Text {
                     text: s.clone(),
                     cache: None,
                 }]
             }
-            // Array of content blocks -- iterate and decode each one.
             serde_json::Value::Array(arr) => decode_tool_result_blocks(arr)?,
-            // Fallback: try text_content() for any other shape.
             _ => {
                 let text = block.text_content();
                 if text.is_empty() {
@@ -235,8 +196,6 @@ fn decode_tool_result_block(block: ContentBlock) -> Result<CoreContent, Protocol
             }
         }
     } else {
-        // No content field -- fall back to text_content() which checks
-        // the deprecated output field.
         let text = block.text_content();
         if text.is_empty() {
             vec![]
@@ -310,11 +269,6 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
             data: serde_json::Value::String(block.data.unwrap_or_default()),
         }),
         other => {
-            // Unknown block types cannot be safely represented -- return an error
-            // so the caller knows data was lost rather than silently creating
-            // an empty text block. Truncate the block_type to limit log output
-            // from potentially malicious client input. Char-boundary-safe
-            // truncation avoids panics on multi-byte UTF-8.
             let truncated = crate::util::truncate_str_safe(other, 64);
             tracing::warn!(
                 block_type = truncated,
@@ -353,21 +307,9 @@ fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
     }
 }
 
-// ---------------------------------------------------------------------------
-// encode_response
-// ---------------------------------------------------------------------------
-
-/// Encode a [`CoreResponse`] into an Anthropic [`MessageResponse`].
-///
-/// Content blocks that cannot be represented in the Anthropic wire format are
-/// handled according to the plan's two-path rule:
-///
-/// - **Safe to drop** (Document, Audio, Video): the block is logged with
-///   `tracing::warn!` and silently omitted. `encode_content_block` signals this
-///   via `Err(ProtocolError::EncodeSkippable(..))`.
-///
-/// - **Must propagate** (Refusal): returns `Err(ProtocolError::Encode(..))`
-///   because silently dropping a refusal would change the response semantics.
+/// Encode a [`CoreResponse`] into an Anthropic [`MessageResponse`]. Blocks
+/// the format cannot represent are dropped with a warning
+/// (`EncodeSkippable`); a `CoreContent::Refusal` is a hard `Encode` error.
 pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolError> {
     if !resp.provider_meta.is_empty() {
         tracing::warn!(
@@ -385,10 +327,7 @@ pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolEr
     for block in resp.content {
         match encode_content_block(block) {
             Ok(encoded) => content.push(encoded),
-            Err(ProtocolError::EncodeSkippable(_msg)) => {
-                // Safe-to-drop block type for this protocol -- skip it.
-                // The warning was already logged in encode_content_block.
-            }
+            Err(ProtocolError::EncodeSkippable(_msg)) => {}
             Err(other) => return Err(other),
         }
     }
@@ -465,9 +404,6 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             Ok(block)
         }
         CoreContent::Document { .. } => {
-            // Document blocks are not supported in Anthropic responses. The
-            // omission is safe (the data was never user-visible in this context),
-            // so we signal via EncodeSkippable so encode_response can skip it.
             tracing::warn!(
                 "Anthropic Messages protocol does not natively support document blocks in responses; omitting"
             );
@@ -492,8 +428,6 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             ))
         }
         CoreContent::RedactedThinking { data } => {
-            // Anthropic natively supports redacted_thinking -- encode as proper
-            // redacted_thinking content block type.
             let data_str = match data {
                 serde_json::Value::String(s) => s,
                 other => other.to_string(),
@@ -501,10 +435,6 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             Ok(ContentBlock::new_redacted_thinking(data_str))
         }
         CoreContent::Refusal { text } => {
-            // Anthropic does not have a native refusal block type. Per the plan,
-            // return ProtocolError::Encode rather than silently converting to text.
-            // Log only the length to avoid writing potentially sensitive refusal
-            // content into log output.
             tracing::warn!(
                 refusal_text_len = text.len(),
                 "Anthropic Messages protocol has no refusal field; cannot encode"
@@ -516,16 +446,6 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
     }
 }
 
-/// Map [`StopReason`] to an Anthropic `stop_reason` string.
-///
-/// The plan's encode rules table lists three explicit mappings (EndTurn, MaxTokens,
-/// ToolUse). The additional mappings below handle the remaining `StopReason` variants
-/// for completeness:
-///
-/// - `StopSequence` -> `"stop_sequence"` (natively supported by Anthropic)
-/// - `Refusal` -> `"end_turn"` with warning (Anthropic has no refusal stop reason)
-/// - `Error` -> `"end_turn"` with warning (Anthropic has no error stop reason)
-/// - `Unknown` -> `"end_turn"` (safe default)
 fn encode_stop_reason(reason: StopReason) -> String {
     match reason {
         StopReason::EndTurn => "end_turn".to_owned(),
@@ -571,11 +491,6 @@ fn encode_usage(usage: &Usage) -> anthropic::Usage {
     }
 }
 
-/// Builds the `content_block` payload for a `content_block_start` event.
-///
-/// Returns `None` for kinds that must not produce a `content_block_start`:
-/// `ToolUse` is emitted by `ToolCallStart`, which carries the actual id/name,
-/// and the remaining kinds are unsupported.
 fn encode_content_start_block(index: usize, kind: ContentKind) -> Option<ContentBlock> {
     match kind {
         ContentKind::Text => Some(ContentBlock::new_text(String::new())),
@@ -588,9 +503,6 @@ fn encode_content_start_block(index: usize, kind: ContentKind) -> Option<Content
             None
         }
         other => {
-            // ContentStart for unsupported kinds (Image, Document, Audio,
-            // Video, ToolResult, Refusal) -- skip entirely rather than
-            // emitting a misleading text block start.
             tracing::warn!(
                 kind = ?other,
                 "unsupported ContentKind in Anthropic stream encode; skipping content_block_start"
@@ -600,24 +512,7 @@ fn encode_content_start_block(index: usize, kind: ContentKind) -> Option<Content
     }
 }
 
-/// Builds a client-facing `error` SSE event.
-///
-/// Defense-in-depth note: the error message flows directly into the
-/// client-facing SSE event. Sanitization of secrets happens at
-/// `CoreStreamError::new()` construction time in the provider adapter. If a
-/// provider adapter accidentally passes an unsanitized message, it will be
-/// visible to the client here.
-///
-/// Trust boundary: client adapters trust that provider adapters have sanitized
-/// the message. A regression test (`encode_error_does_not_leak_secret_in_message`)
-/// verifies that a `CoreStreamError` containing a secret-like string propagates
-/// verbatim -- the defense must be at construction time, not here.
 fn encode_error_event(error: &CoreStreamError) -> MessageEvent {
-    // Length cap: truncate the error message to 1024 characters to prevent
-    // excessively large SSE payloads from upstream errors. Char-boundary-safe
-    // truncation avoids panics on multi-byte UTF-8 characters in
-    // upstream/provider-derived error messages (consistent with the other
-    // truncation sites in this file).
     let msg = error.message();
     let capped_msg = if msg.len() > 1024 {
         tracing::warn!(
@@ -642,41 +537,22 @@ fn encode_error_event(error: &CoreStreamError) -> MessageEvent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// StreamEncoder
-// ---------------------------------------------------------------------------
-
 /// Stateful encoder that converts [`CoreEvent`] values into Anthropic SSE
-/// [`MessageEvent`] values.
-///
-/// The encoder buffers the latest `UsageDelta` and coalesces it with the
-/// terminal `MessageStop` into a single `message_delta` event carrying both
-/// `usage` and `delta.stop_reason`/`stop_sequence`, followed by one
-/// `message_stop`.  This matches native Anthropic behavior.
+/// [`MessageEvent`] values, buffering the latest `UsageDelta` and coalescing
+/// it into the terminal `message_delta` + `message_stop` pair.
 #[derive(Debug)]
 pub struct StreamEncoder {
-    /// The message ID for this stream.
     msg_id: String,
-    /// The model name to report.
     model: String,
-    /// Buffered usage from the latest UsageDelta.
     pending_usage: Option<anthropic::Usage>,
-    /// Whether message_start has been emitted.
     started: bool,
-    /// Whether the terminal message_delta + message_stop have been emitted.
     finished: bool,
-    /// Indices of text/thinking blocks that received content_block_start
-    /// but have not yet been closed. Native Anthropic always emits
-    /// content_block_stop after every block; we synthesize stops for
-    /// text/thinking at MessageStop since CoreEvent has no ContentStop.
     open_text_blocks: Vec<usize>,
 }
 
 impl StreamEncoder {
-    /// Create a new stream encoder.
-    ///
-    /// `msg_id` and `model` are typically taken from the first
-    /// `CoreEvent::MessageStart`.
+    /// Create a new stream encoder; `msg_id` and `model` are typically taken
+    /// from the first `CoreEvent::MessageStart`.
     pub fn new(msg_id: String, model: String) -> Self {
         Self {
             msg_id,
@@ -688,7 +564,6 @@ impl StreamEncoder {
         }
     }
 
-    /// Records the stream's id/model and builds the `message_start` event.
     fn encode_message_start(&mut self, id: Option<String>, model: String) -> MessageEvent {
         if let Some(id) = id {
             self.msg_id = id;
@@ -721,12 +596,6 @@ impl StreamEncoder {
         }
     }
 
-    /// Emits the terminal `message_delta` + `message_stop` pair, first closing
-    /// any text/thinking blocks that were opened but never closed.
-    ///
-    /// Native Anthropic emits `content_block_stop` for every block; without the
-    /// synthesized stops, strict clients that pair start/stop events mis-frame
-    /// the stream. Tool blocks are closed by `ToolCallStop`.
     fn encode_message_stop(
         &mut self,
         stop_reason: StopReason,
@@ -810,7 +679,6 @@ impl StreamEncoder {
 
             CoreEvent::ContentStart { index, kind } => {
                 let Some(block) = encode_content_start_block(index, kind) else {
-                    // Unsupported or duplicate-producing kind: emit nothing.
                     return Ok(events);
                 };
                 events.push(MessageEvent {
@@ -911,7 +779,6 @@ impl StreamEncoder {
             }
 
             CoreEvent::UsageDelta { usage } => {
-                // Buffer usage; it will be emitted with the terminal event.
                 self.pending_usage = Some(encode_usage(&usage));
             }
 
@@ -942,23 +809,15 @@ impl StreamEncoder {
         Ok(events)
     }
 
-    /// Mark the encoder as finished without emitting synthetic terminal events.
-    ///
-    /// This is used after an in-band error event has been emitted: the error
-    /// event itself is the terminal event, so subsequent `finish()` calls
-    /// return an empty vec rather than a synthetic message_delta/message_stop pair.
+    /// Mark the encoder as finished without emitting synthetic terminal
+    /// events; later `finish()` calls return an empty vec.
     pub fn mark_finished(&mut self) {
         self.finished = true;
     }
 
-    /// Flush any remaining buffered events (e.g. if the stream was terminated
-    /// without a `MessageStop`).
-    ///
-    /// When the stream terminated abnormally (no explicit `MessageStop`), the
-    /// stop reason is set to `"end_turn"` with a `tracing::warn`, as this is the
-    /// least misleading stop reason for an interrupted stream. Always emits a
-    /// `message_delta` + `message_stop` pair so the Anthropic client receives a
-    /// proper terminal sequence.
+    /// Flush remaining buffered events when the stream ended without a
+    /// `MessageStop`: emits a synthetic `message_delta` (stop reason
+    /// `"end_turn"`, with a warning) + `message_stop` pair.
     pub fn finish(&mut self) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
@@ -987,10 +846,6 @@ impl StreamEncoder {
                     text: None,
                     thinking: None,
                     partial_json: None,
-                    // Use end_turn as the least misleading stop reason for abnormal
-                    // termination. max_tokens has a specific semantic meaning that
-                    // would cause clients to incorrectly believe the model ran out
-                    // of tokens.
                     stop_reason: Some("end_turn".to_owned()),
                     stop_sequence: None,
                 }),
@@ -1023,17 +878,11 @@ fn encode_error_kind(kind: &CoreStreamErrorKind) -> String {
     }
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::anthropic::Tool;
     use crate::core::UsageProvenance;
-
-    // -- helpers ------------------------------------------------------------
 
     fn make_anthropic_request() -> MessageRequest {
         MessageRequest {
@@ -1053,8 +902,6 @@ mod tests {
             tool_choice: None,
         }
     }
-
-    // -- decode tests -------------------------------------------------------
 
     #[test]
     fn plain_text_request_decodes_to_core() {
@@ -1326,8 +1173,6 @@ mod tests {
         assert!(!core2.stream);
     }
 
-    // -- encode tests -------------------------------------------------------
-
     #[test]
     fn core_text_response_encodes_to_route_response() {
         let resp = CoreResponse {
@@ -1475,8 +1320,6 @@ mod tests {
         assert!(out.id.starts_with("msg_"));
     }
 
-    // -- streaming encode tests ---------------------------------------------
-
     #[test]
     fn streaming_text_event_mapping() {
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
@@ -1559,12 +1402,8 @@ mod tests {
 
     #[test]
     fn streaming_content_start_tool_use_defers_to_tool_call_start() {
-        // ContentStart { kind: ToolUse } must NOT emit content_block_start
-        // because ToolCallStart carries the actual id/name and will emit it.
-        // Emitting both would produce a duplicate content_block_start.
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
 
-        // ContentStart for ToolUse should produce zero events.
         let content_start_events = enc
             .encode_event(CoreEvent::ContentStart {
                 index: 0,
@@ -1577,7 +1416,6 @@ mod tests {
             content_start_events.len()
         );
 
-        // ToolCallStart should produce exactly one content_block_start.
         let tool_start_events = enc
             .encode_event(CoreEvent::ToolCallStart {
                 index: 0,
@@ -1600,10 +1438,6 @@ mod tests {
 
     #[test]
     fn streaming_text_block_emits_content_block_stop() {
-        // Text/thinking blocks receive content_block_start and content_block_delta
-        // but never content_block_stop (only ToolCallStop emits one). The encoder
-        // must synthesize a stop at MessageStop, before message_delta, so strict
-        // clients that pair start/stop events do not mis-frame the stream.
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
         enc.encode_event(CoreEvent::MessageStart {
             id: None,
@@ -1630,13 +1464,11 @@ mod tests {
             })
             .unwrap();
 
-        // A content_block_stop for index 0 must be present.
         assert!(
             stop.iter()
                 .any(|e| e.r#type == "content_block_stop" && e.index == Some(0))
         );
 
-        // ...and it must precede the message_delta event.
         let md = stop
             .iter()
             .position(|e| e.r#type == "message_delta")
@@ -1652,13 +1484,11 @@ mod tests {
     fn streaming_usage_coalesced_with_message_stop() {
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
 
-        // Send UsageDelta first.
         enc.encode_event(CoreEvent::UsageDelta {
             usage: Usage::provider_reported(50, 100),
         })
         .unwrap();
 
-        // Then send MessageStop -- should coalesce.
         let events = enc
             .encode_event(CoreEvent::MessageStop {
                 stop_reason: StopReason::EndTurn,
@@ -1666,7 +1496,6 @@ mod tests {
             })
             .unwrap();
 
-        // Should produce exactly 2 events: message_delta (with usage + stop) and message_stop.
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].r#type, "message_delta");
         assert!(events[0].usage.is_some());
@@ -1741,7 +1570,6 @@ mod tests {
         let remaining = enc.finish().unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].r#type, "message_delta");
-        // Abnormal termination uses end_turn as the least misleading stop reason.
         assert_eq!(
             remaining[0].delta.as_ref().unwrap().stop_reason.as_deref(),
             Some("end_turn")
@@ -1752,8 +1580,6 @@ mod tests {
     #[test]
     fn streaming_finish_without_pending_usage_still_emits_terminal() {
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
-        // No UsageDelta sent -- finish() should still emit terminal events
-        // with synthetic zero usage.
         let remaining = enc.finish().unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].r#type, "message_delta");
@@ -1784,14 +1610,8 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // -- every CoreEvent variant handled ------------------------------------
-
     #[test]
     fn every_core_event_variant_maps_or_errors_intentionally() {
-        // Test all ContentKind variants for ContentStart. The stream encoder
-        // handles Text and Thinking explicitly (emitting content_block_start);
-        // ToolUse is deferred to ToolCallStart; other kinds are skipped with a
-        // warning (returning empty events, not an error).
         let content_kinds: Vec<ContentKind> = vec![
             ContentKind::Text,
             ContentKind::Thinking,
@@ -1812,7 +1632,6 @@ mod tests {
             assert!(result.is_ok(), "ContentStart {:?} should not error", kind);
         }
 
-        // Test all other CoreEvent variants.
         let variants: Vec<CoreEvent> = vec![
             CoreEvent::MessageStart {
                 id: None,
@@ -1857,8 +1676,6 @@ mod tests {
             assert!(result.is_ok(), "event {event:?} should not error");
         }
     }
-
-    // -- unsupported content variants ---------------------------------------
 
     #[test]
     fn encode_image_produces_image_block() {
@@ -1918,7 +1735,6 @@ mod tests {
 
     #[test]
     fn encode_response_omits_unsupported_blocks() {
-        // encode_response filters out blocks that return ProtocolError::Encode.
         let resp = CoreResponse {
             id: Some("msg_123".into()),
             model: ModelRef {
@@ -1941,12 +1757,9 @@ mod tests {
             cost: None,
         };
         let out = encode_response(resp).unwrap();
-        // Document block should be omitted; only text remains.
         assert_eq!(out.content.len(), 1);
         assert_eq!(out.content[0].r#type, "text");
     }
-
-    // -- metadata / provider hints preserved --------------------------------
 
     #[test]
     fn metadata_raw_preserved_in_decode() {
@@ -2007,8 +1820,6 @@ mod tests {
         assert!(matches!(result.unwrap_err(), ProtocolError::Decode(_)));
     }
 
-    // -- tool definitions ---------------------------------------------------
-
     #[test]
     fn tools_decoded_to_core() {
         let mut req = make_anthropic_request();
@@ -2023,17 +1834,8 @@ mod tests {
         assert_eq!(core.tools[0].description.as_deref(), Some("Get weather"));
     }
 
-    // -- source guard -------------------------------------------------------
-
     #[test]
     fn client_anthropic_does_not_import_forbidden_modules() {
-        // Source guard: this module must not import llm_proxy_provider,
-        // llm_proxy_server, core config/routing, endpoint classification,
-        // scenario/fallback code, or transformer/*. The crate dependency
-        // graph prevents most of these at compile time (those crates are not
-        // dependencies of llm-proxy-protocol). This runtime check provides
-        // a secondary defense by verifying that the module source does not
-        // contain forbidden import patterns in `use` statements.
         let source = include_str!("anthropic.rs");
         for line in source.lines() {
             let trimmed = line.trim();
@@ -2065,8 +1867,6 @@ mod tests {
         }
     }
 
-    // -- edge-case tests ----------------------------------------------------
-
     #[test]
     fn decode_empty_model_returns_error() {
         let mut req = make_anthropic_request();
@@ -2089,7 +1889,6 @@ mod tests {
 
     #[test]
     fn decode_null_optional_fields() {
-        // Ensure that explicitly-null optional fields are handled gracefully.
         let mut req = make_anthropic_request();
         req.system = None;
         req.temperature = None;
@@ -2128,7 +1927,6 @@ mod tests {
             cost: None,
         };
         let result = encode_response(resp);
-        // Refusal should propagate as ProtocolError::Encode (not skippable).
         assert!(matches!(result, Err(ProtocolError::Encode(_))));
     }
 
@@ -2160,7 +1958,6 @@ mod tests {
             cost: None,
         };
         let out = encode_response(resp).unwrap();
-        // Document is dropped; both text blocks are preserved.
         assert_eq!(out.content.len(), 2);
         assert_eq!(out.content[0].text.as_deref(), Some("hello"));
         assert_eq!(out.content[1].text.as_deref(), Some(" world"));
@@ -2168,9 +1965,6 @@ mod tests {
 
     #[test]
     fn encode_error_does_not_leak_secret_in_message() {
-        // This test documents the trust boundary: the error message from
-        // CoreStreamError is forwarded verbatim into the client-facing SSE
-        // event. Sanitization must happen at CoreStreamError::new() time.
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
         let secret_msg = "api_key=sk-12345-secret";
         let events = enc
@@ -2179,22 +1973,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(events[0].error.as_ref().unwrap().message, secret_msg);
-        // The defense-in-depth contract requires that provider adapters
-        // sanitize the message before constructing CoreStreamError.
     }
 
     #[test]
     fn encode_error_truncates_multibyte_message_without_panicking() {
-        // Regression: the >1024-byte branch of the CoreEvent::Error arm used to
-        // slice with `msg[..1024]`, which panics if byte 1024 lands inside a
-        // multi-byte UTF-8 code point. Build a message longer than 1024 bytes
-        // whose byte offset 1024 falls mid-code-point deterministically, then
-        // assert the encoder truncates at a char boundary instead of panicking.
-        //
-        // 1 ASCII char (1 byte) + 257 four-byte chars ('🚀') = 1 + 1028 = 1029
-        // bytes. Byte 1024 is the 3rd byte of the 257th emoji (offset 1023 in
-        // the emoji run = 3 bytes into that code point), i.e. mid-code-point.
-        let emoji = "🚀"; // U+1F680, 4 bytes in UTF-8
+        let emoji = "🚀";
         assert_eq!(emoji.len(), 4);
         let msg: String = std::iter::once('_')
             .chain(std::iter::repeat_n(emoji, 257).flat_map(|s| s.chars()))
@@ -2209,7 +1992,6 @@ mod tests {
         );
 
         let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
-        // Must not panic.
         let events = enc
             .encode_event(CoreEvent::Error {
                 error: CoreStreamError::new(CoreStreamErrorKind::Upstream, msg.clone()),
@@ -2221,12 +2003,10 @@ mod tests {
             capped.len() <= 1024,
             "truncated message must not exceed the cap"
         );
-        // The result is a valid char boundary (and valid UTF-8 by construction).
         assert!(
             msg.starts_with(capped.as_str()),
             "truncated message must be a prefix of the original"
         );
-        // Sanity: we actually exercised the truncation branch.
         assert!(capped.len() < msg.len());
     }
 

@@ -86,8 +86,7 @@ pub enum AutostartAction {
         #[arg(short, long)]
         port: Option<u16>,
         /// Overwrite an existing launchd plist / .desktop entry instead of
-        /// aborting. Without this flag `enable` refuses to clobber a
-        /// hand-edited unit (audit GAP-MED-4).
+        /// aborting.
         #[arg(long)]
         force: bool,
     },

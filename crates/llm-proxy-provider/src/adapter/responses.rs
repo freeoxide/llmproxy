@@ -1,12 +1,5 @@
-//! OpenAI Responses API provider adapter.
-//!
-//! Translates between core types and the Responses API wire format:
-//!
-//! ```text
-//! CoreRequest  -> ResponsesRequest
-//! ResponsesResponse -> CoreResponse
-//! ResponsesChunk stream -> CoreEvent stream
-//! ```
+//! OpenAI Responses API provider adapter: translates core requests, responses,
+//! and event streams to and from the OpenAI Responses wire format.
 
 use std::collections::HashMap;
 
@@ -26,51 +19,18 @@ use super::{
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Adapter for the OpenAI Responses API.
 #[derive(Debug, Clone, Default)]
 pub struct ResponsesAdapter;
 
-// ---------------------------------------------------------------------------
-// Stream decoder
-// ---------------------------------------------------------------------------
-
-/// Stateful stream decoder for Responses API SSE frames.
-///
-/// ## CoreEvent variants emitted
-///
-/// - `MessageStart` -- on `response.created` or `response.in_progress`
-/// - `ContentStart` -- on `response.output_text.delta` (text) or
-///   `response.output_item.added` with `function_call` (tool use)
-/// - `TextDelta` -- on `response.output_text.delta`
-/// - `ToolCallStart` -- on `response.output_item.added` with `function_call`
-///   (one per upstream `output_index`, supporting parallel calls)
-/// - `ToolCallDelta` -- on `response.function_call_arguments.delta`
-///   (routed to the open block matching the chunk's `output_index`)
-/// - `ToolCallStop` -- on `response.function_call_arguments.done`; any blocks
-///   still open are closed on `response.completed`/`response.done`/`finish()`
-/// - `UsageDelta` -- on `response.completed` or `response.done` with usage
-/// - `MessageStop` -- on `response.completed` or `response.done`
-/// - `Error` -- on `response.failed`
-///
-/// Intentionally never emitted: `Ping`, `ThinkingDelta` (the Responses API
-/// does not produce heartbeat or thinking-stream events).
+/// Stateful stream decoder translating OpenAI Responses API SSE frames into `CoreEvent`s.
 #[derive(Debug)]
 pub struct ResponsesStreamDecoder {
     model_ref: ModelRef,
     started: bool,
     content_index: usize,
     content_started: bool,
-    /// Open tool-call blocks keyed by the upstream `output_index`, mapping to
-    /// the core `content_index` assigned when the block started. The Responses
-    /// API interleaves parallel function-call argument deltas and
-    /// disambiguates them via `output_index`, so the decoder must track one
-    /// block per concurrent call rather than a single open call.
     tool_blocks: HashMap<usize, usize>,
-    /// Whether any tool call was seen during this stream.
     saw_tool_call: bool,
     stop_sent: bool,
 }
@@ -148,9 +108,6 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                     && !delta.is_empty()
                 {
                     let oi = chunk.output_index.unwrap_or(0);
-                    // If no block is open for this output_index (e.g. a missed
-                    // response.output_item.added event), synthesize a start
-                    // keyed by it before routing the delta.
                     let block_idx = self.ensure_tool_block(
                         oi,
                         "no prior response.output_item.added event",
@@ -164,9 +121,6 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             }
             "response.function_call_arguments.done" => {
                 let oi = chunk.output_index.unwrap_or(0);
-                // If no block is open for this output_index (e.g. a missed
-                // response.output_item.added event), emit a synthetic start so
-                // the stop has a matching ToolCallStart, then close it.
                 self.ensure_tool_block(
                     oi,
                     "no prior response.output_item.added event before arguments.done",
@@ -180,16 +134,12 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 self.close_content_if_open();
                 self.close_tool_blocks(&mut events);
 
-                // Extract usage.
                 if let Some(ref usage) = chunk.usage {
                     events.push(CoreEvent::UsageDelta {
                         usage: build_responses_usage(usage),
                     });
                 }
 
-                // Extract stop reason from output if present, falling back to
-                // saw_tool_call for streams where function_call output items
-                // may not be present on the response.completed event.
                 let stop_reason = self.infer_stop_reason(chunk.output.as_deref());
 
                 if !self.stop_sent {
@@ -226,7 +176,6 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                     .and_then(|e| e.get("message").and_then(|m| m.as_str()))
                     .unwrap_or("response failed")
                     .to_owned();
-                // Map error code to more specific CoreStreamErrorKind when available.
                 let kind = chunk
                     .error
                     .as_ref()
@@ -251,9 +200,7 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                     error: llm_proxy_protocol::core::CoreStreamError::new(kind, message),
                 });
             }
-            _ => {
-                // Unknown event type; skip.
-            }
+            _ => {}
         }
 
         Ok(events)
@@ -272,11 +219,6 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 
         self.close_content_if_open();
 
-        // Flush any unclosed tool calls (e.g. a stream that emitted
-        // ToolCallStart/arguments.delta but ended without arguments.done or
-        // response.completed), so downstream consumers receive a balanced
-        // ToolCallStart/ToolCallStop pair. Mirrors the Gemini/OpenAI-chat
-        // decoders' unclosed-tool-block handling in finish().
         self.close_tool_blocks(&mut events);
 
         if !self.stop_sent {
@@ -304,12 +246,6 @@ impl ResponsesStreamDecoder {
         }
     }
 
-    /// Emit `ToolCallStop` for every still-open tool block (sorted by
-    /// `content_index` for a deterministic, ascending close order) and clear
-    /// the map. Mirrors the Gemini/OpenAI-chat decoders' `close_tool_blocks`
-    /// so every `ToolCallStart` is guaranteed a matching `ToolCallStop`.
-    /// Opens a text content block when a `message` output first carries
-    /// `output_text` and none is currently open.
     fn start_text_block_if_needed(
         &mut self,
         output: &ResponsesOutput,
@@ -332,10 +268,6 @@ impl ResponsesStreamDecoder {
         }
     }
 
-    /// Opens a tool-call block for `oi` unless one is already open.
-    ///
-    /// Parallel calls are disambiguated by the upstream `output_index`, so one
-    /// block is tracked per concurrent call.
     fn start_function_call(
         &mut self,
         oi: usize,
@@ -365,9 +297,6 @@ impl ResponsesStreamDecoder {
         });
     }
 
-    /// Returns the content index of the tool block for `oi`, synthesizing a
-    /// `ToolCallStart` (logged with `warn_message`) when the upstream never sent
-    /// a `response.output_item.added` for it.
     fn ensure_tool_block(
         &mut self,
         oi: usize,
@@ -405,10 +334,6 @@ impl ResponsesStreamDecoder {
         self.tool_blocks.clear();
     }
 
-    /// Infer the stop reason from output items and whether a tool call was seen.
-    ///
-    /// Checks for `function_call` output items in the chunk. If none are found,
-    /// falls back to the `saw_tool_call` flag that was set during streaming.
     fn infer_stop_reason(&self, outputs: Option<&[ResponsesOutput]>) -> StopReason {
         if let Some(outs) = outputs {
             if outs.iter().any(|o| o.r#type == "function_call") {
@@ -423,15 +348,6 @@ impl ResponsesStreamDecoder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ResponsesAdapter impl
-// ---------------------------------------------------------------------------
-
-/// Folds one core content block into the Responses input item list.
-///
-/// Text accumulates in `text_parts` so consecutive text blocks collapse into a
-/// single input item; a tool block flushes that buffer first so a message never
-/// emits duplicate role entries.
 fn encode_content_item<'a>(
     c: &'a CoreContent,
     role: &str,
@@ -452,7 +368,6 @@ fn encode_content_item<'a>(
             name,
             input: tool_input,
         } => {
-            // Flush pending text as its own input item first.
             if !text_parts.is_empty() {
                 input.push(ResponsesInput {
                     role: role.to_owned(),
@@ -461,8 +376,6 @@ fn encode_content_item<'a>(
                 text_parts.clear();
             }
 
-            // The Responses API represents prior tool calls as input items with
-            // type "function_call".
             let arguments = serde_json::to_string(tool_input).unwrap_or_else(|e| {
                 tracing::warn!(
                     error = %e,
@@ -518,10 +431,6 @@ fn encode_content_item<'a>(
     }
 }
 
-/// Collects the text of every content block on a `message` output.
-///
-/// Unknown block types still contribute their `text` field, if any, rather than
-/// being dropped silently.
 fn push_message_text(output: &ResponsesOutput, content: &mut Vec<CoreContent>) {
     for block in output.content.iter().flatten() {
         if block.r#type != "output_text" {
@@ -554,9 +463,7 @@ impl ResponsesAdapter {
     ) -> Result<super::ProxyRequest, ProviderError> {
         let mut input = Vec::new();
 
-        // System prompt as first developer message.
         if !core.system.is_empty() {
-            // Warn about non-text system content blocks (consistent with other adapters).
             for c in &core.system {
                 if !matches!(c, CoreContent::Text { .. }) {
                     tracing::warn!(
@@ -587,31 +494,21 @@ impl ResponsesAdapter {
             }
         }
 
-        // Conversation messages.
         for msg in &core.messages {
             let role = match msg.role {
                 CoreRole::User => "user",
                 CoreRole::Assistant => "assistant",
                 CoreRole::System => "developer",
                 CoreRole::Tool => "user",
-                // Future CoreRole variants are mapped to "user" as a safe default.
-                // Update this match when new variants are added to CoreRole.
                 _ => "user",
             };
 
-            // Build content from all supported types, not just text.
             let mut text_parts = Vec::new();
 
             for c in &msg.content {
                 encode_content_item(c, role, &mut text_parts, &mut input);
             }
 
-            // Flush any remaining text content as a separate same-role input
-            // item. Trailing text after a tool block (e.g. an assistant message
-            // shaped [ToolUse, Text] or [ToolResult, Text]) must be preserved,
-            // and the Responses API permits multiple input items with the same
-            // role, so flush unconditionally rather than gating on the absence
-            // of function_call/function_call_output.
             if !text_parts.is_empty() {
                 let text: String = text_parts.join("");
                 input.push(ResponsesInput {
@@ -621,7 +518,6 @@ impl ResponsesAdapter {
             }
         }
 
-        // Tools.
         let tools: Vec<ResponsesTool> = core
             .tools
             .iter()
@@ -637,7 +533,6 @@ impl ResponsesAdapter {
             })
             .collect();
 
-        // Reasoning effort.
         let reasoning = core
             .sampling
             .reasoning_effort
@@ -655,7 +550,6 @@ impl ResponsesAdapter {
             tool_choice: None,
         };
 
-        // Warn about sampling fields that the Responses API does not support.
         if core.sampling.temperature.is_some() {
             tracing::warn!(
                 "Responses: temperature specified but not forwarded; \
@@ -687,8 +581,6 @@ impl ResponsesAdapter {
             );
         }
 
-        // Forward tool_choice if present.  Omit unknown variants instead of
-        // sending null (per the plan's lossy translation rules).
         if let Some(ref tc) = core.tool_choice {
             req.tool_choice = match tc {
                 CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
@@ -729,8 +621,6 @@ impl ResponsesAdapter {
                 }
                 "function_call" => {
                     let input = output
-                        // Lazily build the empty object only on the `None`/parse-fail path
-                        // so the common tool-calling happy path avoids a heap allocation (MEDIUM-4).
                         .arguments
                         .as_ref()
                         .and_then(|args| serde_json::from_str::<serde_json::Value>(args).ok())
@@ -751,7 +641,6 @@ impl ResponsesAdapter {
             }
         }
 
-        // Guarantee at least one content block.
         if content.is_empty() {
             content.push(CoreContent::Text {
                 text: String::new(),
@@ -797,11 +686,6 @@ impl ResponsesAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build usage from Responses API usage.
 fn build_responses_usage(usage: &ResponsesUsage) -> Usage {
     Usage {
         input_tokens: usage.input_tokens,
@@ -812,10 +696,6 @@ fn build_responses_usage(usage: &ResponsesUsage) -> Usage {
         provenance: UsageProvenance::ProviderReported,
     }
 }
-
-// ===========================================================================
-// Tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -854,8 +734,6 @@ mod tests {
             provider_hints: Default::default(),
         }
     }
-
-    // -- Encode tests --------------------------------------------------------
 
     #[test]
     fn encode_text_request() {
@@ -957,8 +835,6 @@ mod tests {
         assert_eq!(body.stream, Some(true));
         assert!(proxy_req.stream);
     }
-
-    // -- Decode tests --------------------------------------------------------
 
     #[test]
     fn decode_text_response() {
@@ -1069,8 +945,6 @@ mod tests {
         assert_eq!(core_resp.model.requested, "my-model");
     }
 
-    // -- Streaming tests -----------------------------------------------------
-
     #[test]
     fn stream_text_decoding() {
         let target = make_target();
@@ -1142,8 +1016,6 @@ mod tests {
         );
     }
 
-    // -- Stream tool call / malformed frame / response.failed tests -----------
-
     #[test]
     fn stream_tool_call_decoding() {
         let target = make_target();
@@ -1196,26 +1068,18 @@ mod tests {
 
     #[test]
     fn stream_parallel_tool_calls_partitioned_by_output_index() {
-        // The Responses API interleaves parallel function-call argument deltas
-        // and disambiguates them via `output_index`. The decoder must emit two
-        // distinct ToolCallStart events with different indices and route each
-        // delta to the correct content_index so the two argument streams are
-        // partitioned rather than merged into one invalid JSON blob.
         let target = make_target();
         let adapter = ResponsesAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![
             make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
-            // First parallel call (output_index 0).
             make_frame(
                 r#"{"type":"response.output_item.added","output_index":0,"output":[{"type":"function_call","call_id":"call_a","name":"get_weather"}]}"#,
             ),
-            // Second parallel call (output_index 1) before the first completes.
             make_frame(
                 r#"{"type":"response.output_item.added","output_index":1,"output":[{"type":"function_call","call_id":"call_b","name":"get_time"}]}"#,
             ),
-            // Interleaved argument deltas.
             make_frame(
                 r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"city\":"}"#,
             ),
@@ -1228,7 +1092,6 @@ mod tests {
             make_frame(
                 r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"UTC\"}"}"#,
             ),
-            // Close the two calls out of arrival order (call_b first).
             make_frame(r#"{"type":"response.function_call_arguments.done","output_index":1}"#),
             make_frame(r#"{"type":"response.function_call_arguments.done","output_index":0}"#),
             make_frame(
@@ -1241,7 +1104,6 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        // Two distinct ToolCallStart events with different indices.
         let starts: Vec<_> = all_events
             .iter()
             .filter_map(|e| match e {
@@ -1255,7 +1117,6 @@ mod tests {
         let indices: Vec<_> = starts.iter().map(|(i, _, _)| *i).collect();
         assert_eq!(indices, vec![0, 1], "expected distinct ascending indices");
 
-        // The argument deltas must be partitioned per content_index, not merged.
         let mut args_by_index: std::collections::HashMap<usize, String> =
             std::collections::HashMap::new();
         for e in &all_events {
@@ -1272,7 +1133,6 @@ mod tests {
             "output_index 1 args must be partitioned"
         );
 
-        // Each started block gets a matching stop.
         let stops: Vec<_> = all_events
             .iter()
             .filter_map(|e| match e {
@@ -1292,7 +1152,6 @@ mod tests {
 
         let frame = make_frame("not valid json {{{");
         let events = decoder.decode_frame(&frame).unwrap();
-        // Malformed frame should return empty (no MessageStart yet since type is unknown).
         assert!(events.is_empty());
     }
 
@@ -1311,8 +1170,6 @@ mod tests {
             "response.failed must emit CoreEvent::Error"
         );
     }
-
-    // -- Encode: tool_choice forwarding test ----------------------------------
 
     #[test]
     fn encode_tool_choice_forwarded() {
@@ -1333,8 +1190,6 @@ mod tests {
         let tc = body.tool_choice.unwrap();
         assert_eq!(tc["type"], "auto");
     }
-
-    // -- Additional missing tests ----------------------------------------------
 
     #[test]
     fn encode_tool_use_as_function_call() {
@@ -1425,7 +1280,6 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        // Stop reason should be ToolUse since we saw a function_call.
         let msg_stop = all_events
             .iter()
             .find(|e| matches!(e, CoreEvent::MessageStop { .. }));
@@ -1452,7 +1306,6 @@ mod tests {
         let adapter = ResponsesAdapter;
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        // Simulate receiving a tool call event but no explicit done/completed.
         let frames = vec![
             make_frame(r#"{"type":"response.created","id":"resp_1"}"#),
             make_frame(
@@ -1532,8 +1385,6 @@ mod tests {
         }
     }
 
-    // -- Additional tests: upstream model alias, malformed decode, etc --
-
     #[test]
     fn encode_uses_upstream_model() {
         let mut target = make_target();
@@ -1558,7 +1409,6 @@ mod tests {
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
-        // Should produce a valid request with empty input array.
         assert_eq!(body["input"].as_array().unwrap().len(), 0);
     }
 
@@ -1643,8 +1493,6 @@ mod tests {
         assert_eq!(core_resp.stop_reason, StopReason::MaxTokens);
     }
 
-    // -- Source guard ---------------------------------------------------------
-
     #[test]
     fn adapter_source_no_forbidden_imports() {
         let source = include_str!("responses.rs");
@@ -1661,8 +1509,6 @@ mod tests {
             "adapter must not import server crate"
         );
     }
-
-    // -- Helpers --------------------------------------------------------------
 
     fn make_frame(data: &str) -> SseFrame {
         SseFrame {

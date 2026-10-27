@@ -1,8 +1,7 @@
 //! PID file management helpers.
 //!
-//! Delegates to `llm_proxy_core::PidManager` for the core PID file operations
-//! and adds validation (reject PID 0, overflow checks) and restrictive
-//! file permissions.
+//! Delegates to `llm_proxy_core::PidManager` and adds PID validation
+//! (reject 0, overflow) plus restrictive file permissions.
 
 use std::io::Write;
 
@@ -18,21 +17,14 @@ pub const STOP_MAX_POLLS: u32 = 50;
 /// Interval between polls when waiting for graceful shutdown.
 pub const STOP_POLL_INTERVAL_MS: u64 = 200;
 
-/// Build a [`llm_proxy_core::PidManager`] for the default config directory.
 pub(crate) fn pid_manager() -> llm_proxy_core::PidManager {
     llm_proxy_core::PidManager::new(config_dir())
 }
 
 /// Read the PID from the PID file via the given manager.
 ///
-/// Returns `None` if the file does not exist. Validates that the parsed PID
-/// is non-zero and fits in `i32` to catch corrupt/stale PID files and prevent
-/// undefined behavior when passing the PID to `libc::kill()`.
-///
-/// This is the injectable variant: callers that already hold a [`llm_proxy_core::PidManager`]
-/// (e.g. `cmd_stop`/`cmd_status` operating on a tempdir-backed manager) use it
-/// directly instead of rebuilding one from the global config dir (audit
-/// MEDIUM-6).
+/// Returns `None` if the file does not exist. Rejects PID 0 and PIDs above
+/// `i32::MAX` as corrupt.
 pub fn read_pid_from(mgr: &llm_proxy_core::PidManager) -> Result<Option<u32>> {
     let pid = mgr.read_pid()?;
     if let Some(p) = pid {
@@ -46,22 +38,17 @@ pub fn read_pid_from(mgr: &llm_proxy_core::PidManager) -> Result<Option<u32>> {
     Ok(pid)
 }
 
-/// Read the PID from the PID file. Returns `None` if the file does not exist.
+/// Read the PID from the default PID file. Returns `None` if it does not exist.
 ///
-/// Validates that the parsed PID is non-zero and fits in `i32` to catch
-/// corrupt/stale PID files and prevent undefined behavior when passing the
-/// PID to `libc::kill()`.
+/// Rejects PID 0 and PIDs above `i32::MAX` as corrupt.
 pub fn read_pid() -> Result<Option<u32>> {
     read_pid_from(&pid_manager())
 }
 
 /// Atomically create the PID file with exclusive ownership.
 ///
-/// Uses `create_new(true)` so the file is created exclusively -- if another
-/// process already created it, the call fails and we return the OS error.
-/// This eliminates the TOCTOU race between checking for a stale PID and
-/// writing the new one. After creation, restrictive permissions (0600) are
-/// applied.
+/// Fails if the file already exists (`create_new`); the file is written with
+/// 0600 permissions.
 pub fn write_pid() -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
@@ -75,16 +62,12 @@ pub fn write_pid() -> Result<()> {
         .open(&path)
         .with_context(|| format!("creating PID file {}", path.display()))?;
     write!(f, "{pid}").with_context(|| format!("writing PID file {}", path.display()))?;
-    // Set restrictive permissions on the PID file.
     set_private_permissions(&path)?;
     info!(pid, "wrote PID file");
     Ok(())
 }
 
-/// Write a specific PID value to the PID file.
-///
-/// Used by the daemon parent to write the child PID before detaching.
-/// Applies restrictive permissions (0600) after creation.
+/// Write a specific PID value (e.g. a daemon child's PID) to a new PID file.
 pub fn write_pid_value(pid: u32) -> Result<()> {
     let dir = config_dir();
     std::fs::create_dir_all(&dir)
@@ -104,17 +87,13 @@ pub fn write_pid_value(pid: u32) -> Result<()> {
 
 /// Remove the PID file.
 pub fn remove_pid() -> Result<()> {
-    // `PidManager::remove_pid` returns a typed `Result<(), PidError>`; convert
-    // into the app layer's `anyhow::Result` via `?` (anyhow implements
-    // `From<PidError>` because `PidError: std::error::Error + Send + Sync`).
     Ok(pid_manager().remove_pid()?)
 }
 
 /// Check if a process with the given PID is running.
 ///
-/// Delegates to [`llm_proxy_core::PidManager::is_process_running`]. Returns `false` for
-/// PID 0 (which would otherwise signal the entire process group on Unix)
-/// and on non-Unix platforms where process signaling is unavailable.
+/// Returns `false` for PID 0 (which would signal the entire process group on
+/// Unix) and on non-Unix platforms.
 pub fn is_process_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -132,9 +111,6 @@ mod tests {
         let pid_path = dir.path().join("llm-proxy.pid");
         std::fs::write(&pid_path, "0").unwrap();
 
-        // Exercise the injectable wrapper that performs the zero-PID guard
-        // (the production path used by status/stop). A PID file of "0" must be
-        // rejected rather than returned as Some(0).
         let mgr = llm_proxy_core::PidManager::new(dir.path());
         let result = read_pid_from(&mgr);
         assert!(
@@ -151,14 +127,11 @@ mod tests {
 
     #[test]
     fn is_process_running_nonexistent_pid() {
-        // PID 299999999 is extremely unlikely to exist.
         assert!(!is_process_running(299_999_999));
     }
 
     #[test]
     fn is_process_running_rejects_pid_zero() {
-        // PID 0 should always return false to avoid signaling the entire
-        // process group on Unix.
         assert!(!is_process_running(0));
     }
 }

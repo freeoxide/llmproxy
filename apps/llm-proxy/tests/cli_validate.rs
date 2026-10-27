@@ -1,9 +1,5 @@
-//! Integration tests for the `validate` command.
-//!
-//! Covers end-to-end `cmd_validate` behaviour: valid TOML, invalid TOML, and
-//! the wrong-extension error surfacing through the command. The pure extension
-//! accept/reject matrix is exercised as per-case unit tests in
-//! `src/config_validation.rs` (see LOW-20).
+//! Integration tests for the `validate` command: valid TOML, invalid TOML,
+//! wrong extension, and the admin/auth validation rules.
 
 #[cfg(test)]
 mod tests {
@@ -52,9 +48,6 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_loopback_bind_without_client_keys() {
-        // The client-identity safety rule, exercised through the command
-        // layer: an anonymous proxy exposed past loopback must refuse to
-        // start, so validation fails before any listener could bind.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         std::fs::write(
@@ -71,8 +64,6 @@ server_name = "test"
         .unwrap();
 
         let result = cmd_validate(Some(&config));
-        // anyhow's `to_string()` shows only the outer context; `{:#}` walks
-        // the source chain down to the CoreError validation message.
         let msg = format!(
             "{:#}",
             result.expect_err("non-loopback anonymous bind must be rejected")
@@ -85,8 +76,6 @@ server_name = "test"
 
     #[test]
     fn validate_accepts_client_keys_on_non_loopback_bind() {
-        // With at least one hashed client key configured, binding off
-        // loopback is a legitimate deployment and must validate.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
         std::fs::write(

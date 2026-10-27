@@ -1,7 +1,5 @@
-//! llm-proxy-provider: upstream provider adapter framework.
-//!
-//! Manages protocol adapters for upstream LLM providers with connection pooling,
-//! streaming support, and provider-specific encoding/decoding.
+//! llm-proxy-provider: upstream provider adapter framework — protocol adapters,
+//! connection pooling, and streaming for upstream LLM providers.
 
 #![deny(missing_docs)]
 

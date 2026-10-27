@@ -1,8 +1,7 @@
 //! PID file management for daemon mode.
 //!
-//! Provides [`PidManager`] which handles creating, reading, and removing PID
-//! files used to track a running daemon process. The config directory is
-//! configurable so that tests can point at a temporary directory.
+//! [`PidManager`] handles creating, reading, and removing the PID file used
+//! to track a running daemon process.
 
 use std::io::Write;
 use std::num::ParseIntError;
@@ -10,10 +9,8 @@ use std::path::{Path, PathBuf};
 
 /// Errors returned by [`PidManager`] operations.
 ///
-/// Typed (rather than `anyhow::Error`) so that callers of this public library
-/// API can inspect or branch on the failure mode. Each variant carries the
-/// filesystem path involved so the error stays actionable without the caller
-/// having to supply that context (GAP-LOW-14).
+/// Typed so callers can branch on the failure mode; each variant carries the
+/// filesystem path involved.
 #[derive(Debug, thiserror::Error)]
 pub enum PidError {
     /// A filesystem I/O error occurred while reading, writing, or removing a
@@ -22,8 +19,7 @@ pub enum PidError {
     Io {
         /// The filesystem path involved in the failed operation.
         path: PathBuf,
-        /// The underlying I/O error. (Named `source` so thiserror uses it as the
-        /// [`std::error::Error::source`] chain root.)
+        /// The underlying I/O error.
         source: std::io::Error,
     },
     /// The PID file contents could not be parsed as a `u32`.
@@ -99,7 +95,6 @@ impl PidManager {
         })?;
         let pid = std::process::id();
 
-        // Write to a temporary file first, then rename atomically.
         let tmp_path = self.pid_file.with_extension("pid.tmp");
         {
             #[cfg(unix)]
@@ -177,7 +172,6 @@ impl PidManager {
                 true
             } else {
                 let err = std::io::Error::last_os_error();
-                // EPERM means the process exists but we lack permission.
                 err.raw_os_error() != Some(libc::ESRCH)
             }
         }
@@ -189,30 +183,21 @@ impl PidManager {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::{PidError, PidManager};
 
-    /// TestWritePIDAndGetPID_RoundTrip: writing a PID and reading it back
-    /// should return the same value.
     #[test]
     fn write_and_read_pid_roundtrip() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mgr = PidManager::new(dir.path());
 
-        // Write the PID of the current test process.
         mgr.write_pid().expect("write_pid");
 
         let pid = mgr.read_pid().expect("read_pid").expect("pid should exist");
         assert_eq!(pid, std::process::id());
     }
 
-    /// TestGetPID_MissingFile: reading from a non-existent PID file should
-    /// return `Ok(None)`.
     #[test]
     fn read_pid_missing_file() {
         let dir = tempfile::tempdir().expect("create temp dir");
@@ -222,15 +207,11 @@ mod tests {
         assert!(result.is_none(), "expected None for missing PID file");
     }
 
-    /// TestGetPID_InvalidContent: reading a PID file with non-numeric content
-    /// should return a typed [`PidError::Parse`] carrying the offending path
-    /// (GAP-LOW-14: the error is inspectable, not erased into `anyhow::Error`).
     #[test]
     fn read_pid_invalid_content() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mgr = PidManager::new(dir.path());
 
-        // Write garbage to the PID file.
         std::fs::write(mgr.pid_file(), "not-a-number").expect("write garbage");
 
         match mgr.read_pid() {
@@ -240,22 +221,17 @@ mod tests {
                     *mgr.pid_file(),
                     "typed error should carry the PID file path"
                 );
-                let _ = source; // ParseIntError present; not asserting its exact wording
+                let _ = source;
             }
             other => panic!("expected PidError::Parse, got {other:?}"),
         }
     }
 
-    /// TestReadPID_IoErrorVariant: a read failure other than "not found" should
-    /// surface as a typed [`PidError::Io`] with the path, so callers can branch
-    /// on the failure mode (GAP-LOW-14).
     #[test]
     fn read_pid_io_error_is_typed() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mgr = PidManager::new(dir.path());
 
-        // Replace the expected PID file path with a directory, so reading it as
-        // a file yields an I/O error (not NotFound).
         std::fs::create_dir(mgr.pid_file()).expect("create dir at pid path");
 
         match mgr.read_pid() {
@@ -270,8 +246,6 @@ mod tests {
         }
     }
 
-    /// TestIsProcessRunning_CurrentProcess: the current process PID should be
-    /// reported as running.
     #[test]
     fn is_process_running_current_process() {
         let pid = std::process::id();
@@ -281,11 +255,8 @@ mod tests {
         );
     }
 
-    /// TestIsProcessRunning_NonexistentPID: a very large PID that almost
-    /// certainly does not exist should be reported as not running.
     #[test]
     fn is_process_running_nonexistent_pid() {
-        // PID 299999999 is extremely unlikely to exist on any system.
         let pid = 299_999_999;
         assert!(
             !PidManager::is_process_running(pid),
@@ -293,13 +264,11 @@ mod tests {
         );
     }
 
-    /// TestRemovePID: removing the PID file should delete it from disk.
     #[test]
     fn remove_pid_deletes_file() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mgr = PidManager::new(dir.path());
 
-        // Write then remove.
         mgr.write_pid().expect("write_pid");
         assert!(mgr.pid_file().exists(), "PID file should exist after write");
         mgr.remove_pid().expect("remove_pid");
@@ -309,26 +278,20 @@ mod tests {
         );
     }
 
-    /// TestRemovePID_MissingFile: removing a non-existent PID file should
-    /// succeed silently.
     #[test]
     fn remove_pid_succeeds_when_missing() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mgr = PidManager::new(dir.path());
-        // No PID file was created. remove_pid should succeed.
         mgr.remove_pid()
             .expect("remove_pid on missing file should succeed");
     }
 
-    /// TestAtomicWrite: verify the PID file has content immediately after
-    /// write_pid (the temp-file + rename strategy ensures no partial reads).
     #[test]
     fn write_pid_is_atomic() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let mgr = PidManager::new(dir.path());
         mgr.write_pid().expect("write_pid");
 
-        // File should exist and contain the PID.
         let content = std::fs::read_to_string(mgr.pid_file()).expect("read PID file");
         let pid: u32 = content.trim().parse().expect("parse PID");
         assert_eq!(pid, std::process::id());

@@ -14,33 +14,17 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 #[derive(Debug, Clone)]
 struct RefreshOutcome {
     completed_at: Instant,
-    /// Preserved so single-flight followers receive the same error variant
-    /// (and therefore the same HTTP status via `map_catalog_error`) as the
-    /// leader. Only the variants `map_catalog_error` discriminates on are
-    /// preserved; everything else already collapses to `RouteError::Internal`,
-    /// so storing it as `InvalidConfig` is lossless.
     error: Option<PreservedError>,
 }
 
-/// Category-preserving snapshot of a [`ProviderError`] produced by a refresh.
-///
-/// `ProviderError` is not `Clone` (it carries a `serde_json::Error`), so the
-/// single-flight outcome cache stores this reconstruction instead of the full
-/// error. Only the variants [`map_catalog_error`](crate::routes) discriminates
-/// on are preserved by variant; all other variants map to `RouteError::Internal`
-/// regardless, so they collapse to [`ProviderError::InvalidConfig`] losslessly.
 #[derive(Debug, Clone)]
 enum PreservedError {
-    /// Original was `ProviderError::Http`.
     Http { message: String, timeout: bool },
-    /// Original was `ProviderError::Api`.
     Api { status: u16, body: String },
-    /// Original was any other variant; only the `Display` string is retained.
     Other(String),
 }
 
 impl PreservedError {
-    /// Snapshot the category-relevant fields of a [`ProviderError`].
     fn from_provider_error(error: &ProviderError) -> Self {
         match error {
             ProviderError::Http {
@@ -57,8 +41,6 @@ impl PreservedError {
         }
     }
 
-    /// Reconstruct a [`ProviderError`] that maps to the same HTTP status as the
-    /// original (the `redirect` flag is irrelevant to status mapping).
     fn to_provider_error(&self) -> ProviderError {
         match self {
             Self::Http { message, timeout } => ProviderError::Http {
@@ -75,11 +57,8 @@ impl PreservedError {
     }
 }
 
-/// Cached, generation-tagged catalog membership index (audit LOW-9).
 #[derive(Clone, Debug)]
 struct IndexedCatalog {
-    /// The `cache_generations` value this index was built from; a mismatch
-    /// against the live generation marks the index stale and forces a rebuild.
     generation: u64,
     ids: Arc<HashSet<String>>,
 }
@@ -89,14 +68,7 @@ struct IndexedCatalog {
 pub struct ModelCatalogService {
     cache_dir: Option<PathBuf>,
     cache: RwLock<HashMap<String, CatalogFile>>,
-    /// Bumped every time the discovered `cache` entry for a provider is
-    /// replaced, so `id_index` can detect staleness without holding a lock
-    /// across the network refresh (audit LOW-9).
     cache_generations: Mutex<HashMap<String, u64>>,
-    /// Cached O(1) membership index of catalog model ids, keyed by provider
-    /// name (audit LOW-9). Built from the merged catalog; tagged with the
-    /// `cache` generation it reflects so a concurrent refresh forces a rebuild
-    /// instead of serving a stale set.
     id_index: RwLock<HashMap<String, IndexedCatalog>>,
     refresh_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
     refresh_outcomes: Mutex<HashMap<String, RefreshOutcome>>,
@@ -119,8 +91,6 @@ impl ModelCatalogService {
     }
 
     /// Return the merged, filtered catalog, optionally refreshing it live.
-    ///
-    /// # Errors
     ///
     /// Returns an error when a live refresh fails without stale/static fallback,
     /// or when a cache file is unsafe or malformed.
@@ -164,46 +134,20 @@ impl ModelCatalogService {
         ))
     }
 
-    /// O(1) catalog-enforcement membership check (audit LOW-9).
-    ///
-    /// Replaces the per-request O(N) linear scan over the merged catalog that
-    /// `resolve_target` used to perform via `catalog()` + a `Vec::iter().any`
-    /// check. Backed by a cached `HashSet` of catalog model ids (built by
-    /// `id_index_for`), rebuilt automatically when the provider's discovered
-    /// catalog is refreshed or loaded from disk.
-    ///
-    /// `protocol` follows the same contract as the former linear scan: the
-    /// `"gemini_generate_content"` protocol strips a leading `models/` prefix
-    /// from the request and accepts either spelling of the catalog id, so a
-    /// request for `"gemini-2.5-pro"` matches a catalog id of
-    /// `"models/gemini-2.5-pro"` (and vice-versa); every other protocol
-    /// requires an exact id match.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the on-disk catalog cache cannot be loaded
-    /// (mirrors the failure mode of [`Self::catalog`]).
+    /// O(1) catalog-enforcement membership check for `upstream_model`:
+    /// `"gemini_generate_content"` strips a leading `models/` and accepts
+    /// either spelling; other protocols require an exact id match.
     pub async fn contains_model(
         &self,
         provider: &ProviderConfig,
         upstream_model: &str,
         protocol: &str,
     ) -> Result<bool, ProviderError> {
-        // Load the on-disk cache first so the index reflects the latest
-        // persisted catalog. Mirrors the load prelude of `catalog()`.
         self.load_disk_cache(provider).await?;
         let ids = self.id_index_for(provider).await?;
         Ok(model_id_present(&ids, upstream_model, protocol))
     }
 
-    /// Return the cached membership index for `provider`, rebuilding it from
-    /// the merged catalog when absent or stale (audit LOW-9).
-    ///
-    /// Staleness is tracked via [`Self::current_generation`]: the index is
-    /// tagged with the generation it was built from, and a mismatch against the
-    /// live generation (advanced by every discovered-cache mutation) forces a
-    /// rebuild. The rebuild re-checks the generation before storing, so a
-    /// concurrent refresh can never leave a stale index behind.
     async fn id_index_for(
         &self,
         provider: &ProviderConfig,
@@ -211,7 +155,6 @@ impl ModelCatalogService {
         let name = provider.name.as_str();
         let gen_before = self.current_generation(name);
 
-        // Fast path: a current-generation index already exists.
         {
             let guard = self.id_index.read().await;
             if let Some(indexed) = guard.get(name) {
@@ -221,8 +164,6 @@ impl ModelCatalogService {
             }
         }
 
-        // Slow path: build from the merged catalog (config allow/deny/static
-        // applied to the discovered models), exactly as `catalog()` returns.
         let config = provider.catalog.as_ref().cloned().unwrap_or_default();
         let discovered = self
             .cache
@@ -234,9 +175,6 @@ impl ModelCatalogService {
         let merged = merge_catalog(&config, &discovered);
         let ids = Arc::new(normalized_ids(&merged));
 
-        // Store only if the discovered cache did not change under us. If a
-        // concurrent refresh advanced the generation, drop this build and let
-        // the next caller rebuild — a stale index is never persisted.
         let gen_after = self.current_generation(name);
         if gen_before == gen_after {
             let mut guard = self.id_index.write().await;
@@ -251,8 +189,6 @@ impl ModelCatalogService {
         Ok(ids)
     }
 
-    /// Current generation of the discovered cache for `provider` (0 when never
-    /// populated). Advanced by [`Self::bump_cache_generation`].
     fn current_generation(&self, provider: &str) -> u64 {
         self.cache_generations
             .lock()
@@ -262,8 +198,6 @@ impl ModelCatalogService {
             .unwrap_or(0)
     }
 
-    /// Advance the generation for `provider`, marking any cached membership
-    /// index stale. Called after every mutation of the discovered cache.
     fn bump_cache_generation(&self, provider: &str) {
         let mut guard = self
             .cache_generations
@@ -295,13 +229,9 @@ impl ModelCatalogService {
             .filter(|outcome| outcome.completed_at >= requested_at)
             .cloned()
         {
-            return outcome.error.map_or(Ok(()), |preserved| {
-                // Reconstruct the typed error so single-flight followers receive
-                // the same error variant -- and therefore the same HTTP status
-                // via `map_catalog_error` -- as the leader (e.g. an upstream
-                // timeout stays a 504, not a 500 Internal).
-                Err(preserved.to_provider_error())
-            });
+            return outcome
+                .error
+                .map_or(Ok(()), |preserved| Err(preserved.to_provider_error()));
         }
 
         let models = match self.discovery.discover(provider).await {
@@ -347,8 +277,6 @@ impl ModelCatalogService {
             }
         }
         self.cache.write().await.insert(provider.name.clone(), file);
-        // The discovered catalog changed; advance the generation so any cached
-        // membership index is rebuilt on next access (audit LOW-9).
         self.bump_cache_generation(&provider.name);
         self.record_refresh_outcome(&provider.name, None)?;
         Ok(())
@@ -379,8 +307,6 @@ impl ModelCatalogService {
             .catalog
             .as_ref()
             .map_or_else(std::time::Duration::default, |c| c.cache_ttl);
-        // Clamp the TTL seconds to i64 range to avoid silent wrapping on
-        // absurdly large values. In practice, TTL is always well within range.
         let ttl_secs = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
         self.cache
             .read()
@@ -404,23 +330,11 @@ impl ModelCatalogService {
             ));
         }
         let Some(cache_dir) = &self.cache_dir else {
-            // No disk cache: nothing to load.
             return Ok(());
         };
-        // Fast path: if this provider's catalog is already in memory, return
-        // without taking the write lock at all, avoiding contention on the
-        // common (already-loaded) request path.
         if self.cache.read().await.contains_key(&provider.name) {
             return Ok(());
         }
-        // Cold path: stat + read + parse OUTSIDE any lock. The write lock is
-        // global across all providers, so holding it across disk I/O would
-        // serialize every concurrent catalog()/contains_model() call for every
-        // other provider (head-of-line blocking). Two concurrent first-load
-        // callers for the same provider may both read and parse the same file;
-        // that is harmless -- the second insert overwrites byte-identical
-        // content, and the extra bump_cache_generation only forces one cheap
-        // id_index rebuild (which re-checks the generation before storing).
         let path = cache_dir.join(format!("{}.toml", provider.name));
         let metadata = match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) => metadata,
@@ -448,9 +362,6 @@ impl ModelCatalogService {
                 path.display()
             )));
         }
-        // Critical section: re-check (another caller may have populated it) and
-        // insert. Bump the generation after dropping the guard so it does not
-        // run under the write lock.
         {
             let mut cache = self.cache.write().await;
             if cache.contains_key(&provider.name) {
@@ -458,16 +369,11 @@ impl ModelCatalogService {
             }
             cache.insert(provider.name.clone(), file);
         }
-        // The discovered catalog changed; advance the generation so any cached
-        // membership index is rebuilt on next access (audit LOW-9).
         self.bump_cache_generation(&provider.name);
         Ok(())
     }
 }
 
-/// Build a `HashSet` of raw catalog model ids from a merged catalog slice
-/// (audit LOW-9). The gemini `models/`-prefix normalization is handled at
-/// lookup time in [`model_id_present`], so this stores only the verbatim ids.
 fn normalized_ids(merged: &[StaticModelCatalogEntry]) -> HashSet<String> {
     let mut ids = HashSet::with_capacity(merged.len());
     for entry in merged {
@@ -476,21 +382,11 @@ fn normalized_ids(merged: &[StaticModelCatalogEntry]) -> HashSet<String> {
     ids
 }
 
-/// O(1) membership check against a catalog id set, preserving the exact
-/// semantics of the former linear `catalog_contains_model` scan (audit LOW-9):
-///
-/// - `"gemini_generate_content"` strips a leading `models/` from the request
-///   and matches either the bare id or the `models/`-prefixed form present in
-///   the catalog, so a request for `"gemini-2.5-pro"` matches a catalog id of
-///   `"models/gemini-2.5-pro"` and vice-versa.
-/// - Every other protocol requires an exact id match (no prefix stripping).
 fn model_id_present(ids: &HashSet<String>, upstream_model: &str, protocol: &str) -> bool {
     if protocol == "gemini_generate_content" {
         let requested = upstream_model
             .strip_prefix("models/")
             .unwrap_or(upstream_model);
-        // The catalog may store either the bare id or the `models/`-prefixed
-        // form; accept either spelling (mirrors the former strip-prefix scan).
         return ids.contains(requested) || {
             let prefixed = format!("models/{requested}");
             ids.contains(prefixed.as_str())
@@ -503,18 +399,6 @@ fn invalid_cache(error: &std::io::Error) -> ProviderError {
     ProviderError::InvalidConfig(format!("catalog cache I/O failed: {error}"))
 }
 
-/// Format the current UTC time as an RFC 3339 string.
-///
-/// # Errors
-///
-/// Returns an error if formatting the timestamp fails. Propagated (rather
-/// than falling back to the Unix epoch) because an epoch sentinel would make
-/// the cache perpetually stale: `cache_is_fresh` computes
-/// `now_utc() - generated_at`, and an epoch `generated_at` yields a huge
-/// positive age, forcing a network refresh on every `catalog()` request.
-/// Failing the refresh loudly is the safe direction — the caller already
-/// handles refresh failures with a stale/static fallback (audit:
-/// now-rfc3339-epoch-fallback).
 fn now_rfc3339() -> Result<String, ProviderError> {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
@@ -583,7 +467,6 @@ pub fn write_catalog_atomic(cache_dir: &Path, file: &CatalogFile) -> Result<(), 
     Ok(())
 }
 
-/// Maximum allowed length for a provider slug.
 const MAX_PROVIDER_SLUG_LEN: usize = 128;
 
 fn is_safe_provider_slug(provider: &str) -> bool {
@@ -723,12 +606,6 @@ mod tests {
                 .unwrap()
                 .expect_err("every single-flight follower should observe the refresh failure");
         }
-        // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
-        // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
-        // persistently-failing endpoint is probed `1 + MAX_TRANSIENT_RETRIES`
-        // times. Single-flight still holds — only one refresh actually reaches
-        // `discover`; the others reuse the cached failure outcome — so the
-        // count is exactly the per-call probe budget, not 8× it.
         assert_eq!(
             count.load(Ordering::SeqCst),
             1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize
@@ -744,12 +621,6 @@ mod tests {
         let models = service.catalog(&provider(endpoint), true).await.unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "cached-model");
-        // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
-        // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
-        // persistently-failing endpoint is probed `1 + MAX_TRANSIENT_RETRIES`
-        // times. Single-flight still holds — only one refresh actually reaches
-        // `discover`; the others reuse the cached failure outcome — so the
-        // count is exactly the per-call probe budget, not 8× it.
         assert_eq!(
             count.load(Ordering::SeqCst),
             1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize
@@ -772,19 +643,11 @@ mod tests {
         let result = service.catalog(&provider, true).await;
 
         result.expect_err("catalog refresh should fail when the endpoint persistently errors");
-        // GAP-LOW-4: discovery retries transient (5xx/transport) failures up to
-        // `MAX_TRANSIENT_RETRIES` times after the first attempt, so a
-        // persistently-failing endpoint is probed `1 + MAX_TRANSIENT_RETRIES`
-        // times. Single-flight still holds — only one refresh actually reaches
-        // `discover`; the others reuse the cached failure outcome — so the
-        // count is exactly the per-call probe budget, not 8× it.
         assert_eq!(
             count.load(Ordering::SeqCst),
             1 + DiscoveryClient::MAX_TRANSIENT_RETRIES as usize
         );
     }
-
-    // -- load_disk_cache validation edge cases ---------------------------------
 
     fn minimal_provider(name: &str) -> ProviderConfig {
         ProviderConfig {
@@ -807,7 +670,6 @@ mod tests {
         let directory = temp_dir();
         std::fs::create_dir_all(&directory).unwrap();
 
-        // Write a real cache file, then replace it with a symlink.
         let real = directory.join("real.toml");
         std::fs::write(&real, "not used").unwrap();
         let link = directory.join("symlink-provider.toml");
@@ -833,7 +695,6 @@ mod tests {
         let directory = temp_dir();
         std::fs::create_dir_all(&directory).unwrap();
 
-        // Create a FIFO (named pipe) which is neither a regular file nor a symlink.
         let fifo = directory.join("fifo-provider.toml");
         #[cfg(unix)]
         {
@@ -863,7 +724,6 @@ mod tests {
         let directory = temp_dir();
         std::fs::create_dir_all(&directory).unwrap();
 
-        // Write a cache file whose internal provider name differs from the filename.
         let mut file = catalog_file("2026-06-10T00:00:00Z");
         file.catalog.provider = "other-provider".to_owned();
         let raw = toml::to_string_pretty(&file).unwrap();
@@ -908,8 +768,6 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    // -- is_safe_provider_slug tests -------------------------------------------
-
     #[test]
     fn safe_slug_accepts_valid_names() {
         assert!(is_safe_provider_slug("openai"));
@@ -948,8 +806,6 @@ mod tests {
         );
     }
 
-    // -- cache_is_fresh logic tests --------------------------------------------
-
     #[tokio::test]
     async fn cache_is_fresh_returns_true_within_ttl() {
         let directory = temp_dir();
@@ -972,7 +828,6 @@ mod tests {
     #[tokio::test]
     async fn cache_is_fresh_returns_false_for_expired() {
         let directory = temp_dir();
-        // generated_at far in the past (well beyond any reasonable TTL)
         write_catalog_atomic(&directory, &catalog_file("2020-01-01T00:00:00Z")).unwrap();
 
         let service = ModelCatalogService::new(Some(directory.clone()));
@@ -995,8 +850,6 @@ mod tests {
             "cache with no entries should not be fresh"
         );
     }
-
-    // -- cache_is_fresh boundary tests (findings 4, 10) ------------------------
 
     #[tokio::test]
     async fn cache_is_fresh_with_zero_ttl_is_always_stale() {
@@ -1021,7 +874,6 @@ mod tests {
     #[tokio::test]
     async fn cache_is_fresh_with_future_timestamp_is_stale() {
         let directory = temp_dir();
-        // A timestamp far in the future (clock skew)
         let future = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
         let future_str = future
             .format(&time::format_description::well_known::Rfc3339)
@@ -1054,8 +906,6 @@ mod tests {
 
         std::fs::remove_dir_all(directory).unwrap();
     }
-
-    // -- Concurrent successful refresh test (finding 13) -----------------------
 
     async fn succeeding_server(model_ids: Vec<&str>) -> (String, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
@@ -1123,10 +973,6 @@ mod tests {
         );
     }
 
-    // -- contains_model O(1) index (audit LOW-9) -------------------------------
-
-    /// A provider whose catalog is purely `Static` (no discovery), so the
-    /// membership index is built lazily from config and never invalidated.
     fn static_catalog_provider(name: &str, models: Vec<StaticModelCatalogEntry>) -> ProviderConfig {
         ProviderConfig {
             name: name.to_owned(),
@@ -1181,8 +1027,6 @@ mod tests {
 
     #[tokio::test]
     async fn contains_model_gemini_prefix_normalization() {
-        // Catalog stores the `models/`-prefixed form; gemini requests may omit
-        // the prefix, non-gemini requests must not strip it.
         let provider =
             static_catalog_provider("gemini-prov", vec![model_entry("models/gemini-2.5-pro")]);
         let service = ModelCatalogService::new(None);
@@ -1211,7 +1055,6 @@ mod tests {
                 .unwrap(),
             "gemini: unrelated model must be rejected"
         );
-        // Non-gemini protocol must NOT strip the prefix — exact match only.
         assert!(
             service
                 .contains_model(&provider, "models/gemini-2.5-pro", "openai_chat")
@@ -1230,18 +1073,13 @@ mod tests {
 
     #[tokio::test]
     async fn contains_model_index_invalidated_after_refresh() {
-        // Seed the disk cache with the default "cached-model" so the first
-        // membership check builds an index from it.
         let directory = temp_dir();
         write_catalog_atomic(&directory, &catalog_file("2026-06-10T00:00:00Z")).unwrap();
         let (endpoint, _count) = succeeding_server(vec!["new-model"]).await;
         let mut provider = provider(endpoint);
-        // Zero TTL forces the next live catalog() call to refresh, which
-        // replaces the discovered cache and bumps the generation.
         provider.catalog.as_mut().unwrap().cache_ttl = Duration::ZERO;
         let service = ModelCatalogService::new(Some(directory.clone()));
 
-        // First check loads the disk cache ("cached-model") and caches the index.
         assert!(
             service
                 .contains_model(&provider, "cached-model", "openai_chat")
@@ -1250,8 +1088,6 @@ mod tests {
             "seeded model must be present before refresh"
         );
 
-        // A live refresh replaces the discovered catalog with "new-model" and
-        // bumps the generation, forcing the index to rebuild.
         service.catalog(&provider, true).await.unwrap();
 
         assert!(

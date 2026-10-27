@@ -1,12 +1,5 @@
-//! Anthropic Messages API provider adapter.
-//!
-//! Translates between core types and the Anthropic Messages wire format:
-//!
-//! ```text
-//! CoreRequest  -> MessageRequest
-//! MessageResponse -> CoreResponse
-//! MessageEvent stream -> CoreEvent stream
-//! ```
+//! Anthropic Messages API provider adapter: translates core requests,
+//! responses, and event streams to and from the Anthropic wire format.
 
 use std::sync::LazyLock;
 
@@ -23,58 +16,17 @@ use super::{
 use crate::error::ProviderError;
 use crate::sse::SseFrame;
 
-// ---------------------------------------------------------------------------
-// Tool name sanitization (collision-safe, reversible)
-// ---------------------------------------------------------------------------
-
-/// Anthropic requires max_tokens but the core type makes it optional.
-/// Use this default when the caller does not specify one.  Chosen to be
-/// large enough for most use cases while staying within typical model limits.
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
 
-/// Extract a mutable JSON object from a `serde_json::Value`.
-///
-/// The `serde_json::json!()` macro always produces either an object, array,
-/// or primitive value.  In all call sites below the macro literal is an object
-/// (`{ ... }`), so this unwrap is safe.  The function exists so the safety
-/// argument is documented in one place rather than repeated at each site.
 #[inline]
 fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
     val.as_object_mut()
         .expect("json! macro with {{...}} always produces a JSON object")
 }
 
-// The sanitize/desanitize approach uses a sentinel prefix `__llmp_` to mark
-// names that were actually rewritten.  Only names carrying this sentinel are
-// decoded during desanitization, which prevents false-positive decoding of
-// tool names that naturally contain `_0xHH_` patterns (e.g. `parse_0xff_value`).
-//
-// NOTE: The `__llmp_` sentinel is NOT collision-safe against tool names that
-// literally start with `__llmp_` (e.g. an original tool named
-// `__llmp_foo_0x2e_bar`).  Such a name would be falsely treated as encoded and
-// decoded back incorrectly.  This is accepted as a negligible-probability edge
-// case: real tool names virtually never start with a double-underscore reserved
-// prefix, and the only consequence is a mangled name on round-trip, not a
-// security issue.
-
-// Anthropic `tool_use_id` must match `^[A-Za-z0-9_]{0,256}$`.
-// NOTE: The regex pattern is a compile-time constant that is syntactically
-// valid, so compilation cannot fail at runtime.
 static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
-/// Sanitize a tool name for the Anthropic API using collision-safe, reversible encoding.
-///
-/// Disallowed characters are encoded as `_0xHH_` where HH is the hex byte value.
-/// This ensures two different tool names (e.g. `my.tool` and `my_tool`) produce
-/// different sanitized names (`my_0x2e_tool` vs `my_tool`), avoiding collisions.
-///
-/// When encoding is applied, a sentinel prefix `__llmp_` is prepended so that
-/// [`desanitize_tool_name`] can distinguish genuinely encoded names from tool names
-/// that naturally contain `_0xHH_` patterns (e.g. `parse_0xff_value`).
-///
-/// Truncates to 128 chars if needed (avoiding partial `_0xHH_` sequences).
-/// Returns the sanitized name and whether it was actually rewritten.
 fn sanitize_tool_name(name: &str) -> (String, bool) {
     use std::fmt::Write;
     let sentinel = "__llmp_";
@@ -86,44 +38,32 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
         if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
             result.push(ch);
         } else {
-            // Encode as _0xHH_ for each byte of the character using a
-            // stack-allocated buffer instead of allocating a String.
             let mut buf = [0u8; 4];
             let encoded = ch.encode_utf8(&mut buf);
             for &byte in encoded.as_bytes() {
-                // NOTE: write! to a String cannot fail (the fmt::Write
-                // impl for String is infallible).
                 write!(result, "_0x{:02x}_", byte).expect("write! to String is infallible");
             }
             changed = true;
         }
     }
 
-    // If encoding was applied, prepend the sentinel.
     if changed {
         result.insert_str(0, sentinel);
     }
 
-    // Truncate to max_len if needed, avoiding partial _0xHH_ sequences.
     if result.len() > max_len {
         let mut end = max_len;
         while !result.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
-        // Scan backward: if we cut in the middle of a `_0xHH_` sequence,
-        // truncate before the opening `_` instead.
         if end >= 5 {
-            // Check if we're inside a potential _0xHH_ pattern.
             if let Some(pos) = result[..end].rfind("_0x") {
-                let seq_end = pos + 6; // _0xHH_ is 6 bytes
+                let seq_end = pos + 6;
                 if seq_end > end {
-                    // The _0xHH_ sequence straddles the cut point.
-                    // Truncate before the opening `_` instead.
                     end = pos;
                 }
             }
         }
-        // Final char-boundary check after adjustment.
         while !result.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
@@ -133,7 +73,6 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
         }
     }
 
-    // Guarantee non-empty.
     if result.is_empty() {
         return ("tool".to_owned(), name != "tool");
     }
@@ -141,29 +80,13 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
     (result, changed)
 }
 
-/// Reverse a sanitized tool name back to the original by decoding `_0xHH_` patterns.
-///
-/// Uses a sentinel prefix `__llmp_` to distinguish genuinely encoded names from
-/// tool names that happen to contain `_0x` naturally (e.g. `parse_0xff_value`).
-/// Only names that carry the `__llmp_` sentinel are decoded; names without it
-/// are returned as-is, preventing false-positive decoding.
-///
-/// # Collision edge case (accepted)
-///
-/// The `__llmp_` sentinel is NOT collision-safe against tool names that
-/// literally start with `__llmp_`.  An original name such as
-/// `__llmp_foo_0x2e_bar` would be misinterpreted as encoded and decoded back
-/// incorrectly.  This is accepted as a negligible-probability edge case; real
-/// tool names virtually never start with this reserved double-underscore prefix.
 fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
     const SENTINEL: &str = "__llmp_";
 
-    // Only decode names that carry the sentinel prefix.
     if !name.starts_with(SENTINEL) {
         return std::borrow::Cow::Borrowed(name);
     }
 
-    // Strip the sentinel before decoding.
     let stripped = &name[SENTINEL.len()..];
     if !stripped.contains("_0x") {
         return std::borrow::Cow::Owned(stripped.to_owned());
@@ -174,44 +97,34 @@ fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
     let mut i = 0;
 
     while i < bytes.len() {
-        // Pattern: _0xHH_ (6 bytes at offsets i..=i+5).
-        // Need at least 6 bytes remaining: i + 5 must be a valid index.
         if bytes[i] == b'_' && i + 5 < bytes.len() && bytes[i + 1] == b'0' && bytes[i + 2] == b'x' {
             let hex_hi = i + 3;
             let hex_lo = i + 4;
             let closing = i + 5;
             if bytes[closing] == b'_' {
-                // Parse the two hex digits.
                 if let Some(byte_val) = hex_byte(bytes[hex_hi], bytes[hex_lo]) {
                     result.push(byte_val);
-                    i = closing + 1; // skip past the closing '_'
+                    i = closing + 1;
                     continue;
                 }
             }
         }
-        // Not a valid pattern, push the byte as-is.
         result.push(bytes[i]);
         i += 1;
     }
 
-    // Convert accumulated bytes back to a UTF-8 string.
     match String::from_utf8(result) {
         Ok(s) => std::borrow::Cow::Owned(s),
-        Err(e) => {
-            // Fallback: lossy conversion for safety.
-            std::borrow::Cow::Owned(String::from_utf8_lossy(e.as_bytes()).into_owned())
-        }
+        Err(e) => std::borrow::Cow::Owned(String::from_utf8_lossy(e.as_bytes()).into_owned()),
     }
 }
 
-/// Parse two ASCII hex digits into a byte value.
 fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
     let hi_val = hex_digit(hi)?;
     let lo_val = hex_digit(lo)?;
     Some(hi_val << 4 | lo_val)
 }
 
-/// Parse a single ASCII hex digit into its numeric value.
 const fn hex_digit(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -221,9 +134,6 @@ const fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// Sanitize a tool_use_id for the Anthropic API.
-///
-/// Replaces disallowed characters with underscores, truncates to 256 chars.
 fn sanitize_tool_use_id(id: &str) -> String {
     let sanitized: String = INVALID_TOOL_USE_ID_CHAR.replace_all(id, "_").into_owned();
     if sanitized.len() > 256 {
@@ -239,10 +149,6 @@ fn sanitize_tool_use_id(id: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Adapter struct
-// ---------------------------------------------------------------------------
-
 /// Adapter for the Anthropic Messages API.
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicAdapter;
@@ -255,43 +161,17 @@ impl AnthropicAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Stream decoder
-// ---------------------------------------------------------------------------
-
-/// Stateful stream decoder for Anthropic SSE frames.
-///
-/// ## CoreEvent variants emitted
-///
-/// - `MessageStart` -- on `message_start`
-/// - `ContentStart` -- on `content_block_start` (Text, Thinking, or ToolUse)
-/// - `TextDelta` -- on `content_block_delta` with `text_delta`
-/// - `ThinkingDelta` -- on `content_block_delta` with `thinking_delta`
-/// - `ToolCallStart` -- on `content_block_start` with `tool_use`
-/// - `ToolCallDelta` -- on `content_block_delta` with `input_json_delta`
-/// - `ToolCallStop` -- on `content_block_stop` for tool_use blocks
-/// - `UsageDelta` -- on `message_delta` with usage
-/// - `MessageStop` -- on `message_delta` with stop_reason or `message_stop`
-/// - `Ping` -- on `ping`
-/// - `Error` -- on `error`
-///
-/// Intentionally never emitted: none (all variants are covered).
+/// Stateful stream decoder translating Anthropic SSE frames into `CoreEvent`s.
 #[derive(Debug)]
 pub struct AnthropicStreamDecoder {
     model_ref: ModelRef,
     started: bool,
     current_block_kind: ContentKind,
     tool_blocks: Vec<usize>,
-    /// Tracks which tool blocks have already received a `ToolCallStop` via
-    /// `content_block_stop`, so `finish()` does not emit duplicates.
     tool_blocks_closed: Vec<bool>,
     stop_sent: bool,
 }
 
-/// Returns the tool-block `field` value, or a sentinel when upstream omitted it.
-///
-/// Anthropic is expected to always send `id` and `name` on a `tool_use` block;
-/// a missing value is logged and replaced so the stream stays decodable.
 fn tool_field_or_sentinel(value: Option<&str>, field: &str, sentinel: &str) -> String {
     match value {
         Some(v) => v.to_owned(),
@@ -305,10 +185,6 @@ fn tool_field_or_sentinel(value: Option<&str>, field: &str, sentinel: &str) -> S
     }
 }
 
-/// Translates a `content_block_delta` event into the matching core delta event.
-///
-/// Empty payloads are dropped: they carry no information and would otherwise
-/// surface as zero-length deltas downstream.
 fn push_content_block_delta(event: &MessageEvent, events: &mut Vec<CoreEvent>) {
     let idx = event.index.unwrap_or(0);
     let Some(ref delta) = event.delta else {
@@ -349,7 +225,6 @@ fn push_content_block_delta(event: &MessageEvent, events: &mut Vec<CoreEvent>) {
     }
 }
 
-/// Translates an Anthropic `error` event into a `CoreEvent::Error`.
 fn push_stream_error(event: &MessageEvent, events: &mut Vec<CoreEvent>) {
     let Some(ref err) = event.error else {
         return;
@@ -367,7 +242,6 @@ fn push_stream_error(event: &MessageEvent, events: &mut Vec<CoreEvent>) {
 }
 
 impl AnthropicStreamDecoder {
-    /// Handles `content_block_start`, tracking the block kind and tool blocks.
     fn push_content_block_start(&mut self, event: &MessageEvent, events: &mut Vec<CoreEvent>) {
         let idx = event.index.unwrap_or(0);
         let Some(ref block) = event.content_block else {
@@ -387,8 +261,6 @@ impl AnthropicStreamDecoder {
                 self.tool_blocks_closed.push(false);
                 let id = tool_field_or_sentinel(block.id.as_deref(), "id", "<unknown_tool_id>");
                 let name = tool_field_or_sentinel(block.name.as_deref(), "name", "<unknown_tool>");
-                // Reverse-map sanitized tool names back to originals,
-                // same as the non-streaming decode path.
                 let original_name = desanitize_tool_name(&name).into_owned();
                 events.push(CoreEvent::ToolCallStart {
                     index: idx,
@@ -396,7 +268,6 @@ impl AnthropicStreamDecoder {
                     name: original_name,
                 });
             }
-            // "text", plus any unknown block type, emit a generic ContentStart.
             _ => {
                 self.current_block_kind = ContentKind::Text;
                 events.push(CoreEvent::ContentStart {
@@ -407,12 +278,10 @@ impl AnthropicStreamDecoder {
         }
     }
 
-    /// Handles `content_block_stop`, closing an open tool block.
     fn push_content_block_stop(&mut self, event: &MessageEvent, events: &mut Vec<CoreEvent>) {
         let idx = event.index.unwrap_or(0);
         if self.current_block_kind == ContentKind::ToolUse {
             events.push(CoreEvent::ToolCallStop { index: idx });
-            // Mark this tool block as closed so finish() won't re-emit.
             let closed_slot = self
                 .tool_blocks
                 .iter()
@@ -421,10 +290,6 @@ impl AnthropicStreamDecoder {
             if let Some(closed) = closed_slot {
                 *closed = true;
             } else {
-                // Index not found in tracked tool blocks -- the tool call
-                // was never opened via a content_block_start event, so
-                // there is nothing to mark as closed.  Log the mismatch
-                // for observability.
                 tracing::warn!(
                     idx,
                     "Anthropic: tool block index not found in content_block_stop; \
@@ -435,11 +300,7 @@ impl AnthropicStreamDecoder {
         self.current_block_kind = ContentKind::Text;
     }
 
-    /// Handles `message_delta`, emitting usage before any terminal stop event.
     fn push_message_delta(&mut self, event: &MessageEvent, events: &mut Vec<CoreEvent>) {
-        // Usage from message_delta -- emitted BEFORE MessageStop so that
-        // downstream consumers see UsageDelta before the terminal event,
-        // consistent with the plan's documented event ordering.
         if let Some(ref usage) = event.usage {
             events.push(CoreEvent::UsageDelta {
                 usage: build_anthropic_usage(
@@ -450,7 +311,6 @@ impl AnthropicStreamDecoder {
                 ),
             });
         }
-        // Stop reason from message_delta -- emitted AFTER UsageDelta.
         if let Some(ref delta) = event.delta
             && let Some(ref reason) = delta.stop_reason
             && !reason.is_empty()
@@ -531,9 +391,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             "error" => {
                 push_stream_error(&event, &mut events);
             }
-            _ => {
-                // Unknown event type; skip.
-            }
+            _ => {}
         }
 
         Ok(events)
@@ -550,7 +408,6 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             });
         }
 
-        // Close any tool blocks that were NOT already closed by content_block_stop.
         for (i, &idx) in self.tool_blocks.iter().enumerate() {
             let closed = self.tool_blocks_closed.get(i).copied().unwrap_or(false);
             if !closed {
@@ -574,10 +431,6 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AnthropicAdapter impl
-// ---------------------------------------------------------------------------
-
 impl AnthropicAdapter {
     /// Encode a core request into an Anthropic Messages request.
     pub fn encode_request(
@@ -590,7 +443,6 @@ impl AnthropicAdapter {
         let tools = encode_tools(&core.tools);
         let tool_choice = core.tool_choice.as_ref().and_then(encode_tool_choice);
 
-        // Build the full request as JSON to avoid #[non_exhaustive] struct literal issues.
         let mut req = serde_json::json!({
             "model": target.upstream_model,
             "max_tokens": core.sampling.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
@@ -614,7 +466,6 @@ impl AnthropicAdapter {
         if let Some(top_p) = core.sampling.top_p {
             obj.insert("top_p".to_owned(), serde_json::json!(top_p));
         }
-        // Forward stop sequences.
         if let Some(ref stop) = core.sampling.stop
             && !stop.is_empty()
         {
@@ -633,8 +484,6 @@ impl AnthropicAdapter {
         if let Some(ref thinking) = core.sampling.thinking {
             obj.insert("thinking".to_owned(), thinking.clone());
         }
-        // Forward reasoning_effort if present (Anthropic supports this in
-        // extended thinking mode).
         if let Some(ref effort) = core.sampling.reasoning_effort {
             obj.insert(
                 "reasoning_effort".to_owned(),
@@ -680,13 +529,10 @@ impl AnthropicAdapter {
                     });
                 }
                 "tool_use" => {
-                    // Lazily build the empty object only on the `None` path so the
-                    // common tool-calling happy path avoids a heap allocation (MEDIUM-4).
                     let input = block
                         .input
                         .clone()
                         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                    // Reverse-map sanitized tool names back to originals.
                     let name = block.name.clone().unwrap_or_else(|| {
                         tracing::warn!("Anthropic: tool_use block missing name in response decode");
                         "<unknown_tool>".to_owned()
@@ -703,7 +549,6 @@ impl AnthropicAdapter {
                     });
                 }
                 _ => {
-                    // Unknown block type; store as text for safety.
                     let text = block.text.clone().unwrap_or_default();
                     if !text.is_empty() {
                         content.push(CoreContent::Text { text, cache: None });
@@ -712,7 +557,6 @@ impl AnthropicAdapter {
             }
         }
 
-        // Guarantee at least one content block.
         if content.is_empty() {
             content.push(CoreContent::Text {
                 text: String::new(),
@@ -724,8 +568,6 @@ impl AnthropicAdapter {
             .stop_reason
             .as_deref()
             .map(map_anthropic_stop_reason)
-            // Provider omitted `stop_reason`; record that it was absent rather
-            // than unmapped so the diagnostic is unambiguous.
             .unwrap_or(StopReason::Unknown("absent".to_owned()));
 
         let usage = build_anthropic_usage(
@@ -764,11 +606,6 @@ impl AnthropicAdapter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Map an Anthropic stop reason to a core StopReason.
 fn map_anthropic_stop_reason(reason: &str) -> StopReason {
     match reason {
         "end_turn" => StopReason::EndTurn,
@@ -780,7 +617,6 @@ fn map_anthropic_stop_reason(reason: &str) -> StopReason {
     }
 }
 
-/// Build usage from Anthropic-style usage info.
 fn build_anthropic_usage(
     input_tokens: i32,
     output_tokens: i32,
@@ -797,7 +633,6 @@ fn build_anthropic_usage(
     }
 }
 
-/// Encode content blocks for a user message.
 fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = content
         .iter()
@@ -858,11 +693,6 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
     serde_json::Value::Array(blocks)
 }
 
-/// Encode content blocks for an assistant message.
-/// Builds the Anthropic `system` field from core system content.
-///
-/// Returns `None` when there is nothing to send; non-`Text` blocks are dropped
-/// with a warning because Anthropic's system field only accepts text blocks.
 fn encode_system(system: &[CoreContent]) -> Option<serde_json::Value> {
     if system.is_empty() {
         return None;
@@ -902,11 +732,6 @@ fn encode_system(system: &[CoreContent]) -> Option<serde_json::Value> {
     }
 }
 
-/// Builds the Anthropic `messages` array from core messages.
-///
-/// Anthropic has no system role inside `messages` -- a system-role message
-/// reaching here means the client adapter did not extract it, so it is dropped
-/// with a warning. Tool results and unknown future roles are sent as `user`.
 fn encode_messages(core_messages: &[CoreMessage]) -> Vec<serde_json::Value> {
     let mut messages = Vec::with_capacity(core_messages.len());
     for msg in core_messages {
@@ -926,9 +751,6 @@ fn encode_messages(core_messages: &[CoreMessage]) -> Vec<serde_json::Value> {
                 }));
             }
             CoreRole::System => {
-                // System messages should have been extracted into the
-                // `system` field by the client adapter.  If one reaches
-                // here it means the client adapter did not separate it.
                 tracing::warn!(
                     role = "system",
                     "Anthropic adapter received system-role message in messages; \
@@ -936,7 +758,6 @@ fn encode_messages(core_messages: &[CoreMessage]) -> Vec<serde_json::Value> {
                 );
             }
             CoreRole::Tool => {
-                // Tool results come through user role in Anthropic.
                 let content = encode_content_blocks(&msg.content);
                 messages.push(serde_json::json!({
                     "role": "user",
@@ -944,7 +765,6 @@ fn encode_messages(core_messages: &[CoreMessage]) -> Vec<serde_json::Value> {
                 }));
             }
             _ => {
-                // Handle future CoreRole variants.
                 let content = encode_content_blocks(&msg.content);
                 messages.push(serde_json::json!({
                     "role": "user",
@@ -956,13 +776,10 @@ fn encode_messages(core_messages: &[CoreMessage]) -> Vec<serde_json::Value> {
     messages
 }
 
-/// Builds the Anthropic `tools` array, sanitizing tool names and coercing a
-/// non-object `input_schema` to an empty object schema.
 fn encode_tools(tools: &[CoreTool]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .map(|t| {
-            // Coerce non-object input_schema to a default object schema.
             let schema = if t.input_schema.is_object() {
                 t.input_schema.clone()
             } else {
@@ -984,10 +801,6 @@ fn encode_tools(tools: &[CoreTool]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Encodes the core tool choice into Anthropic's `tool_choice` field.
-///
-/// Unknown variants return `None` (the field is omitted) rather than JSON
-/// null, which the Anthropic API would reject.
 fn encode_tool_choice(tc: &CoreToolChoice) -> Option<serde_json::Value> {
     match tc {
         CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
@@ -1057,10 +870,6 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
     serde_json::Value::Array(blocks)
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1097,8 +906,6 @@ mod tests {
         }
     }
 
-    // -- Tool name sanitization tests ----------------------------------------
-
     #[test]
     fn sanitize_tool_name_valid() {
         let (name, changed) = sanitize_tool_name("get_weather");
@@ -1111,7 +918,6 @@ mod tests {
 
     #[test]
     fn sanitize_tool_name_replaces_dots_collision_safe() {
-        // "my.tool.name" should NOT collide with "my_tool_name".
         let (name1, changed1) = sanitize_tool_name("my.tool.name");
         let (name2, changed2) = sanitize_tool_name("my_tool_name");
         assert!(changed1);
@@ -1148,11 +954,8 @@ mod tests {
     fn sanitize_tool_name_special_chars() {
         let (name, changed) = sanitize_tool_name("get weather!@#");
         assert!(changed);
-        // Spaces and special chars should be encoded, not simply replaced with _.
         assert!(name.contains("0x"));
     }
-
-    // -- Tool use ID sanitization tests ----------------------------------------
 
     #[test]
     fn sanitize_tool_use_id_valid() {
@@ -1168,8 +971,6 @@ mod tests {
     fn sanitize_tool_use_id_empty_becomes_default() {
         assert_eq!(sanitize_tool_use_id(""), "tool_result");
     }
-
-    // -- Encode tests --------------------------------------------------------
 
     #[test]
     fn encode_text_request() {
@@ -1232,7 +1033,6 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
-        // Dots are encoded collision-safe as _0x2e_
         assert!(tools[0]["name"].as_str().unwrap().contains("0x2e"));
     }
 
@@ -1311,8 +1111,6 @@ mod tests {
         assert!(body.get("thinking").is_some());
         assert_eq!(body["thinking"]["budget_tokens"], 5000);
     }
-
-    // -- Decode tests --------------------------------------------------------
 
     #[test]
     fn decode_text_response() {
@@ -1442,8 +1240,6 @@ mod tests {
             Some("claude-sonnet-4-20250514")
         );
     }
-
-    // -- Streaming tests -----------------------------------------------------
 
     #[test]
     fn stream_text_decoding() {
@@ -1640,8 +1436,6 @@ mod tests {
         )));
     }
 
-    // -- Stop reason mapping tests -------------------------------------------
-
     #[test]
     fn anthropic_stop_reason_mappings() {
         assert_eq!(map_anthropic_stop_reason("end_turn"), StopReason::EndTurn);
@@ -1655,14 +1449,11 @@ mod tests {
             StopReason::StopSequence
         );
         assert_eq!(map_anthropic_stop_reason("refusal"), StopReason::Refusal);
-        // Unmapped values are preserved in Unknown(String) (GAP-LOW-9).
         assert_eq!(
             map_anthropic_stop_reason("unknown"),
             StopReason::Unknown("unknown".to_owned())
         );
     }
-
-    // -- Missing tests: encode stop sequences, input_schema coercion ----------
 
     #[test]
     fn encode_stop_sequences() {
@@ -1727,8 +1518,6 @@ mod tests {
         let schema = &body["tools"].as_array().unwrap()[0]["input_schema"];
         assert_eq!(schema["type"], "object");
     }
-
-    // -- Missing tests: decode redacted thinking, stop_sequence, malformed frame --
 
     #[test]
     fn decode_redacted_thinking_response() {
@@ -1795,15 +1584,12 @@ mod tests {
         assert!(events.is_empty());
     }
 
-    // -- Missing test: usage-only chunk classification ------------------------
-
     #[test]
     fn stream_usage_only_chunk() {
         let target = make_target();
         let adapter = AnthropicAdapter::new();
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        // Send a message_delta with usage but no text content.
         let frames = vec![
             make_frame(
                 r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
@@ -1818,7 +1604,6 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        // Usage should NOT be dropped just because there was no text.
         assert!(
             all_events
                 .iter()
@@ -1830,8 +1615,6 @@ mod tests {
                 .any(|e| matches!(e, CoreEvent::MessageStop { .. }))
         );
     }
-
-    // -- Missing test: full lifecycle event ordering --------------------------
 
     #[test]
     fn stream_full_lifecycle_ordering() {
@@ -1860,7 +1643,6 @@ mod tests {
             all_events.extend(decoder.decode_frame(frame).unwrap());
         }
 
-        // Verify ordering: MessageStart < ContentStart < TextDelta < MessageStop.
         let msg_start_idx = all_events
             .iter()
             .position(|e| matches!(e, CoreEvent::MessageStart { .. }))
@@ -1891,8 +1673,6 @@ mod tests {
             "TextDelta must precede MessageStop"
         );
     }
-
-    // -- Additional missing tests ----------------------------------------------
 
     #[test]
     fn encode_tool_result_as_tool_result_block() {
@@ -2102,7 +1882,6 @@ mod tests {
 
         let frame = make_frame(r#"{"type":"some_new_event","data":"whatever"}"#);
         let events = decoder.decode_frame(&frame).unwrap();
-        // Unknown event types produce no events (they are skipped).
         assert!(events.is_empty());
     }
 
@@ -2134,13 +1913,9 @@ mod tests {
         }
     }
 
-    // -- Additional tests: sentinel, false-positive, upstream model, malformed, etc --
-
     #[test]
     fn desanitize_sentinel_prevents_false_positive() {
-        // A tool name that naturally contains _0xHH_ should NOT be decoded.
         let natural_name = "parse_0xff_value";
-        // This name was never sanitized, so it should be returned as-is.
         assert_eq!(desanitize_tool_name(natural_name), natural_name);
     }
 
@@ -2209,7 +1984,6 @@ mod tests {
         let target = make_target();
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
-        // Should produce a valid request with empty messages array.
         assert_eq!(body["messages"].as_array().unwrap().len(), 0);
     }
 
@@ -2259,7 +2033,6 @@ mod tests {
         let adapter = AnthropicAdapter::new();
         let mut decoder = adapter.new_stream_decoder(&target);
 
-        // A chunk that only has message_stop with no prior content.
         let frames = vec![
             make_frame(
                 r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#,
@@ -2287,8 +2060,6 @@ mod tests {
 
     #[test]
     fn stream_no_duplicate_tool_call_stop() {
-        // Verify that finish() does NOT emit duplicate ToolCallStop for tool
-        // blocks that already received ToolCallStop during decode_frame().
         let target = make_target();
         let adapter = AnthropicAdapter::new();
         let mut decoder = adapter.new_stream_decoder(&target);
@@ -2312,7 +2083,6 @@ mod tests {
         }
         all_events.extend(decoder.finish().unwrap());
 
-        // Count ToolCallStop events -- should be exactly 1.
         let tool_call_stop_count = all_events
             .iter()
             .filter(|e| matches!(e, CoreEvent::ToolCallStop { .. }))
@@ -2322,8 +2092,6 @@ mod tests {
             "ToolCallStop should be emitted exactly once"
         );
     }
-
-    // -- Source guard ---------------------------------------------------------
 
     #[test]
     fn adapter_source_no_forbidden_imports() {
@@ -2341,8 +2109,6 @@ mod tests {
             "adapter must not import server crate"
         );
     }
-
-    // -- Helpers --------------------------------------------------------------
 
     fn make_frame(data: &str) -> SseFrame {
         SseFrame {

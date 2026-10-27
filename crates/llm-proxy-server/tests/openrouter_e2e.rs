@@ -1,34 +1,6 @@
-//! End-to-end verification of the proxy's *goals* against faithful OpenRouter
-//! response shapes.
-//!
-//! OpenRouter (<https://openrouter.ai>) speaks the OpenAI Chat Completions
-//! wire protocol, but its real responses carry OpenRouter-specific extras that a
-//! vanilla OpenAI fixture does not: `id`s prefixed `gen-…`, a top-level
-//! `provider` routing field, a `cost` member inside `usage`, `system_fingerprint`,
-//! `native_finish_reason`, `logprobs`, and its own `{"error":{"code","message",
-//! "metadata"}}` envelope on 402/429. This suite drives the *real* in-process
-//! proxy pipeline (`build_router` + `AppState`) against a mock upstream that
-//! returns those exact shapes, so the assertions validate behaviour against
-//! reality rather than hand-tidied fixtures.
-//!
-//! Each test is mapped to a documented goal of the proxy:
-//!
-//! | Goal                                  | Test                                                  |
-//! |---------------------------------------|-------------------------------------------------------|
-//! | Protocol hub: OpenAI client passthrough | `openai_client_*_translates_to_openai_shape`        |
-//! | Cross-protocol translation (headline) | `anthropic_client_*_translates_to_anthropic_shape`   |
-//! | Tool-call fidelity (OpenAI client)    | `tool_calls_preserved_for_openai_client`             |
-//! | Tool-call fidelity (cross-protocol)   | `tool_calls_translate_to_anthropic_tool_use_blocks`  |
-//! | Robustness to provider-specific extras | `openrouter_specific_extras_do_not_break_conversion`|
-//! | Streaming fidelity (OpenAI client)    | `openai_client_stream_ends_with_done`                |
-//! | Streaming fidelity (cross-protocol)   | `anthropic_client_stream_cross_protocol`             |
-//! | OpenRouter header injection           | `openrouter_app_headers_forwarded_upstream`          |
-//! | Error fidelity (429 passthrough)      | `openrouter_429_surfaces_as_client_shaped_error`     |
-//! | Live network validation (opt-in)      | `live_openrouter_round_trip` (`#[ignore]`)           |
-//!
-//! The first nine run offline and deterministically in CI. The last is
-//! `#[ignore]`-gated on `OPENROUTER_API_KEY` so the real path can be re-validated
-//! on demand without key material or network in CI.
+//! End-to-end verification against faithful OpenRouter response shapes
+//! (`gen-` ids, top-level `provider`, `usage.cost`, `native_finish_reason`,
+//! its own error envelope) through the real in-process proxy pipeline.
 
 #[cfg(test)]
 mod tests {
@@ -54,11 +26,6 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    // ===========================================================================
-    // Mock-server plumbing (mirrors the established harness in core_pipeline.rs)
-    // ===========================================================================
-
-    /// Poll the mock server's TCP port until it accepts a connection or 5 s elapse.
     async fn wait_for_ready(addr: std::net::SocketAddr) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -72,8 +39,6 @@ mod tests {
         }
     }
 
-    /// Spawn a mock axum server, surfacing a serve-task panic loudly (see the audit
-    /// note on `mock-server-joinhandle-swallow` in core_pipeline.rs).
     fn spawn_mock_serve(listener: tokio::net::TcpListener, app: Router) {
         tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(axum::serve(listener, app).into_future())
@@ -95,12 +60,6 @@ mod tests {
         });
     }
 
-    /// A canned non-streaming OpenRouter Chat Completions response.
-    ///
-    /// Deliberately rich in OpenRouter-specific extras (`gen-` id, top-level
-    /// `provider`, `cost` inside `usage`, `system_fingerprint`,
-    /// `native_finish_reason`, `logprobs`, `refusal`) so that the "robustness to
-    /// provider variance" goal is exercised by every test that consumes it.
     fn openrouter_non_stream_response() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "id": "gen-1719000000-AbCdEf",
@@ -130,7 +89,6 @@ mod tests {
         .unwrap()
     }
 
-    /// A canned non-streaming OpenRouter tool-call response.
     fn openrouter_tool_call_response() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "id": "gen-toolcall-001",
@@ -165,7 +123,6 @@ mod tests {
         .unwrap()
     }
 
-    /// A canned OpenRouter rate-limit (429) error envelope.
     fn openrouter_429_body() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "error": {
@@ -180,7 +137,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Spawn a mock returning a canned JSON body for any POST path.
     async fn spawn_mock(body: Vec<u8>) -> String {
         let app = Router::new().route(
             "/{*path}",
@@ -195,7 +151,6 @@ mod tests {
         spawn_and_url(app).await
     }
 
-    /// Spawn a mock returning a canned status + body (for error envelopes).
     async fn spawn_mock_status(status: StatusCode, body: Vec<u8>) -> String {
         let app = Router::new().route(
             "/{*path}",
@@ -210,8 +165,6 @@ mod tests {
         spawn_and_url(app).await
     }
 
-    /// Spawn a mock returning OpenRouter-style streaming chunks (with `provider`,
-    /// `native_finish_reason`, and a final usage chunk carrying `cost`).
     async fn spawn_mock_openrouter_stream() -> String {
         let app = Router::new().route(
         "/{*path}",
@@ -235,9 +188,6 @@ mod tests {
         spawn_and_url(app).await
     }
 
-    /// Spawn a mock that captures the request headers, returning the canned body.
-    /// Used to prove OpenRouter app headers (`HTTP-Referer`, `X-Title`) reach the
-    /// upstream.
     async fn spawn_mock_with_header_capture(
         body: Vec<u8>,
     ) -> (String, Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>>) {
@@ -266,9 +216,6 @@ mod tests {
         (url, captured)
     }
 
-    /// Spawn a mock that captures the request body the proxy forwards upstream,
-    /// returning the canned response. Used to prove the request encode path drops
-    /// no input content.
     async fn spawn_mock_with_body_capture(
         body: Vec<u8>,
     ) -> (String, Arc<tokio::sync::Mutex<Option<bytes::Bytes>>>) {
@@ -297,8 +244,6 @@ mod tests {
         (url, captured)
     }
 
-    /// Bind a catch-all mock on an ephemeral port, spawn it, wait for readiness,
-    /// and return its base URL.
     async fn spawn_and_url(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -307,15 +252,6 @@ mod tests {
         format!("http://{addr}/v1/chat/completions")
     }
 
-    // ===========================================================================
-    // AppState + request builders
-    // ===========================================================================
-
-    /// Build an AppState whose single provider `openrouter` speaks the OpenAI Chat
-    /// Completions protocol at `mock_endpoint`. Both client routes
-    /// (`chat_completions` and `messages`) resolve to that one adapter, which is
-    /// what enables cross-protocol translation: an Anthropic Messages client and an
-    /// OpenAI Chat client both target the same OpenAI/OpenRouter upstream.
     fn openrouter_state(mock_endpoint: &str, extra_headers: HashMap<String, String>) -> AppState {
         let provider = ProviderConfig {
             name: "openrouter".to_owned(),
@@ -335,7 +271,6 @@ mod tests {
                 );
                 m
             },
-            // An OpenAI-protocol provider serves both client protocols.
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: Some("chat".to_owned()),
@@ -418,7 +353,6 @@ mod tests {
         .to_string()
     }
 
-    /// Read a non-streaming JSON response body.
     async fn read_json(resp: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -426,7 +360,6 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// Collect a streaming response body as a UTF-8 string.
     async fn read_stream_text(resp: axum::response::Response) -> String {
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
@@ -434,13 +367,6 @@ mod tests {
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 
-    // ===========================================================================
-    // Goal: protocol hub — OpenAI client passthrough to an OpenAI/OpenRouter upstream
-    // ===========================================================================
-
-    /// An OpenAI Chat client talking to the proxy receives an OpenAI-shaped
-    /// response back: `object=chat.completion`, translated text, normalised
-    /// `finish_reason`, and usage with OpenAI token field names.
     #[tokio::test]
     async fn openai_client_to_openrouter_translates_to_openai_shape() {
         let mock_url = spawn_mock(openrouter_non_stream_response()).await;
@@ -468,20 +394,10 @@ mod tests {
             "text must survive the round trip: {}",
             body
         );
-        // Usage keeps OpenAI field names.
         assert_eq!(body["usage"]["prompt_tokens"], 12);
         assert_eq!(body["usage"]["completion_tokens"], 8);
     }
 
-    // ===========================================================================
-    // Goal: cross-protocol translation (the headline feature)
-    // ===========================================================================
-
-    /// An Anthropic Messages client talking to the proxy — whose upstream is an
-    /// OpenAI/OpenRouter endpoint — receives an Anthropic-shaped response: the
-    /// upstream OpenAI body is decoded to the core type and re-encoded for the
-    /// Anthropic client. Text, `stop_reason` (`stop` -> `end_turn`), and usage
-    /// (`completion_tokens` -> `output_tokens`) must all translate.
     #[tokio::test]
     async fn anthropic_client_to_openrouter_translates_to_anthropic_shape() {
         let mock_url = spawn_mock(openrouter_non_stream_response()).await;
@@ -498,10 +414,8 @@ mod tests {
         );
 
         let body = read_json(resp).await;
-        // Anthropic envelope.
         assert_eq!(body["type"], "message");
         assert_eq!(body["role"], "assistant");
-        // Text translated through the OpenAI -> core -> Anthropic path.
         assert!(
             body["content"][0]["text"]
                 .as_str()
@@ -510,19 +424,11 @@ mod tests {
             "text must survive cross-protocol translation: {}",
             body
         );
-        // OpenAI finish_reason "stop" normalises to Anthropic "end_turn".
         assert_eq!(body["stop_reason"], "end_turn");
-        // Usage field names translate to the Anthropic convention.
         assert_eq!(body["usage"]["input_tokens"], 12);
         assert_eq!(body["usage"]["output_tokens"], 8);
     }
 
-    // ===========================================================================
-    // Goal: tool-call fidelity
-    // ===========================================================================
-
-    /// An OpenAI client receives upstream `tool_calls` intact (id, function name,
-    /// JSON arguments), with `finish_reason=tool_calls`.
     #[tokio::test]
     async fn tool_calls_preserved_for_openai_client() {
         let mock_url = spawn_mock(openrouter_tool_call_response()).await;
@@ -560,9 +466,6 @@ mod tests {
         );
     }
 
-    /// An Anthropic client receives upstream OpenAI tool calls translated into
-    /// Anthropic `tool_use` content blocks: `type=tool_use`, the function `name`,
-    /// and parsed `input` (arguments string -> object).
     #[tokio::test]
     async fn tool_calls_translate_to_anthropic_tool_use_blocks() {
         let mock_url = spawn_mock(openrouter_tool_call_response()).await;
@@ -587,25 +490,13 @@ mod tests {
             .expect("at least one content block must be a tool_use")
             .clone();
         assert_eq!(tool_use["name"], "get_weather");
-        // The OpenAI arguments JSON string is parsed into an Anthropic input object.
         assert_eq!(tool_use["input"]["city"], "San Francisco");
     }
 
-    // ===========================================================================
-    // Goal: robustness to provider-specific response fields
-    // ===========================================================================
-
-    /// OpenRouter responses carry fields the proxy does not model (`gen-` ids,
-    /// top-level `provider`, `cost` inside `usage`, `system_fingerprint`,
-    /// `native_finish_reason`, `logprobs`, `refusal`). The OpenAI response structs
-    /// deliberately omit `deny_unknown_fields` (see the doc on `ChatCompletionResponse`
-    /// in `llm-proxy-protocol/src/openai.rs`), so these must not surface as a 502 to
-    /// either client protocol. This test pins that contract.
     #[tokio::test]
     async fn openrouter_specific_extras_do_not_break_conversion() {
         let mock_url = spawn_mock(openrouter_non_stream_response()).await;
 
-        // OpenAI client.
         let app = build_router(openrouter_state(&mock_url, HashMap::new()));
         let resp = app
             .oneshot(openai_chat_request(&make_chat_body(false)))
@@ -622,7 +513,6 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["object"], "chat.completion");
 
-        // Anthropic client (cross-protocol) — same upstream body, different decode.
         let app = build_router(openrouter_state(&mock_url, HashMap::new()));
         let resp = app
             .oneshot(anthropic_messages_request(&make_messages_body(false)))
@@ -637,12 +527,6 @@ mod tests {
         assert_eq!(v["type"], "message");
     }
 
-    // ===========================================================================
-    // Goal: streaming fidelity
-    // ===========================================================================
-
-    /// An OpenAI client streaming request yields `chat.completion.chunk` frames and
-    /// terminates with `[DONE]`, with the translated text present in the deltas.
     #[tokio::test]
     async fn openai_client_stream_ends_with_done() {
         let mock_url = spawn_mock_openrouter_stream().await;
@@ -669,10 +553,6 @@ mod tests {
         );
     }
 
-    /// An Anthropic client streaming against an OpenAI/OpenRouter upstream is the
-    /// cross-protocol streaming gold path: OpenAI chunks are decoded to core events
-    /// and re-emitted as Anthropic SSE events (`message_start`,
-    /// `content_block_delta`, `message_stop`).
     #[tokio::test]
     async fn anthropic_client_stream_cross_protocol() {
         let mock_url = spawn_mock_openrouter_stream().await;
@@ -703,13 +583,6 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Goal: OpenRouter app-header injection
-    // ===========================================================================
-
-    /// Headers declared on the adapter (`HTTP-Referer`, `X-Title` — what OpenRouter
-    /// expects from integrating apps) are forwarded on the upstream request, while
-    /// the bearer API key is applied via the configured `auth_style`.
     #[tokio::test]
     async fn openrouter_app_headers_forwarded_upstream() {
         let (mock_url, captured) =
@@ -726,7 +599,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // Give the background mock handler a moment to record the request.
         tokio::time::sleep(Duration::from_millis(100)).await;
         let g = captured.lock().unwrap();
         let upstream_headers = g
@@ -752,28 +624,11 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Goal: error fidelity — upstream 429 passes through, client-shaped
-    // ===========================================================================
-
-    /// An OpenRouter 429 surfaces to *each* client protocol as a client-shaped
-    /// error with the 429 *status* passed through — not collapsed to a 502. Two
-    /// finer points are pinned here, both from `routes/error_response.rs`:
-    ///
-    /// - The error `type` is `"api_error"`, **not** `"rate_limit_error"`. The
-    ///   `rate_limit_error` label is reserved for the proxy's *own* rate limiter
-    ///   (`RouteError::RateLimited`); an *upstream* 429 is `RouteError::Upstream`,
-    ///   which keeps status 429 (the one code `map_upstream_status` passes through)
-    ///   but is typed generically.
-    /// - The upstream's raw error body (OpenRouter's `provider_name`, `raw`, etc.)
-    ///   is logged server-side only and **must not** reach the client envelope —
-    ///   the client gets a sanitized generic message.
     #[tokio::test]
     async fn openrouter_429_surfaces_as_client_shaped_error() {
         let mock_url =
             spawn_mock_status(StatusCode::TOO_MANY_REQUESTS, openrouter_429_body()).await;
 
-        // Anthropic client (cross-protocol error translation).
         let app = build_router(openrouter_state(&mock_url, HashMap::new()));
         let resp = app
             .oneshot(anthropic_messages_request(&make_messages_body(false)))
@@ -795,7 +650,6 @@ mod tests {
             "upstream raw error text must not leak into the client envelope: {msg}"
         );
 
-        // OpenAI client.
         let app = build_router(openrouter_state(&mock_url, HashMap::new()));
         let resp = app
             .oneshot(openai_chat_request(&make_chat_body(false)))
@@ -817,15 +671,6 @@ mod tests {
         );
     }
 
-    // ===========================================================================
-    // Goal: content/token fidelity — nothing is stripped in either direction
-    // ===========================================================================
-
-    /// Input fidelity: the request the proxy forwards upstream must carry every
-    /// piece of content the client sent — the system prompt, every message turn,
-    /// and verbatim text including unicode/emoji/CJK. If the encode path dropped
-    /// any token, one of these distinctive fragments would be missing from the
-    /// captured upstream body. (Anthropic-client -> OpenAI-upstream encode path.)
     #[tokio::test]
     async fn input_content_is_preserved_on_encode() {
         let (mock_url, captured) =
@@ -879,11 +724,6 @@ mod tests {
         );
     }
 
-    /// Output fidelity: a rich OpenRouter response (long multi-paragraph text with
-    /// unicode/emoji, two tool calls, and explicit usage) must convert to an
-    /// Anthropic response that preserves ALL of it — full verbatim text, every
-    /// tool_use block, and exact usage token counts. If the decode path stripped
-    /// anything, a fragment, a tool_use block, or a token count would be wrong.
     #[tokio::test]
     async fn output_content_is_preserved_on_decode() {
         let long_text = "Para one: the quick brown fox. Para two: café résumé 🚀 你好世界. \
@@ -925,7 +765,6 @@ mod tests {
         let v = read_json(resp).await;
         let joined = serde_json::to_string(&v["content"]).expect("content serializes");
 
-        // Full verbatim text — every paragraph and the unicode/emoji runs.
         for fragment in [
             "Para one: the quick brown fox",
             "café résumé 🚀 你好世界",
@@ -936,7 +775,6 @@ mod tests {
                 "decode stripped output text fragment {fragment:?}\ncontent: {joined}"
             );
         }
-        // Both tool calls survive as Anthropic tool_use blocks.
         let tool_uses = v["content"]
             .as_array()
             .map(|blocks| blocks.iter().filter(|b| b["type"] == "tool_use").count())
@@ -945,7 +783,6 @@ mod tests {
             tool_uses, 2,
             "both tool calls must survive decode: {joined}"
         );
-        // Usage token counts pass through unchanged (OpenAI -> Anthropic field names).
         assert_eq!(
             v["usage"]["input_tokens"], 77,
             "input token count must be preserved"
@@ -956,12 +793,6 @@ mod tests {
         );
     }
 
-    /// Robustness: real OpenRouter (and other OpenAI-compatible) 2xx responses can
-    /// omit `usage` entirely (e.g. certain Venice-backed free models). Since
-    /// `ChatCompletionResponse.usage` is `#[serde(default)]`, an absent `usage`
-    /// decodes with zero token counts instead of failing the whole response into a
-    /// 502 "provider response decode error". This previously reproduced the
-    /// intermittent live 502 for `meta-llama/llama-3.2-3b-instruct:free`.
     #[tokio::test]
     async fn response_missing_usage_decodes_with_zero_usage() {
         let body = serde_json::to_vec(&json!({
@@ -975,7 +806,6 @@ mod tests {
                 "message": { "role": "assistant", "content": "pong" },
                 "finish_reason": "stop"
             }]
-            // NOTE: deliberately no "usage" field — some OpenRouter backends omit it.
         }))
         .unwrap();
 
@@ -1000,8 +830,6 @@ mod tests {
         );
     }
 
-    /// Variant where the provider sends `"usage": null` instead of omitting the
-    /// field. Must also decode with zero usage, not 502.
     #[tokio::test]
     async fn response_with_null_usage_decodes_with_zero_usage() {
         let body = serde_json::to_vec(&json!({
@@ -1036,16 +864,6 @@ mod tests {
         assert_eq!(v["usage"]["output_tokens"], 0);
     }
 
-    // ===========================================================================
-    // Goal: live network validation (opt-in)
-    // ===========================================================================
-
-    /// Default candidate free models. OpenRouter rate-limits its free tier
-    /// aggressively, so the live test tries several and requires at least one to
-    /// succeed. Override with `OPENROUTER_MODELS=m1,m2,...` (or a single
-    /// `OPENROUTER_MODEL=m`). Names are current as of authoring time; OpenRouter
-    /// rotates free models, so a missing one is reported and skipped rather than
-    /// failing the run.
     const DEFAULT_FREE_MODELS: &[&str] = &[
         "meta-llama/llama-3.2-3b-instruct:free",
         "liquid/lfm-2.5-1.2b-instruct:free",
@@ -1057,9 +875,6 @@ mod tests {
         "cohere/north-mini-code:free",
     ];
 
-    /// Build an AppState whose single `openrouter` provider targets the real
-    /// OpenRouter Chat Completions endpoint, applying the `HTTP-Referer` / `X-Title`
-    /// headers OpenRouter expects from integrating apps.
     fn live_state(api_key: &str) -> AppState {
         let mut headers = HashMap::new();
         headers.insert(
@@ -1129,10 +944,6 @@ mod tests {
         )
     }
 
-    /// Issue one live Anthropic Messages request, retrying with backoff while
-    /// the upstream answers 429.
-    ///
-    /// Returns the final status and raw response body.
     async fn live_request_with_backoff(
         app: &axum::Router,
         model: &str,
@@ -1165,22 +976,6 @@ mod tests {
         (status, bytes)
     }
 
-    /// Real end-to-end round trips against <https://openrouter.ai> through the proxy.
-    ///
-    /// Skipped unless `OPENROUTER_API_KEY` is set; run with:
-    ///
-    /// ```text
-    /// OPENROUTER_API_KEY=sk-or-... \
-    ///   cargo test -p llm-proxy-server --test openrouter_e2e \
-    ///   live_openrouter_round_trip -- --ignored --nocapture
-    /// ```
-    ///
-    /// Tries several free models (OpenRouter rate-limits the free tier, so some
-    /// will 429) and requires at least one to complete a full Anthropic-client →
-    /// OpenRouter cross-protocol conversion. A 502 from any model is a hard failure
-    /// (it would mean the proxy could not convert a real OpenRouter response);
-    /// 429/400/404/etc. are reported but tolerated. Override the set with
-    /// `OPENROUTER_MODELS=a,b,c` or pin a single `OPENROUTER_MODEL`.
     #[tokio::test]
     #[ignore = "requires network + OPENROUTER_API_KEY; run with --ignored"]
     async fn live_openrouter_round_trip() {
@@ -1205,9 +1000,6 @@ mod tests {
 
         let app = build_router(live_state(&api_key));
 
-        // OpenRouter rate-limits the free tier per-minute (and per-day for some
-        // models), so each model is retried with backoff on 429. Override with
-        // OPENROUTER_MAX_ATTEMPTS / OPENROUTER_BACKOFF_MS.
         let max_attempts = std::env::var("OPENROUTER_MAX_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -1224,17 +1016,9 @@ mod tests {
         let mut other = 0usize;
         let mut upstream_failures = 0usize;
         let mut first_ok: Option<String> = None;
-        // A 502 is only a *proxy* bug when it is a ProviderDecode
-        // ("provider response decode error"); a 502 carrying "upstream service
-        // error" is an upstream 5xx the proxy correctly collapsed (the upstream
-        // provider's fault — common with free-tier overload) and is tolerated.
-        // Asserted empty at the end; run with RUST_LOG=llm_proxy_server=debug to
-        // see the underlying serde cause of any real decode failure.
         let mut decode_failures: Vec<(String, String)> = Vec::new();
 
         for model in &candidates {
-            // Anthropic Messages client -> OpenRouter (OpenAI) upstream: the
-            // full cross-protocol translation against the real service.
             let body = json!({
                 "model": model,
                 "messages": [{ "role": "user", "content": "Reply with exactly the word: pong" }],
@@ -1248,10 +1032,6 @@ mod tests {
 
             eprintln!("[{model}] final status={status} body={text}");
 
-            // Distinguish the two 502 causes. Only a ProviderDecode ("provider
-            // response decode error") is the proxy's fault; an "upstream service
-            // error" 502 is an upstream 5xx the proxy correctly collapsed and is
-            // tolerated.
             match status {
                 StatusCode::OK => {
                     let v: Value = serde_json::from_slice(&bytes)
@@ -1305,12 +1085,6 @@ mod tests {
         }
     }
 
-    /// Live output fidelity: a real model is asked to emit a short, distinctive
-    /// multi-token sequence (six planet names). The converted Anthropic response
-    /// must contain ALL of them — if the decode/re-encode path dropped any output
-    /// token, a word would be missing. Reasoning-only responses (no text block,
-    /// common when a thinking model is truncated) are skipped rather than failed.
-    /// Retries rate-limited models once. Skipped without `OPENROUTER_API_KEY`.
     #[tokio::test]
     #[ignore = "requires network + OPENROUTER_API_KEY; run with --ignored"]
     async fn live_output_completeness_no_token_loss() {
@@ -1346,7 +1120,6 @@ mod tests {
                 "stream": false
             });
 
-            // One retry on rate limit, with a short backoff.
             let (status, bytes) = live_request_with_backoff(
                 &app,
                 model,
@@ -1362,8 +1135,6 @@ mod tests {
 
             let full = String::from_utf8_lossy(&bytes);
             let v: Value = serde_json::from_slice(&bytes).expect("OK body must be valid JSON");
-            // Scan only text blocks — ignore tool_use ids / thinking that may carry
-            // unrelated tokens.
             let text_only: String = v["content"]
                 .as_array()
                 .map(|blocks| {

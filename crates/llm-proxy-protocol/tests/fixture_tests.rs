@@ -1,22 +1,6 @@
-//! Fixture-driven integration tests for client protocol adapters.
-//!
-//! Loads each fixture's input.json, decodes it to core, compares with core.json,
-//! then encodes a response from core and compares with output.json.
-//!
-//! # Fixture format: client vs provider
-//!
-//! **Client-side fixtures** (this file) use serde's externally-tagged enum format
-//! in `core-events.json` (e.g. `{"TextDelta": {"index": 0, "text": "Hello"}}`).
-//! This matches how `CoreEvent` serializes with default serde derive.
-//!
-//! **Provider-side fixtures** (in `llm-proxy-provider/tests/fixture_tests.rs`) use
-//! a human-readable format with a `"type"` field per event (e.g.
-//! `{"type": "text_delta", "text": "Hello"}`). This format is compared against the
-//! actual adapter output via `event_variant_name()`.
-//!
-//! The two formats serve different purposes: client fixtures test serde round-trips,
-//! while provider fixtures test adapter decode output against human-readable expected
-//! values. This is a deliberate design choice.
+//! Fixture-driven integration tests for the client protocol adapters: decode
+//! `input.json` to core and compare with `core.json`, then encode a
+//! `CoreResponse` and compare key fields with `output.json`.
 
 #[cfg(test)]
 mod tests {
@@ -31,13 +15,8 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    // ---------------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------------
-
     const FIXTURE_ROOT: &str = "tests/fixtures";
 
-    /// Read a fixture file as a parsed JSON value.
     fn read_fixture(dir: &Path, name: &str) -> serde_json::Value {
         let path = dir.join(name);
         let content = fs::read_to_string(&path)
@@ -46,15 +25,12 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to parse {} as JSON: {e}", path.display()))
     }
 
-    /// Read a fixture file as raw string.
     fn read_fixture_raw(dir: &Path, name: &str) -> String {
         let path = dir.join(name);
         fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
     }
 
-    /// Verify that decoding an input produces a core request that matches core.json.
-    /// Returns the decoded core request for further testing.
     fn assert_decode_matches_core(
         adapter: &str,
         input_json: &serde_json::Value,
@@ -81,24 +57,20 @@ mod tests {
         );
     }
 
-    /// Verify that a malformed input produces a ProtocolError.
-    ///
-    /// Both serde deserialization failures AND semantic validation errors
-    /// (e.g. empty model, empty messages) are treated as expected errors.
     fn assert_malformed_returns_error(adapter: &str, input_json: &serde_json::Value) {
         let result = match adapter {
             "anthropic" => {
                 let req: AnthropicMessageRequest = match serde_json::from_value(input_json.clone())
                 {
                     Ok(r) => r,
-                    Err(_) => return, // serde parse failure is also a valid error
+                    Err(_) => return,
                 };
                 anthropic_adapter::decode_request(req)
             }
             "openai_chat" => {
                 let req: ChatCompletionRequest = match serde_json::from_value(input_json.clone()) {
                     Ok(r) => r,
-                    Err(_) => return, // serde parse failure is also a valid error
+                    Err(_) => return,
                 };
                 openai_adapter::decode_request(req)
             }
@@ -110,8 +82,6 @@ mod tests {
         );
     }
 
-    /// Compare the `tool_calls` array of an encoded OpenAI message against the
-    /// expected message. A no-op when the expected message has no `tool_calls`.
     fn assert_tool_calls_match(out_m: &serde_json::Value, exp_m: &serde_json::Value) {
         if exp_m.get("tool_calls").is_none() {
             return;
@@ -138,7 +108,6 @@ mod tests {
         }
     }
 
-    /// Verify that encoding a CoreResponse produces output that matches output.json.
     fn assert_encode_matches_output(
         adapter: &str,
         response: CoreResponse,
@@ -150,7 +119,6 @@ mod tests {
                     .expect("anthropic encode_response should succeed");
                 let serialized = serde_json::to_value(&out)
                     .expect("serialized Anthropic response should be valid JSON");
-                // Compare key fields (id, type, content, stop_reason, model)
                 assert_eq!(
                     serialized.get("type").and_then(|v| v.as_str()),
                     output_json.get("type").and_then(|v| v.as_str()),
@@ -190,7 +158,6 @@ mod tests {
                     exp_choices.and_then(|c| c.get("finish_reason")),
                     "finish_reason mismatch"
                 );
-                // Compare message content
                 let out_msg = out_choices.and_then(|c| c.get("message"));
                 let exp_msg = exp_choices.and_then(|c| c.get("message"));
                 if let (Some(out_m), Some(exp_m)) = (out_msg, exp_msg) {
@@ -199,10 +166,8 @@ mod tests {
                         exp_m.get("content"),
                         "message content mismatch"
                     );
-                    // Compare tool_calls if present
                     assert_tool_calls_match(out_m, exp_m);
                 }
-                // Compare model if present in expected output
                 if output_json.get("model").is_some() {
                     assert_eq!(
                         serialized.get("model"),
@@ -210,7 +175,6 @@ mod tests {
                         "model mismatch"
                     );
                 }
-                // Compare usage if present in expected output
                 if let Some(exp_usage) = output_json.get("usage") {
                     let out_usage = serialized.get("usage");
                     assert!(
@@ -235,17 +199,10 @@ mod tests {
         };
     }
 
-    /// Run the decode-then-encode golden test for a non-stream fixture.
     fn run_non_stream_fixture(adapter: &str, case: &str) {
         let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
         let input = read_fixture(&dir, "input.json");
 
-        // Special handling for malformed cases -- only input.json is needed.
-        //
-        // Note: this relies on the exact directory name "malformed". If multiple
-        // malformed variants are needed in the future (e.g. "malformed-empty-messages",
-        // "malformed-no-model"), either use a marker file like `malformed.flag` inside
-        // the fixture directory, or explicitly list all malformed variant names here.
         if case == "malformed" {
             assert_malformed_returns_error(adapter, &input);
             return;
@@ -255,11 +212,6 @@ mod tests {
 
         assert_decode_matches_core(adapter, &input, &core);
 
-        // Encode direction: load the independently-authored core-response.json
-        // (normalized CoreResponse), encode it through the adapter, and compare
-        // key fields with output.json.  This breaks the tautology where the
-        // CoreResponse was previously derived from the same output.json it was
-        // compared against.
         if dir.join("output.json").exists() {
             let output = read_fixture(&dir, "output.json");
             let core_response_raw = read_fixture_raw(&dir, "core-response.json");
@@ -268,10 +220,6 @@ mod tests {
             assert_encode_matches_output(adapter, response, &output);
         }
     }
-
-    // ---------------------------------------------------------------------------
-    // Anthropic non-stream fixtures
-    // ---------------------------------------------------------------------------
 
     #[test]
     fn anthropic_plain_text_request_fixture() {
@@ -323,10 +271,6 @@ mod tests {
         run_non_stream_fixture("anthropic", "malformed");
     }
 
-    // ---------------------------------------------------------------------------
-    // OpenAI Chat non-stream fixtures
-    // ---------------------------------------------------------------------------
-
     #[test]
     fn openai_plain_text_request_fixture() {
         run_non_stream_fixture("openai_chat", "plain-text-request");
@@ -376,10 +320,6 @@ mod tests {
     fn openai_malformed_fixture() {
         run_non_stream_fixture("openai_chat", "malformed");
     }
-
-    // ---------------------------------------------------------------------------
-    // Fixture file completeness checks
-    // ---------------------------------------------------------------------------
 
     #[test]
     fn all_anthropic_non_stream_fixtures_have_required_files() {
@@ -455,11 +395,6 @@ mod tests {
         }
     }
 
-    /// Returns the list of all streaming fixture (adapter, case) pairs.
-    ///
-    /// Used by `all_streaming_fixtures_have_required_files`,
-    /// `streaming_core_events_json_is_valid`, `streaming_sse_fixtures_are_well_formed`,
-    /// and `streaming_encode_round_trip` to avoid duplicating the case list.
     fn all_streaming_cases() -> Vec<(&'static str, &'static str)> {
         vec![
             ("anthropic", "streaming-text"),
@@ -477,14 +412,6 @@ mod tests {
         ]
     }
 
-    /// Verify that all streaming fixtures have the required files.
-    ///
-    /// Client streaming fixtures require:
-    /// - `input.sse`: Optional reference file showing the corresponding provider wire
-    ///   format. Not consumed by any test, but serves as documentation of the provider
-    ///   stream that would produce these CoreEvents.
-    /// - `core-events.json`: The CoreEvent sequence to encode through the StreamEncoder.
-    /// - `output.sse`: The expected SSE output from the StreamEncoder.
     #[test]
     fn all_streaming_fixtures_have_required_files() {
         for (adapter, case) in &all_streaming_cases() {
@@ -504,17 +431,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Unified coverage-matrix test
-    // ---------------------------------------------------------------------------
-
-    /// Non-stream fixture cases required for every client adapter.
-    /// Each entry is (case_name, required_files).
-    ///
-    /// Universal cases apply to all client adapters.  Additional cases from the
-    /// plan (multiple-messages, refusal, redacted-thinking, multimedia content,
-    /// sampling-intent, model-mapping, stop-sequence) are listed as TODO items
-    /// for the next audit round.
     fn required_client_non_stream_cases() -> Vec<(&'static str, Vec<&'static str>)> {
         vec![
             (
@@ -599,13 +515,9 @@ mod tests {
                 ],
             ),
             ("malformed", vec!["input.json"]),
-            // TODO: Additional cases for the next audit round:
-            //   multiple-messages, refusal, redacted-thinking, image/document/audio/video
-            //   content, sampling-intent, model-mapping, stop-sequence.
         ]
     }
 
-    /// Streaming fixture cases required for every client adapter.
     fn required_client_streaming_cases() -> Vec<(&'static str, Vec<&'static str>)> {
         vec![
             (
@@ -635,8 +547,6 @@ mod tests {
         ]
     }
 
-    /// Append `adapter/case/file` for every required fixture file that is
-    /// absent on disk.
     fn collect_missing_fixtures(
         adapter: &str,
         cases: &[(&str, Vec<&str>)],
@@ -653,18 +563,13 @@ mod tests {
         }
     }
 
-    /// Unified coverage-matrix test that enforces required fixture cases for
-    /// all client adapters.  Mirrors the provider-side coverage-matrix pattern.
-    /// `cargo test` must fail when a required fixture is missing.
     #[test]
     fn coverage_matrix_all_required_client_fixtures_exist() {
         let adapters = ["anthropic", "openai_chat"];
         let mut missing: Vec<String> = Vec::new();
 
         for adapter in &adapters {
-            // Non-stream cases
             collect_missing_fixtures(adapter, &required_client_non_stream_cases(), &mut missing);
-            // Streaming cases
             collect_missing_fixtures(adapter, &required_client_streaming_cases(), &mut missing);
         }
 
@@ -675,57 +580,9 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------------------------------
-    // Streaming fixture validation tests
-    // ---------------------------------------------------------------------------
-
-    // TODO(streaming-audit): The streaming fixture tests below only validate
-    // structure (core-events.json deserializes, SSE files contain valid SSE lines,
-    // encoder produces some valid output).  They do NOT perform strict byte-level
-    // comparison of the encoded output.sse against the fixture's output.sse.  This
-    // gap exists because:
-    //   1. The StreamEncoder may emit additional framing events (e.g.
-    //      content_block_start/stop) not explicitly listed in the minimal
-    //      core-events.json representation.
-    //   2. A strict comparison would require normalizing SSE whitespace and event
-    //      ordering, or building a SSE parser that extracts structured events from
-    //      both the actual output and output.sse for semantic comparison.
-    //   3. The streaming decode path (input.sse -> CoreEvents) is not yet
-    //      implemented for client adapters (only provider adapters have
-    //      StreamDecoder).
-    // Adding strict output.sse comparison is deferred to a future audit round.
-
-    /// Tracked placeholder for the client-side streaming **decode** round-trip.
-    ///
-    /// The client adapters in `llm_proxy_protocol::client` currently expose only a
-    /// `StreamEncoder` (see `client::anthropic` and `client::openai_chat`); there
-    /// is no client `StreamDecoder` analogous to the provider crate's
-    /// `ProviderStreamDecoder`. So parsing of upstream `input.sse` frames into
-    /// `CoreEvent`s — the path a real proxy client would exercise on
-    /// partial/malformed/abruptly-truncated streams — is unimplemented and
-    /// therefore untested at the protocol layer.
-    ///
-    /// This test is kept as a tracked `#[ignore]` stub so the gap is visible in
-    /// `cargo test` output (run with `--ignored` to see it) and is not forgotten
-    /// when the decoder lands. When a client `StreamDecoder` is implemented,
-    /// un-ignore this test and mirror the provider crate's
-    /// `run_stream_decode_fixture` (see `llm-proxy-provider/tests/fixture_tests.rs`):
-    ///
-    /// 1. Parse each `(adapter, case)` `input.sse` into SSE frames.
-    /// 2. Feed the frames through the new client `StreamDecoder` and collect the
-    ///    emitted `CoreEvent`s.
-    /// 3. Compare the decoded events' variant + fields against
-    ///    `core-events.json` (semantic comparison, not byte-for-byte, to allow
-    ///    for framing/normalization differences).
-    /// 4. Add a dedicated **malformed / abrupt-truncation** case: feed a frame
-    ///    split mid-UTF-8 and a stream cut off before the terminal event, and
-    ///    assert the decoder returns a structured error rather than panicking
-    ///    or silently dropping the partial frame.
-    #[ignore = "client StreamDecoder (input.sse -> CoreEvents) not yet implemented; see doc comment"]
+    #[ignore = "client StreamDecoder (input.sse -> CoreEvents) not yet implemented"]
     #[test]
     fn streaming_decode_round_trip() {
-        // This stub intentionally fails if run, so it cannot silently rot into a
-        // false-pass: un-ignore only after implementing the decoder.
         panic!(
             "client streaming decode path is unimplemented: parse input.sse through \
          a client StreamDecoder and compare CoreEvents against core-events.json \
@@ -734,12 +591,6 @@ mod tests {
         );
     }
 
-    /// Verify that the core-events.json fixture can be deserialized into CoreEvent
-    /// values. This is a basic validation that streaming fixtures are well-formed.
-    /// Full encode/decode round-trip tests (parsing input.sse through a
-    /// StreamDecoder, encoding CoreEvents through a StreamEncoder, comparing with
-    /// output.sse) are deferred to a later audit cycle.  The current tests
-    /// validate fixture structure only, not adapter behavior.
     #[test]
     fn streaming_core_events_json_is_valid() {
         for (adapter, case) in &all_streaming_cases() {
@@ -755,15 +606,11 @@ mod tests {
         }
     }
 
-    /// Verify that input.sse and output.sse fixture files contain valid
-    /// SSE-formatted data when non-empty. Empty files are allowed for cases where
-    /// the protocol produces no output (e.g. OpenAI ping is a no-op).
     #[test]
     fn streaming_sse_fixtures_are_well_formed() {
         for (adapter, case) in &all_streaming_cases() {
             let dir = Path::new(FIXTURE_ROOT).join(adapter).join(case);
 
-            // input.sse should always have content (it represents client input).
             let input = read_fixture_raw(&dir, "input.sse");
             assert!(
                 !input.is_empty(),
@@ -777,8 +624,6 @@ mod tests {
                 "{adapter}/{case}/input.sse should contain SSE-formatted lines"
             );
 
-            // output.sse may be empty or whitespace-only when the protocol produces
-            // no output for the given input (e.g. OpenAI Ping is a no-op).
             let output = read_fixture_raw(&dir, "output.sse");
             let output_trimmed = output.trim();
             if !output_trimmed.is_empty() {
@@ -793,22 +638,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------------
-    // Streaming encode round-trip tests
-    // ---------------------------------------------------------------------------
-
-    /// Streaming round-trip test: parse core-events.json into CoreEvent values,
-    /// encode them through the client adapter's StreamEncoder, format the output
-    /// as SSE, and verify that encoding succeeds and produces valid SSE output.
-    ///
-    /// This test validates that the encode path produces structurally valid SSE
-    /// output for the given CoreEvent sequence. It does NOT compare exact byte
-    /// output with output.sse because the encoder may emit additional framing
-    /// events (e.g. content_block_start/stop) that are not explicit in the
-    /// minimal core-events.json representation.
-    ///
-    /// The test covers error and ping events in addition to text/tool/usage/thinking
-    /// events to ensure the encode path handles all CoreEvent variants.
     #[test]
     fn streaming_encode_round_trip() {
         for (adapter, case) in &all_streaming_cases() {
@@ -820,7 +649,6 @@ mod tests {
                     panic!("failed to parse {adapter}/{case}/core-events.json: {e}")
                 });
 
-            // Extract msg_id and model from MessageStart event (or use defaults).
             let default_id = if *adapter == "anthropic" {
                 "msg_default".to_owned()
             } else {
@@ -849,8 +677,6 @@ mod tests {
         }
     }
 
-    /// Encode `events` through the Anthropic `StreamEncoder` and verify that
-    /// every emitted event is structurally valid.
     fn encode_anthropic_stream(
         adapter: &str,
         case: &str,
@@ -885,14 +711,6 @@ mod tests {
         );
     }
 
-    /// Encode `events` through the OpenAI Chat `StreamEncoder` and verify that
-    /// every emitted chunk is structurally valid.
-    ///
-    /// NOTE: created is hard-coded to 1000 and include_usage is false. This means
-    /// the streaming encode test does not exercise the include_usage=true code
-    /// path (which emits a final usage chunk).
-    /// TODO: Derive include_usage from the fixture data (e.g. set to true for
-    /// streaming-usage cases) to ensure the usage-reporting path is tested.
     fn encode_openai_stream(
         adapter: &str,
         case: &str,
@@ -904,13 +722,7 @@ mod tests {
         let mut total_data_lines = 0;
 
         for event in events {
-            // OpenAI encoder returns Err for CoreEvent::Error by design -- errors
-            // are handled at the transport level (HTTP status codes), not in stream
-            // encoding. We accept the Err gracefully and verify that non-error
-            // events still encode correctly.
             let Ok(chunks) = encoder.encode_event(event.clone()) else {
-                // Expected for CoreEvent::Error on OpenAI Chat.
-                // Verify this was indeed an error event.
                 assert!(
                     matches!(event, CoreEvent::Error { .. }),
                     "{adapter}/{case}: encode_event failed for non-error event"
@@ -931,8 +743,6 @@ mod tests {
             total_data_lines += 1;
         }
 
-        // Verify at least some chunks were produced, unless the fixture is an
-        // error-only case where OpenAI intentionally returns Err.
         let is_error_only = events
             .iter()
             .all(|e| matches!(e, CoreEvent::Error { .. } | CoreEvent::Ping));
@@ -944,7 +754,6 @@ mod tests {
         }
     }
 
-    /// Verify an Anthropic MessageEvent is valid JSON with a known event type.
     fn verify_anthropic_event_json(adapter: &str, case: &str, me: &MessageEvent) {
         let json = serde_json::to_string(me).unwrap_or_else(|e| {
             panic!("failed to serialize MessageEvent for {adapter}/{case}: {e}")
@@ -970,7 +779,6 @@ mod tests {
         );
     }
 
-    /// Verify an OpenAI ChatCompletionChunk is valid JSON.
     fn verify_openai_chunk_json(adapter: &str, case: &str, chunk: &ChatCompletionChunk) {
         let json = serde_json::to_string(chunk).unwrap_or_else(|e| {
             panic!("failed to serialize ChatCompletionChunk for {adapter}/{case}: {e}")
