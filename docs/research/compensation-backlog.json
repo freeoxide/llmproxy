@@ -1,0 +1,548 @@
+{
+  "generated": "2026-11-04",
+  "source": "docs/research/repo-intelligence.md (fourth research wave: 23 full four-angle harvests + 40 issue-tracker sweeps)",
+  "candidates": [
+    {
+      "candidate": "Request-path retry and fallback ladder: classified transient-vs-terminal errors, Retry-After honored, per-provider cooldowns, and one whole-request deadline spanning all attempts",
+      "rationale": "llm-proxy forwards each request exactly once (only discovery has transient retry, crates/llm-proxy-provider/src/discovery.rs:145, verified 2026-11-04). Every gateway in the wave treats classified retry/fallback as core, and the #1 cross-repo pain is misclassification that bans healthy capacity (sub2api #8442, CLIProxyAPI #7197, metapi #582).",
+      "area": "routing",
+      "evidence": [
+        "https://github.com/ThinkWatchProject/ThinkWatch/pull/122",
+        "https://github.com/0xzr/freellmpool/pull/97",
+        "https://github.com/EinStack/glide/pull/68",
+        "https://github.com/MartialBE/one-hub/issues/852",
+        "https://github.com/Wei-Shaw/sub2api/issues/8442",
+        "research-repos/NVIDIA-NeMo__Switchyard/crates/libsy-llm-client/src/client.rs",
+        "research-repos/EeroEternal__xlb/src/config.rs"
+      ],
+      "repos": ["ThinkWatchProject/ThinkWatch", "NVIDIA-NeMo/Switchyard", "EeroEternal/xlb", "0xzr/freellmpool", "EinStack/glide", "MartialBE/one-hub", "Wei-Shaw/sub2api", "router-for-me/CLIProxyAPI", "deanxv/done-hub", "lidge-jun/opencodex", "smg-project/smg", "eliasbiondo/antirion"],
+      "priority": "high",
+      "crate": "llm-proxy-provider"
+    },
+    {
+      "candidate": "Pre-answer in-band failover: stage the upstream stream (bounded buffer) until the first output event so an HTTP 200 followed by an SSE error frame can still be retried or failed over before any byte is committed",
+      "rationale": "An OpenAI-compatible upstream can return 200 and then reject the stream in its first frame; llm-proxy's documented in-band error handling surfaces that to the client instead of recovering. CLIProxyAPI holds handshake frames in a 48-frame/1MiB budget; sub2api stages 64KiB-to-temp-file; Switchyard holds a one-role prelude.",
+      "area": "routing",
+      "evidence": [
+        "https://github.com/NVIDIA-NeMo/Switchyard/pull/1133",
+        "https://github.com/NVIDIA-NeMo/Switchyard/issues/1132",
+        "research-repos/router-for-me__CLIProxyAPI/internal/runtime/executor/codex_executor_stream.go",
+        "research-repos/Wei-Shaw__sub2api/backend/internal/service/openai_first_output_timeout.go",
+        "https://github.com/lidge-jun/opencodex/issues/8107"
+      ],
+      "repos": ["router-for-me/CLIProxyAPI", "NVIDIA-NeMo/Switchyard", "Wei-Shaw/sub2api", "lidge-jun/opencodex", "ThinkWatchProject/ThinkWatch"],
+      "priority": "high",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Cache-token usage fidelity: parse OpenAI prompt_tokens_details.cached_tokens (chat and Responses shapes) and Anthropic 5m/1h cache splits into the existing core cache fields; price cache reads/writes at their own rates",
+      "rationale": "llm-proxy's core usage carries cache_creation/cache_read (crates/llm-proxy-protocol/src/core.rs:639-641) fed only from Anthropic-dialect fields; a grep for prompt_tokens_details/cached_tokens over crates/ and apps/ returns nothing (verified 2026-11-04), so OpenAI-dialect cached tokens never reach the ledger or cost estimates. Twelve repos show this exact gap breaking cost dashboards, budgets, and client auto-compaction.",
+      "area": "cost-tracking",
+      "evidence": [
+        "https://github.com/deanxv/done-hub/pull/52",
+        "https://github.com/deanxv/done-hub/pull/39",
+        "https://github.com/MartialBE/one-hub/issues/884",
+        "https://github.com/lidge-jun/opencodex/issues/8101",
+        "https://github.com/AgentOps-AI/agentops/issues/1445",
+        "https://github.com/mudler/LocalAI/issues/13006",
+        "research-repos/deanxv__done-hub/types/common.go"
+      ],
+      "repos": ["deanxv/done-hub", "MartialBE/one-hub", "lidge-jun/opencodex", "AgentOps-AI/agentops", "mudler/LocalAI", "mostlygeek/llama-swap", "Inebrio/Routerly", "mozilla-ai/otari", "NVIDIA-NeMo/Switchyard", "api7/aisix", "katanemo/plano", "router-for-me/CLIProxyAPI"],
+      "priority": "high",
+      "crate": "llm-proxy-protocol"
+    },
+    {
+      "candidate": "Context-window preflight: estimate input tokens with the existing offline counter, reject over-limit requests before egress with dialect-exact typed errors (OpenAI context_length_exceeded, Anthropic 'prompt is too long', Responses response.failed)",
+      "rationale": "llm-proxy already surfaces context_length on /v1/models (crates/llm-proxy-server/src/routes/models.rs:35,142) and ships an offline token counter, but never preflight-checks, so agents get raw upstream 400s and waste spend on doomed calls. mistral.rs shipped exactly this 'for coding agents'; opencodex shows clients branch on the mapped code to decide compact-vs-retry.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/EricLBuehler/mistral.rs/pull/2538",
+        "https://github.com/lidge-jun/opencodex/pull/8128",
+        "https://github.com/ericc-ch/copilot-api/issues/210",
+        "https://github.com/mostlygeek/llama-swap/issues/1281",
+        "research-repos/os-tack__ostk-cache/src/usage_truth.rs"
+      ],
+      "repos": ["EricLBuehler/mistral.rs", "lidge-jun/opencodex", "ericc-ch/copilot-api", "mostlygeek/llama-swap", "os-tack/ostk-cache", "LostRuins/koboldcpp", "yolorouter/yolorouter"],
+      "priority": "high",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Client-disconnect cancellation and settlement: propagate disconnects upstream, write a cancellation usage row with estimated usage instead of dropping accounting",
+      "rationale": "llm-proxy's ClientCancelled event (crates/llm-proxy-server/src/routes/core_pipeline.rs:982) covers streams that already started and carries no usage payload; a client leaving while the upstream is awaited leaves no row at all. done-hub decouples the upstream call from the client context so billing always completes; otari writes an estimated row for abandoned streams.",
+      "area": "observability",
+      "evidence": [
+        "https://github.com/ThinkWatchProject/ThinkWatch/pull/54",
+        "https://github.com/ThinkWatchProject/ThinkWatch/pull/62",
+        "https://github.com/mozilla-ai/otari/pull/2869",
+        "https://github.com/ericc-ch/copilot-api/pull/278",
+        "research-repos/deanxv__done-hub/providers/base/common.go"
+      ],
+      "repos": ["ThinkWatchProject/ThinkWatch", "deanxv/done-hub", "mozilla-ai/otari", "ericc-ch/copilot-api", "EeroEternal/xlb", "EricLBuehler/mistral.rs", "0xzr/freellmpool"],
+      "priority": "high",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Per-key budgets and multi-window rate limits (RPM/TPM/RPD) wired to the SQLite usage ledger, with in-flight USD reservation for max-output estimates",
+      "rationale": "llm-proxy rate-limits per identity - caller key id when authenticated, client IP otherwise (crates/llm-proxy-server/src/routes/core_pipeline.rs:173-176, so per-key RPM already exists per the compendium's narrowed gap #3) - but has no token (TPM) windows, per-key spend caps, or in-flight reservations, and client keys grant all-or-nothing model access. Eight repos ship per-key spend caps or multi-window limits; mcp-gateway's enforcer proves the hot-path cost (<0.1ms) in micro-USD atomics; sub2api reserves worst-case USD before forwarding.",
+      "area": "rate-limiting",
+      "evidence": [
+        "https://github.com/ENTERPILOT/GoModel/pull/1293",
+        "https://github.com/Nya-Foundation/NyaProxy/pull/133",
+        "https://github.com/MartialBE/one-hub/issues/835",
+        "research-repos/yolorouter__yolorouter/internal/model/api_key.go",
+        "research-repos/mozilla-ai__otari/src/gateway/models/budgets.py",
+        "research-repos/MikkoParkkola__mcp-gateway/src/cost_accounting/enforcer.rs"
+      ],
+      "repos": ["ENTERPILOT/GoModel", "mozilla-ai/otari", "yolorouter/yolorouter", "MikkoParkkola/mcp-gateway", "Nya-Foundation/NyaProxy", "MartialBE/one-hub", "ThinkWatchProject/ThinkWatch", "api7/aisix", "Wei-Shaw/sub2api"],
+      "priority": "high",
+      "crate": "llm-proxy-core"
+    },
+    {
+      "candidate": "Usage-estimation fallback: inject stream_options.include_usage on OpenAI streams, force Accept-Encoding: identity upstream, estimate tokens when usage is absent, and flag rows usage_estimated",
+      "rationale": "When an upstream omits usage (streams without stream_options, callers leaving mid-stream), llm-proxy records nothing instead of an estimated, flagged row. plano injected exactly these knobs after finding gzipped bodies landing in usage_missing; aisix estimates via bundled tiktoken and tells the client so a caller never reads zero against an unreconcilable bill.",
+      "area": "cost-tracking",
+      "evidence": [
+        "https://github.com/katanemo/plano/pull/1043",
+        "research-repos/ThinkWatchProject__ThinkWatch/crates/gateway/src/usage_estimate.rs",
+        "research-repos/api7__aisix/crates/aisix-proxy/src/token_estimate.rs",
+        "https://github.com/mozilla-ai/otari/pull/2869"
+      ],
+      "repos": ["katanemo/plano", "ThinkWatchProject/ThinkWatch", "api7/aisix", "mozilla-ai/otari"],
+      "priority": "high",
+      "crate": "llm-proxy-provider"
+    },
+    {
+      "candidate": "Phase-shaped timeouts: connect / first-byte (TTFB) / in-stream idle / total, cross-validated at config load, replacing the single flat per-route timeout",
+      "rationale": "llm-proxy applies one flat TimeoutLayer (crates/llm-proxy-server/src/routes/mod.rs:64-67) and one idle watchdog used identically for prefill wait and reasoning pauses (crates/llm-proxy-provider/src/transport.rs:71-81). Seven repos shape timeouts around LLM stream phases; reasoning models that think for minutes before the first token are killed by flat budgets.",
+      "area": "ops",
+      "evidence": [
+        "https://github.com/EeroEternal/xlb/pull/2",
+        "research-repos/EeroEternal__xlb/src/config.rs",
+        "research-repos/yolorouter__yolorouter/internal/config/config.go",
+        "https://github.com/ericc-ch/copilot-api/issues/223",
+        "https://github.com/1mcp-app/agent/issues/709",
+        "https://github.com/NVIDIA-NeMo/Switchyard/issues/1168"
+      ],
+      "repos": ["EeroEternal/xlb", "yolorouter/yolorouter", "ericc-ch/copilot-api", "1mcp-app/agent", "NVIDIA-NeMo/Switchyard", "ThinkWatchProject/ThinkWatch", "mostlygeek/llama-swap"],
+      "priority": "high",
+      "crate": "llm-proxy-provider"
+    },
+    {
+      "candidate": "Client-facing /v1/responses endpoint: streaming event synthesis, wire-exact usage fields, and Codex-proven tool-call grouping/ordering semantics",
+      "rationale": "llm-proxy's client surface is OpenAI Chat + Anthropic Messages only. Eleven repos serve Responses to clients; one-hub users demand it because Codex-class clients cannot be pointed elsewhere, and its merged PR shows Responses SSE clients hard-require wire-exact usage fields (a zero-value cached_tokens omitted via omitempty broke Codex). completion-to-response is the minimal implementation shape.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/MartialBE/one-hub/issues/868",
+        "https://github.com/MartialBE/one-hub/pull/910",
+        "research-repos/NoahStepheno__completion-to-response/internal/transform/transform.go",
+        "https://github.com/EricLBuehler/mistral.rs/pull/2538",
+        "research-repos/eliasbiondo__antirion/crates/antirion-pipeline/src/accept.rs"
+      ],
+      "repos": ["MartialBE/one-hub", "NoahStepheno/completion-to-response", "EricLBuehler/mistral.rs", "eliasbiondo/antirion", "yolorouter/yolorouter", "api7/aisix", "router-for-me/CLIProxyAPI", "smg-project/smg", "ThinkWatchProject/ThinkWatch", "musistudio/claude-code-router", "deanxv/done-hub"],
+      "priority": "high",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Egress header hygiene: strip client auth/Origin/browser headers on the upstream hop, never re-attach credentials across redirects, and sanitize client-supplied request ids in logs",
+      "rationale": "llm-proxy forwards only the inbound auth token in passthrough mode and has no header policy for the server-to-server hop. The cloudflare-workers fix shows caller auth headers overriding provider credentials; llama-swap shows browser Origin headers making Anthropic 401; freellmpool shows redirects leaking credentials to internal targets.",
+      "area": "auth",
+      "evidence": [
+        "https://github.com/blue-pen5805/llm-proxy-on-cloudflare-workers/issues/350",
+        "https://github.com/mostlygeek/llama-swap/issues/1214",
+        "https://github.com/0xzr/freellmpool/issues/87",
+        "https://github.com/aws-samples/bedrock-access-gateway/pull/262"
+      ],
+      "repos": ["blue-pen5805/llm-proxy-on-cloudflare-workers", "mostlygeek/llama-swap", "0xzr/freellmpool", "aws-samples/bedrock-access-gateway"],
+      "priority": "high",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Loopback hardening: validate Host/Origin (DNS-rebinding defense) in mode=none, and refuse non-loopback binds without client auth at config validation",
+      "rationale": "llm-proxy's mode=none safety rests on bind address alone; its CORS layer exists only when allowed_origins is configured and Host is never validated. mcp-gateway shipped an always-on Origin/Host guard as a CWE-346 fix after an external report that a web page could reach the loopback port; jan refused non-loopback binds without a key and stopped '*' trusted-hosts from accepting every Host.",
+      "area": "auth",
+      "evidence": [
+        "research-repos/MikkoParkkola__mcp-gateway/src/gateway/router/origin_guard.rs",
+        "https://github.com/janhq/jan/pull/9505",
+        "https://github.com/janhq/jan/pull/9507",
+        "https://github.com/cita-777/metapi/issues/631",
+        "https://github.com/redis/redis-vl-python/pull/746"
+      ],
+      "repos": ["MikkoParkkola/mcp-gateway", "janhq/jan", "cita-777/metapi", "redis/redis-vl-python", "AmoyLab/Unla"],
+      "priority": "high",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Subscription OAuth upstream credentials: PKCE browser-login and device-code flows, single-flight proactive refresh, and quota-window telemetry surfaced to the client",
+      "rationale": "llm-proxy accepts only static bearer keys upstream (SecretString in TOML). Seven repos make consumer-subscription upstreams (Codex/ChatGPT, Claude, Gemini, Grok, Kimi) first-class; claude-code-proxy proves the full flow fits a small Rust binary, and its PR #149 shows quota/reset clocks mapped into the Anthropic usage block.",
+      "area": "auth",
+      "evidence": [
+        "https://github.com/Inebrio/Routerly/pull/107",
+        "research-repos/raine__claude-code-proxy/src/providers/codex/auth/manager.rs",
+        "https://github.com/raine/claude-code-proxy/pull/149",
+        "https://github.com/cita-777/metapi/pull/430",
+        "research-repos/deanxv__done-hub/providers/claudecode/base.go",
+        "https://github.com/ericc-ch/copilot-api/issues/255"
+      ],
+      "repos": ["Inebrio/Routerly", "raine/claude-code-proxy", "router-for-me/CLIProxyAPI", "Wei-Shaw/sub2api", "deanxv/done-hub", "cita-777/metapi", "ericc-ch/copilot-api", "musistudio/claude-code-router"],
+      "priority": "high",
+      "crate": "llm-proxy-provider"
+    },
+    {
+      "candidate": "Reasoning-parameter translation: reasoning_effort <-> thinking.budget_tokens <-> Gemini thinkingBudget with per-model clamps, and enforcement of declared budgets",
+      "rationale": "llm-proxy passes Thinking content blocks through but converts no reasoning parameters between dialects. CLIProxyAPI ships a dedicated conversion engine; Switchyard derives effort from budget ratios with loss diagnostics; bedrock-gateway shows per-generation thinking-API churn breaking static translation; mistral.rs shows accepted-but-unenforced budgets silently spending the whole window.",
+      "area": "protocol",
+      "evidence": [
+        "research-repos/router-for-me__CLIProxyAPI/internal/thinking/convert.go",
+        "https://github.com/NVIDIA-NeMo/Switchyard/pull/1216",
+        "https://github.com/aws-samples/bedrock-access-gateway/issues/248",
+        "https://github.com/EricLBuehler/mistral.rs/issues/2522",
+        "https://github.com/NVIDIA-NeMo/Guardrails/issues/2539"
+      ],
+      "repos": ["router-for-me/CLIProxyAPI", "NVIDIA-NeMo/Switchyard", "aws-samples/bedrock-access-gateway", "EricLBuehler/mistral.rs", "NVIDIA-NeMo/Guardrails", "oobabooga/textgen"],
+      "priority": "medium",
+      "crate": "llm-proxy-protocol"
+    },
+    {
+      "candidate": "SSE keep-alive heartbeats during silent generation, plus a guaranteed terminal usage event on every stream including tool-call turns",
+      "rationale": "Silent reasoning windows trip client and intermediary timeouts that heartbeat comment frames prevent (done-hub ::PING; Switchyard asked for event: ping), and koboldcpp shows agent auto-compaction never firing when the terminal usage chunk is dropped on streamed tool requests.",
+      "area": "protocol",
+      "evidence": [
+        "research-repos/deanxv__done-hub/relay/relay_util/heartbeat.go",
+        "https://github.com/NVIDIA-NeMo/Switchyard/issues/1168",
+        "https://github.com/LostRuins/koboldcpp/issues/2480",
+        "https://github.com/ericc-ch/copilot-api/issues/223"
+      ],
+      "repos": ["deanxv/done-hub", "NVIDIA-NeMo/Switchyard", "LostRuins/koboldcpp", "ericc-ch/copilot-api", "ThinkWatchProject/ThinkWatch"],
+      "priority": "medium",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Prompt-cache hygiene: normalize cache-busting volatile bytes (client correlation tokens, per-turn reminder blocks) before egress, keep any request mutation byte-stable past the last cache breakpoint, and optionally auto-inject cache markers",
+      "rationale": "llm-proxy performs no request-body normalization, no cache_control/prompt_cache_key injection, and has no mutation-safety boundary. ostk-cache measured cache_read going 0 -> 963K tokens/turn just by stripping one volatile token; sub2api engineered fingerprint convergence for the same effect; plano injects markers per provider family.",
+      "area": "caching",
+      "evidence": [
+        "research-repos/os-tack__ostk-cache/src/billing_strip.rs",
+        "https://github.com/Wei-Shaw/sub2api/pull/8464",
+        "https://github.com/musistudio/claude-code-router/pull/1866",
+        "research-repos/katanemo__plano/crates/brightstaff/src/handlers/llm/prompt_caching.rs",
+        "research-repos/agiwhitelist__tokdiet/src/providers.ts",
+        "https://github.com/janhq/jan/pull/9497"
+      ],
+      "repos": ["os-tack/ostk-cache", "Wei-Shaw/sub2api", "musistudio/claude-code-router", "katanemo/plano", "agiwhitelist/tokdiet", "janhq/jan", "api7/aisix"],
+      "priority": "medium",
+      "crate": "llm-proxy-core"
+    },
+    {
+      "candidate": "Cross-protocol reasoning/tool-state replay: preserve Gemini thought signatures on replayed function calls, round-trip OpenAI reasoning_content (never omit when empty), and carry encrypted reasoning through signatures",
+      "rationale": "metapi shows Gemini upstreams 400-ing replayed tool history missing thought_signature; done-hub ships the sentinel-retry recovery; completion-to-response shows omitting empty reasoning_content breaking DeepSeek multi-turn; claude-code-proxy packs encrypted reasoning into a synthetic signature the client echoes back.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/cita-777/metapi/issues/580",
+        "research-repos/deanxv__done-hub/relay/common.go",
+        "research-repos/NoahStepheno__completion-to-response/internal/types/completion.go",
+        "research-repos/raine__claude-code-proxy/src/providers/codex/translate/reasoning_signature.rs"
+      ],
+      "repos": ["cita-777/metapi", "deanxv/done-hub", "NoahStepheno/completion-to-response", "raine/claude-code-proxy", "router-for-me/CLIProxyAPI"],
+      "priority": "medium",
+      "crate": "llm-proxy-protocol"
+    },
+    {
+      "candidate": "Session attribution and optional sticky affinity: record session/conversation ids (from client headers like x-claude-code-session-id and metadata.user_id) on usage rows; optionally pin a session to an upstream for cache locality",
+      "rationale": "llm-proxy's ledger records only the key id; nine repos attribute per-session and several pin sessions to upstreams explicitly for prompt-cache warmth. otari users cannot see their own spend without session grouping; CCR's fallback misattribution shows why the served model must be recorded per row.",
+      "area": "observability",
+      "evidence": [
+        "research-repos/Wei-Shaw__sub2api/backend/internal/service/gateway_service.go",
+        "research-repos/router-for-me__CLIProxyAPI/sdk/cliproxy/auth/session_cache.go",
+        "research-repos/NVIDIA-NeMo__Switchyard/crates/switchyard-server/src/routing_log.rs",
+        "research-repos/agiwhitelist__tokdiet/src/session.ts",
+        "https://github.com/mozilla-ai/otari/issues/2792"
+      ],
+      "repos": ["Wei-Shaw/sub2api", "router-for-me/CLIProxyAPI", "NVIDIA-NeMo/Switchyard", "agiwhitelist/tokdiet", "mozilla-ai/otari", "katanemo/plano", "ThinkWatchProject/ThinkWatch", "musistudio/claude-code-router", "lidge-jun/opencodex"],
+      "priority": "medium",
+      "crate": "llm-proxy-storage"
+    },
+    {
+      "candidate": "Per-key model/provider allowlists (glob patterns) enforced after authentication",
+      "rationale": "llm-proxy's client keys reach everything the catalog exposes; its model allow/deny exists only at catalog level. Four repos ship per-key scoping; CLIProxyAPI's PR shows restricted keys must fail closed for requests without an identifiable model.",
+      "area": "auth",
+      "evidence": [
+        "https://github.com/MartialBE/one-hub/pull/824",
+        "https://github.com/router-for-me/CLIProxyAPI/pull/7117",
+        "research-repos/MikkoParkkola__mcp-gateway/examples/per-client-tool-scopes.yaml",
+        "https://github.com/Wei-Shaw/sub2api/issues/8480",
+        "research-repos/deanxv__done-hub/relay/common.go"
+      ],
+      "repos": ["MartialBE/one-hub", "router-for-me/CLIProxyAPI", "MikkoParkkola/mcp-gateway", "Wei-Shaw/sub2api", "deanxv/done-hub", "samanhappy/mcphub"],
+      "priority": "medium",
+      "crate": "llm-proxy-core"
+    },
+    {
+      "candidate": "Gemini-native client ingress: POST /v1beta/models/{model}:generateContent and :streamGenerateContent translated through the existing hub (Gemini is currently upstream-only)",
+      "rationale": "llm-proxy speaks only OpenAI Chat and Anthropic Messages on the client side. Seven harvested repos serve native Gemini clients - ThinkWatch routes them through the identical pipeline (limits, routing, guards, billing), done-hub mounts a sibling /v1beta group sharing the /v1 middleware chain, and antirion accepts Gemini and Bedrock client dialects inbound. This clears the record's 3+ recurring-needs threshold, unlike the two-repo Ollama dialect candidate that follows it.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/ThinkWatchProject/ThinkWatch/pull/43",
+        "research-repos/deanxv__done-hub/router/relay-router.go",
+        "research-repos/yolorouter__yolorouter/internal/router/router.go",
+        "research-repos/musistudio__claude-code-router/packages/core/src/routing/protocol-endpoints.ts",
+        "research-repos/agiwhitelist__tokdiet/src/providers.ts",
+        "research-repos/eliasbiondo__antirion/crates/antirion-pipeline/src/accept.rs"
+      ],
+      "repos": ["ThinkWatchProject/ThinkWatch", "deanxv/done-hub", "yolorouter/yolorouter", "router-for-me/CLIProxyAPI", "musistudio/claude-code-router", "agiwhitelist/tokdiet", "eliasbiondo/antirion"],
+      "priority": "medium",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Upstream health and quota-state tracking: passive parsing of 429/rate-limit headers into per-provider cooldowns keyed to real reset times, plus a synthetic probe that auto-disables unreachable models",
+      "rationale": "llm-proxy's only upstream health notion is discovery-time transient retry. yolorouter parses exactly three dialects and derives bench duration from learned rows with a corroboration cap; sub2api pauses accounts by real quota windows; metapi auto-disables models past probe thresholds; xlb pairs active probes with passive ejection.",
+      "area": "ops",
+      "evidence": [
+        "https://github.com/0xzr/freellmpool/pull/97",
+        "research-repos/yolorouter__yolorouter/internal/gateway/rate_limit_evidence.go",
+        "research-repos/Wei-Shaw__sub2api/backend/internal/service/account_scheduling_threshold_eval.go",
+        "https://github.com/cita-777/metapi/pull/510"
+      ],
+      "repos": ["0xzr/freellmpool", "yolorouter/yolorouter", "Wei-Shaw/sub2api", "cita-777/metapi", "EeroEternal/xlb", "MikkoParkkola/mcp-gateway", "router-for-me/CLIProxyAPI"],
+      "priority": "medium",
+      "crate": "llm-proxy-provider"
+    },
+    {
+      "candidate": "Prometheus exposition and OTel export of the existing lock-free metrics",
+      "rationale": "llm-proxy's metrics are in-process counters with no scrape or export path. Five repos treat OTel/Prometheus as a standard subsystem; redis-vl's contributor note says 'every deployment writes its own counters' when a library exports none.",
+      "area": "observability",
+      "evidence": [
+        "https://github.com/EinStack/glide/pull/237",
+        "https://github.com/AmoyLab/Unla/pull/289",
+        "research-repos/NVIDIA-NeMo__Switchyard/crates/switchyard-server/src/metrics.rs",
+        "research-repos/smg-project__smg/model_gateway/src/observability/otel_trace.rs",
+        "https://github.com/redis/redis-vl-python/pull/814"
+      ],
+      "repos": ["EinStack/glide", "AmoyLab/Unla", "NVIDIA-NeMo/Switchyard", "smg-project/smg", "redis/redis-vl-python", "samanhappy/mcphub", "messkan/prompt-cache"],
+      "priority": "medium",
+      "crate": "llm-proxy-core"
+    },
+    {
+      "candidate": "Pricing catalog sync from models.dev (with refresh and aliasing) plus an explicit unpriced state that is never silently $0",
+      "rationale": "llm-proxy prices are operator-typed fixed-point TOML with no refresh story. Six repos converge on models.dev as the canonical feed; RouterArena charges unpriced models the table maximum instead of $0 after silent skips corrupted evaluations; tokdiet shows an unpriced month looking like a free month.",
+      "area": "cost-tracking",
+      "evidence": [
+        "research-repos/mozilla-ai__otari/src/gateway/services/pricing_refresh_service.py",
+        "https://github.com/katanemo/plano/pull/971",
+        "research-repos/deanxv__done-hub/model/pricing_modelsdev.go",
+        "research-repos/musistudio__claude-code-router/scripts/generate-models-json.mjs",
+        "https://github.com/RouteWorks/RouterArena/pull/218",
+        "https://github.com/agiwhitelist/tokdiet/issues/1"
+      ],
+      "repos": ["mozilla-ai/otari", "katanemo/plano", "deanxv/done-hub", "musistudio/claude-code-router", "RouteWorks/RouterArena", "agiwhitelist/tokdiet", "AgentOps-AI/agentops", "inference-gateway/inference-gateway"],
+      "priority": "medium",
+      "crate": "llm-proxy-core"
+    },
+    {
+      "candidate": "Hot config reload with refusal semantics: surgical per-provider swaps that never tear down unrelated connections, with restart-required refusals instead of half-applied changes",
+      "rationale": "llm-proxy requires a restart for config changes. Five repos ship hot reload; mcphub's worst production pain was config edits re-spawning every upstream; mcp-gateway refuses auth-weakening reloads with stable error prefixes and a restart_required flag; preflight keeps the previous runtime on a failed reload.",
+      "area": "ops",
+      "evidence": [
+        "research-repos/MikkoParkkola__mcp-gateway/src/config_reload/mod.rs",
+        "research-repos/router-for-me__CLIProxyAPI/internal/watcher/config_reload.go",
+        "research-repos/ghuntley__preflight/src/main.rs",
+        "https://github.com/samanhappy/mcphub/issues/1448",
+        "https://github.com/ENTERPILOT/GoModel/issues/1308"
+      ],
+      "repos": ["MikkoParkkola/mcp-gateway", "router-for-me/CLIProxyAPI", "ghuntley/preflight", "samanhappy/mcphub", "ENTERPILOT/GoModel", "ThinkWatchProject/ThinkWatch", "messkan/prompt-cache"],
+      "priority": "medium",
+      "crate": "apps/llm-proxy"
+    },
+    {
+      "candidate": "Idempotency-key replay for retried POSTs: claim the key before budget checks, replay the stored response for matching retries, 409 while in flight",
+      "rationale": "llm-proxy's dedup window only 409-rejects concurrent identical requests; a client retry after a timeout re-executes and re-bills. mcp-gateway's admission holds active leases that never expire by design; otari's fingerprint covers request-shaping headers so old claims still match; xlb gates replay of non-idempotent requests on the key's presence.",
+      "area": "protocol",
+      "evidence": [
+        "research-repos/MikkoParkkola__mcp-gateway/src/idempotency/admission.rs",
+        "research-repos/mozilla-ai__otari/src/gateway/api/routes/_idempotency.py",
+        "research-repos/EeroEternal__xlb/src/config.rs"
+      ],
+      "repos": ["MikkoParkkola/mcp-gateway", "mozilla-ai/otari", "EeroEternal/xlb"],
+      "priority": "medium",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Config-validation hardening: refuse cleartext credentials on http:// URLs to off-machine hosts; warn/refuse on non-loopback binds without auth",
+      "rationale": "llm-proxy only validates that an endpoint scheme is http or https, so an api_key over plain http to a remote host is accepted silently. mcp-gateway refuses credential-bearing cleartext configs before startup, loopback exempt with an explicit opt-in.",
+      "area": "auth",
+      "evidence": [
+        "research-repos/MikkoParkkola__mcp-gateway/src/config/mod.rs",
+        "https://github.com/janhq/jan/pull/9505"
+      ],
+      "repos": ["MikkoParkkola/mcp-gateway", "janhq/jan"],
+      "priority": "medium",
+      "crate": "llm-proxy-core"
+    },
+    {
+      "candidate": "`doctor` command: live provider reachability checks, per-model one-token verification probes, and named remedies for failures",
+      "rationale": "llm-proxy's `validate` is static config validation and `status` is liveness. mcp-gateway's doctor runs live checks into a pass/fail/warn table where every failure carries fix/verify/rollback commands; the awesome-ai-gateway ecosystem ships standalone key-liveness monitors because balance pages stay green while keys are dead.",
+      "area": "ops",
+      "evidence": [
+        "research-repos/MikkoParkkola__mcp-gateway/src/commands/doctor.rs",
+        "https://github.com/cuihuan/awesome-ai-gateway/pull/101",
+        "https://github.com/Wei-Shaw/sub2api/issues/8454"
+      ],
+      "repos": ["MikkoParkkola/mcp-gateway", "cuihuan/awesome-ai-gateway", "Wei-Shaw/sub2api", "musistudio/claude-code-router", "yolorouter/yolorouter"],
+      "priority": "medium",
+      "crate": "apps/llm-proxy"
+    },
+    {
+      "candidate": "In-flight request visibility: expose live requests (provider, model, state, elapsed) in the admin API alongside completed usage rows",
+      "rationale": "llm-proxy's admin API reports only completed usage; operators debugging slow providers have a blind spot. Routerly's users asked explicitly; claude-code-proxy and ollamaMQ ship live views as first-class operator surfaces.",
+      "area": "observability",
+      "evidence": [
+        "https://github.com/Inebrio/Routerly/issues/148",
+        "research-repos/raine__claude-code-proxy/src/monitor.rs",
+        "research-repos/Chleba__ollamaMQ/src/tui.rs"
+      ],
+      "repos": ["Inebrio/Routerly", "raine/claude-code-proxy", "Chleba/ollamaMQ"],
+      "priority": "medium",
+      "crate": "llm-proxy-api"
+    },
+    {
+      "candidate": "Streaming truncation semantics: never synthesize success on an abnormal end; emit typed in-band error events carrying finish-reason context",
+      "rationale": "llm-proxy already defers in-band errors until after visible output; the recurring ecosystem failure is masking truncation as completion (sub2api #8505, koboldcpp #2481, jan #9515) or emitting a bare socket destroy (CCR #1917). Typed terminal events let clients decide retry-safety.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/Wei-Shaw/sub2api/issues/8505",
+        "https://github.com/LostRuins/koboldcpp/issues/2481",
+        "https://github.com/musistudio/claude-code-router/issues/1917",
+        "https://github.com/0xzr/freellmpool/pull/17",
+        "https://github.com/EinStack/glide/issues/272"
+      ],
+      "repos": ["Wei-Shaw/sub2api", "LostRuins/koboldcpp", "musistudio/claude-code-router", "0xzr/freellmpool", "EinStack/glide", "janhq/jan"],
+      "priority": "medium",
+      "crate": "llm-proxy-protocol"
+    },
+    {
+      "candidate": "Streaming tool-call fragment robustness: longest-match tool-name resolution and tolerance for quotes/newlines inside JSON arguments during fragment reassembly",
+      "rationale": "llm-proxy's SSE decoders keep tool-arg fragment state; the recurring upstream failure mode in the wild is ambiguous tool-name prefixes (search vs search_web silently executing the wrong tool) and quotes/newlines inside streamed JSON arguments.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/oobabooga/textgen/issues/7666",
+        "https://github.com/oobabooga/textgen/pull/7477",
+        "https://github.com/EricLBuehler/mistral.rs/issues/2466"
+      ],
+      "repos": ["oobabooga/textgen", "EricLBuehler/mistral.rs", "smg-project/smg"],
+      "priority": "medium",
+      "crate": "llm-proxy-protocol"
+    },
+    {
+      "candidate": "Per-provider concurrency caps with bounded admission: semaphore-limited in-flight requests per provider/model, returning 503 (not 429) with a short Retry-After when saturated",
+      "rationale": "llm-proxy has no concurrency cap anywhere in the egress path. xlb's RAII lease and queue_full 503, metapi's per-site max_concurrency, and ollamaMQ's per-model caps all exist because capacity shedding misread as rate-limiting arms hour-long client backoff ladders (llama-swap #1256).",
+      "area": "rate-limiting",
+      "evidence": [
+        "research-repos/EeroEternal__xlb/src/config.rs",
+        "https://github.com/cita-777/metapi/pull/609",
+        "https://github.com/mostlygeek/llama-swap/issues/1256",
+        "research-repos/Chleba__ollamaMQ/src/dispatcher.rs"
+      ],
+      "repos": ["EeroEternal/xlb", "cita-777/metapi", "mostlygeek/llama-swap", "Chleba/ollamaMQ", "Nya-Foundation/NyaProxy", "smg-project/smg"],
+      "priority": "medium",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Provider API-key pools: multiple credentials per provider with rotation, cooldown on 401/429/5xx, and utilization-aware ordering",
+      "rationale": "llm-proxy supports one static key per provider. Users of one-hub forks call the one-key-per-channel shape 'very inconvenient' (done-hub #57); CCR's users file it as the top missing feature (#1923); the cloudflare-workers discovery path already rotates on 429 within a request.",
+      "area": "auth",
+      "evidence": [
+        "https://github.com/deanxv/done-hub/issues/57",
+        "https://github.com/musistudio/claude-code-router/issues/1923",
+        "https://github.com/blue-pen5805/llm-proxy-on-cloudflare-workers/pull/349",
+        "https://github.com/ericc-ch/copilot-api/issues/255"
+      ],
+      "repos": ["deanxv/done-hub", "musistudio/claude-code-router", "blue-pen5805/llm-proxy-on-cloudflare-workers", "ericc-ch/copilot-api", "router-for-me/CLIProxyAPI", "MartialBE/one-hub"],
+      "priority": "medium",
+      "crate": "llm-proxy-core"
+    },
+    {
+      "candidate": "Self-loop prevention: refuse configurations whose upstream resolves to the proxy's own listener, and stamp/strip a hop header on egress",
+      "rationale": "These proxies are configured via base-URL swaps, where a wrong URL silently creates infinite forwarding. ostk-cache refuses self-referential upstreams and 508s on hop-header ingress; inference-gateway short-circuits calls that loop back through its own listener.",
+      "area": "ops",
+      "evidence": [
+        "research-repos/os-tack__ostk-cache/crates/ostk-cache-core/src/capture.rs",
+        "https://github.com/inference-gateway/inference-gateway/issues/822"
+      ],
+      "repos": ["os-tack/ostk-cache", "inference-gateway/inference-gateway"],
+      "priority": "low",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Retention hygiene: prove ledger retention knobs drive eviction, and never orphan sidecar data when pruning",
+      "rationale": "llm-proxy's SQLite ledger has max_age/max_rows/prune_interval; the ecosystem shows retention bugs where body files outlive rows (13 GB of orphans in nine days on CCR) and capacity knobs that never reach the backend (llama-cpp-python disk cache).",
+      "area": "ops",
+      "evidence": [
+        "https://github.com/musistudio/claude-code-router/pull/1931",
+        "https://github.com/mostlygeek/llama-swap/pull/1294",
+        "https://github.com/abetlen/llama-cpp-python/pull/2400"
+      ],
+      "repos": ["musistudio/claude-code-router", "mostlygeek/llama-swap", "abetlen/llama-cpp-python"],
+      "priority": "low",
+      "crate": "llm-proxy-storage"
+    },
+    {
+      "candidate": "Config provenance: print resolved settings with the source of each (CLI > env > config > default)",
+      "rationale": "llm-proxy supports three override layers (config, env interpolation, CLI) but `validate` prints resolved values without origins, leaving 'why is my flag ignored?' unanswerable. ostk-cache's Source-tagged --print-config answers it from output.",
+      "area": "ops",
+      "evidence": [
+        "research-repos/os-tack__ostk-cache/src/config.rs"
+      ],
+      "repos": ["os-tack/ostk-cache"],
+      "priority": "low",
+      "crate": "apps/llm-proxy"
+    },
+    {
+      "candidate": "Admin/ops MCP surface: expose the admin usage API as MCP tools so an agent can operate the proxy itself",
+      "rationale": "Three gateways expose their management plane over MCP (inference-gateway stateless 2026-07-28; done-hub's per-user dashboard tool; sub2api's four pre-configured read/write servers reusing REST ownership checks). llm-proxy's read-only admin API is the natural substrate.",
+      "area": "mcp",
+      "evidence": [
+        "https://github.com/inference-gateway/inference-gateway/pull/709",
+        "research-repos/deanxv__done-hub/mcp/server.go",
+        "https://github.com/Wei-Shaw/sub2api/pull/8389"
+      ],
+      "repos": ["inference-gateway/inference-gateway", "deanxv/done-hub", "Wei-Shaw/sub2api"],
+      "priority": "low",
+      "crate": "llm-proxy-api"
+    },
+    {
+      "candidate": "Ollama-native client dialect (/api/chat, /api/generate, /api/tags) reusing the existing admission chain",
+      "rationale": "llm-proxy's inbound surface is OpenAI Chat + Anthropic Messages only. ollamaMQ serves the full Ollama surface on both sides; opencodex added an Ollama-compatible inbound API by reusing one admission path rather than new code - the low-cost pattern for dialect breadth. Kept at low priority despite sitting below the record's 3+ repo threshold (unlike the Gemini ingress candidate above): local-inference alignment is strategic for llm-proxy but the harvested demand is two repos.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/lidge-jun/opencodex/pull/8099",
+        "research-repos/Chleba__ollamaMQ/README.md"
+      ],
+      "repos": ["lidge-jun/opencodex", "Chleba/ollamaMQ"],
+      "priority": "low",
+      "crate": "llm-proxy-server"
+    },
+    {
+      "candidate": "Cache-Control: no-store on all admin API responses",
+      "rationale": "done-hub shipped this after a CDN cached authenticated API responses into an authorization bypass; llm-proxy emits no Cache-Control/Pragma headers anywhere, including its constant-time-token-gated admin API.",
+      "area": "auth",
+      "evidence": [
+        "research-repos/deanxv__done-hub/middleware/cache.go"
+      ],
+      "repos": ["deanxv/done-hub"],
+      "priority": "low",
+      "crate": "llm-proxy-api"
+    },
+    {
+      "candidate": "Retry terminality signals: when llm-proxy exhausts its own retries, mark the final error non-retryable (x-should-retry: false plus a computed Retry-After) so client retry loops don't stack",
+      "rationale": "claude-code-proxy's exhausted 503 lacked x-should-retry:false, so Claude Code stacked its own retry loop on the proxy's - one deterministic turn hung ~30 minutes over ~100 upstream calls. ThinkWatch returns computed Retry-After plus x-should-retry: false on every refusal.",
+      "area": "protocol",
+      "evidence": [
+        "https://github.com/raine/claude-code-proxy/pull/175",
+        "https://github.com/ThinkWatchProject/ThinkWatch/pull/81",
+        "https://github.com/router-for-me/CLIProxyAPI/pull/7239"
+      ],
+      "repos": ["raine/claude-code-proxy", "ThinkWatchProject/ThinkWatch", "router-for-me/CLIProxyAPI", "inference-gateway/inference-gateway"],
+      "priority": "low",
+      "crate": "llm-proxy-server"
+    }
+  ]
+}

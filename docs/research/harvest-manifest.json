@@ -1,0 +1,725 @@
+{
+ "generated": "2026-11-04",
+ "repos": [
+  {
+   "repo": "0xzr/freellmpool",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "1mcp-app/agent",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "AgentOps-AI/agentops",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "AmoyLab/Unla",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "ENTERPILOT/GoModel",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "EinStack/glide",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "EricLBuehler/mistral.rs",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "Inebrio/Routerly",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "LMCache/LMCache",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "LostRuins/koboldcpp",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "MartialBE/one-hub",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "MikkoParkkola/mcp-gateway",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "NVIDIA-NeMo/Guardrails",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "NVIDIA-NeMo/Switchyard",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "Nya-Foundation/NyaProxy",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "RouteWorks/RouterArena",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "StackOneHQ/defender",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "ThinkWatchProject/ThinkWatch",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "Wei-Shaw/sub2api",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "abetlen/llama-cpp-python",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "api7/aisix",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "aws-samples/bedrock-access-gateway",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "blue-pen5805/llm-proxy-on-cloudflare-workers",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "cita-777/metapi",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "cuihuan/awesome-ai-gateway",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "data-privacy-stack/presidio",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "eclipse-lmos/lmos-router",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "ericc-ch/copilot-api",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "ferro-labs/ai-gateway",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "guardrails-ai/guardrails",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "inference-gateway/inference-gateway",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "janhq/jan",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "katanemo/plano",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "kvcache-ai/Mooncake",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "lidge-jun/opencodex",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "meta-llama/PurpleLlama",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "metatool-ai/metamcp",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "mostlygeek/llama-swap",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "mozilla-ai/llamafile",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "mozilla-ai/otari",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "mudler/LocalAI",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "musistudio/claude-code-router",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "oobabooga/textgen",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "open-webui/mcpo",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "protectai/llm-guard",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "raine/claude-code-proxy",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "redis/redis-vl-python",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "router-for-me/CLIProxyAPI",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "samanhappy/mcphub",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "smart-mcp-proxy/mcpproxy-go",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "smg-project/smg",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "sparfenyuk/mcp-proxy",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "tensorchord/Awesome-LLMOps",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "theroyallab/tabbyAPI",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "ulab-uiuc/LLMRouter",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "zilliztech/GPTCache",
+   "cloned": true,
+   "issues": 100,
+   "pulls": 100
+  },
+  {
+   "repo": "ip2a/mcpstore",
+   "cloned": false,
+   "issues": 99,
+   "pulls": 82
+  },
+  {
+   "repo": "KenyonY/openai-forward",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 80
+  },
+  {
+   "repo": "NadirRouter/NadirClaw",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 80
+  },
+  {
+   "repo": "Xerxes-2/clewdr",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 76
+  },
+  {
+   "repo": "zuisong/gemini-openai-proxy",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 72
+  },
+  {
+   "repo": "howardpen9/awesome-ai-api-proxy",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 69
+  },
+  {
+   "repo": "coaidev/coai",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 68
+  },
+  {
+   "repo": "1rgs/claude-code-proxy",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 64
+  },
+  {
+   "repo": "Nayjest/lm-proxy",
+   "cloned": false,
+   "issues": 92,
+   "pulls": 69
+  },
+  {
+   "repo": "protectai/rebuff",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 60
+  },
+  {
+   "repo": "BenedictKing/ccx",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 44
+  },
+  {
+   "repo": "codefuse-ai/ModelCache",
+   "cloned": false,
+   "issues": 75,
+   "pulls": 58
+  },
+  {
+   "repo": "stulzq/azure-openai-proxy",
+   "cloned": false,
+   "issues": 100,
+   "pulls": 27
+  },
+  {
+   "repo": "PublicAffairs/openai-gemini",
+   "cloned": false,
+   "issues": 87,
+   "pulls": 31
+  },
+  {
+   "repo": "jianshuo/ccglass",
+   "cloned": false,
+   "issues": 70,
+   "pulls": 45
+  },
+  {
+   "repo": "eliasbiondo/antirion",
+   "cloned": true,
+   "issues": 62,
+   "pulls": 46
+  },
+  {
+   "repo": "12britz/awesome-ai-gateways",
+   "cloned": false,
+   "issues": 54,
+   "pulls": 50
+  },
+  {
+   "repo": "InditexTech/cerbia",
+   "cloned": false,
+   "issues": 53,
+   "pulls": 45
+  },
+  {
+   "repo": "deadbits/vigil-llm",
+   "cloned": false,
+   "issues": 75,
+   "pulls": 22
+  },
+  {
+   "repo": "youssefvdel/qwengate",
+   "cloned": false,
+   "issues": 63,
+   "pulls": 30
+  },
+  {
+   "repo": "deanxv/done-hub",
+   "cloned": true,
+   "issues": 65,
+   "pulls": 15
+  },
+  {
+   "repo": "VoAPI/VoAPI",
+   "cloned": false,
+   "issues": 76,
+   "pulls": 0
+  },
+  {
+   "repo": "zhu327/gemini-openai-proxy",
+   "cloned": false,
+   "issues": 60,
+   "pulls": 12
+  },
+  {
+   "repo": "openziti/llm-gateway",
+   "cloned": false,
+   "issues": 34,
+   "pulls": 28
+  },
+  {
+   "repo": "Router-One/awesome-llm-gateway",
+   "cloned": false,
+   "issues": 28,
+   "pulls": 28
+  },
+  {
+   "repo": "sihyeong/Awesome-LLM-Inference-Engine",
+   "cloned": false,
+   "issues": 25,
+   "pulls": 23
+  },
+  {
+   "repo": "Writesonic/GPTRouter",
+   "cloned": false,
+   "issues": 25,
+   "pulls": 15
+  },
+  {
+   "repo": "m0n0x41d/anthropic-proxy-rs",
+   "cloned": false,
+   "issues": 21,
+   "pulls": 16
+  },
+  {
+   "repo": "luohy15/y-router",
+   "cloned": false,
+   "issues": 23,
+   "pulls": 12
+  },
+  {
+   "repo": "burugo/one-mcp",
+   "cloned": false,
+   "issues": 24,
+   "pulls": 7
+  },
+  {
+   "repo": "messkan/prompt-cache",
+   "cloned": true,
+   "issues": 17,
+   "pulls": 11
+  },
+  {
+   "repo": "EeroEternal/xlb",
+   "cloned": true,
+   "issues": 10,
+   "pulls": 10
+  },
+  {
+   "repo": "occludra/gateway",
+   "cloned": false,
+   "issues": 10,
+   "pulls": 10
+  },
+  {
+   "repo": "talhaanwarch/awesome-llmops-platforms",
+   "cloned": false,
+   "issues": 10,
+   "pulls": 9
+  },
+  {
+   "repo": "ai-gateways/awesome-ai-gateways",
+   "cloned": false,
+   "issues": 9,
+   "pulls": 9
+  },
+  {
+   "repo": "CassiopeiaCode/CosyRedactGateway",
+   "cloned": false,
+   "issues": 9,
+   "pulls": 6
+  },
+  {
+   "repo": "hbsgithub/deno-azure-openai-proxy",
+   "cloned": false,
+   "issues": 10,
+   "pulls": 5
+  },
+  {
+   "repo": "upstash/semantic-cache",
+   "cloned": false,
+   "issues": 9,
+   "pulls": 6
+  },
+  {
+   "repo": "dext7r/ollama-api-pool",
+   "cloned": false,
+   "issues": 8,
+   "pulls": 6
+  },
+  {
+   "repo": "yolorouter/yolorouter",
+   "cloned": true,
+   "issues": 10,
+   "pulls": 3
+  },
+  {
+   "repo": "thu-nics/TokenRouter",
+   "cloned": false,
+   "issues": 5,
+   "pulls": 5
+  },
+  {
+   "repo": "ulab-uiuc/GraphRouter",
+   "cloned": false,
+   "issues": 9,
+   "pulls": 1
+  },
+  {
+   "repo": "ulab-uiuc/Router-R1",
+   "cloned": false,
+   "issues": 10,
+   "pulls": 0
+  },
+  {
+   "repo": "Chleba/ollamaMQ",
+   "cloned": true,
+   "issues": 5,
+   "pulls": 4
+  },
+  {
+   "repo": "stanford-futuredata/FrugalGPT",
+   "cloned": false,
+   "issues": 8,
+   "pulls": 1
+  },
+  {
+   "repo": "anyscale/llm-router",
+   "cloned": false,
+   "issues": 5,
+   "pulls": 3
+  },
+  {
+   "repo": "ghuntley/preflight",
+   "cloned": true,
+   "issues": 3,
+   "pulls": 3
+  },
+  {
+   "repo": "rohanarun/computer-use-cache",
+   "cloned": false,
+   "issues": 3,
+   "pulls": 3
+  },
+  {
+   "repo": "yenanjing/awesome-model-routing",
+   "cloned": false,
+   "issues": 4,
+   "pulls": 2
+  },
+  {
+   "repo": "MilkThink-Lab/RouterEval",
+   "cloned": false,
+   "issues": 4,
+   "pulls": 1
+  },
+  {
+   "repo": "achetronic/claude-oauth-proxy",
+   "cloned": false,
+   "issues": 2,
+   "pulls": 2
+  },
+  {
+   "repo": "akl7777777/shell-api",
+   "cloned": false,
+   "issues": 3,
+   "pulls": 1
+  },
+  {
+   "repo": "dongfangzan/local-openai2anthropic",
+   "cloned": false,
+   "issues": 3,
+   "pulls": 1
+  },
+  {
+   "repo": "NoahStepheno/completion-to-response",
+   "cloned": true,
+   "issues": 2,
+   "pulls": 1
+  },
+  {
+   "repo": "unclecode/antomix",
+   "cloned": false,
+   "issues": 3,
+   "pulls": 0
+  },
+  {
+   "repo": "os-tack/ostk-cache",
+   "cloned": true,
+   "issues": 1,
+   "pulls": 1
+  },
+  {
+   "repo": "stevessr/Veloera",
+   "cloned": false,
+   "issues": 1,
+   "pulls": 1
+  },
+  {
+   "repo": "agiwhitelist/tokdiet",
+   "cloned": true,
+   "issues": 1,
+   "pulls": 0
+  },
+  {
+   "repo": "Jhongwe1/edge-llm-gateway",
+   "cloned": false,
+   "issues": 0,
+   "pulls": 0
+  },
+  {
+   "repo": "RixAPI/Rix-API",
+   "cloned": false,
+   "issues": 0,
+   "pulls": 0
+  },
+  {
+   "repo": "ShirokamiRyzen/Neko-router",
+   "cloned": false,
+   "issues": 0,
+   "pulls": 0
+  },
+  {
+   "repo": "kasuboski/openai-gateway",
+   "cloned": false,
+   "issues": 0,
+   "pulls": 0
+  },
+  {
+   "repo": "kushals256/jevcache",
+   "cloned": false,
+   "issues": 0,
+   "pulls": 0
+  },
+  {
+   "repo": "yasuoiwakura/openai-ollama-api-bridge",
+   "cloned": false,
+   "issues": 0,
+   "pulls": 0
+  }
+ ]
+}
