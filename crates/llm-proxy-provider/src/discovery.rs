@@ -31,24 +31,7 @@ impl DiscoveryClient {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 {
-                    return attempt.error("too many discovery redirects");
-                }
-                let next = attempt.url();
-                if !matches!(next.scheme(), "http" | "https") {
-                    return attempt.stop();
-                }
-                if let Some(origin) = attempt.previous().first() {
-                    let cross_host = next.host_str() != origin.host_str()
-                        || next.port_or_known_default() != origin.port_or_known_default()
-                        || next.scheme() != origin.scheme();
-                    if cross_host {
-                        return attempt.error("discovery redirect leaves the origin host");
-                    }
-                }
-                attempt.follow()
-            }))
+            .redirect(crate::transport::same_origin_redirect_policy())
             .build()?;
         Ok(Self { http })
     }
