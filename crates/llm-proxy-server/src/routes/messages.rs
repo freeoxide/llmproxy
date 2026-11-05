@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Response};
@@ -59,10 +58,18 @@ async fn handle_messages_inner(
     let request_path = format!("/providers/{provider}/v1/messages");
     let ctx = core_pipeline::prepare_request(&state, &meta, &headers, &body, &request_path)
         .inspect_err(&emit_failed)?;
-    let req: MessageRequest = match Json::<MessageRequest>::from_bytes(&body) {
-        Ok(json) => json.0,
-        Err(rejection) => {
-            let err = json_rejection_to_route_error(rejection);
+    let raw: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            let err = RouteError::InvalidRequest(format!("invalid JSON: {e}"));
+            emit_failed(&err);
+            return Err(err);
+        }
+    };
+    let req: MessageRequest = match serde::Deserialize::deserialize(raw.clone()) {
+        Ok(req) => req,
+        Err(e) => {
+            let err = RouteError::InvalidRequest(format!("invalid request body: {e}"));
             emit_failed(&err);
             return Err(err);
         }
@@ -73,6 +80,12 @@ async fn handle_messages_inner(
     let core = anthropic::decode_request(req)
         .map_err(core_pipeline::protocol_error_to_route)
         .inspect_err(&emit_failed)?;
+    // The raw body rides along so same-format routes can forward it verbatim
+    // and the cross-format policy can name leftover fields.
+    let wire = llm_proxy_provider::adapter::ClientWireRequest::new(
+        llm_proxy_provider::adapter::ClientWireFormat::AnthropicMessages,
+        raw,
+    );
 
     let is_streaming = core.stream;
     info!(
@@ -89,21 +102,15 @@ async fn handle_messages_inner(
         route_kind: ProviderRouteKind::Messages,
         client_protocol: ClientProtocol::Anthropic,
     };
+    let inbound = core_pipeline::InboundRequest {
+        auth: inbound_auth,
+        headers,
+        wire,
+    };
     if is_streaming {
-        core_pipeline::handle_core_stream(state, ctx, dispatch, core, inbound_auth).await
+        core_pipeline::handle_core_stream(state, ctx, dispatch, core, inbound).await
     } else {
-        core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound_auth).await
-    }
-}
-fn json_rejection_to_route_error(rejection: axum::extract::rejection::JsonRejection) -> RouteError {
-    match rejection {
-        axum::extract::rejection::JsonRejection::JsonSyntaxError(e) => {
-            RouteError::InvalidRequest(format!("invalid JSON: {e}"))
-        }
-        axum::extract::rejection::JsonRejection::JsonDataError(e) => {
-            RouteError::InvalidRequest(format!("invalid request body: {e}"))
-        }
-        other => RouteError::InvalidRequest(format!("invalid JSON: {other}")),
+        core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound).await
     }
 }
 

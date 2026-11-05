@@ -373,6 +373,7 @@ fn encode_content_item<'a>(
             id,
             name,
             input: tool_input,
+            signature: None,
         } => {
             if !text_parts.is_empty() {
                 input.push(ResponsesInput::Message {
@@ -460,7 +461,15 @@ impl ResponsesAdapter {
         &self,
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
+        client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
+        // No client dialect shares the Responses wire format, so every
+        // request is cross-format: settle the leftover client fields first.
+        let carried = super::client_wire::apply_field_policy(
+            client,
+            super::ProviderProtocol::OpenAiResponses,
+            target.lossy,
+        )?;
         let mut input = Vec::new();
 
         if !core.system.is_empty() {
@@ -533,13 +542,26 @@ impl ResponsesAdapter {
             })
             .collect();
 
-        let reasoning = core
-            .sampling
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| ResponsesReasoning {
-                effort: Some(effort.clone()),
-            });
+        // Reasoning translation: an effort level is validated (or derived
+        // from an Anthropic `thinking` budget); `thinking` itself never
+        // crosses to the Responses wire. An Anthropic `output_config.effort`
+        // maps onto the same field.
+        let mut effort = super::reasoning::chat_effort(&core.sampling)?;
+        if effort.is_none()
+            && let Some(config_effort) = client
+                .body
+                .as_object()
+                .and_then(|obj| obj.get("output_config"))
+                .and_then(serde_json::Value::as_object)
+                .and_then(|config| config.get("effort"))
+                .and_then(serde_json::Value::as_str)
+        {
+            super::reasoning::validate_effort(config_effort)?;
+            effort = Some(config_effort.to_owned());
+        }
+        let reasoning = effort.as_ref().map(|effort| ResponsesReasoning {
+            effort: Some(effort.clone()),
+        });
 
         let mut req = ResponsesRequest {
             model: target.upstream_model.clone(),
@@ -551,6 +573,7 @@ impl ResponsesAdapter {
             temperature: core.sampling.temperature,
             top_p: core.sampling.top_p,
             max_output_tokens: core.sampling.max_tokens,
+            extra: carried,
         };
 
         if core.sampling.stop.as_ref().is_some_and(|s| !s.is_empty()) {
@@ -586,7 +609,7 @@ impl ResponsesAdapter {
         let body = serde_json::to_vec(&req)?;
         let url = expand_url_template(&target.endpoint, target)?;
 
-        Ok(build_proxy_request(body, target, core.stream, url))
+        Ok(build_proxy_request(body, target, core.stream, url, client))
     }
 
     /// Decode a Responses API response body.
@@ -615,6 +638,7 @@ impl ResponsesAdapter {
                         id: output.call_id.clone().unwrap_or_default(),
                         name: output.name.clone().unwrap_or_default(),
                         input,
+                        signature: None,
                     });
                 }
                 _ => {
@@ -699,6 +723,16 @@ fn build_responses_usage(usage: &ResponsesUsage) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::client_wire::{ClientWireFormat, ClientWireRequest};
+
+    /// An Anthropic-dialect client wire: never the same format as the
+    /// Responses adapter, so tests exercise the cross-format encode.
+    fn client_wire(core: &CoreRequest) -> ClientWireRequest {
+        ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({"model": core.model.requested, "messages": []}),
+        )
+    }
     use llm_proxy_core::AuthStyle;
     use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions};
     use llm_proxy_protocol::zen::ResponsesContent;
@@ -714,6 +748,7 @@ mod tests {
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         }
     }
 
@@ -824,7 +859,9 @@ mod tests {
         }]);
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.model, "gpt-4o-2024-08-06");
@@ -850,7 +887,9 @@ mod tests {
         }];
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         match &body.input[0] {
@@ -875,7 +914,9 @@ mod tests {
         }];
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.tools.len(), 1);
@@ -894,7 +935,9 @@ mod tests {
         core.sampling.reasoning_effort = Some("high".into());
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.reasoning.is_some());
@@ -913,7 +956,9 @@ mod tests {
         core.stream = true;
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stream, Some(true));
@@ -1022,7 +1067,9 @@ mod tests {
 
         assert_eq!(core_resp.stop_reason, StopReason::ToolUse);
         match &core_resp.content[0] {
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_123");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -1307,7 +1354,9 @@ mod tests {
         core.tool_choice = Some(CoreToolChoice::Auto);
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.tool_choice.is_some(), "tool_choice must be forwarded");
@@ -1323,11 +1372,14 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "SF"}),
+                signature: None,
             }],
         }]);
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.input.len(), 1);
@@ -1358,7 +1410,9 @@ mod tests {
         }]);
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.input.len(), 1);
@@ -1389,7 +1443,9 @@ mod tests {
         }];
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let params = body.tools[0].parameters.as_ref().unwrap();
@@ -1517,7 +1573,9 @@ mod tests {
             core.tool_choice = Some(tc);
             let adapter = ResponsesAdapter;
             let target = make_target();
-            let proxy_req = adapter.encode_request(&core, &target).unwrap();
+            let proxy_req = adapter
+                .encode_request(&core, &target, &client_wire(&core))
+                .unwrap();
 
             let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
             assert_eq!(body.tool_choice.unwrap(), expected_value);
@@ -1536,7 +1594,9 @@ mod tests {
             }],
         }]);
         let adapter = ResponsesAdapter;
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["model"], "gpt-4o-2024-08-06-alias");
     }
@@ -1546,7 +1606,9 @@ mod tests {
         let core = make_core_request(vec![]);
         let adapter = ResponsesAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["input"].as_array().unwrap().len(), 0);
     }

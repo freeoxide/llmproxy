@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Response};
@@ -60,17 +59,32 @@ async fn handle_chat_completions_inner(
     let request_path = format!("/providers/{provider}/v1/chat/completions");
     let ctx = core_pipeline::prepare_request(&state, &meta, &headers, &body, &request_path)
         .inspect_err(&emit_failed)?;
-    let req: ChatCompletionRequest = match Json::<ChatCompletionRequest>::from_bytes(&body) {
-        Ok(Json(value)) => value,
-        Err(rejection) => {
-            let err = json_rejection_to_route_error(rejection);
+    let raw: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            let err = RouteError::InvalidRequest(format!("invalid JSON syntax: {e}"));
+            emit_failed(&err);
+            return Err(err);
+        }
+    };
+    let req: ChatCompletionRequest = match serde::Deserialize::deserialize(raw.clone()) {
+        Ok(req) => req,
+        Err(e) => {
+            let err =
+                RouteError::InvalidRequest(format!("JSON body did not match expected type: {e}"));
             emit_failed(&err);
             return Err(err);
         }
     };
     let core = openai_chat::decode_request(req)
         .map_err(core_pipeline::protocol_error_to_route)
-        .inspect_err(|e| emit_failed(e))?;
+        .inspect_err(&emit_failed)?;
+    // The raw body rides along so same-format routes can forward it verbatim
+    // and the cross-format policy can name leftover fields.
+    let wire = llm_proxy_provider::adapter::ClientWireRequest::new(
+        llm_proxy_provider::adapter::ClientWireFormat::OpenAiChatCompletions,
+        raw,
+    );
 
     let is_streaming = core.stream;
     info!(
@@ -87,25 +101,15 @@ async fn handle_chat_completions_inner(
         route_kind: ProviderRouteKind::ChatCompletions,
         client_protocol: ClientProtocol::OpenAiChat,
     };
+    let inbound = core_pipeline::InboundRequest {
+        auth: inbound_auth,
+        headers,
+        wire,
+    };
     if is_streaming {
-        core_pipeline::handle_core_stream(state, ctx, dispatch, core, inbound_auth).await
+        core_pipeline::handle_core_stream(state, ctx, dispatch, core, inbound).await
     } else {
-        core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound_auth).await
-    }
-}
-fn json_rejection_to_route_error(rejection: axum::extract::rejection::JsonRejection) -> RouteError {
-    use axum::extract::rejection::JsonRejection;
-    match rejection {
-        JsonRejection::JsonSyntaxError(e) => {
-            RouteError::InvalidRequest(format!("invalid JSON syntax: {e}"))
-        }
-        JsonRejection::JsonDataError(e) => {
-            RouteError::InvalidRequest(format!("JSON body did not match expected type: {e}"))
-        }
-        JsonRejection::MissingJsonContentType(_) => {
-            RouteError::InvalidRequest("missing application/json Content-Type".to_owned())
-        }
-        other => RouteError::InvalidRequest(format!("could not read request body: {other}")),
+        core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound).await
     }
 }
 

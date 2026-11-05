@@ -9,7 +9,8 @@ use llm_proxy_protocol::core::{
 };
 use llm_proxy_protocol::zen::{
     GeminiFunctionCall, GeminiFunctionDeclaration, GeminiGenerationConfig, GeminiPart,
-    GeminiRequest, GeminiResponse, GeminiStreamChunk, GeminiTool, GeminiUsage,
+    GeminiRequest, GeminiResponse, GeminiStreamChunk, GeminiThinkingConfig, GeminiTool,
+    GeminiUsage,
 };
 
 use super::{
@@ -221,6 +222,7 @@ impl GeminiStreamDecoder {
 fn encode_content_part(
     c: &CoreContent,
     tool_name_map: &HashMap<String, String>,
+    tool_signature_map: &HashMap<String, String>,
     parts: &mut Vec<GeminiPart>,
 ) -> Result<(), ProviderError> {
     match c {
@@ -232,8 +234,24 @@ fn encode_content_part(
                 parts.push(GeminiPart::text(text.clone()));
             }
         }
-        CoreContent::ToolUse { name, input, .. } => {
-            parts.push(GeminiPart::function_call(name.clone(), Some(input.clone())));
+        CoreContent::ToolUse {
+            name,
+            input,
+            signature,
+            ..
+        } => {
+            let mut part = GeminiPart::function_call(name.clone(), Some(input.clone()));
+            // Thought signatures captured from a previous Gemini response ride
+            // the replayed functionCall part back to the model.
+            if let Some(signature) = signature {
+                part = part.with_thought_signature(signature.clone());
+            }
+            parts.push(part);
+        }
+        CoreContent::Image { source } => {
+            if let Some(part) = neutral_image_to_gemini_part(source) {
+                parts.push(part);
+            }
         }
         CoreContent::ToolResult {
             tool_use_id,
@@ -256,7 +274,13 @@ fn encode_content_part(
                      not found in the conversation history"
                 )));
             };
-            parts.push(GeminiPart::function_response(fn_name.clone(), response_val));
+            // Gemini requires the original thoughtSignature on the
+            // functionResponse part when replaying signed tool state.
+            let mut part = GeminiPart::function_response(fn_name.clone(), response_val);
+            if let Some(signature) = tool_signature_map.get(tool_use_id) {
+                part = part.with_thought_signature(signature.clone());
+            }
+            parts.push(part);
         }
         _ => {
             tracing::warn!(
@@ -266,6 +290,37 @@ fn encode_content_part(
         }
     }
     Ok(())
+}
+
+/// Maps a neutral core image source onto a Gemini media part: base64 sources
+/// become `inlineData`, url sources become `fileData`.
+fn neutral_image_to_gemini_part(source: &serde_json::Value) -> Option<GeminiPart> {
+    let obj = source.as_object()?;
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("base64") => {
+            let mime_type = obj.get("media_type").and_then(serde_json::Value::as_str)?;
+            let data = obj.get("data").and_then(serde_json::Value::as_str)?;
+            Some(GeminiPart::inline_data(
+                mime_type.to_owned(),
+                data.to_owned(),
+            ))
+        }
+        Some("url") => {
+            let url = obj.get("url").and_then(serde_json::Value::as_str)?;
+            let mime_type = obj
+                .get("media_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("image/png");
+            Some(GeminiPart::file_data(mime_type.to_owned(), url.to_owned()))
+        }
+        other => {
+            tracing::warn!(
+                source_type = ?other,
+                "Gemini: unsupported neutral image source type; dropping"
+            );
+            None
+        }
+    }
 }
 
 fn encode_tool_result_payload(
@@ -303,10 +358,25 @@ impl GeminiAdapter {
         &self,
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
+        client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
+        // No client dialect shares Gemini's wire format, so every request is
+        // cross-format: settle the leftover client fields first.
+        let carried = super::client_wire::apply_field_policy(
+            client,
+            super::ProviderProtocol::GeminiGenerateContent,
+            target.lossy,
+        )?;
+        if !carried.is_empty() {
+            tracing::warn!(
+                keys = ?carried.keys().collect::<Vec<_>>(),
+                "Gemini: carried client fields have no Gemini request slot; dropping"
+            );
+        }
         let mut contents = Vec::new();
 
         let tool_name_map = build_tool_name_map(core);
+        let tool_signature_map = build_tool_signature_map(core);
 
         for msg in &core.messages {
             let role = match msg.role {
@@ -319,7 +389,7 @@ impl GeminiAdapter {
 
             let mut parts: Vec<GeminiPart> = Vec::new();
             for c in &msg.content {
-                encode_content_part(c, &tool_name_map, &mut parts)?;
+                encode_content_part(c, &tool_name_map, &tool_signature_map, &mut parts)?;
             }
 
             if !parts.is_empty() {
@@ -397,15 +467,35 @@ impl GeminiAdapter {
             }]
         };
 
+        let thinking_config =
+            super::reasoning::gemini_budget(&core.sampling, &target.upstream_model)?.map(
+                |budget| GeminiThinkingConfig {
+                    thinking_budget: budget,
+                },
+            );
+
+        // `top_k` arrives via the core (Anthropic clients) or as a carried
+        // extra (OpenAI Chat clients send it as an unknown field).
+        let top_k = core.sampling.top_k.or_else(|| {
+            client
+                .body
+                .as_object()
+                .and_then(|obj| obj.get("top_k"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|v| i32::try_from(v).ok())
+        });
+
         let generation_config = GeminiGenerationConfig {
             temperature: core.sampling.temperature,
             top_p: core.sampling.top_p,
+            top_k,
             max_output_tokens: core.sampling.max_tokens,
             stop_sequences: core
                 .sampling
                 .stop
                 .as_ref()
                 .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) }),
+            thinking_config,
         };
 
         if core.tool_choice.is_some() {
@@ -416,12 +506,6 @@ impl GeminiAdapter {
             );
         }
 
-        if core.sampling.reasoning_effort.is_some() {
-            tracing::warn!(
-                "Gemini: reasoning_effort specified but not forwarded; \
-                 Gemini does not support this parameter"
-            );
-        }
         if core.metadata.user_id.is_some() {
             tracing::warn!(
                 "Gemini: user_id specified but not forwarded; \
@@ -439,7 +523,7 @@ impl GeminiAdapter {
         let body = serde_json::to_vec(&req)?;
         let url = gemini_stream_url(expand_url_template(&target.endpoint, target)?, core.stream);
 
-        Ok(build_proxy_request(body, target, core.stream, url))
+        Ok(build_proxy_request(body, target, core.stream, url, client))
     }
 
     /// Decode a Gemini GenerateContent response body.
@@ -483,6 +567,9 @@ impl GeminiAdapter {
                     id: format!("gemini_call_{}", tool_id_counter),
                     name: function_call.name.clone(),
                     input,
+                    // Thought signatures must be replayed on the function
+                    // response part, so they ride the ToolUse block.
+                    signature: part.thought_signature.clone(),
                 });
                 tool_id_counter += 1;
             }
@@ -561,6 +648,25 @@ fn gemini_stream_url(url: String, stream: bool) -> String {
     url
 }
 
+/// Maps tool_use_id -> thought signature across the conversation so a
+/// functionResponse part can replay the signature of the call it answers.
+fn build_tool_signature_map(core: &CoreRequest) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for msg in &core.messages {
+        for content in &msg.content {
+            if let CoreContent::ToolUse {
+                id,
+                signature: Some(signature),
+                ..
+            } = content
+            {
+                map.insert(id.clone(), signature.clone());
+            }
+        }
+    }
+    map
+}
+
 fn build_tool_name_map(core: &CoreRequest) -> HashMap<String, String> {
     let mut map = HashMap::new();
     for msg in &core.messages {
@@ -587,7 +693,17 @@ fn build_gemini_usage(usage: &GeminiUsage) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::client_wire::{ClientWireFormat, ClientWireRequest};
     use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions};
+
+    /// An Anthropic-dialect client wire: never the same format as the Gemini
+    /// adapter, so tests exercise the cross-format encode.
+    fn client_wire(core: &CoreRequest) -> ClientWireRequest {
+        ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({"model": core.model.requested, "messages": []}),
+        )
+    }
 
     fn make_target() -> ProviderAdapterTarget {
         ProviderAdapterTarget {
@@ -602,6 +718,7 @@ mod tests {
             requested_model: "gemini-2.5-pro".into(),
             upstream_model: "gemini-2.5-pro".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         }
     }
 
@@ -633,7 +750,9 @@ mod tests {
         }]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.contents.len(), 1);
@@ -656,7 +775,9 @@ mod tests {
         }];
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.contents[0].role, "user");
@@ -682,7 +803,9 @@ mod tests {
         }];
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.contents[0].role, "user");
@@ -722,7 +845,9 @@ mod tests {
         }];
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.tools.len(), 1);
@@ -745,7 +870,9 @@ mod tests {
         };
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let config = body.generation_config.unwrap();
@@ -764,7 +891,9 @@ mod tests {
         }]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         assert_eq!(
             proxy_req.url,
@@ -784,7 +913,9 @@ mod tests {
         core.stream = true;
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
         assert!(
             proxy_req.url.ends_with(":streamGenerateContent?alt=sse"),
             "streaming URL must select streamGenerateContent with alt=sse: {}",
@@ -808,7 +939,9 @@ mod tests {
         }]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
         assert!(
             proxy_req.url.ends_with(":generateContent"),
             "non-streaming URL must keep generateContent: {}",
@@ -1113,6 +1246,7 @@ mod tests {
                     id: "gemini_call_0".into(),
                     name: "get_weather".into(),
                     input: serde_json::json!({"city": "SF"}),
+                    signature: None,
                 }],
             },
             CoreMessage {
@@ -1130,7 +1264,9 @@ mod tests {
         ]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let fr = body
@@ -1149,11 +1285,14 @@ mod tests {
                 id: "gemini_call_0".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "SF"}),
+                signature: None,
             }],
         }]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.contents.len(), 1);
@@ -1178,7 +1317,9 @@ mod tests {
         core.sampling.top_p = Some(0.9);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let config = body.generation_config.unwrap();
@@ -1201,7 +1342,9 @@ mod tests {
         }];
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let params = body.tools[0].function_declarations[0]
@@ -1287,7 +1430,9 @@ mod tests {
         core.sampling.stop = Some(vec!["END".into(), "STOP".into()]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let config = body.generation_config.unwrap();
@@ -1306,6 +1451,7 @@ mod tests {
                     id: "gemini_call_0".into(),
                     name: "get_weather".into(),
                     input: serde_json::json!({"city": "SF"}),
+                    signature: None,
                 }],
             },
             CoreMessage {
@@ -1323,7 +1469,9 @@ mod tests {
         ]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let fr = body
@@ -1442,7 +1590,9 @@ mod tests {
         core.sampling.reasoning_effort = Some("high".into());
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: GeminiRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let config = body.generation_config.unwrap();
@@ -1494,7 +1644,9 @@ mod tests {
             }],
         }]);
         let adapter = GeminiAdapter;
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
         assert!(proxy_req.url.contains("gemini-2.5-flash-preview-05-20"));
     }
 
@@ -1510,7 +1662,9 @@ mod tests {
         core.stream = true;
         let target = make_target();
         let adapter = GeminiAdapter;
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
         assert!(
             proxy_req.stream,
             "stream flag should be forwarded to ProxyRequest"
@@ -1522,7 +1676,9 @@ mod tests {
         let core = make_core_request(vec![]);
         let adapter = GeminiAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["contents"].as_array().unwrap().len(), 0);
     }

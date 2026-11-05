@@ -1,0 +1,17 @@
+{
+  "accept": "application/json",
+  "user-agent": "Anthropic/JS 1.5.0",
+  "x-stainless-retry-count": "0",
+  "x-stainless-timeout": "600",
+  "x-stainless-lang": "js",
+  "x-stainless-package-version": "1.5.0",
+  "x-stainless-os": "Linux",
+  "x-stainless-arch": "x64",
+  "x-stainless-runtime": "node",
+  "x-stainless-runtime-version": "v20.19.2",
+  "anthropic-version": "2026-10-21",
+  "authorization": "Bearer sk-ant-api03-capture-fixture-key-not-real",
+  "content-type": "application/json",
+  "accept-language": "*",
+  "sec-fetch-mode": "cors"
+}

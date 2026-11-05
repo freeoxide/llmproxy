@@ -267,6 +267,8 @@ mod tests {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: Arc::new(extra_headers),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -897,6 +899,8 @@ mod tests {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://openrouter.ai/api/v1/chat/completions".to_owned(),
                         headers: Arc::new(headers),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m

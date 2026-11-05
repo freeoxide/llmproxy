@@ -1,0 +1,609 @@
+//! The client side of the wire at the provider edge: which dialect a request
+//! arrived in, its raw body, and the cross-format field policy.
+//!
+//! Same-format requests (an Anthropic-dialect client reaching an Anthropic
+//! Messages upstream, an OpenAI Chat client reaching a Chat Completions
+//! upstream) are forwarded from the raw body with only surgical edits, so
+//! unknown fields survive byte-for-byte. Cross-format requests go through the
+//! normalized core encoding, and every client field the core does not model is
+//! looked up in one table per format pair: **carried** verbatim, **mapped** by
+//! adapter code, or **rejected** with an error naming it (a per-route `lossy`
+//! opt-in turns a rejection into a drop with a logged warning).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use serde_json::Value;
+
+use crate::adapter::ProviderProtocol;
+use crate::error::ProviderError;
+
+/// The wire dialect a client request arrived in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClientWireFormat {
+    /// Anthropic Messages (`/v1/messages`).
+    AnthropicMessages,
+    /// OpenAI Chat Completions (`/v1/chat/completions`).
+    OpenAiChatCompletions,
+}
+
+impl ClientWireFormat {
+    /// Canonical name, for logs.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenAiChatCompletions => "openai_chat_completions",
+        }
+    }
+}
+
+/// The client's request as it arrived: dialect, parsed raw body, and the
+/// inbound headers the per-provider allowlist selected for forwarding.
+///
+/// The routes construct it (empty `forwarded_headers`); the pipeline fills
+/// `forwarded_headers` once the target and its allowlist are resolved.
+#[derive(Clone)]
+pub struct ClientWireRequest {
+    /// Dialect of the raw body.
+    pub format: ClientWireFormat,
+    /// The parsed raw request body. Same-format passthrough edits this value
+    /// instead of re-encoding the normalized core request.
+    pub body: Arc<Value>,
+    /// Allowlisted inbound headers, applied to the upstream request.
+    pub forwarded_headers: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for ClientWireRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientWireRequest")
+            .field("format", &self.format)
+            .field("body", &"<opaque client body>")
+            .field(
+                "forwarded_header_names",
+                &self.forwarded_headers.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl ClientWireRequest {
+    /// Construct from the dialect and raw parsed body; `forwarded_headers`
+    /// starts empty and is filled by the pipeline.
+    #[must_use]
+    pub fn new(format: ClientWireFormat, body: Value) -> Self {
+        Self {
+            format,
+            body: Arc::new(body),
+            forwarded_headers: HashMap::new(),
+        }
+    }
+
+    /// Whether this request's dialect matches the provider's protocol, i.e.
+    /// same-format passthrough applies.
+    #[must_use]
+    pub fn same_format_as(&self, protocol: ProviderProtocol) -> bool {
+        matches!(
+            (self.format, protocol),
+            (
+                ClientWireFormat::AnthropicMessages,
+                ProviderProtocol::AnthropicMessages
+            ) | (
+                ClientWireFormat::OpenAiChatCompletions,
+                ProviderProtocol::OpenAiChatCompletions
+            )
+        )
+    }
+
+    /// The raw body as a JSON object, or `None` (with a warning) when the body
+    /// is not an object; a non-object can never have passed typed decode, so
+    /// this only guards against internal wiring mistakes.
+    #[must_use]
+    pub fn body_object(&self) -> Option<&serde_json::Map<String, Value>> {
+        match self.body.as_object() {
+            Some(obj) => Some(obj),
+            None => {
+                tracing::warn!(
+                    format = self.format.name(),
+                    "client raw body is not a JSON object; cannot passthrough"
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Top-level request keys the typed Anthropic Messages decode consumes.
+/// Everything else on an Anthropic client body is an "extra" for the policy.
+pub const ANTHROPIC_MESSAGES_REQUEST_KEYS: &[&str] = &[
+    "model",
+    "max_tokens",
+    "system",
+    "messages",
+    "stream",
+    "tools",
+    "temperature",
+    "top_p",
+    "top_k",
+    "stop_sequences",
+    "metadata",
+    "thinking",
+    "tool_choice",
+];
+
+/// Top-level request keys the typed OpenAI Chat decode consumes.
+pub const OPENAI_CHAT_REQUEST_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "temperature",
+    "top_p",
+    "max_completion_tokens",
+    "max_tokens",
+    "reasoning_effort",
+    "thinking",
+    "tools",
+    "tool_choice",
+    "stop",
+    "stream_options",
+    "user",
+];
+
+/// Top-level keys of `body` that the typed decode for `format` does not
+/// consume; these are the fields the cross-format policy speaks about.
+#[must_use]
+pub fn extra_field_names(body: &Value, format: ClientWireFormat) -> Vec<&str> {
+    let Some(obj) = body.as_object() else {
+        return Vec::new();
+    };
+    let known = match format {
+        ClientWireFormat::AnthropicMessages => ANTHROPIC_MESSAGES_REQUEST_KEYS,
+        ClientWireFormat::OpenAiChatCompletions => OPENAI_CHAT_REQUEST_KEYS,
+    };
+    let mut extras: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !known.contains(key))
+        .collect();
+    extras.sort_unstable();
+    extras
+}
+
+/// What happens to a client field when crossing formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldDisposition {
+    /// Copied verbatim onto the provider request (the provider accepts the
+    /// same field name and shape).
+    Carried,
+    /// Translated by adapter code into the provider's equivalent. Subfields
+    /// the translation does not consume are rejected by name like unmapped
+    /// fields (see [`check_output_config_subkeys`]).
+    Mapped,
+    /// The provider has no equivalent; the request fails naming the field
+    /// (dropped with a warning under the per-route `lossy` opt-in).
+    Rejected,
+}
+
+/// The cross-format field policy: one disposition per (client field, provider
+/// protocol) pair. Fields the typed decode already consumed into the core
+/// (messages, sampling, tools, ...) are mapped by the adapters and are not
+/// named here; this table answers for the leftover client fields.
+#[must_use]
+pub fn field_disposition(provider: ProviderProtocol, field: &str) -> FieldDisposition {
+    match provider {
+        ProviderProtocol::AnthropicMessages => match field {
+            // Anthropic accepts these OpenAI Chat fields with the same shape.
+            "service_tier" | "top_k" => FieldDisposition::Carried,
+            // Mapped by the Anthropic adapter from the raw client body.
+            "parallel_tool_calls" => FieldDisposition::Mapped,
+            _ => FieldDisposition::Rejected,
+        },
+        ProviderProtocol::OpenAiChatCompletions => match field {
+            // The Chat Completions API accepts these with the same shape.
+            "service_tier" => FieldDisposition::Carried,
+            // Mapped by the chat adapter from the raw client body.
+            "output_config" => FieldDisposition::Mapped,
+            _ => FieldDisposition::Rejected,
+        },
+        ProviderProtocol::OpenAiResponses => match field {
+            // The Responses API accepts these with the same shape.
+            "service_tier" | "parallel_tool_calls" | "store" | "prompt_cache_key" => {
+                FieldDisposition::Carried
+            }
+            // Mapped by the Responses adapter from the raw client body.
+            "output_config" => FieldDisposition::Mapped,
+            _ => FieldDisposition::Rejected,
+        },
+        ProviderProtocol::GeminiGenerateContent => match field {
+            // Mapped by the Gemini adapter into generationConfig.topK.
+            "top_k" => FieldDisposition::Mapped,
+            _ => FieldDisposition::Rejected,
+        },
+    }
+}
+
+/// Applies the cross-format field policy to the client's extra fields.
+///
+/// Returns the `Carried` fields (the caller injects them verbatim); `Mapped`
+/// fields are the caller's translation code. A `Rejected` field fails with an
+/// error naming every rejected field, unless `lossy` drops them with a logged
+/// warning instead.
+pub fn apply_field_policy(
+    client: &ClientWireRequest,
+    provider: ProviderProtocol,
+    lossy: bool,
+) -> Result<serde_json::Map<String, Value>, ProviderError> {
+    let mut carried = serde_json::Map::new();
+    let mut rejected: Vec<String> = Vec::new();
+    let extras = extra_field_names(&client.body, client.format);
+    let body_obj = client.body.as_object();
+
+    for field in extras {
+        match field_disposition(provider, field) {
+            FieldDisposition::Carried => {
+                if let Some(value) = body_obj.and_then(|obj| obj.get(field)) {
+                    carried.insert(field.to_owned(), value.clone());
+                }
+            }
+            FieldDisposition::Mapped => {}
+            FieldDisposition::Rejected => rejected.push(field.to_owned()),
+        }
+    }
+
+    check_cross_format_tools(client, provider, lossy)?;
+    check_output_config_subkeys(client, provider, lossy)?;
+
+    if rejected.is_empty() {
+        return Ok(carried);
+    }
+    if lossy {
+        for field in &rejected {
+            tracing::warn!(
+                field,
+                provider = provider.name(),
+                "lossy route: dropping client field with no provider equivalent"
+            );
+        }
+        return Ok(carried);
+    }
+    Err(ProviderError::InvalidRequest(format!(
+        "field(s) {} have no {} equivalent; remove them or enable the route's lossy mode",
+        rejected.join(", "),
+        provider.name()
+    )))
+}
+
+/// Server tools (Anthropic `{"type": "web_search_...", ...}`) decode as bare
+/// names in the core; forwarding them cross-format would silently change what
+/// the model can do, so they are rejected by name (or dropped whole under
+/// `lossy`, which the caller must then also drop from the tools list).
+fn check_cross_format_tools(
+    client: &ClientWireRequest,
+    provider: ProviderProtocol,
+    lossy: bool,
+) -> Result<(), ProviderError> {
+    if client.format != ClientWireFormat::AnthropicMessages {
+        return Ok(());
+    }
+    let Some(obj) = client.body.as_object() else {
+        return Ok(());
+    };
+    let Some(Value::Array(tools)) = obj.get("tools") else {
+        return Ok(());
+    };
+    let mut server_tools: Vec<String> = Vec::new();
+    for tool in tools.iter().filter_map(Value::as_object) {
+        if let Some(Value::String(kind)) = tool.get("type") {
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unnamed>");
+            server_tools.push(format!("type={kind} name={name}"));
+        }
+    }
+    if server_tools.is_empty() {
+        return Ok(());
+    }
+    if lossy {
+        tracing::warn!(
+            tools = ?server_tools,
+            provider = provider.name(),
+            "lossy route: dropping server tools with no provider equivalent"
+        );
+        return Ok(());
+    }
+    Err(ProviderError::InvalidRequest(format!(
+        "server tool(s) [{}] have no {} equivalent; remove them or enable the route's lossy mode",
+        server_tools.join(", "),
+        provider.name()
+    )))
+}
+
+/// Subkeys of `output_config` the adapter mappings translate (the `effort`
+/// level becomes the chat-family `reasoning_effort`/`reasoning.effort`).
+/// Keep in sync with the mappings in the chat and Responses adapters.
+const OUTPUT_CONFIG_MAPPED_SUBKEYS: &[&str] = &["effort"];
+
+/// `output_config` is declared [`FieldDisposition::Mapped`] for the
+/// chat-family providers, but the mappings translate only its `effort`
+/// subkey — a structured-output `format` or any other subkey has no
+/// translation. Those subkeys are rejected by name (dropped with a warning
+/// under `lossy`) instead of silently vanishing, and a non-object
+/// `output_config` (which no mapping can read) is treated the same way.
+fn check_output_config_subkeys(
+    client: &ClientWireRequest,
+    provider: ProviderProtocol,
+    lossy: bool,
+) -> Result<(), ProviderError> {
+    if field_disposition(provider, "output_config") != FieldDisposition::Mapped {
+        return Ok(());
+    }
+    let Some(config) = client
+        .body
+        .as_object()
+        .and_then(|obj| obj.get("output_config"))
+    else {
+        return Ok(());
+    };
+    if config.is_null() {
+        // `output_config: null` means absent, mirroring the `thinking` decode.
+        return Ok(());
+    }
+    let Some(subkeys) = config.as_object() else {
+        if lossy {
+            tracing::warn!(
+                field = "output_config",
+                provider = provider.name(),
+                "lossy route: dropping non-object output_config"
+            );
+            return Ok(());
+        }
+        return Err(ProviderError::InvalidRequest(format!(
+            "output_config must be an object to be translated for {}",
+            provider.name()
+        )));
+    };
+    let unmapped: Vec<&str> = subkeys
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !OUTPUT_CONFIG_MAPPED_SUBKEYS.contains(key))
+        .collect();
+    if unmapped.is_empty() {
+        return Ok(());
+    }
+    if lossy {
+        for key in &unmapped {
+            tracing::warn!(
+                field = %format!("output_config.{key}"),
+                provider = provider.name(),
+                "lossy route: dropping client field with no provider equivalent"
+            );
+        }
+        return Ok(());
+    }
+    Err(ProviderError::InvalidRequest(format!(
+        "output_config subfield(s) {} have no {} equivalent; remove them or enable the route's lossy mode",
+        unmapped.join(", "),
+        provider.name()
+    )))
+}
+
+/// Whether the raw Anthropic client body contains at least one server tool;
+/// the Anthropic adapter drops those tools from the normalized `tools` list on
+/// lossy cross-format routes (they cannot be represented as functions).
+#[must_use]
+pub fn anthropic_body_has_server_tools(body: &Value) -> bool {
+    let Some(Value::Array(tools)) = body.as_object().and_then(|obj| obj.get("tools")) else {
+        return false;
+    };
+    tools
+        .iter()
+        .any(|tool| tool.as_object().is_some_and(|t| t.contains_key("type")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn wire(format: ClientWireFormat, body: Value) -> ClientWireRequest {
+        ClientWireRequest::new(format, body)
+    }
+
+    #[test]
+    fn same_format_detection() {
+        let anthropic = wire(ClientWireFormat::AnthropicMessages, json!({}));
+        let chat = wire(ClientWireFormat::OpenAiChatCompletions, json!({}));
+        assert!(anthropic.same_format_as(ProviderProtocol::AnthropicMessages));
+        assert!(!anthropic.same_format_as(ProviderProtocol::OpenAiChatCompletions));
+        assert!(chat.same_format_as(ProviderProtocol::OpenAiChatCompletions));
+        assert!(!chat.same_format_as(ProviderProtocol::AnthropicMessages));
+    }
+
+    #[test]
+    fn extra_fields_are_the_unconsumed_keys() {
+        let body = json!({
+            "model": "m", "messages": [], "seed": 7, "response_format": {"type": "json_object"}
+        });
+        let extras = extra_field_names(&body, ClientWireFormat::OpenAiChatCompletions);
+        assert_eq!(extras, vec!["response_format", "seed"]);
+    }
+
+    #[test]
+    fn anthropic_extras_include_service_tier_and_output_config() {
+        let body = json!({"model": "m", "messages": [], "service_tier": "auto"});
+        let extras = extra_field_names(&body, ClientWireFormat::AnthropicMessages);
+        assert_eq!(extras, vec!["service_tier"]);
+    }
+
+    #[test]
+    fn carried_fields_survive_the_policy() {
+        let client = wire(
+            ClientWireFormat::OpenAiChatCompletions,
+            json!({"model": "m", "messages": [], "service_tier": "flex"}),
+        );
+        let carried = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, false)
+            .expect("service_tier is carried");
+        assert_eq!(carried.get("service_tier"), Some(&json!("flex")));
+    }
+
+    #[test]
+    fn rejected_fields_are_named_in_the_error() {
+        let client = wire(
+            ClientWireFormat::OpenAiChatCompletions,
+            json!({"model": "m", "messages": [], "seed": 7, "logprobs": true}),
+        );
+        let err = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, false)
+            .expect_err("seed and logprobs must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("seed"), "error must name seed: {msg}");
+        assert!(msg.contains("logprobs"), "error must name logprobs: {msg}");
+    }
+
+    #[test]
+    fn lossy_mode_drops_rejected_fields_instead_of_failing() {
+        let client = wire(
+            ClientWireFormat::OpenAiChatCompletions,
+            json!({"model": "m", "messages": [], "seed": 7}),
+        );
+        let carried = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, true)
+            .expect("lossy drops instead of rejecting");
+        assert!(carried.is_empty());
+    }
+
+    #[test]
+    fn mapped_fields_do_not_fail_and_are_not_carried() {
+        let client = wire(
+            ClientWireFormat::OpenAiChatCompletions,
+            json!({"model": "m", "messages": [], "parallel_tool_calls": false}),
+        );
+        let carried = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, false)
+            .expect("parallel_tool_calls is mapped, not rejected");
+        assert!(carried.is_empty());
+    }
+
+    #[test]
+    fn output_config_effort_subkey_passes_the_policy() {
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({"model": "m", "max_tokens": 8, "messages": [], "output_config": {"effort": "high"}}),
+        );
+        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
+            .expect("the effort subkey is the mapped one");
+    }
+
+    #[test]
+    fn unmapped_output_config_subkeys_are_rejected_by_name() {
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({
+                "model": "m", "max_tokens": 8, "messages": [],
+                "output_config": {"effort": "high", "format": {"type": "json_schema"}}
+            }),
+        );
+        let err = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
+            .expect_err("output_config.format has no chat translation");
+        assert!(
+            err.to_string().contains("format"),
+            "error must name the subfield: {err}"
+        );
+        // Same contract on the Responses path.
+        let err = apply_field_policy(&client, ProviderProtocol::OpenAiResponses, false)
+            .expect_err("output_config.format has no Responses translation");
+        assert!(
+            err.to_string().contains("format"),
+            "error must name the subfield: {err}"
+        );
+    }
+
+    #[test]
+    fn lossy_mode_drops_unmapped_output_config_subkeys() {
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({
+                "model": "m", "max_tokens": 8, "messages": [],
+                "output_config": {"format": {"type": "json_schema"}}
+            }),
+        );
+        let carried = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, true)
+            .expect("lossy drops the unmapped subkey instead of rejecting");
+        assert!(carried.is_empty());
+    }
+
+    #[test]
+    fn non_object_output_config_is_rejected() {
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({"model": "m", "max_tokens": 8, "messages": [], "output_config": "high"}),
+        );
+        let err = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
+            .expect_err("a non-object output_config cannot be translated");
+        assert!(
+            err.to_string().contains("output_config"),
+            "error must name the field: {err}"
+        );
+        // `null` means absent, as with the `thinking` decode.
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({"model": "m", "max_tokens": 8, "messages": [], "output_config": null}),
+        );
+        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
+            .expect("null output_config is absent");
+    }
+
+    #[test]
+    fn server_tools_are_rejected_by_name_cross_format() {
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({
+                "model": "m", "max_tokens": 8, "messages": [],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+            }),
+        );
+        let err = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
+            .expect_err("server tools must be rejected cross-format");
+        assert!(
+            err.to_string().contains("web_search_20250305"),
+            "error must name the server tool: {err}"
+        );
+    }
+
+    #[test]
+    fn server_tools_pass_on_lossy_routes() {
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({
+                "model": "m", "max_tokens": 8, "messages": [],
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}]
+            }),
+        );
+        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, true).unwrap();
+        assert!(anthropic_body_has_server_tools(&client.body));
+    }
+
+    #[test]
+    fn plain_function_tools_are_not_server_tools() {
+        let client = wire(
+            ClientWireFormat::AnthropicMessages,
+            json!({
+                "model": "m", "max_tokens": 8, "messages": [],
+                "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]
+            }),
+        );
+        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false).unwrap();
+        assert!(!anthropic_body_has_server_tools(&client.body));
+    }
+
+    #[test]
+    fn responses_carries_its_native_knobs() {
+        let client = wire(
+            ClientWireFormat::OpenAiChatCompletions,
+            json!({"model": "m", "messages": [], "store": false, "prompt_cache_key": "k"}),
+        );
+        let carried = apply_field_policy(&client, ProviderProtocol::OpenAiResponses, false)
+            .expect("store and prompt_cache_key are native Responses fields");
+        assert_eq!(carried.get("store"), Some(&json!(false)));
+        assert_eq!(carried.get("prompt_cache_key"), Some(&json!("k")));
+    }
+}

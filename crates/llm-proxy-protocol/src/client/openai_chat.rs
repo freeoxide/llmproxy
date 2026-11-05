@@ -90,15 +90,11 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 }
             }
             "user" => {
-                let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
                     ttl: cc.ttl,
                 });
-                let mut content = Vec::new();
-                if !text.is_empty() || cache.is_some() {
-                    content.push(CoreContent::Text { text, cache });
-                }
+                let content = decode_user_content(&msg.content, cache);
                 messages.push(CoreMessage {
                     role: CoreRole::User,
                     content,
@@ -108,12 +104,13 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 let assistant_text = msg.content_text();
                 let mut content = Vec::new();
                 if let Some(thinking) = msg.reasoning_content {
-                    if !thinking.is_empty() {
-                        content.push(CoreContent::Thinking {
-                            text: thinking,
-                            signature: None,
-                        });
-                    }
+                    // Preserve an explicitly empty `reasoning_content`: some
+                    // providers (DeepSeek) require the field on replayed
+                    // assistant turns even when it is empty.
+                    content.push(CoreContent::Thinking {
+                        text: thinking,
+                        signature: None,
+                    });
                 }
                 for tc in msg.tool_calls {
                     let tc_id = tc.id.ok_or_else(|| {
@@ -135,6 +132,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         id: tc_id,
                         name: tc_name,
                         input: tc_args,
+                        signature: None,
                     });
                 }
                 if !assistant_text.is_empty() {
@@ -233,6 +231,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
         top_p: req.top_p,
         max_tokens: req.max_tokens,
         stop,
+        // The OpenAI Chat wire format has no top_k parameter; if a client
+        // sends one it stays in `extra` and the cross-format policy decides.
+        top_k: None,
         reasoning_effort: req.reasoning_effort,
         thinking: req.thinking,
     };
@@ -267,6 +268,109 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
         metadata,
         provider_hints,
     })
+}
+
+/// Decodes a user message `content` field into core blocks: a bare string, or
+/// an array of structured parts (`text`, `image_url`). `image_url` parts map
+/// to the neutral core image source: `{"type":"url","url":...}` or
+/// `{"type":"base64","media_type":...,"data":...}` (from a `data:` URI), the
+/// shape the Anthropic wire format already uses.
+fn decode_user_content(
+    content: &serde_json::Value,
+    message_cache: Option<CacheControl>,
+) -> Vec<CoreContent> {
+    match content {
+        serde_json::Value::String(text) => {
+            if text.is_empty() && message_cache.is_none() {
+                return Vec::new();
+            }
+            vec![CoreContent::Text {
+                text: text.clone(),
+                cache: message_cache,
+            }]
+        }
+        serde_json::Value::Array(parts) => {
+            let mut blocks = Vec::new();
+            let mut cache = message_cache;
+            for part in parts {
+                let Some(obj) = part.as_object() else {
+                    tracing::warn!(
+                        ?part,
+                        "OpenAI Chat: unsupported content part shape; dropping"
+                    );
+                    continue;
+                };
+                match obj.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if text.is_empty() && cache.is_none() {
+                            continue;
+                        }
+                        blocks.push(CoreContent::Text {
+                            text: text.to_owned(),
+                            cache: cache.take(),
+                        });
+                    }
+                    Some("image_url") => {
+                        if let Some(image) = decode_image_url_part(obj) {
+                            blocks.push(CoreContent::Image { source: image });
+                        }
+                    }
+                    other => {
+                        tracing::warn!(
+                            part_type = ?other,
+                            "OpenAI Chat: unsupported content part type in user message; dropping"
+                        );
+                    }
+                }
+            }
+            blocks
+        }
+        serde_json::Value::Null => Vec::new(),
+        other => {
+            tracing::warn!(
+                ?other,
+                "OpenAI Chat: user content is neither a string nor an array of parts; dropping"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Maps an OpenAI `{"type":"image_url","image_url":{"url":...}}` part to the
+/// neutral core image source. `data:` URIs become base64 sources; http(s)
+/// URLs become url sources. Anything else is dropped with a warning naming
+/// the problem, never silently.
+fn decode_image_url_part(
+    part: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let url = part
+        .get("image_url")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("url"))
+        .and_then(|v| v.as_str())?;
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        let media_type = meta.split(';').next().unwrap_or_default().to_owned();
+        let is_base64 = meta.to_ascii_lowercase().contains(";base64");
+        if !is_base64 || media_type.is_empty() || data.is_empty() {
+            tracing::warn!(
+                data_uri_meta = meta,
+                "OpenAI Chat: image_url data URI is not base64 or has no media type; dropping"
+            );
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        }));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(serde_json::json!({"type": "url", "url": url}));
+    }
+    tracing::warn!(url, "OpenAI Chat: unsupported image_url scheme; dropping");
+    None
 }
 
 fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
@@ -355,7 +459,9 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
                     None => text,
                 });
             }
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 let args_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
                 tool_calls.push(ToolCall {
                     index: Some(tool_calls.len() as i32),
@@ -828,6 +934,105 @@ pub fn stream_error_sse_payload(error: &crate::core::CoreStreamError) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_image_url_parts_decode_to_neutral_image_blocks() {
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    { "type": "text", "text": "what is this?" },
+                    { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } },
+                    { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,aGVsbG8=" } }
+                ]),
+                reasoning_content: None,
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+                cache_control: None,
+                refusal: None,
+                is_error: None,
+            }],
+            stream: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            thinking: None,
+            tools: vec![],
+            tool_choice: None,
+            stop: None,
+            stream_options: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        };
+        let core = decode_request(req).expect("decode");
+        let content = &core.messages[0].content;
+        assert_eq!(
+            content.len(),
+            3,
+            "text and both images must decode: {content:?}"
+        );
+        match &content[0] {
+            CoreContent::Text { text, .. } => assert_eq!(text, "what is this?"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        match &content[1] {
+            CoreContent::Image { source } => {
+                assert_eq!(source["type"], "url");
+                assert_eq!(source["url"], "https://example.com/cat.png");
+            }
+            other => panic!("expected url image, got {other:?}"),
+        }
+        match &content[2] {
+            CoreContent::Image { source } => {
+                assert_eq!(source["type"], "base64");
+                assert_eq!(source["media_type"], "image/jpeg");
+                assert_eq!(source["data"], "aGVsbG8=");
+            }
+            other => panic!("expected base64 image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_reasoning_content_survives_decode_for_replay() {
+        // DeepSeek-style providers require reasoning_content on replayed
+        // assistant turns even when empty; an explicit empty string decodes
+        // to an (empty) Thinking block instead of vanishing.
+        let req = ChatCompletionRequest {
+            model: "deepseek-reasoner".into(),
+            messages: vec![ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::json!(""),
+                reasoning_content: Some(String::new()),
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+                cache_control: None,
+                refusal: None,
+                is_error: None,
+            }],
+            stream: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            thinking: None,
+            tools: vec![],
+            tool_choice: None,
+            stop: None,
+            stream_options: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        };
+        let core = decode_request(req).expect("decode");
+        match &core.messages[0].content[0] {
+            CoreContent::Thinking { text, .. } => assert_eq!(text, ""),
+            other => panic!("expected an empty Thinking block, got {other:?}"),
+        }
+    }
+
     use crate::core::UsageProvenance;
     use crate::openai::{FunctionDef, ToolDef};
 
@@ -944,7 +1149,9 @@ mod tests {
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Assistant);
         match &core.messages[1].content[0] {
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -1273,6 +1480,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "SF"}),
+                signature: None,
             }],
             stop_reason: StopReason::ToolUse,
             stop_sequence: None,

@@ -49,6 +49,11 @@ pub struct ProxyRequest {
     pub stream: bool,
     /// Static adapter headers from config (e.g. `anthropic-version`), applied to every upstream request.
     pub extra_headers: std::collections::HashMap<String, String>,
+    /// Inbound client headers the per-provider allowlist selected for
+    /// forwarding; already filtered, so the transport applies them verbatim.
+    /// Applied before `extra_headers`, so a static config header with the same
+    /// name wins.
+    pub forwarded_headers: std::collections::HashMap<String, String>,
 }
 
 impl fmt::Debug for ProxyRequest {
@@ -58,6 +63,10 @@ impl fmt::Debug for ProxyRequest {
             .field("auth", &self.auth)
             .field("body_len", &self.body.len())
             .field("stream", &self.stream)
+            .field(
+                "forwarded_header_names",
+                &self.forwarded_headers.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -162,6 +171,9 @@ impl ProxyClient {
             builder = builder.header("Accept", "text/event-stream");
         }
         builder = apply_auth(builder, &req.auth);
+        for (name, value) in &req.forwarded_headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
         for (name, value) in &req.extra_headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -409,6 +421,7 @@ mod tests {
             body: br#"{"model":"gpt-5"}"#.to_vec(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
         let debug_output = format!("{:?}", req);
         assert!(
@@ -546,6 +559,7 @@ mod tests {
             body: br#"{"hello":"world"}"#.to_vec(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -603,6 +617,7 @@ mod tests {
                 "x-custom-secret".to_owned(),
                 "secret-extra-header".to_owned(),
             )]),
+            forwarded_headers: std::collections::HashMap::new(),
         }
     }
 
@@ -718,6 +733,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -749,6 +765,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -780,6 +797,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -820,6 +838,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: extra,
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -854,6 +873,7 @@ mod tests {
             body: br#"data: hello"#.to_vec(),
             stream: true,
             extra_headers: extra,
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let result = client.send_stream(req).await;
@@ -878,6 +898,7 @@ mod tests {
             body: br#"{"hello":"world"}"#.to_vec(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -905,6 +926,7 @@ mod tests {
             body: raw_body.clone(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -942,6 +964,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let err = client.send(req).await.unwrap_err();
@@ -971,6 +994,7 @@ mod tests {
             body: vec![],
             stream: true,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let result = client.send_stream(req).await;
@@ -1003,6 +1027,7 @@ mod tests {
             body: vec![],
             stream: true,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let mut stream = client.send_stream(req).await.unwrap();
@@ -1036,6 +1061,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -1063,6 +1089,7 @@ mod tests {
             body: original_body.to_vec(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -1129,6 +1156,7 @@ mod tests {
             body: vec![],
             stream: true,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         {
@@ -1193,6 +1221,7 @@ mod tests {
             body: vec![],
             stream: true,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let mut stream = client.send_stream(req).await.unwrap();
@@ -1250,6 +1279,7 @@ mod tests {
             body: vec![],
             stream: true,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let mut stream = client.send_stream(req).await.unwrap();
@@ -1300,6 +1330,7 @@ mod tests {
             body: vec![],
             stream: true,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let mut stream = client.send_stream(req).await.unwrap();
@@ -1325,6 +1356,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let err = client.send(req).await.unwrap_err();
@@ -1355,6 +1387,7 @@ mod tests {
             body: large_body.clone().into_bytes(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -1497,6 +1530,7 @@ mod tests {
             body: br#"{"hello":"world"}"#.to_vec(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.expect("request via proxy succeeds");
@@ -1614,6 +1648,7 @@ mod tests {
             body: br#"{"via":"socks"}"#.to_vec(),
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.expect("request via socks tunnel");
@@ -1645,6 +1680,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let resp = client.send(req).await.unwrap();
@@ -1668,6 +1704,7 @@ mod tests {
             body: vec![],
             stream: false,
             extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
         };
 
         let result = tokio::time::timeout(Duration::from_secs(15), client.send(req)).await;

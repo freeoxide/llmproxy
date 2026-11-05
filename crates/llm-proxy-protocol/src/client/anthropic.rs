@@ -40,7 +40,9 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         .map(|t| CoreTool {
             name: t.name,
             description: t.description,
-            input_schema: t.input_schema,
+            input_schema: t
+                .input_schema
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
         })
         .collect();
 
@@ -50,7 +52,8 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: Some(req.max_tokens),
-        stop: None,
+        stop: req.stop_sequences.filter(|s| !s.is_empty()),
+        top_k: req.top_k,
         reasoning_effort: None,
         thinking: req.thinking,
     };
@@ -268,6 +271,7 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                 input: block
                     .input
                     .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                signature: block.signature,
             })
         }
         "tool_result" => decode_tool_result_block(block),
@@ -361,6 +365,11 @@ pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolEr
     })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per CoreContent variant: the Anthropic client block \
+             mapping is a single translation table"
+)]
 fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolError> {
     match content {
         CoreContent::Text { text, cache } => {
@@ -386,7 +395,19 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             });
             Ok(ContentBlock::new_image(img_source))
         }
-        CoreContent::ToolUse { id, name, input } => Ok(ContentBlock::new_tool_use(id, name, input)),
+        CoreContent::ToolUse {
+            id,
+            name,
+            input,
+            signature,
+        } => {
+            let mut block = ContentBlock::new_tool_use(id, name, input);
+            // Tool-call signatures (e.g. Gemini thought signatures routed
+            // through an Anthropic-dialect client) ride the `signature` field
+            // so clients that replay blocks verbatim return them to us.
+            block.signature = signature;
+            Ok(block)
+        }
         CoreContent::ToolResult {
             tool_use_id,
             content,
@@ -967,9 +988,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -1022,7 +1046,9 @@ mod tests {
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages.len(), 2);
         match &core.messages[1].content[0] {
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -1204,7 +1230,6 @@ mod tests {
     fn system_content_the_proxy_cannot_read_is_rejected_not_dropped() {
         let unreadable = [
             serde_json::json!([{ "type": "text", "text": "ok" }, { "type": "text", "text": 42 }]),
-            serde_json::json!([{ "type": "text", "text": "ok", "not_a_field": true }]),
             serde_json::json!([{ "type": "image" }]),
             serde_json::json!([{ "type": "text" }]),
             serde_json::json!(42),
@@ -1217,6 +1242,36 @@ mod tests {
                 "expected a rejection for system = {system}"
             );
         }
+    }
+
+    #[test]
+    fn system_blocks_with_unknown_fields_decode_instead_of_failing() {
+        // Plan 02: the request path tolerates unknown fields so same-format
+        // passthrough can forward them; unreadable content is still rejected
+        // (previous test).
+        let mut req = make_anthropic_request();
+        req.system = Some(serde_json::json!([
+            { "type": "text", "text": "ok", "not_a_field": true }
+        ]));
+        let core = decode_request(req).expect("unknown system-block fields must not 400");
+        assert_eq!(core.system.len(), 1);
+        match &core.system[0] {
+            CoreContent::Text { text, .. } => assert_eq!(text, "ok"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_sequences_and_top_k_decode_into_sampling() {
+        let mut req = make_anthropic_request();
+        req.stop_sequences = Some(vec!["END".into(), "STOP".into()]);
+        req.top_k = Some(5);
+        let core = decode_request(req).unwrap();
+        assert_eq!(
+            core.sampling.stop.as_deref(),
+            Some(["END".to_owned(), "STOP".to_owned()].as_slice())
+        );
+        assert_eq!(core.sampling.top_k, Some(5));
     }
 
     #[test]
@@ -1359,6 +1414,7 @@ mod tests {
                 id: "tu_1".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "SF"}),
+                signature: None,
             }],
             stop_reason: StopReason::ToolUse,
             stop_sequence: None,
@@ -2048,7 +2104,10 @@ mod tests {
         req.tools = vec![Tool {
             name: "get_weather".into(),
             description: Some("Get weather".into()),
-            input_schema: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            input_schema: Some(
+                serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            ),
+            extra: serde_json::Map::new(),
         }];
         let core = decode_request(req).unwrap();
         assert_eq!(core.tools.len(), 1);

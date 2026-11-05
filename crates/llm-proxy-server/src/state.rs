@@ -472,6 +472,8 @@ mod tests {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com/v1".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m.insert(
@@ -480,6 +482,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: "https://example.com/v1/messages".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -515,6 +519,8 @@ mod tests {
                         protocol: "not_a_real_protocol".to_owned(),
                         endpoint: "https://example.com".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -617,6 +623,8 @@ mod tests {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://example.com/v1".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -642,6 +650,8 @@ mod tests {
                         protocol: "not_real".to_owned(),
                         endpoint: "https://example.com".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m

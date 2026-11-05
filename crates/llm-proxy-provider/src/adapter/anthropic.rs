@@ -444,71 +444,28 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
 
 impl AnthropicAdapter {
     /// Encode a core request into an Anthropic Messages request.
+    ///
+    /// Same-format (Anthropic-dialect client) requests forward the raw client
+    /// body with only surgical edits: the model name, reasoning translation,
+    /// and stripping fields the Anthropic wire format does not define.
+    /// Cross-format requests encode the normalized core request under the
+    /// cross-format field policy.
     pub fn encode_request(
         &self,
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
+        client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
-        let system = encode_system(&core.system);
-        let messages = encode_messages(&core.messages);
-        let tools = encode_tools(&core.tools);
-        let tool_choice = core.tool_choice.as_ref().and_then(encode_tool_choice);
-
-        let mut req = serde_json::json!({
-            "model": target.upstream_model,
-            "max_tokens": core.sampling.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
-            "messages": messages,
-        });
-
-        let obj = json_object(&mut req);
-
-        if let Some(sys) = system {
-            obj.insert("system".to_owned(), sys);
-        }
-        if core.stream {
-            obj.insert("stream".to_owned(), serde_json::json!(true));
-        }
-        if !tools.is_empty() {
-            obj.insert("tools".to_owned(), serde_json::Value::Array(tools));
-        }
-        if let Some(temp) = core.sampling.temperature {
-            obj.insert("temperature".to_owned(), serde_json::json!(temp));
-        }
-        if let Some(top_p) = core.sampling.top_p {
-            obj.insert("top_p".to_owned(), serde_json::json!(top_p));
-        }
-        if let Some(ref stop) = core.sampling.stop
-            && !stop.is_empty()
-        {
-            let seqs: Vec<serde_json::Value> = stop
-                .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect();
-            obj.insert("stop_sequences".to_owned(), serde_json::Value::Array(seqs));
-        }
-        if let Some(ref user_id) = core.metadata.user_id {
-            obj.insert(
-                "metadata".to_owned(),
-                serde_json::json!({"user_id": user_id}),
-            );
-        }
-        if let Some(ref thinking) = core.sampling.thinking {
-            obj.insert("thinking".to_owned(), thinking.clone());
-        }
-        if let Some(ref effort) = core.sampling.reasoning_effort {
-            obj.insert(
-                "reasoning_effort".to_owned(),
-                serde_json::Value::String(effort.clone()),
-            );
-        }
-        if let Some(tc) = tool_choice {
-            obj.insert("tool_choice".to_owned(), tc);
-        }
-
-        let body = serde_json::to_vec(&req)?;
         let url = expand_url_template(&target.endpoint, target)?;
-
-        Ok(build_proxy_request(body, target, core.stream, url))
+        let req = if client.same_format_as(super::ProviderProtocol::AnthropicMessages)
+            && let Some(raw) = client.body_object()
+        {
+            edit_raw_anthropic_request(raw, core, target)?
+        } else {
+            encode_normalized_request(core, target, client)?
+        };
+        let body = serde_json::to_vec(&req)?;
+        Ok(build_proxy_request(body, target, core.stream, url, client))
     }
 
     /// Decode an Anthropic Messages response body.
@@ -557,6 +514,7 @@ impl AnthropicAdapter {
                         id: tool_id,
                         name: original_name,
                         input,
+                        signature: None,
                     });
                 }
                 _ => {
@@ -612,6 +570,222 @@ impl AnthropicAdapter {
             start_usage: None,
         }
     }
+}
+
+/// Same-format passthrough: apply only the edits the proxy needs to the raw
+/// Anthropic client body. Every other field — including fields this proxy
+/// does not know — survives byte-for-byte.
+fn edit_raw_anthropic_request(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    core: &CoreRequest,
+    target: &ProviderAdapterTarget,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut obj = raw.clone();
+
+    // Edit 1: model aliasing.
+    obj.insert(
+        "model".to_owned(),
+        serde_json::Value::String(target.upstream_model.clone()),
+    );
+
+    // Edit 2: reasoning parameters are translated, never forwarded raw. An
+    // OpenAI-style `reasoning_effort` is not an Anthropic field (the typed
+    // decode leaves it out of the core, so read it from the raw body); a
+    // `thinking` object is clamped to the model's limits.
+    let mut sampling = core.sampling.clone();
+    if sampling.reasoning_effort.is_none()
+        && let Some(effort) = obj
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+    {
+        sampling.reasoning_effort = Some(effort.to_owned());
+    }
+    obj.remove("reasoning_effort");
+    obj.remove("thinking");
+    if let Some(thinking) = super::reasoning::anthropic_thinking(
+        &sampling,
+        &target.upstream_model,
+        sampling.max_tokens,
+    )? {
+        obj.insert("thinking".to_owned(), thinking);
+    }
+
+    // Edit 3: strip foreign fields the proxy itself emits on client-facing
+    // tool_use blocks (Gemini thought signatures); Anthropic rejects unknown
+    // block fields.
+    if let Some(serde_json::Value::Array(messages)) = obj.get_mut("messages") {
+        for message in messages
+            .iter_mut()
+            .filter_map(serde_json::Value::as_object_mut)
+        {
+            let Some(serde_json::Value::Array(blocks)) = message.get_mut("content") else {
+                continue;
+            };
+            for block in blocks
+                .iter_mut()
+                .filter_map(serde_json::Value::as_object_mut)
+            {
+                if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use") {
+                    block.remove("signature");
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::Value::Object(obj))
+}
+
+/// Cross-format encode: build the Anthropic request from the normalized core
+/// request, settle the client's leftover fields through the field policy, and
+/// translate reasoning parameters.
+fn encode_normalized_request(
+    core: &CoreRequest,
+    target: &ProviderAdapterTarget,
+    client: &super::client_wire::ClientWireRequest,
+) -> Result<serde_json::Value, ProviderError> {
+    let carried = super::client_wire::apply_field_policy(
+        client,
+        super::ProviderProtocol::AnthropicMessages,
+        target.lossy,
+    )?;
+
+    let system = encode_system(&core.system);
+    let messages = encode_messages(&core.messages);
+    let tools = encode_tools_for_target(core, client, target);
+    let tool_choice = encode_tool_choice_for_target(core, client);
+
+    let mut req = serde_json::json!({
+        "model": target.upstream_model,
+        "max_tokens": core.sampling.max_tokens.unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+        "messages": messages,
+    });
+
+    let obj = json_object(&mut req);
+
+    if let Some(sys) = system {
+        obj.insert("system".to_owned(), sys);
+    }
+    if core.stream {
+        obj.insert("stream".to_owned(), serde_json::json!(true));
+    }
+    if !tools.is_empty() {
+        obj.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    }
+    if let Some(temp) = core.sampling.temperature {
+        obj.insert("temperature".to_owned(), serde_json::json!(temp));
+    }
+    if let Some(top_p) = core.sampling.top_p {
+        obj.insert("top_p".to_owned(), serde_json::json!(top_p));
+    }
+    if let Some(top_k) = core.sampling.top_k {
+        obj.insert("top_k".to_owned(), serde_json::json!(top_k));
+    }
+    if let Some(ref stop) = core.sampling.stop
+        && !stop.is_empty()
+    {
+        let seqs: Vec<serde_json::Value> = stop
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect();
+        obj.insert("stop_sequences".to_owned(), serde_json::Value::Array(seqs));
+    }
+    if let Some(ref user_id) = core.metadata.user_id {
+        obj.insert(
+            "metadata".to_owned(),
+            serde_json::json!({"user_id": user_id}),
+        );
+    }
+    if let Some(thinking) = super::reasoning::anthropic_thinking(
+        &core.sampling,
+        &target.upstream_model,
+        // The clamp must run against the max_tokens the body actually emits:
+        // a cross-format client that omitted max tokens still gets the
+        // default ceiling below, so the budget can never exceed it.
+        Some(
+            core.sampling
+                .max_tokens
+                .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS),
+        ),
+    )? {
+        obj.insert("thinking".to_owned(), thinking);
+    }
+    if let Some(tc) = tool_choice {
+        obj.insert("tool_choice".to_owned(), tc);
+    }
+    for (name, value) in carried {
+        obj.insert(name, value);
+    }
+
+    Ok(req)
+}
+
+/// Tools for the cross-format path: plain function tools encode as usual;
+/// server tools only survive on lossy routes, where they are dropped (with a
+/// warning from the field policy) rather than mis-encoded as functions.
+fn encode_tools_for_target(
+    core: &CoreRequest,
+    client: &super::client_wire::ClientWireRequest,
+    target: &ProviderAdapterTarget,
+) -> Vec<serde_json::Value> {
+    if !(target.lossy && super::client_wire::anthropic_body_has_server_tools(&client.body)) {
+        return encode_tools(&core.tools);
+    }
+    let server_tool_names: Vec<String> = client
+        .body
+        .as_object()
+        .and_then(|obj| obj.get("tools"))
+        .and_then(serde_json::Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    let obj = tool.as_object()?;
+                    if !obj.contains_key("type") {
+                        return None;
+                    }
+                    obj.get("name")?.as_str().map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    encode_tools(
+        &core
+            .tools
+            .iter()
+            .filter(|tool| !server_tool_names.contains(&tool.name))
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// `tool_choice` for the cross-format path, mapping the OpenAI Chat
+/// `parallel_tool_calls` knob onto Anthropic's `disable_parallel_tool_use`.
+fn encode_tool_choice_for_target(
+    core: &CoreRequest,
+    client: &super::client_wire::ClientWireRequest,
+) -> Option<serde_json::Value> {
+    let mut encoded = core.tool_choice.as_ref().and_then(encode_tool_choice);
+    let parallel = client
+        .body
+        .as_object()
+        .and_then(|obj| obj.get("parallel_tool_calls"))
+        .and_then(serde_json::Value::as_bool);
+    let Some(parallel) = parallel else {
+        return encoded;
+    };
+    let disable = serde_json::json!(!parallel);
+    match encoded.as_mut().and_then(serde_json::Value::as_object_mut) {
+        Some(choice) => {
+            choice.insert("disable_parallel_tool_use".to_owned(), disable);
+        }
+        None => {
+            encoded = Some(serde_json::json!({
+                "type": "auto",
+                "disable_parallel_tool_use": disable,
+            }));
+        }
+    }
+    encoded
 }
 
 fn map_anthropic_stop_reason(reason: &str) -> StopReason {
@@ -941,7 +1115,9 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
                 }
                 Some(block)
             }
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 let (sanitized_name, _) = sanitize_tool_name(name);
                 let sanitized_id = sanitize_tool_use_id(id);
                 Some(serde_json::json!({
@@ -967,7 +1143,18 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::client_wire::{ClientWireFormat, ClientWireRequest};
     use llm_proxy_protocol::core::SamplingOptions;
+
+    /// An OpenAI-Chat-dialect client wire for the raw body: never the same
+    /// format as the Anthropic adapter, so tests exercise the normalized
+    /// cross-format encode (the body carries no policy-relevant extras).
+    fn chat_client(core: &CoreRequest) -> ClientWireRequest {
+        ClientWireRequest::new(
+            ClientWireFormat::OpenAiChatCompletions,
+            serde_json::json!({"model": core.model.requested, "messages": []}),
+        )
+    }
 
     fn make_target() -> ProviderAdapterTarget {
         ProviderAdapterTarget {
@@ -980,6 +1167,7 @@ mod tests {
             requested_model: "claude-sonnet-4-20250514".into(),
             upstream_model: "claude-sonnet-4-20250514".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         }
     }
 
@@ -1154,7 +1342,9 @@ mod tests {
         }]);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
@@ -1181,7 +1371,9 @@ mod tests {
         }]);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-20250514");
@@ -1204,7 +1396,9 @@ mod tests {
         }];
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.get("system").is_some());
@@ -1226,7 +1420,9 @@ mod tests {
         }];
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let tools = body["tools"].as_array().unwrap();
@@ -1246,7 +1442,9 @@ mod tests {
         core.tool_choice = Some(CoreToolChoice::Auto);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["tool_choice"], serde_json::json!({"type": "auto"}));
@@ -1264,7 +1462,9 @@ mod tests {
         core.stream = true;
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["stream"], true);
@@ -1283,7 +1483,9 @@ mod tests {
         core.metadata.user_id = Some("user-42".into());
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.get("metadata").is_some());
@@ -1299,11 +1501,14 @@ mod tests {
                 cache: None,
             }],
         }]);
+        core.sampling.max_tokens = Some(8_192);
         core.sampling.thinking =
             Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000}));
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.get("thinking").is_some());
@@ -1363,7 +1568,9 @@ mod tests {
 
         assert_eq!(core_resp.stop_reason, StopReason::ToolUse);
         match &core_resp.content[0] {
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "toolu_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -1665,7 +1872,9 @@ mod tests {
         core.sampling.stop = Some(vec!["END".into(), "STOP".into()]);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["stop_sequences"], serde_json::json!(["END", "STOP"]));
@@ -1687,7 +1896,9 @@ mod tests {
         }];
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let schema = &body["tools"].as_array().unwrap()[0]["input_schema"];
@@ -1710,7 +1921,9 @@ mod tests {
         }];
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let schema = &body["tools"].as_array().unwrap()[0]["input_schema"];
@@ -1888,7 +2101,9 @@ mod tests {
         }]);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let msgs = body["messages"].as_array().unwrap();
@@ -1916,7 +2131,9 @@ mod tests {
         }]);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let content = &body["messages"].as_array().unwrap()[0]["content"]
@@ -1943,7 +2160,9 @@ mod tests {
         }];
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let system = body["system"].as_array().unwrap();
@@ -1972,7 +2191,9 @@ mod tests {
         }]);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let content = body["messages"].as_array().unwrap()[0]["content"]
@@ -2004,7 +2225,10 @@ mod tests {
     }
 
     #[test]
-    fn encode_reasoning_effort_forwarded() {
+    fn encode_reasoning_effort_translated_to_thinking_not_forwarded() {
+        // BUG-20: `reasoning_effort` is an OpenAI field; the Anthropic edge
+        // translates it into a clamped `thinking.budget_tokens` instead of
+        // forwarding it.
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
             content: vec![CoreContent::Text {
@@ -2015,10 +2239,60 @@ mod tests {
         core.sampling.reasoning_effort = Some("high".into());
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
-        assert_eq!(body["reasoning_effort"], "high");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort must not reach the Anthropic wire: {body}"
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        // The client omitted max tokens, so the body emits the 4096 default;
+        // the budget must be clamped below that effective ceiling (Anthropic
+        // requires budget_tokens < max_tokens).
+        assert_eq!(body["max_tokens"], 4_096);
+        assert_eq!(
+            body["thinking"]["budget_tokens"], 4_095,
+            "budget must stay under the emitted max_tokens"
+        );
+    }
+
+    #[test]
+    fn same_format_passthrough_translates_a_foreign_reasoning_effort() {
+        // An Anthropic-dialect body carrying the OpenAI `reasoning_effort`
+        // field: passthrough still strips it and translates it into a native
+        // `thinking` object instead of dropping or forwarding it.
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model": core.model.requested,
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": "hi"}],
+                "reasoning_effort": "low",
+                "future_field": "kept verbatim",
+            }),
+        );
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target, &client).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "the foreign field must not reach Anthropic: {body}"
+        );
+        assert_eq!(body["thinking"]["budget_tokens"], 2_048);
+        // Unknown fields survive same-format passthrough untouched.
+        assert_eq!(body["future_field"], "kept verbatim");
     }
 
     #[test]
@@ -2035,7 +2309,9 @@ mod tests {
         });
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let tc_name = body["tool_choice"]["name"].as_str().unwrap();
@@ -2159,7 +2435,9 @@ mod tests {
             }],
         }]);
         let adapter = AnthropicAdapter::new();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-20250514-alias");
     }
@@ -2185,7 +2463,9 @@ mod tests {
         let core = make_core_request(vec![]);
         let adapter = AnthropicAdapter::new();
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &chat_client(&core))
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body["messages"].as_array().unwrap().len(), 0);
     }

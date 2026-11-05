@@ -110,6 +110,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 adapters

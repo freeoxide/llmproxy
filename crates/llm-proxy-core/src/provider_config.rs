@@ -501,6 +501,40 @@ fn max_per_token_price() -> Decimal {
     Decimal::new(1_000, 0)
 }
 
+/// Protocol default allowlists for inbound client headers forwarded upstream
+/// (row 12, backlog 10). Anthropic forwards its beta selector and session
+/// headers by default so per-request beta features work through the proxy.
+#[must_use]
+pub fn default_forwarded_inbound_headers(protocol: &str) -> &'static [&'static str] {
+    match protocol {
+        "anthropic_messages" => &["anthropic-beta", "x-claude-code-session-id"],
+        _ => &[],
+    }
+}
+
+/// Inbound headers that are never forwarded upstream, even when configured:
+/// client credentials, hop-by-hop and content headers the transport owns, and
+/// browser headers that leak the caller's environment or break upstreams.
+pub const NEVER_FORWARDED_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "x-goog-api-key",
+    "cookie",
+    "set-cookie",
+    "host",
+    "connection",
+    "content-length",
+    "content-type",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "origin",
+    "referer",
+    "user-agent",
+    "x-request-id",
+];
+
 /// How the API key is sent in HTTP headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -560,6 +594,27 @@ pub struct ProviderAdapterConfig {
         deserialize_with = "deserialize_arc_headers"
     )]
     pub headers: Arc<HashMap<String, String>>,
+    /// Inbound client header names (case-insensitive) forwarded verbatim to
+    /// this upstream. Unset uses the protocol default allowlist
+    /// ([`default_forwarded_inbound_headers`]); headers on the
+    /// never-forwarded list (client auth, `Origin`, browser and transport
+    /// headers) are rejected at validation even when listed here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_inbound_headers: Option<Vec<String>>,
+    /// Per-route `lossy` opt-in: cross-format request fields with no provider
+    /// equivalent are dropped with a logged warning instead of rejecting the
+    /// request with a 400 that names them.
+    #[serde(default)]
+    pub lossy: bool,
+}
+
+impl ProviderAdapterConfig {
+    fn forward_forwarded_for_debug(&self) -> &str {
+        match &self.forward_inbound_headers {
+            Some(_) => "<configured>",
+            None => "<protocol default>",
+        }
+    }
 }
 
 impl std::fmt::Debug for ProviderAdapterConfig {
@@ -568,6 +623,11 @@ impl std::fmt::Debug for ProviderAdapterConfig {
             .field("protocol", &self.protocol)
             .field("endpoint", &endpoint_without_query(&self.endpoint))
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field(
+                "forward_inbound_headers",
+                &self.forward_forwarded_for_debug(),
+            )
+            .field("lossy", &self.lossy)
             .finish()
     }
 }
@@ -937,6 +997,19 @@ pub enum ConfigValidationError {
         /// The forbidden header name.
         header: String,
     },
+    /// A configured inbound-header forwarding name is on the never-forwarded
+    /// list (client credentials, hop-by-hop, browser headers).
+    #[error(
+        "provider \"{provider}\": adapter \"{adapter}\" may not forward inbound header \"{header}\" (client credentials, hop-by-hop, and browser headers are never forwarded)"
+    )]
+    ForbiddenForwardedHeader {
+        /// Name of the offending provider.
+        provider: String,
+        /// Name of the offending adapter.
+        adapter: String,
+        /// The header name that may not be forwarded.
+        header: String,
+    },
     /// An adapter header name is empty.
     #[error("provider \"{provider}\": adapter \"{adapter}\" has an empty header name")]
     EmptyHeaderName {
@@ -1064,6 +1137,8 @@ pub enum ConfigValidationError {
 ///             protocol: "openai_chat_completions".to_owned(),
 ///             endpoint: "https://example.com/v1/chat/completions".to_owned(),
 ///             headers: Arc::new(HashMap::new()),
+///             forward_inbound_headers: None,
+///             lossy: false,
 ///         },
 ///     )]),
 ///     routes: ProviderRoutesConfig::default(),
@@ -1241,6 +1316,45 @@ fn validate_adapters(
         }
 
         validate_headers(&adapter_cfg.headers, name, adapter_name)?;
+        validate_forwarded_inbound_headers(adapter_cfg, name, adapter_name)?;
+    }
+    Ok(())
+}
+
+/// Validates a configured inbound-header forwarding allowlist: names must be
+/// non-empty, CRLF-free, and not on the never-forwarded list.
+fn validate_forwarded_inbound_headers(
+    adapter_cfg: &ProviderAdapterConfig,
+    provider: &str,
+    adapter: &str,
+) -> Result<(), ConfigValidationError> {
+    let Some(names) = &adapter_cfg.forward_inbound_headers else {
+        return Ok(());
+    };
+    for header in names {
+        if header.trim().is_empty() {
+            return Err(ConfigValidationError::EmptyHeaderName {
+                provider: provider.to_owned(),
+                adapter: adapter.to_owned(),
+            });
+        }
+        if header.contains('\r') || header.contains('\n') {
+            return Err(ConfigValidationError::HeaderContainsCrlf {
+                provider: provider.to_owned(),
+                adapter: adapter.to_owned(),
+            });
+        }
+        let lower = header.to_ascii_lowercase();
+        if NEVER_FORWARDED_HEADERS.contains(&lower.as_str())
+            || lower.starts_with("sec-")
+            || lower.starts_with("access-control-")
+        {
+            return Err(ConfigValidationError::ForbiddenForwardedHeader {
+                provider: provider.to_owned(),
+                adapter: adapter.to_owned(),
+                header: header.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -1858,6 +1972,93 @@ chat_completions = "chat"
     }
 
     use super::*;
+
+    #[test]
+    fn forwarded_inbound_allowlist_rejects_client_auth_headers() {
+        let mut provider = make_minimal_provider("fwd-provider");
+        let adapter = provider.adapters.get_mut("chat").expect("chat adapter");
+        adapter.forward_inbound_headers = Some(vec![
+            "anthropic-beta".to_owned(),
+            "authorization".to_owned(),
+        ]);
+        let err = validate_provider_config(&provider, None)
+            .expect_err("authorization must never be forwarded");
+        assert!(
+            matches!(&err, ConfigValidationError::ForbiddenForwardedHeader { header, .. } if header == "authorization"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn forwarded_inbound_allowlist_rejects_browser_and_origin_headers() {
+        for header in [
+            "origin",
+            "user-agent",
+            "cookie",
+            "sec-fetch-mode",
+            "x-request-id",
+        ] {
+            let mut provider = make_minimal_provider("fwd-provider");
+            let adapter = provider.adapters.get_mut("chat").expect("chat adapter");
+            adapter.forward_inbound_headers = Some(vec![header.to_owned()]);
+            let err = validate_provider_config(&provider, None)
+                .expect_err("browser/origin headers must never be forwarded");
+            assert!(
+                matches!(err, ConfigValidationError::ForbiddenForwardedHeader { .. }),
+                "header {header} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_inbound_allowlist_accepts_beta_and_session_headers() {
+        let mut provider = make_minimal_provider("fwd-provider");
+        let adapter = provider.adapters.get_mut("chat").expect("chat adapter");
+        adapter.forward_inbound_headers = Some(vec![
+            "anthropic-beta".to_owned(),
+            "x-claude-code-session-id".to_owned(),
+        ]);
+        validate_provider_config(&provider, None)
+            .expect("beta and session headers are forwardable");
+    }
+
+    #[test]
+    fn anthropic_default_allowlist_carries_beta_and_session_headers() {
+        assert_eq!(
+            default_forwarded_inbound_headers("anthropic_messages"),
+            &["anthropic-beta", "x-claude-code-session-id"]
+        );
+        assert!(default_forwarded_inbound_headers("openai_chat_completions").is_empty());
+        assert!(default_forwarded_inbound_headers("gemini_generate_content").is_empty());
+        assert!(default_forwarded_inbound_headers("openai_responses").is_empty());
+    }
+
+    #[test]
+    fn lossy_flag_parses_from_toml() {
+        let file = toml::from_str::<ProviderFile>(
+            r#"[provider]
+name = "lossy-provider"
+api_key = "k"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+lossy = true
+forward_inbound_headers = ["x-app"]
+
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .expect("lossy provider parses");
+        let adapter = file.provider.adapters.get("chat").expect("chat adapter");
+        assert!(adapter.lossy);
+        assert_eq!(
+            adapter.forward_inbound_headers.as_deref(),
+            Some(&["x-app".to_owned()][..])
+        );
+    }
 
     #[test]
     fn app_config_rejects_removed_models_table() {
@@ -2692,6 +2893,8 @@ endpoint = "https://example.com/v1"
                     protocol: String::new(),
                     endpoint: "https://example.com/v1".to_owned(),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig::default(),
@@ -2720,6 +2923,8 @@ endpoint = "https://example.com/v1"
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1".to_owned(),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig::default(),
@@ -2748,6 +2953,8 @@ endpoint = "https://example.com/v1"
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1".to_owned(),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig::default(),

@@ -2,11 +2,14 @@
 //! response, and event types to and from provider-specific wire formats.
 
 pub mod anthropic;
+pub mod client_wire;
 pub mod gemini;
 pub mod openai_chat;
+pub mod reasoning;
 pub mod responses;
 
 pub use anthropic::{AnthropicAdapter, AnthropicStreamDecoder};
+pub use client_wire::{ClientWireFormat, ClientWireRequest};
 pub use gemini::{GeminiAdapter, GeminiStreamDecoder};
 pub use openai_chat::{OpenAiChatAdapter, OpenAiChatStreamDecoder};
 pub use responses::{ResponsesAdapter, ResponsesStreamDecoder};
@@ -90,6 +93,10 @@ pub struct ProviderAdapterTarget {
     /// Optional static headers from the adapter config (e.g. `anthropic-version`),
     /// `Arc`-shared so building a target is a refcount bump, not a map clone.
     pub headers: Arc<std::collections::HashMap<String, String>>,
+    /// Per-route `lossy` opt-in: cross-format fields with no provider
+    /// equivalent are dropped with a logged warning instead of rejecting the
+    /// request.
+    pub lossy: bool,
 }
 
 impl fmt::Debug for ProviderAdapterTarget {
@@ -104,6 +111,7 @@ impl fmt::Debug for ProviderAdapterTarget {
             .field("requested_model", &self.requested_model)
             .field("upstream_model", &self.upstream_model)
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("lossy", &self.lossy)
             .finish()
     }
 }
@@ -137,10 +145,18 @@ impl ProviderAdapter {
     }
 
     /// Encode a `CoreRequest` into a transport-ready `ProxyRequest`.
+    ///
+    /// When the client's wire format matches this adapter's protocol the raw
+    /// client body is forwarded with only the adapter's surgical edits
+    /// (same-format passthrough, conflict 10); otherwise the normalized core
+    /// request is encoded and every client field the core does not model is
+    /// settled by the cross-format field policy (carried, mapped, or rejected
+    /// by name).
     pub fn encode_request(
         &self,
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
+        client: &ClientWireRequest,
     ) -> Result<ProxyRequest, ProviderError> {
         if !core.provider_hints.raw.is_empty() {
             tracing::debug!(
@@ -149,10 +165,10 @@ impl ProviderAdapter {
             );
         }
         match self {
-            Self::OpenAiChat(a) => a.encode_request(core, target),
-            Self::Anthropic(a) => a.encode_request(core, target),
-            Self::Responses(a) => a.encode_request(core, target),
-            Self::Gemini(a) => a.encode_request(core, target),
+            Self::OpenAiChat(a) => a.encode_request(core, target, client),
+            Self::Anthropic(a) => a.encode_request(core, target, client),
+            Self::Responses(a) => a.encode_request(core, target, client),
+            Self::Gemini(a) => a.encode_request(core, target, client),
         }
     }
 
@@ -395,6 +411,7 @@ pub(crate) fn build_proxy_request(
     target: &ProviderAdapterTarget,
     stream: bool,
     url: String,
+    client: &ClientWireRequest,
 ) -> ProxyRequest {
     let mut extra_headers = (*target.headers).clone();
     if target.protocol == ProviderProtocol::AnthropicMessages
@@ -405,6 +422,19 @@ pub(crate) fn build_proxy_request(
         extra_headers.insert("anthropic-version".to_owned(), ANTHROPIC_VERSION.to_owned());
     }
 
+    // Static config headers win over forwarded inbound headers with the same
+    // name (the transport applies these last).
+    let forwarded_headers = client
+        .forwarded_headers
+        .iter()
+        .filter(|(name, _)| {
+            !extra_headers
+                .keys()
+                .any(|configured| configured.eq_ignore_ascii_case(name))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+
     ProxyRequest {
         url,
         auth: AuthHeaders {
@@ -414,6 +444,7 @@ pub(crate) fn build_proxy_request(
         body,
         stream,
         extra_headers,
+        forwarded_headers,
     }
 }
 
@@ -642,6 +673,7 @@ mod tests {
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
             headers: Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         };
         let debug = format!("{:?}", target);
         assert!(
@@ -787,6 +819,7 @@ mod tests {
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o".into(),
             headers: Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         };
         let mr = response_model_ref(&target);
         assert_eq!(mr.requested, "gpt-4o");
@@ -805,6 +838,7 @@ mod tests {
             requested_model: "my-alias".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
             headers: Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         };
         let mr = response_model_ref(&target);
         assert_eq!(mr.requested, "my-alias");
@@ -859,7 +893,13 @@ mod tests {
     #[test]
     fn anthropic_requests_default_version_header() {
         let target = make_target(ProviderProtocol::AnthropicMessages);
-        let request = build_proxy_request(Vec::new(), &target, false, target.endpoint.clone());
+        let request = build_proxy_request(
+            Vec::new(),
+            &target,
+            false,
+            target.endpoint.clone(),
+            &ClientWireRequest::new(ClientWireFormat::AnthropicMessages, serde_json::json!({})),
+        );
 
         assert_eq!(
             request.extra_headers.get("anthropic-version"),
@@ -872,7 +912,13 @@ mod tests {
         let mut target = make_target(ProviderProtocol::AnthropicMessages);
         Arc::make_mut(&mut target.headers)
             .insert("Anthropic-Version".to_owned(), "2024-01-01".to_owned());
-        let request = build_proxy_request(Vec::new(), &target, false, target.endpoint.clone());
+        let request = build_proxy_request(
+            Vec::new(),
+            &target,
+            false,
+            target.endpoint.clone(),
+            &ClientWireRequest::new(ClientWireFormat::AnthropicMessages, serde_json::json!({})),
+        );
 
         assert_eq!(
             request.extra_headers.get("Anthropic-Version"),
@@ -911,6 +957,7 @@ mod tests {
             requested_model: "gpt-4o".into(),
             upstream_model: "gemini-2.5-pro".into(),
             headers: Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         }
     }
 }

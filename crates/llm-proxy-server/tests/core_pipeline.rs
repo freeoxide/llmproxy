@@ -177,6 +177,8 @@ mod tests {
                         protocol: protocol.to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -1256,6 +1258,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_url,
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -2639,6 +2643,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_url,
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -2743,6 +2749,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_url,
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -3049,6 +3057,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: "https://127.0.0.1:0/v1/messages".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -3277,6 +3287,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m

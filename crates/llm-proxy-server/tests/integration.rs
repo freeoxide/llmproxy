@@ -71,6 +71,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: "https://127.0.0.1:0/v1/messages".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -378,10 +380,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_unknown_fields_returns_bad_request() {
+    async fn messages_unknown_fields_no_longer_fail_decode() {
+        // Plan 02: the same-format request path tolerates unknown fields so
+        // they can be forwarded verbatim; decode no longer answers 400. The
+        // unreachable upstream proves the request travelled past decode.
         let app = build_router(state_with_provider());
         let body = json!({
             "model": "claude-sonnet-4-6",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 64,
+            "future_field": "not supported"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "unknown fields must pass decode and fail at the (unreachable) upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_format_unknown_fields_are_rejected_by_name() {
+        // An Anthropic-dialect client against a Chat Completions upstream:
+        // the leftover `future_field` must be rejected with a 400 naming it.
+        let state = state_with_cross_format_provider();
+        let app = build_router(state);
+        let body = json!({
+            "model": "gpt-4o",
             "messages": [{ "role": "user", "content": "hello" }],
             "max_tokens": 64,
             "future_field": "not supported"
@@ -400,7 +431,11 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(resp_body["error"]["type"], "invalid_request_error");
+        let message = resp_body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("future_field"),
+            "the error must name the rejected field: {resp_body}"
+        );
     }
 
     #[tokio::test]
@@ -869,6 +904,71 @@ mod tests {
     }
 
     use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus};
+
+    fn state_with_cross_format_provider() -> AppState {
+        // Anthropic-dialect client route (`/v1/messages`) resolving to a Chat
+        // Completions upstream: every request crosses formats.
+        let provider = ProviderConfig {
+            name: "mock-provider".to_owned(),
+            api_key: secrecy::SecretString::from("test-key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            egress: None,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "chat".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "openai_chat_completions".to_owned(),
+                        endpoint: "https://127.0.0.1:0/v1/chat/completions".to_owned(),
+                        headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
+                    },
+                );
+                m
+            },
+            routes: ProviderRoutesConfig {
+                messages: Some("chat".to_owned()),
+                chat_completions: None,
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        AppState::new(
+            AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:3456".parse().unwrap(),
+                    request_timeout: Duration::from_secs(300),
+                    shutdown_timeout: Duration::from_secs(30),
+                    log_level: "info".to_owned(),
+                    hot_reload: false,
+                    allowed_origins: None,
+                    server_name: "test-proxy".to_owned(),
+                    rate_limit_rpm: 100,
+                    trust_forwarded_headers: false,
+                    dedup_window: Duration::from_millis(500),
+                    log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
+                },
+                auth: Default::default(),
+                storage: None,
+            },
+            registry,
+            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
+            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_server::BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        )
+    }
 
     fn state_with_provider_and_bus() -> (AppState, Arc<RecordingBus>) {
         let bus = Arc::new(RecordingBus::new());

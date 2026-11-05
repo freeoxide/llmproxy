@@ -88,6 +88,12 @@ pub struct ProviderAdapterTargetConfig {
     /// per request is a refcount bump, not a map clone. Downstream code that
     /// needs to mutate materializes an owned copy.
     pub headers: Arc<HashMap<String, String>>,
+    /// Resolved inbound-header forwarding allowlist for this route: the
+    /// configured names, or the protocol default
+    /// ([`crate::provider_config::default_forwarded_inbound_headers`]).
+    pub forward_inbound_headers: Arc<Vec<String>>,
+    /// Per-route `lossy` opt-in from the adapter config.
+    pub lossy: bool,
 }
 
 impl std::fmt::Debug for ProviderAdapterTargetConfig {
@@ -102,6 +108,8 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
             .field("requested_model", &self.requested_model)
             .field("upstream_model", &self.upstream_model)
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("forward_inbound_headers", &self.forward_inbound_headers)
+            .field("lossy", &self.lossy)
             .finish()
     }
 }
@@ -363,6 +371,20 @@ impl ProviderRegistry {
             requested_model: requested_model.to_owned(),
             upstream_model: upstream_model.to_owned(),
             headers: Arc::clone(&adapter_cfg.headers),
+            forward_inbound_headers: Arc::new(
+                adapter_cfg
+                    .forward_inbound_headers
+                    .clone()
+                    .unwrap_or_else(|| {
+                        crate::provider_config::default_forwarded_inbound_headers(
+                            &adapter_cfg.protocol,
+                        )
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect()
+                    }),
+            ),
+            lossy: adapter_cfg.lossy,
         })
     }
 
@@ -450,6 +472,8 @@ mod tests {
                         "x-secret".to_owned(),
                         "header-secret".to_owned(),
                     )])),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig {
@@ -487,6 +511,8 @@ mod tests {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1/chat/completions".to_owned(),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig {
@@ -793,6 +819,8 @@ chat_completions = "chat"
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1/chat/completions".to_owned(),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig {
@@ -849,6 +877,8 @@ chat_completions = "chat"
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: format!("https://example.com/v{i}"),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             );
         }

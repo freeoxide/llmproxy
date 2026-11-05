@@ -48,6 +48,12 @@ pub enum ProviderError {
     /// Invalid configuration or input (e.g. unsafe model name for URL interpolation).
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+
+    /// The client request cannot be represented on the target provider's wire
+    /// format (cross-format field policy rejection); the message names the
+    /// fields and must surface to the client as a 400, not a 502.
+    #[error("request not representable for this provider: {0}")]
+    InvalidRequest(String),
 }
 
 impl From<reqwest::Error> for ProviderError {

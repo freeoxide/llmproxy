@@ -161,6 +161,8 @@ mod tests {
                         protocol: protocol.to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -407,6 +409,8 @@ mod tests {
                         protocol: "openai_chat".to_owned(),
                         endpoint: "http://0.0.0.0:1/unreachable".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -555,7 +559,9 @@ mod tests {
             resp_body["id"].as_str().unwrap().starts_with("chatcmpl-"),
             "id must start with chatcmpl-"
         );
-        assert_eq!(resp_body["model"], "gpt-4o");
+        // Same-format passthrough: the upstream response body reaches the
+        // client verbatim, so it advertises the upstream model name.
+        assert_eq!(resp_body["model"], "gpt-4o-2024-08-06");
         assert_eq!(resp_body["choices"][0]["finish_reason"], "stop");
         assert!(resp_body["choices"][0]["message"]["content"].is_string());
         assert!(resp_body["usage"]["prompt_tokens"].is_number());
@@ -646,19 +652,28 @@ mod tests {
         let upstream_json: Value =
             serde_json::from_slice(upstream_body).expect("upstream body should be valid JSON");
 
+        // Same-format passthrough (plan 02): the upstream body is the client's
+        // raw body with only the proxy's surgical edits — the field names the
+        // client used survive untouched.
         assert_eq!(upstream_json["model"], "gpt-4o");
-        assert_eq!(upstream_json["max_completion_tokens"], 256);
+        assert_eq!(upstream_json["max_tokens"], 256);
+        assert!(
+            upstream_json.get("max_completion_tokens").is_none(),
+            "same-format passthrough must not rename client fields"
+        );
         assert_eq!(upstream_json["temperature"], 0.7);
         assert_eq!(upstream_json["top_p"], 0.9);
         assert!(upstream_json["tools"].is_array(), "tools must be preserved");
         assert_eq!(upstream_json["tools"][0]["function"]["name"], "get_weather");
-        // The Chat Completions API documents the generic tool_choice modes
-        // as plain strings; only a named function uses the object form.
         assert_eq!(upstream_json["tool_choice"], "auto");
-        assert_eq!(upstream_json["reasoning_effort"], "high");
         assert_eq!(upstream_json["user"], "test-user-123");
-        assert_eq!(upstream_json["thinking"]["type"], "enabled");
-        assert_eq!(upstream_json["thinking"]["budget_tokens"], 10000);
+        // BUG-20: an Anthropic-style `thinking` object never reaches a chat
+        // API; the explicit reasoning_effort wins.
+        assert!(
+            upstream_json.get("thinking").is_none(),
+            "thinking must be translated, not forwarded: {upstream_json}"
+        );
+        assert_eq!(upstream_json["reasoning_effort"], "high");
     }
 
     #[tokio::test]
@@ -1766,6 +1781,8 @@ mod tests {
                 protocol: "openai_chat_completions".to_owned(),
                 endpoint: "https://provider-a.example.com/v1/chat/completions".to_owned(),
                 headers: std::sync::Arc::new(HashMap::new()),
+                forward_inbound_headers: None,
+                lossy: false,
             },
         );
         let provider_a = ProviderConfig {
@@ -1792,6 +1809,8 @@ mod tests {
                 protocol: "openai_chat_completions".to_owned(),
                 endpoint: "https://provider-b.example.com/v1/chat/completions".to_owned(),
                 headers: std::sync::Arc::new(HashMap::new()),
+                forward_inbound_headers: None,
+                lossy: false,
             },
         );
         let provider_b = ProviderConfig {

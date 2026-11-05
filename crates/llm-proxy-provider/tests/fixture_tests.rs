@@ -77,6 +77,7 @@ mod tests {
             requested_model: model.clone(),
             upstream_model: model,
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         }
     }
 
@@ -199,6 +200,7 @@ mod tests {
                     .unwrap_or("")
                     .to_owned(),
                 input: obj.get("input").cloned().unwrap_or(serde_json::json!({})),
+                signature: None,
             },
             "tool_result" => CoreContent::ToolResult {
                 tool_use_id: obj
@@ -316,6 +318,13 @@ mod tests {
             top_p: obj
                 .get("top_p")
                 .and_then(|v| if v.is_null() { None } else { v.as_f64() }),
+            top_k: obj.get("top_k").and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    v.as_i64().and_then(|i| i32::try_from(i).ok())
+                }
+            }),
             max_tokens: obj.get("max_tokens").and_then(|v| {
                 if v.is_null() {
                     None
@@ -516,8 +525,20 @@ mod tests {
         let target = make_target(protocol);
         let adapter = get_adapter(adapter_name);
 
+        // The opposite dialect of the target protocol, so fixtures exercise
+        // the cross-format normalized encode.
+        let client_format = match protocol {
+            llm_proxy_provider::adapter::ProviderProtocol::AnthropicMessages => {
+                llm_proxy_provider::adapter::ClientWireFormat::OpenAiChatCompletions
+            }
+            _ => llm_proxy_provider::adapter::ClientWireFormat::AnthropicMessages,
+        };
+        let client = llm_proxy_provider::adapter::ClientWireRequest::new(
+            client_format,
+            serde_json::json!({"model": core.model.requested, "messages": []}),
+        );
         let proxy_req = adapter
-            .encode_request(&core, &target)
+            .encode_request(&core, &target, &client)
             .unwrap_or_else(|e| panic!("encode_request failed for {adapter_name}/{case}: {e}"));
 
         let actual: serde_json::Value =

@@ -17,8 +17,8 @@ use llm_proxy_protocol::core::{
     CoreEvent, CoreRequest, Cost, ModelRef, StopReason, Usage, UsageProvenance,
 };
 use llm_proxy_provider::adapter::{
-    ProviderAdapter, ProviderAdapterTarget, ProviderProtocol, ProviderStreamDecoder,
-    ProviderStreamDecoderKind,
+    ClientWireRequest, ProviderAdapter, ProviderAdapterTarget, ProviderProtocol,
+    ProviderStreamDecoder, ProviderStreamDecoderKind,
 };
 use llm_proxy_provider::sse::SseFramer;
 use llm_proxy_provider::transport::ProxyRequest;
@@ -27,7 +27,7 @@ use rust_decimal::Decimal;
 use secrecy::SecretString;
 use tracing::{Instrument, warn};
 
-use crate::middleware::get_client_ip;
+use crate::middleware::{get_client_ip, select_forwarded_headers};
 use crate::state::AppState;
 
 use super::error_response::{
@@ -245,7 +245,14 @@ async fn resolve_target(
     route_kind: ProviderRouteKind,
     core: &CoreRequest,
     inbound_auth: Option<&SecretString>,
-) -> Result<(ProviderAdapterTarget, ProviderAdapter), RouteError> {
+) -> Result<
+    (
+        ProviderAdapterTarget,
+        ProviderAdapter,
+        std::sync::Arc<Vec<String>>,
+    ),
+    RouteError,
+> {
     let providers = state.providers();
 
     let adapter_target_config = providers
@@ -313,9 +320,26 @@ async fn resolve_target(
         requested_model: adapter_target_config.requested_model,
         upstream_model: adapter_target_config.upstream_model,
         headers: adapter_target_config.headers,
+        lossy: adapter_target_config.lossy,
     };
 
-    Ok((provider_target, adapter))
+    Ok((
+        provider_target,
+        adapter,
+        std::sync::Arc::clone(&adapter_target_config.forward_inbound_headers),
+    ))
+}
+
+/// Maps an encode failure to a route error: a cross-format policy rejection
+/// (`ProviderError::InvalidRequest`) is the client's fault (400 naming the
+/// fields); anything else is internal.
+fn map_encode_error(e: llm_proxy_provider::error::ProviderError) -> RouteError {
+    match e {
+        llm_proxy_provider::error::ProviderError::InvalidRequest(message) => {
+            RouteError::InvalidRequest(message)
+        }
+        other => RouteError::Internal(format!("encode error: {other}")),
+    }
 }
 
 fn map_provider_route_error(error: ProviderRouteResolutionError) -> RouteError {
@@ -461,6 +485,18 @@ fn compute_cost(usage: &Usage, pricing: &ModelPricing) -> Cost {
         total,
     }
 }
+/// Inbound request context the pipeline needs beyond the decoded core:
+/// the client's auth token (for passthrough auth), the raw inbound headers
+/// (for the forwarding allowlist), and the client's raw wire request.
+pub(crate) struct InboundRequest {
+    /// Bearer/x-api-key token from the client, if any.
+    pub(crate) auth: Option<SecretString>,
+    /// The client's request headers.
+    pub(crate) headers: HeaderMap,
+    /// The client's raw wire request (dialect + body).
+    pub(crate) wire: ClientWireRequest,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CoreDispatch<'a> {
     pub(crate) provider_name: &'a str,
@@ -479,8 +515,13 @@ pub(crate) async fn handle_core_once(
     ctx: RequestContext,
     dispatch: CoreDispatch<'_>,
     core: CoreRequest,
-    inbound_auth: Option<SecretString>,
+    inbound: InboundRequest,
 ) -> Result<Response<Body>, RouteError> {
+    let InboundRequest {
+        auth: inbound_auth,
+        headers: inbound_headers,
+        mut wire,
+    } = inbound;
     let CoreDispatch {
         provider_name,
         route_kind,
@@ -515,7 +556,7 @@ pub(crate) async fn handle_core_once(
             body_hash: ctx.body_hash.clone(),
         }));
 
-    let (target, adapter) = resolve_target(
+    let (target, adapter, allowlist) = resolve_target(
         &state,
         provider_name,
         route_kind,
@@ -538,11 +579,12 @@ pub(crate) async fn handle_core_once(
     tracing::debug!(
         request_id = %ctx.request_id,
         provider = %target.provider_name,
-        upstream_model = %target.upstream_model,
+        upstream_model = &target.upstream_model,
         "routed to provider"
     );
-    let proxy_req: ProxyRequest = adapter.encode_request(&core, &target).map_err(|e| {
-        let err = RouteError::Internal(format!("encode error: {e}"));
+    wire.forwarded_headers = select_forwarded_headers(&inbound_headers, &allowlist);
+    let proxy_req: ProxyRequest = adapter.encode_request(&core, &target, &wire).map_err(|e| {
+        let err = map_encode_error(e);
         state.metrics.record_failure();
         emit_response_failed(
             &state.event_bus,
@@ -602,63 +644,40 @@ pub(crate) async fn handle_core_once(
     let resp_model = core_resp.model.clone();
     let resp_upstream_id = core_resp.id.clone();
     let resp_stop_reason = core_resp.stop_reason.clone();
-    let response_body = match client_protocol {
-        ClientProtocol::Anthropic => {
-            let msg_resp = anthropic::encode_response(core_resp).map_err(|e| {
-                let err = RouteError::Internal(format!("client encode: {e}"));
-                state.metrics.record_failure();
-                emit_response_failed(
-                    &state.event_bus,
-                    &ctx.request_id,
-                    Some(provider_name),
-                    Some(&resp_model),
-                    &err,
-                    ctx.start,
-                );
-                err
-            })?;
-            serde_json::to_vec(&msg_resp).map_err(|e| {
-                let err = RouteError::Internal(format!("serialize: {e}"));
-                state.metrics.record_failure();
-                emit_response_failed(
-                    &state.event_bus,
-                    &ctx.request_id,
-                    Some(provider_name),
-                    Some(&resp_model),
-                    &err,
-                    ctx.start,
-                );
-                err
-            })?
+    // Same-format passthrough: the upstream response body reaches the client
+    // verbatim; the decode above only read usage and the stop reason for the
+    // ledger, it did not rewrite the body (conflict 10). Cross-format clients
+    // get the body re-encoded into their dialect.
+    let response_body = if wire.same_format_as(target.protocol) {
+        if target.upstream_model != core.model.requested {
+            tracing::debug!(
+                request_id = %ctx.request_id,
+                "same-format passthrough: the response advertises the upstream model name"
+            );
         }
-        ClientProtocol::OpenAiChat => {
-            let chat_resp = openai_chat::encode_response(core_resp).map_err(|e| {
-                let err = RouteError::Internal(format!("client encode: {e}"));
-                state.metrics.record_failure();
-                emit_response_failed(
-                    &state.event_bus,
-                    &ctx.request_id,
-                    Some(provider_name),
-                    Some(&resp_model),
-                    &err,
-                    ctx.start,
-                );
-                err
-            })?;
-            serde_json::to_vec(&chat_resp).map_err(|e| {
-                let err = RouteError::Internal(format!("serialize: {e}"));
-                state.metrics.record_failure();
-                emit_response_failed(
-                    &state.event_bus,
-                    &ctx.request_id,
-                    Some(provider_name),
-                    Some(&resp_model),
-                    &err,
-                    ctx.start,
-                );
-                err
-            })?
-        }
+        response_bytes
+    } else {
+        let encoded: Result<Vec<u8>, String> = match client_protocol {
+            ClientProtocol::Anthropic => anthropic::encode_response(core_resp)
+                .map_err(|e| e.to_string())
+                .and_then(|msg_resp| serde_json::to_vec(&msg_resp).map_err(|e| e.to_string())),
+            ClientProtocol::OpenAiChat => openai_chat::encode_response(core_resp)
+                .map_err(|e| e.to_string())
+                .and_then(|chat_resp| serde_json::to_vec(&chat_resp).map_err(|e| e.to_string())),
+        };
+        encoded.map_err(|e| {
+            let err = RouteError::Internal(format!("client encode: {e}"));
+            state.metrics.record_failure();
+            emit_response_failed(
+                &state.event_bus,
+                &ctx.request_id,
+                Some(provider_name),
+                Some(&resp_model),
+                &err,
+                ctx.start,
+            );
+            err
+        })?
     };
     state
         .metrics
@@ -725,8 +744,13 @@ pub(crate) async fn handle_core_stream(
     ctx: RequestContext,
     dispatch: CoreDispatch<'_>,
     core: CoreRequest,
-    inbound_auth: Option<SecretString>,
+    inbound: InboundRequest,
 ) -> Result<Response<Body>, RouteError> {
+    let InboundRequest {
+        auth: inbound_auth,
+        headers: inbound_headers,
+        mut wire,
+    } = inbound;
     let CoreDispatch {
         provider_name,
         route_kind,
@@ -761,7 +785,7 @@ pub(crate) async fn handle_core_stream(
             body_hash: ctx.body_hash.clone(),
         }));
 
-    let (target, adapter) = resolve_target(
+    let (target, adapter, allowlist) = resolve_target(
         &state,
         provider_name,
         route_kind,
@@ -784,11 +808,12 @@ pub(crate) async fn handle_core_stream(
     tracing::debug!(
         request_id = %ctx.request_id,
         provider = %target.provider_name,
-        upstream_model = %target.upstream_model,
+        upstream_model = &target.upstream_model,
         "routed to provider (streaming)"
     );
-    let proxy_req: ProxyRequest = adapter.encode_request(&core, &target).map_err(|e| {
-        let err = RouteError::Internal(format!("encode error: {e}"));
+    wire.forwarded_headers = select_forwarded_headers(&inbound_headers, &allowlist);
+    let proxy_req: ProxyRequest = adapter.encode_request(&core, &target, &wire).map_err(|e| {
+        let err = map_encode_error(e);
         state.metrics.record_failure();
         emit_response_failed(
             &state.event_bus,

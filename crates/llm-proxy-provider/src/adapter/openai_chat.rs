@@ -296,21 +296,87 @@ impl OpenAiChatStreamDecoder {
     }
 }
 
+/// Encodes user content: plain text when the message has no media, or an
+/// array of `text` / `image_url` parts when it does. The neutral core image
+/// source (`{"type":"url",...}` / `{"type":"base64",...}`) maps back onto the
+/// OpenAI `image_url` shape (base64 sources become `data:` URIs).
+fn encode_user_content(content: &[CoreContent]) -> serde_json::Value {
+    let has_media = content
+        .iter()
+        .any(|c| matches!(c, CoreContent::Image { .. }));
+    if !has_media {
+        let text = collect_text(content);
+        return serde_json::Value::String(text);
+    }
+    let mut parts = Vec::new();
+    for c in content {
+        match c {
+            CoreContent::Text { text, .. } => {
+                if !text.is_empty() {
+                    parts.push(serde_json::json!({"type": "text", "text": text}));
+                }
+            }
+            CoreContent::Image { source } => {
+                if let Some(part) = neutral_image_to_openai_part(source) {
+                    parts.push(part);
+                }
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "OpenAI Chat: dropping unsupported user content block during encode"
+                );
+            }
+        }
+    }
+    serde_json::Value::Array(parts)
+}
+
+/// Maps a neutral core image source onto an OpenAI `image_url` content part.
+fn neutral_image_to_openai_part(source: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = source.as_object()?;
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("url") => {
+            let url = obj.get("url").and_then(serde_json::Value::as_str)?;
+            Some(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": url}
+            }))
+        }
+        Some("base64") => {
+            let media_type = obj.get("media_type").and_then(serde_json::Value::as_str)?;
+            let data = obj.get("data").and_then(serde_json::Value::as_str)?;
+            Some(serde_json::json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{media_type};base64,{data}")}
+            }))
+        }
+        other => {
+            tracing::warn!(
+                source_type = ?other,
+                "OpenAI Chat: unsupported neutral image source type; dropping"
+            );
+            None
+        }
+    }
+}
+
 fn encode_assistant_content(
     content: &CoreContent,
     tool_calls: &mut Vec<ToolCall>,
     reasoning_content: &mut Option<String>,
 ) {
     match content {
-        CoreContent::Thinking { text, .. } => {
-            if !text.is_empty() {
-                match reasoning_content {
-                    Some(existing) => existing.push_str(text),
-                    None => *reasoning_content = Some(text.clone()),
-                }
-            }
-        }
-        CoreContent::ToolUse { id, name, input } => {
+        // An empty Thinking block means the client explicitly replayed an
+        // empty `reasoning_content`; providers that require the field on
+        // replay (DeepSeek) must see it, so it is never omitted.
+        CoreContent::Thinking { text, .. } => match reasoning_content {
+            Some(existing) => existing.push_str(text),
+            None => *reasoning_content = Some(text.clone()),
+        },
+        CoreContent::ToolUse {
+            id, name, input, ..
+        } => {
             let arguments = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_owned());
             tool_calls.push(ToolCall {
                 index: None,
@@ -357,90 +423,115 @@ fn push_tool_result_messages(content: &[CoreContent], messages: &mut Vec<ChatMes
 
 impl OpenAiChatAdapter {
     /// Encode a core request into an OpenAI Chat Completions request.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "field-by-field wire encode of the OpenAI Chat Completions request \
-                 shape, kept in one place so the mapping can be audited against \
-                 the API schema without jumping between helpers"
-    )]
+    ///
+    /// Same-format (Chat Completions client) requests forward the raw client
+    /// body with only surgical edits: the model name, usage-on-streams, and
+    /// reasoning translation. Cross-format requests encode the normalized
+    /// core request under the cross-format field policy.
     pub fn encode_request(
         &self,
         core: &CoreRequest,
         target: &ProviderAdapterTarget,
+        client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
-        let mut messages = Vec::new();
+        let url = expand_url_template(&target.endpoint, target)?;
+        let req = if client.same_format_as(super::ProviderProtocol::OpenAiChatCompletions)
+            && let Some(raw) = client.body_object()
+        {
+            edit_raw_chat_request(raw, core, target)?
+        } else {
+            encode_normalized_request(core, target, client)?
+        };
+        let body = serde_json::to_vec(&req)?;
+        Ok(build_proxy_request(body, target, core.stream, url, client))
+    }
+}
 
-        for sys_content in &core.system {
-            match sys_content {
-                CoreContent::Text { text, cache } => {
-                    if cache.is_some() {
-                        tracing::warn!(
-                            "OpenAI Chat: cache_control is not supported, dropping cache marker on system message"
-                        );
-                    }
-                    if !text.is_empty() {
-                        messages.push(ChatMessage {
-                            role: "system".to_owned(),
-                            content: serde_json::Value::String(text.clone()),
-                            reasoning_content: None,
-                            tool_calls: Vec::new(),
-                            name: None,
-                            tool_call_id: None,
-                            cache_control: None,
-                            refusal: None,
-                            is_error: None,
-                        });
-                    }
-                }
-                other => {
-                    tracing::warn!(
-                        ?other,
-                        "OpenAI Chat: dropping non-Text system content block during encode"
-                    );
-                }
+/// Same-format passthrough: apply only the edits the proxy needs to the raw
+/// OpenAI Chat client body; every other field survives byte-for-byte.
+fn edit_raw_chat_request(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    core: &CoreRequest,
+    target: &ProviderAdapterTarget,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut obj = raw.clone();
+
+    // Edit 1: model aliasing.
+    obj.insert(
+        "model".to_owned(),
+        serde_json::Value::String(target.upstream_model.clone()),
+    );
+
+    // Edit 2: an Anthropic-style `thinking` object is not a Chat field; the
+    // reasoning module derives `reasoning_effort` from it instead.
+    obj.remove("thinking");
+    if let Some(effort) = super::reasoning::chat_effort(&core.sampling)? {
+        obj.insert(
+            "reasoning_effort".to_owned(),
+            serde_json::Value::String(effort),
+        );
+    } else {
+        obj.remove("reasoning_effort");
+    }
+
+    // Edit 3: the proxy needs real usage on streams for the ledger, whatever
+    // the client asked to see (the client encoder decides what is exposed).
+    if core.stream {
+        let include_usage = serde_json::json!({"include_usage": true});
+        match obj
+            .get_mut("stream_options")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            Some(options) => {
+                options.insert(
+                    "include_usage".to_owned(),
+                    include_usage["include_usage"].clone(),
+                );
+            }
+            None => {
+                obj.insert("stream_options".to_owned(), include_usage);
             }
         }
+    }
 
-        for msg in &core.messages {
-            match msg.role {
-                CoreRole::User => {
-                    let text = collect_text(&msg.content);
-                    if !text.is_empty() {
-                        messages.push(ChatMessage {
-                            role: "user".to_owned(),
-                            content: serde_json::Value::String(text),
-                            reasoning_content: None,
-                            tool_calls: Vec::new(),
-                            name: None,
-                            tool_call_id: None,
-                            cache_control: None,
-                            refusal: None,
-                            is_error: None,
-                        });
-                    }
+    Ok(serde_json::Value::Object(obj))
+}
 
-                    push_tool_result_messages(&msg.content, &mut messages);
+#[expect(
+    clippy::too_many_lines,
+    reason = "field-by-field wire encode of the OpenAI Chat Completions request \
+             shape, kept in one place so the mapping can be audited against \
+             the API schema without jumping between helpers"
+)]
+/// Cross-format encode: build the Chat Completions request from the
+/// normalized core request, settle the client's leftover fields through the
+/// field policy, and translate reasoning parameters.
+fn encode_normalized_request(
+    core: &CoreRequest,
+    target: &ProviderAdapterTarget,
+    client: &super::client_wire::ClientWireRequest,
+) -> Result<serde_json::Value, ProviderError> {
+    let carried = super::client_wire::apply_field_policy(
+        client,
+        super::ProviderProtocol::OpenAiChatCompletions,
+        target.lossy,
+    )?;
+    let mut messages = Vec::new();
+
+    for sys_content in &core.system {
+        match sys_content {
+            CoreContent::Text { text, cache } => {
+                if cache.is_some() {
+                    tracing::warn!(
+                        "OpenAI Chat: cache_control is not supported, dropping cache marker on system message"
+                    );
                 }
-                CoreRole::Assistant => {
-                    let text = collect_text(&msg.content);
-                    let mut tool_calls = Vec::new();
-                    let mut reasoning_content: Option<String> = None;
-
-                    for content in &msg.content {
-                        encode_assistant_content(content, &mut tool_calls, &mut reasoning_content);
-                    }
-
-                    let content = if text.is_empty() && !tool_calls.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        serde_json::Value::String(text)
-                    };
-
+                if !text.is_empty() {
                     messages.push(ChatMessage {
-                        role: "assistant".to_owned(),
-                        content,
-                        reasoning_content,
-                        tool_calls,
+                        role: "system".to_owned(),
+                        content: serde_json::Value::String(text.clone()),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
                         name: None,
                         tool_call_id: None,
                         cache_control: None,
@@ -448,149 +539,230 @@ impl OpenAiChatAdapter {
                         is_error: None,
                     });
                 }
-                CoreRole::System => {
-                    let text = collect_text(&msg.content);
-                    if !text.is_empty() {
-                        messages.push(ChatMessage {
-                            role: "system".to_owned(),
-                            content: serde_json::Value::String(text),
-                            reasoning_content: None,
-                            tool_calls: Vec::new(),
-                            name: None,
-                            tool_call_id: None,
-                            cache_control: None,
-                            refusal: None,
-                            is_error: None,
-                        });
-                    }
-                }
-                CoreRole::Tool => {
-                    let text = collect_text(&msg.content);
-                    let tool_use_id = msg
-                        .content
-                        .iter()
-                        .find_map(|c| match c {
-                            CoreContent::ToolResult { tool_use_id, .. } => {
-                                Some(tool_use_id.clone())
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    if tool_use_id.is_empty() {
-                        tracing::warn!(
-                            "OpenAI Chat: Tool message has empty tool_use_id; downstream protocols may reject this"
-                        );
-                    }
+            }
+            other => {
+                tracing::warn!(
+                    ?other,
+                    "OpenAI Chat: dropping non-Text system content block during encode"
+                );
+            }
+        }
+    }
+
+    for msg in &core.messages {
+        match msg.role {
+            CoreRole::User => {
+                let content = encode_user_content(&msg.content);
+                let is_empty = match &content {
+                    serde_json::Value::String(text) => text.is_empty(),
+                    serde_json::Value::Array(parts) => parts.is_empty(),
+                    _ => false,
+                };
+                if !is_empty {
                     messages.push(ChatMessage {
-                        role: "tool".to_owned(),
-                        content: serde_json::Value::String(text),
+                        role: "user".to_owned(),
+                        content,
                         reasoning_content: None,
                         tool_calls: Vec::new(),
                         name: None,
-                        tool_call_id: Some(tool_use_id),
+                        tool_call_id: None,
                         cache_control: None,
                         refusal: None,
                         is_error: None,
                     });
                 }
-                _ => {
-                    let text = collect_text(&msg.content);
-                    if !text.is_empty() {
-                        messages.push(ChatMessage {
-                            role: "user".to_owned(),
-                            content: serde_json::Value::String(text),
-                            reasoning_content: None,
-                            tool_calls: Vec::new(),
-                            name: None,
-                            tool_call_id: None,
-                            cache_control: None,
-                            refusal: None,
-                            is_error: None,
-                        });
-                    }
-                }
-            }
-        }
 
-        let tools: Vec<ToolDef> = core
-            .tools
-            .iter()
-            .map(|t| {
-                let schema = if t.input_schema.is_null() {
-                    serde_json::json!({"type": "object", "properties": {}})
+                push_tool_result_messages(&msg.content, &mut messages);
+            }
+            CoreRole::Assistant => {
+                let text = collect_text(&msg.content);
+                let mut tool_calls = Vec::new();
+                let mut reasoning_content: Option<String> = None;
+
+                for content in &msg.content {
+                    encode_assistant_content(content, &mut tool_calls, &mut reasoning_content);
+                }
+
+                let content = if text.is_empty() && !tool_calls.is_empty() {
+                    serde_json::Value::Null
                 } else {
-                    t.input_schema.clone()
+                    serde_json::Value::String(text)
                 };
-                ToolDef {
-                    r#type: "function".to_owned(),
-                    function: FunctionDef {
-                        name: t.name.clone(),
-                        description: t.description.clone(),
-                        parameters: Some(schema),
-                    },
-                }
-            })
-            .collect();
 
-        let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
-            // The Chat Completions API documents tool_choice as a string for
-            // the generic modes and an object only for naming a function.
-            CoreToolChoice::Auto => Some(serde_json::json!("auto")),
-            CoreToolChoice::Any => Some(serde_json::json!("required")),
-            CoreToolChoice::None => Some(serde_json::json!("none")),
-            CoreToolChoice::Tool { name } => Some(serde_json::json!({
-                "type": "function",
-                "function": {"name": name}
-            })),
-            CoreToolChoice::Raw(v) => Some(v.clone()),
-            _ => {
-                tracing::warn!(?tc, "OpenAI Chat: unknown tool_choice variant, omitting");
-                None
+                messages.push(ChatMessage {
+                    role: "assistant".to_owned(),
+                    content,
+                    reasoning_content,
+                    tool_calls,
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: None,
+                    is_error: None,
+                });
             }
-        });
-
-        let mut req = ChatCompletionRequest {
-            model: target.upstream_model.clone(),
-            messages,
-            stream: if core.stream { Some(true) } else { None },
-            temperature: core.sampling.temperature,
-            top_p: core.sampling.top_p,
-            max_tokens: core.sampling.max_tokens,
-            reasoning_effort: core.sampling.reasoning_effort.clone(),
-            thinking: core.sampling.thinking.clone(),
-            tools,
-            tool_choice,
-            stop: core.sampling.stop.as_ref().map(|v| {
-                if v.len() == 1 {
-                    serde_json::Value::String(v[0].clone())
-                } else {
-                    serde_json::Value::Array(
-                        v.iter()
-                            .map(|s| serde_json::Value::String(s.clone()))
-                            .collect(),
-                    )
+            CoreRole::System => {
+                let text = collect_text(&msg.content);
+                if !text.is_empty() {
+                    messages.push(ChatMessage {
+                        role: "system".to_owned(),
+                        content: serde_json::Value::String(text),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        cache_control: None,
+                        refusal: None,
+                        is_error: None,
+                    });
                 }
-            }),
-            stream_options: None,
-            user: core.metadata.user_id.clone(),
-            extra: serde_json::Map::new(),
-        };
-
-        if core.stream {
-            // Always ask for usage on streams so the ledger records real
-            // numbers; whether the client sees a usage chunk is decided by
-            // the client encoder, not by this request.
-            req.stream_options = Some(StreamOptions {
-                include_usage: Some(true),
-            });
+            }
+            CoreRole::Tool => {
+                let text = collect_text(&msg.content);
+                let tool_use_id = msg
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        CoreContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if tool_use_id.is_empty() {
+                    tracing::warn!(
+                        "OpenAI Chat: Tool message has empty tool_use_id; downstream protocols may reject this"
+                    );
+                }
+                messages.push(ChatMessage {
+                    role: "tool".to_owned(),
+                    content: serde_json::Value::String(text),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    name: None,
+                    tool_call_id: Some(tool_use_id),
+                    cache_control: None,
+                    refusal: None,
+                    is_error: None,
+                });
+            }
+            _ => {
+                let text = collect_text(&msg.content);
+                if !text.is_empty() {
+                    messages.push(ChatMessage {
+                        role: "user".to_owned(),
+                        content: serde_json::Value::String(text),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        name: None,
+                        tool_call_id: None,
+                        cache_control: None,
+                        refusal: None,
+                        is_error: None,
+                    });
+                }
+            }
         }
-
-        let body = serde_json::to_vec(&req)?;
-        let url = expand_url_template(&target.endpoint, target)?;
-
-        Ok(build_proxy_request(body, target, core.stream, url))
     }
 
+    let tools: Vec<ToolDef> = core
+        .tools
+        .iter()
+        .map(|t| {
+            let schema = if t.input_schema.is_null() {
+                serde_json::json!({"type": "object", "properties": {}})
+            } else {
+                t.input_schema.clone()
+            };
+            ToolDef {
+                r#type: "function".to_owned(),
+                function: FunctionDef {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: Some(schema),
+                },
+            }
+        })
+        .collect();
+
+    let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
+        // The Chat Completions API documents tool_choice as a string for
+        // the generic modes and an object only for naming a function.
+        CoreToolChoice::Auto => Some(serde_json::json!("auto")),
+        CoreToolChoice::Any => Some(serde_json::json!("required")),
+        CoreToolChoice::None => Some(serde_json::json!("none")),
+        CoreToolChoice::Tool { name } => Some(serde_json::json!({
+            "type": "function",
+            "function": {"name": name}
+        })),
+        CoreToolChoice::Raw(v) => Some(v.clone()),
+        _ => {
+            tracing::warn!(?tc, "OpenAI Chat: unknown tool_choice variant, omitting");
+            None
+        }
+    });
+
+    let mut req = ChatCompletionRequest {
+        model: target.upstream_model.clone(),
+        messages,
+        stream: if core.stream { Some(true) } else { None },
+        temperature: core.sampling.temperature,
+        top_p: core.sampling.top_p,
+        max_tokens: core.sampling.max_tokens,
+        reasoning_effort: core.sampling.reasoning_effort.clone(),
+        thinking: core.sampling.thinking.clone(),
+        tools,
+        tool_choice,
+        stop: core.sampling.stop.as_ref().map(|v| {
+            if v.len() == 1 {
+                serde_json::Value::String(v[0].clone())
+            } else {
+                serde_json::Value::Array(
+                    v.iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect(),
+                )
+            }
+        }),
+        stream_options: None,
+        user: core.metadata.user_id.clone(),
+        extra: serde_json::Map::new(),
+    };
+
+    if core.stream {
+        // Always ask for usage on streams so the ledger records real
+        // numbers; whether the client sees a usage chunk is decided by
+        // the client encoder, not by this request.
+        req.stream_options = Some(StreamOptions {
+            include_usage: Some(true),
+        });
+    }
+
+    // Reasoning translation: `thinking` never crosses to the Chat wire;
+    // `reasoning_effort` is validated (or derived from a budget). An
+    // Anthropic `output_config.effort` maps onto the same field.
+    req.thinking = None;
+    let mut effort = super::reasoning::chat_effort(&core.sampling)?;
+    if effort.is_none()
+        && let Some(config_effort) = client
+            .body
+            .as_object()
+            .and_then(|obj| obj.get("output_config"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|config| config.get("effort"))
+            .and_then(serde_json::Value::as_str)
+    {
+        super::reasoning::validate_effort(config_effort)?;
+        effort = Some(config_effort.to_owned());
+    }
+    req.reasoning_effort = effort;
+
+    // Carried extras (e.g. an Anthropic client's `service_tier`) ride the
+    // flatten map of the request struct.
+    req.extra = carried;
+
+    Ok(serde_json::to_value(&req)?)
+}
+
+impl OpenAiChatAdapter {
     /// Decode an OpenAI Chat Completions response body.
     pub fn decode_response(
         &self,
@@ -656,6 +828,7 @@ impl OpenAiChatAdapter {
                     tracing::warn!("OpenAI: tool_call missing id in response decode");
                     "<unknown_tool_id>".to_owned()
                 }),
+                signature: None,
                 name: tc
                     .function
                     .as_ref()
@@ -742,6 +915,17 @@ fn collect_text(content: &[CoreContent]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::adapter::client_wire::{ClientWireFormat, ClientWireRequest};
+
+    /// An Anthropic-dialect client wire: never the same format as the Chat
+    /// adapter, so tests exercise the cross-format normalized encode.
+    fn client_wire(core: &CoreRequest) -> ClientWireRequest {
+        ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({"model": core.model.requested, "messages": []}),
+        )
+    }
     use llm_proxy_core::AuthStyle;
     use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions, UsageProvenance};
     use llm_proxy_protocol::openai::{Choice, UsageInfo};
@@ -757,6 +941,7 @@ mod tests {
             requested_model: "gpt-4o".into(),
             upstream_model: "gpt-4o-2024-08-06".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
+            lossy: false,
         }
     }
 
@@ -788,7 +973,9 @@ mod tests {
         }]);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.model, "gpt-4o-2024-08-06");
@@ -815,7 +1002,9 @@ mod tests {
         }];
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.messages[0].role, "system");
@@ -841,7 +1030,9 @@ mod tests {
         }];
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.tools.len(), 1);
@@ -860,7 +1051,9 @@ mod tests {
         core.tool_choice = Some(CoreToolChoice::Auto);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.tool_choice, Some(serde_json::json!("auto")));
@@ -882,6 +1075,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "get_weather".into(),
                     input: serde_json::json!({"city": "SF"}),
+                    signature: None,
                 }],
             },
             CoreMessage {
@@ -899,7 +1093,9 @@ mod tests {
         ]);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.messages.len(), 3);
@@ -930,7 +1126,9 @@ mod tests {
         );
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stream, Some(true));
@@ -951,7 +1149,9 @@ mod tests {
         core.stream = true;
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stream, Some(true));
@@ -972,7 +1172,9 @@ mod tests {
         }]);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.model, "gpt-4o-2024-08-06");
@@ -996,7 +1198,9 @@ mod tests {
         };
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.temperature, Some(0.7));
@@ -1181,7 +1385,9 @@ mod tests {
         assert_eq!(core_resp.stop_reason, StopReason::ToolUse);
         let tool = &core_resp.content[0];
         match tool {
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_123");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -1351,11 +1557,14 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "SF"}),
+                signature: None,
             }],
         }]);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.messages.len(), 1);
@@ -1380,12 +1589,15 @@ mod tests {
                     id: "call_1".into(),
                     name: "get_weather".into(),
                     input: serde_json::json!({"city": "SF"}),
+                    signature: None,
                 },
             ],
         }]);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(
@@ -1610,7 +1822,9 @@ mod tests {
         core.sampling.reasoning_effort = Some("high".into());
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.reasoning_effort, Some("high".to_owned()));
@@ -1628,7 +1842,9 @@ mod tests {
         core.sampling.stop = Some(vec!["END".into(), "STOP".into()]);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stop, Some(serde_json::json!(["END", "STOP"])));
@@ -1646,14 +1862,18 @@ mod tests {
         core.sampling.stop = Some(vec!["END".into()]);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stop, Some(serde_json::json!("END")));
     }
 
     #[test]
-    fn encode_thinking_forwarded() {
+    fn encode_thinking_translated_to_reasoning_effort_not_forwarded() {
+        // BUG-20: an Anthropic-style `thinking` object must never reach a
+        // chat API verbatim; it is translated into `reasoning_effort`.
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
             content: vec![CoreContent::Text {
@@ -1665,11 +1885,121 @@ mod tests {
             Some(serde_json::json!({"type": "enabled", "budget_tokens": 5000}));
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        assert!(body.thinking.is_some());
-        assert_eq!(body.thinking.unwrap()["budget_tokens"], 5000);
+        assert!(
+            body.thinking.is_none(),
+            "thinking must not be forwarded to a chat API: {:?}",
+            body.thinking
+        );
+        assert_eq!(body.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn encode_unknown_reasoning_effort_is_rejected_not_forwarded() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.sampling.reasoning_effort = Some("extreme".into());
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let err = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap_err();
+        assert!(err.to_string().contains("extreme"), "{err}");
+    }
+
+    #[test]
+    fn encode_output_config_effort_maps_to_reasoning_effort() {
+        // The field policy declares an Anthropic client's `output_config` as
+        // Mapped for the Chat provider: its `effort` must become
+        // `reasoning_effort` on the wire, not vanish silently.
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model": core.model.requested,
+                "max_tokens": 64,
+                "messages": [],
+                "output_config": {"effort": "high"},
+            }),
+        );
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target, &client).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert_eq!(body["reasoning_effort"], serde_json::json!("high"));
+        assert!(
+            body.get("output_config").is_none(),
+            "output_config is mapped, not carried: {body}"
+        );
+    }
+
+    #[test]
+    fn encode_output_config_unknown_effort_is_rejected() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model": core.model.requested,
+                "max_tokens": 64,
+                "messages": [],
+                "output_config": {"effort": "turbo"},
+            }),
+        );
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let err = adapter.encode_request(&core, &target, &client).unwrap_err();
+        assert!(err.to_string().contains("turbo"), "{err}");
+    }
+
+    #[test]
+    fn encode_output_config_unmapped_subkey_is_rejected() {
+        // `output_config.format` (Anthropic structured outputs) has no Chat
+        // translation: the request must fail naming the subfield instead of
+        // silently dropping it next to the mapped `effort`.
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let client = ClientWireRequest::new(
+            ClientWireFormat::AnthropicMessages,
+            serde_json::json!({
+                "model": core.model.requested,
+                "max_tokens": 64,
+                "messages": [],
+                "output_config": {"effort": "high", "format": {"type": "json_schema"}},
+            }),
+        );
+        let adapter = OpenAiChatAdapter;
+        let target = make_target();
+        let err = adapter.encode_request(&core, &target, &client).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("output_config"), "must name the field: {msg}");
+        assert!(msg.contains("format"), "must name the subfield: {msg}");
     }
 
     #[test]
@@ -1684,7 +2014,9 @@ mod tests {
         core.tool_choice = Some(CoreToolChoice::Auto);
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.tool_choice.is_some());
@@ -1706,7 +2038,9 @@ mod tests {
         }];
         let adapter = OpenAiChatAdapter;
         let target = make_target();
-        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        let proxy_req = adapter
+            .encode_request(&core, &target, &client_wire(&core))
+            .unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         let schema = &body.tools[0].function.parameters;

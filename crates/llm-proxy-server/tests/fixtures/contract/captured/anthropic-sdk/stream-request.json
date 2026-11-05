@@ -1,0 +1,58 @@
+{
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 1024,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a terse weather assistant.",
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get the current weather for a city.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "C",
+              "F"
+            ]
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "auto",
+    "disable_parallel_tool_use": true
+  },
+  "temperature": 0.1,
+  "top_p": 0.9,
+  "top_k": 40,
+  "stop_sequences": [
+    "\n\nHuman:"
+  ],
+  "metadata": {
+    "user_id": "user_capture_fixture"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarize."
+    }
+  ],
+  "stream": true
+}

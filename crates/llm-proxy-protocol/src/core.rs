@@ -169,6 +169,11 @@ pub enum CoreContent {
         name: String,
         /// JSON arguments for the tool call.
         input: serde_json::Value,
+        /// Opaque tool-call signature a provider requires on replay (Gemini
+        /// `thoughtSignature`); redacted to `[REDACTED]` in `Debug` output.
+        /// Anthropic-style thinking signatures live on [`CoreContent::Thinking`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// The result of a tool invocation, fed back to the model.
     ToolResult {
@@ -226,11 +231,17 @@ impl fmt::Debug for CoreContent {
                 .debug_struct("Video")
                 .field("source", &OpaqueJsonRef(source))
                 .finish(),
-            CoreContent::ToolUse { id, name, input } => f
+            CoreContent::ToolUse {
+                id,
+                name,
+                input,
+                signature,
+            } => f
                 .debug_struct("ToolUse")
                 .field("id", &id)
                 .field("name", &name)
                 .field("input", &OpaqueJsonRef(input))
+                .field("signature", &signature.as_ref().map(|_| "[REDACTED]"))
                 .finish(),
             CoreContent::ToolResult {
                 tool_use_id,
@@ -418,6 +429,10 @@ pub struct SamplingOptions {
     /// bare OpenAI string becomes a single-element vec.
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
+    /// Top-K sampling (Anthropic `top_k`, Gemini `topK`); OpenAI Chat has no
+    /// equivalent, so the cross-format policy rejects it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
     /// Reasoning effort level (e.g. `"low"`, `"medium"`, `"high"`).
     pub reasoning_effort: Option<String>,
     /// Extended thinking configuration (provider-specific JSON, e.g. Anthropic
@@ -537,6 +552,7 @@ impl fmt::Debug for SamplingOptions {
             .field("top_p", &self.top_p)
             .field("max_tokens", &self.max_tokens)
             .field("stop", &self.stop)
+            .field("top_k", &self.top_k)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("thinking", &self.thinking.as_ref().map(OpaqueJsonRef))
             .finish()
@@ -1324,6 +1340,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "fn".into(),
                     input: serde_json::json!({"x": 1}),
+                    signature: None,
                 },
             ],
             stop_reason: StopReason::ToolUse,
@@ -1528,6 +1545,7 @@ mod tests {
                 id: String::new(),
                 name: String::new(),
                 input: serde_json::Value::Null,
+                signature: None,
             },
             CoreContent::ToolResult {
                 tool_use_id: String::new(),
@@ -1590,6 +1608,7 @@ mod tests {
             top_p: Some(0.0),
             max_tokens: Some(0),
             stop: None,
+            top_k: None,
             reasoning_effort: None,
             thinking: None,
         };
@@ -1751,6 +1770,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "fn".into(),
                 input: serde_json::json!({"x": 1}),
+                signature: None,
             },
             CoreContent::ToolResult {
                 tool_use_id: "call_1".into(),

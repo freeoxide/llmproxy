@@ -30,6 +30,10 @@ pub struct ResponsesRequest {
     /// Upper bound on tokens generated in the response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i32>,
+    /// Carried client fields the Responses API accepts verbatim (e.g.
+    /// `service_tier`, `parallel_tool_calls`, `store`, `prompt_cache_key`).
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// One entry in the Responses API `input` array: either a conversational
@@ -260,6 +264,25 @@ pub struct GeminiPart {
         skip_serializing_if = "Option::is_none"
     )]
     pub function_response: Option<GeminiFunctionResponse>,
+    /// Opaque thought signature attached to a `functionCall` part (and echoed
+    /// on the matching `functionResponse` part when replaying tool state);
+    /// camelCase `thoughtSignature` per the Gemini wire format.
+    #[serde(
+        rename = "thoughtSignature",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub thought_signature: Option<String>,
+    /// Inline media bytes (`inlineData`), used for base64 image parts.
+    #[serde(
+        rename = "inlineData",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub inline_data: Option<GeminiInlineData>,
+    /// Media referenced by URI (`fileData`), used for URL image parts.
+    #[serde(rename = "fileData", default, skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<GeminiFileData>,
 }
 
 /// A function call emitted by the Gemini model.
@@ -288,6 +311,9 @@ impl GeminiPart {
             text: Some(text),
             function_call: None,
             function_response: None,
+            thought_signature: None,
+            inline_data: None,
+            file_data: None,
         }
     }
 
@@ -297,6 +323,9 @@ impl GeminiPart {
             text: None,
             function_call: Some(GeminiFunctionCall { name, args }),
             function_response: None,
+            thought_signature: None,
+            inline_data: None,
+            file_data: None,
         }
     }
 
@@ -306,8 +335,67 @@ impl GeminiPart {
             text: None,
             function_call: None,
             function_response: Some(GeminiFunctionResponse { name, response }),
+            thought_signature: None,
+            inline_data: None,
+            file_data: None,
         }
     }
+
+    /// Attach a thought signature to this part (present on `functionCall`
+    /// parts the model signed, and on `functionResponse` parts that replay
+    /// them).
+    pub fn with_thought_signature(mut self, signature: String) -> Self {
+        self.thought_signature = Some(signature);
+        self
+    }
+
+    /// Create an inline-media (base64) part.
+    pub fn inline_data(mime_type: String, data: String) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+            inline_data: Some(GeminiInlineData { mime_type, data }),
+            file_data: None,
+        }
+    }
+
+    /// Create a URI-referenced media part.
+    pub fn file_data(mime_type: String, file_uri: String) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: None,
+            thought_signature: None,
+            inline_data: None,
+            file_data: Some(GeminiFileData {
+                mime_type,
+                file_uri,
+            }),
+        }
+    }
+}
+
+/// Inline media bytes (`inlineData`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiInlineData {
+    /// MIME type of the media (`mimeType` on the wire).
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    /// Base64-encoded media bytes.
+    pub data: String,
+}
+
+/// Media referenced by URI (`fileData`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiFileData {
+    /// MIME type of the media (`mimeType` on the wire).
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    /// URI of the media (`fileUri` on the wire).
+    #[serde(rename = "fileUri")]
+    pub file_uri: String,
 }
 
 /// Generation parameters for a Gemini request.
@@ -317,11 +405,29 @@ pub struct GeminiGenerationConfig {
     pub temperature: Option<f64>,
     /// Nucleus sampling threshold.
     pub top_p: Option<f64>,
+    /// Top-K sampling (`topK` on the wire).
+    #[serde(rename = "topK", default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
     /// Maximum number of tokens in the completion.
     pub max_output_tokens: Option<i32>,
     /// Stop sequences that cause generation to stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+    /// Thinking configuration (`thinkingConfig` on the wire).
+    #[serde(
+        rename = "thinkingConfig",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub thinking_config: Option<GeminiThinkingConfig>,
+}
+
+/// Thinking configuration for a Gemini request (`generationConfig.thinkingConfig`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiThinkingConfig {
+    /// The thinking budget in tokens (`thinkingBudget`); 0 disables thinking.
+    #[serde(rename = "thinkingBudget")]
+    pub thinking_budget: i64,
 }
 
 /// A tool declaration in the Gemini API.
@@ -410,6 +516,7 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            extra: serde_json::Map::new(),
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ResponsesRequest = serde_json::from_str(&json).unwrap();
@@ -509,8 +616,10 @@ mod tests {
             generation_config: Some(GeminiGenerationConfig {
                 temperature: Some(0.7),
                 top_p: None,
+                top_k: None,
                 max_output_tokens: Some(1024),
                 stop_sequences: None,
+                thinking_config: None,
             }),
             tools: vec![],
             stream: Some(true),
