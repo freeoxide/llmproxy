@@ -41,8 +41,8 @@ GET  /providers/{provider}/v1/models
 See `config.toml.example` and the files under `providers/` for configuration
 examples.
 
-See the [protocol design](docs/protocol.md) and
-[research index](docs/research/README.md) for architecture and compatibility notes.
+See the [documentation index](docs/README.md) for the project goal, plans,
+protocol design and research.
 
 ## References
 

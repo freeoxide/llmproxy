@@ -6,6 +6,8 @@
 Common tasks have `just` recipes — `just fmt`, `just lint`, `just test`,
 `just build`, `just run` — which wrap the cargo commands below.
 
+The project goal, decisions and plans are indexed in `docs/README.md`.
+
 ## Rust quality gates
 
 Run after every change:
