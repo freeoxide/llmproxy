@@ -26,7 +26,7 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         upstream: None,
     };
 
-    let system = decode_system(req.system);
+    let system = decode_system(req.system)?;
 
     let messages = req
         .messages
@@ -83,46 +83,55 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
     })
 }
 
-fn decode_system(system: Option<serde_json::Value>) -> Vec<CoreContent> {
+fn decode_cache_control(cache_control: AnthropicCacheControl) -> CacheControl {
+    CacheControl {
+        r#type: CacheControlType::from(cache_control.r#type),
+        ttl: cache_control.ttl,
+    }
+}
+
+fn malformed_block(context: &str, error: &serde_json::Error) -> ProtocolError {
+    let detail = error.to_string();
+    let detail = crate::util::truncate_str_safe(&detail, 120);
+    ProtocolError::InvalidRequest(format!("malformed {context}: {detail}"))
+}
+
+fn decode_system(system: Option<serde_json::Value>) -> Result<Vec<CoreContent>, ProtocolError> {
     match system {
-        None => Vec::new(),
+        None => Ok(Vec::new()),
         Some(serde_json::Value::String(s)) => {
             if s.is_empty() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            vec![CoreContent::Text {
+            Ok(vec![CoreContent::Text {
                 text: s,
                 cache: None,
-            }]
+            }])
         }
         Some(serde_json::Value::Array(arr)) => {
-            let mut result = Vec::new();
+            let mut result = Vec::with_capacity(arr.len());
             for item in arr {
-                let Ok(block) = serde_json::from_value::<SystemContentBlock>(item) else {
-                    tracing::warn!(
-                        "decode_system: skipping system array item that failed deserialization"
-                    );
-                    continue;
-                };
+                let block = serde_json::from_value::<SystemContentBlock>(item)
+                    .map_err(|error| malformed_block("system block", &error))?;
                 if block.r#type != "text" {
-                    let bt = block.r#type.as_str();
-                    let truncated = crate::util::truncate_str_safe(bt, 64);
-                    tracing::warn!(
-                        block_type = truncated,
-                        "non-text system block skipped during Anthropic decode"
-                    );
-                    continue;
+                    let block_type = crate::util::truncate_str_safe(&block.r#type, 64);
+                    return Err(ProtocolError::InvalidRequest(format!(
+                        "system blocks must have type \"text\", got \"{block_type}\""
+                    )));
                 }
-                if let Some(t) = block.text {
-                    let cache = block.cache_control.map(|cc| CacheControl {
-                        r#type: CacheControlType::from(cc.r#type),
-                    });
-                    result.push(CoreContent::Text { text: t, cache });
-                }
+                let Some(text) = block.text else {
+                    return Err(ProtocolError::InvalidRequest(
+                        "system block of type \"text\" is missing \"text\"".into(),
+                    ));
+                };
+                let cache = block.cache_control.map(decode_cache_control);
+                result.push(CoreContent::Text { text, cache });
             }
-            result
+            Ok(result)
         }
-        _ => Vec::new(),
+        Some(_) => Err(ProtocolError::InvalidRequest(
+            "system must be a string or an array of text blocks".into(),
+        )),
     }
 }
 
@@ -135,7 +144,9 @@ fn decode_message(msg: &Message) -> Result<CoreMessage, ProtocolError> {
         }
     };
 
-    let blocks = msg.content_blocks();
+    let blocks = msg
+        .content_blocks()
+        .map_err(|error| malformed_block("message content", &error))?;
     let mut content = Vec::with_capacity(blocks.len());
     for block in blocks {
         content.push(decode_content_block(block)?);
@@ -147,9 +158,8 @@ fn decode_message(msg: &Message) -> Result<CoreMessage, ProtocolError> {
 fn decode_tool_result_blocks(arr: &[serde_json::Value]) -> Result<Vec<CoreContent>, ProtocolError> {
     let mut blocks = Vec::with_capacity(arr.len());
     for item in arr {
-        let Ok(cb) = serde_json::from_value::<crate::anthropic::ContentBlock>(item.clone()) else {
-            continue;
-        };
+        let cb = serde_json::from_value::<ContentBlock>(item.clone())
+            .map_err(|error| malformed_block("tool_result content", &error))?;
         match decode_content_block(cb) {
             Ok(core) => blocks.push(core),
             Err(ProtocolError::Decode(msg)) => {
@@ -219,9 +229,7 @@ fn decode_tool_result_block(block: ContentBlock) -> Result<CoreContent, Protocol
 fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolError> {
     match block.r#type.as_str() {
         "text" => {
-            let cache = block.cache_control.map(|cc| CacheControl {
-                r#type: CacheControlType::from(cc.r#type),
-            });
+            let cache = block.cache_control.map(decode_cache_control);
             Ok(CoreContent::Text {
                 text: block.text.unwrap_or_default(),
                 cache,
@@ -356,6 +364,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
         CoreContent::Text { text, cache } => {
             let cc = cache.map(|c| AnthropicCacheControl {
                 r#type: c.r#type.as_str().to_owned(),
+                ttl: c.ttl,
             });
             let mut block = ContentBlock::new_text(text);
             block.cache_control = cc;
@@ -1092,6 +1101,83 @@ mod tests {
                 assert_eq!(cache.as_ref().unwrap().r#type, CacheControlType::Ephemeral);
             }
             _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn system_block_with_cache_ttl_keeps_its_text_and_ttl() {
+        let mut req = make_anthropic_request();
+        req.system = Some(serde_json::json!([
+            { "type": "text", "text": "Long prompt", "cache_control": {"type": "ephemeral", "ttl": "1h"} }
+        ]));
+        let core = decode_request(req).unwrap();
+        match core.system.as_slice() {
+            [CoreContent::Text { text, cache }] => {
+                assert_eq!(text, "Long prompt");
+                assert_eq!(cache.as_ref().unwrap().ttl.as_deref(), Some("1h"));
+            }
+            other => panic!("expected one text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_block_with_cache_ttl_keeps_its_text() {
+        let mut req = make_anthropic_request();
+        req.messages = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                { "type": "text", "text": "Long question", "cache_control": {"type": "ephemeral", "ttl": "1h"} }
+            ]),
+        }];
+        let core = decode_request(req).unwrap();
+        match core.messages[0].content.as_slice() {
+            [CoreContent::Text { text, cache }] => {
+                assert_eq!(text, "Long question");
+                assert_eq!(cache.as_ref().unwrap().ttl.as_deref(), Some("1h"));
+            }
+            other => panic!("expected one text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_content_the_proxy_cannot_read_is_rejected_not_dropped() {
+        let unreadable = [
+            serde_json::json!([{ "type": "text", "text": "ok" }, { "type": "text", "text": 42 }]),
+            serde_json::json!([{ "type": "text", "text": "ok", "not_a_field": true }]),
+            serde_json::json!([{ "type": "image" }]),
+            serde_json::json!([{ "type": "text" }]),
+            serde_json::json!(42),
+        ];
+        for system in unreadable {
+            let mut req = make_anthropic_request();
+            req.system = Some(system.clone());
+            assert!(
+                matches!(decode_request(req), Err(ProtocolError::InvalidRequest(_))),
+                "expected a rejection for system = {system}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_message_and_tool_result_blocks_are_rejected_not_dropped() {
+        let unreadable = [
+            serde_json::json!([{ "type": "text", "text": 42 }]),
+            serde_json::json!([{
+                "type": "tool_result",
+                "tool_use_id": "tu_1",
+                "content": [{ "type": "text", "text": 42 }]
+            }]),
+        ];
+        for content in unreadable {
+            let mut req = make_anthropic_request();
+            req.messages = vec![Message {
+                role: "user".into(),
+                content: content.clone(),
+            }];
+            assert!(
+                matches!(decode_request(req), Err(ProtocolError::InvalidRequest(_))),
+                "expected a rejection for content = {content}"
+            );
         }
     }
 

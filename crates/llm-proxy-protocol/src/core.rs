@@ -262,12 +262,16 @@ impl fmt::Debug for CoreContent {
 pub struct CacheControl {
     /// Discriminator -- typically `"ephemeral"`.
     pub r#type: CacheControlType,
+    /// Cache lifetime such as `"5m"` or `"1h"`; the provider default applies when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 impl fmt::Debug for CacheControl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CacheControl")
             .field("type", &self.r#type)
+            .field("ttl", &self.ttl)
             .finish()
     }
 }
@@ -1234,6 +1238,7 @@ mod tests {
                 text: "extra instruction".into(),
                 cache: Some(CacheControl {
                     r#type: CacheControlType::Ephemeral,
+                    ttl: None,
                 }),
             },
         ];
@@ -2337,6 +2342,7 @@ mod tests {
     fn cache_control_round_trips_through_json() {
         let cc = CacheControl {
             r#type: CacheControlType::Ephemeral,
+            ttl: Some("1h".into()),
         };
         let json = serde_json::to_string(&cc).expect("serialize CacheControl");
         let back: CacheControl = serde_json::from_str(&json).expect("deserialize CacheControl");
@@ -2344,6 +2350,7 @@ mod tests {
 
         let cc_other = CacheControl {
             r#type: CacheControlType::Other("custom".into()),
+            ttl: None,
         };
         let json = serde_json::to_string(&cc_other).expect("serialize CacheControl Other");
         let back: CacheControl =

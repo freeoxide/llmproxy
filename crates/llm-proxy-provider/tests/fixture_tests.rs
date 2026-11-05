@@ -170,6 +170,7 @@ mod tests {
                     match typ {
                         "ephemeral" => Some(CacheControl {
                             r#type: CacheControlType::Ephemeral,
+                            ttl: None,
                         }),
                         other => panic!(
                             "parse_core_content: unknown cache control type '{other}' in fixture. \

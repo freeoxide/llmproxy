@@ -62,6 +62,7 @@ mod tests {
     fn cache_control_type_is_exported() {
         let cc = CacheControl {
             r#type: CacheControlType::Ephemeral,
+            ttl: None,
         };
         assert_eq!(
             serde_json::to_string(&cc).unwrap(),

@@ -107,13 +107,16 @@ pub struct SystemContentBlock {
     pub cache_control: Option<CacheControl>,
 }
 
-/// Cache control directives for prompt caching.
+/// Cache control directives for prompt caching. Unknown fields are tolerated
+/// so a new cache option can never invalidate the block that carries it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CacheControl {
     /// Cache control type, typically `"ephemeral"`.
     #[serde(rename = "type")]
     pub r#type: String,
+    /// Cache lifetime such as `"5m"` or `"1h"`; the provider default applies when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 /// Optional metadata attached to a [`MessageRequest`]; unknown fields are
@@ -144,14 +147,15 @@ pub struct Message {
 impl Message {
     /// Parses the message `content` into a list of [`ContentBlock`]s; accepts
     /// both `"content": "text"` and `"content": [block, ...]` wire shapes.
-    #[must_use]
+    /// Errors on any other shape or a malformed block, so content is never
+    /// dropped silently.
     #[expect(deprecated, reason = "constructs ContentBlock with output: None")]
-    pub fn content_blocks(&self) -> Vec<ContentBlock> {
+    pub fn content_blocks(&self) -> Result<Vec<ContentBlock>, serde_json::Error> {
         if self.content.is_null() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if let Some(s) = self.content.as_str() {
-            return vec![ContentBlock {
+            return Ok(vec![ContentBlock {
                 r#type: "text".to_owned(),
                 text: Some(s.to_owned()),
                 id: None,
@@ -166,28 +170,17 @@ impl Message {
                 source: None,
                 cache_control: None,
                 data: None,
-            }];
+            }]);
         }
         if let Some(arr) = self.content.as_array() {
-            let mut blocks = Vec::with_capacity(arr.len());
-            for item in arr {
-                if let Ok(b) = serde_json::from_value::<ContentBlock>(item.clone()) {
-                    blocks.push(b);
-                } else {
-                    let block_type = item
-                        .as_object()
-                        .and_then(|obj| obj.get("type"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    tracing::warn!(
-                        block_type,
-                        "content_blocks: skipping unparseable array item"
-                    );
-                }
-            }
-            return blocks;
+            return arr
+                .iter()
+                .map(|item| serde_json::from_value::<ContentBlock>(item.clone()))
+                .collect();
         }
-        Vec::new()
+        Err(serde::de::Error::custom(
+            "message content must be a string or an array of blocks",
+        ))
     }
 }
 
@@ -799,7 +792,7 @@ mod tests {
             role: "user".into(),
             content: serde_json::Value::String("hello world".into()),
         };
-        let blocks = msg.content_blocks();
+        let blocks = msg.content_blocks().unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].r#type, "text");
         assert_eq!(blocks[0].text.as_deref(), Some("hello world"));
@@ -815,7 +808,7 @@ mod tests {
             role: "assistant".into(),
             content: raw,
         };
-        let blocks = msg.content_blocks();
+        let blocks = msg.content_blocks().unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].r#type, "text");
         assert_eq!(blocks[0].text.as_deref(), Some("hello"));
@@ -830,7 +823,44 @@ mod tests {
             role: "user".into(),
             content: serde_json::Value::Null,
         };
-        assert!(msg.content_blocks().is_empty());
+        assert!(msg.content_blocks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn content_blocks_rejects_a_malformed_block_instead_of_dropping_it() {
+        let msg = Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                { "type": "text", "text": "keep me" },
+                { "type": "text", "text": 42 }
+            ]),
+        };
+        msg.content_blocks().unwrap_err();
+    }
+
+    #[test]
+    fn content_blocks_rejects_content_that_is_not_text_or_blocks() {
+        let msg = Message {
+            role: "user".into(),
+            content: serde_json::json!(42),
+        };
+        msg.content_blocks().unwrap_err();
+    }
+
+    #[test]
+    fn content_blocks_accepts_a_cache_option_it_does_not_know() {
+        let msg = Message {
+            role: "user".into(),
+            content: serde_json::json!([{
+                "type": "text",
+                "text": "keep me",
+                "cache_control": { "type": "ephemeral", "ttl": "1h", "future_option": true }
+            }]),
+        };
+        let blocks = msg.content_blocks().unwrap();
+        assert_eq!(blocks[0].text.as_deref(), Some("keep me"));
+        let cache = blocks[0].cache_control.as_ref().unwrap();
+        assert_eq!(cache.ttl.as_deref(), Some("1h"));
     }
 
     #[test]
@@ -940,6 +970,7 @@ mod tests {
             source: None,
             cache_control: Some(CacheControl {
                 r#type: "ephemeral".into(),
+                ttl: None,
             }),
             data: None,
         };
