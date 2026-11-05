@@ -709,10 +709,11 @@ fn encode_system(system: &[CoreContent]) -> Option<serde_json::Value> {
                     "text": text,
                 });
                 if let Some(cc) = cache {
-                    json_object(&mut block).insert(
-                        "cache_control".to_owned(),
-                        serde_json::json!({"type": cc.r#type}),
-                    );
+                    let mut marker = serde_json::json!({"type": cc.r#type});
+                    if let Some(ttl) = &cc.ttl {
+                        json_object(&mut marker).insert("ttl".to_owned(), ttl.clone().into());
+                    }
+                    json_object(&mut block).insert("cache_control".to_owned(), marker);
                 }
                 Some(block)
             }
@@ -1738,6 +1739,7 @@ mod tests {
             text: "You are helpful".into(),
             cache: Some(llm_proxy_protocol::core::CacheControl {
                 r#type: "ephemeral".to_owned().into(),
+                ttl: Some("1h".to_owned()),
             }),
         }];
         let adapter = AnthropicAdapter::new();
@@ -1746,7 +1748,9 @@ mod tests {
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         let system = body["system"].as_array().unwrap();
+        assert_eq!(system[0]["text"], "You are helpful");
         assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
     }
 
     #[test]

@@ -83,6 +83,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
+                    ttl: None,
                 });
                 if !text.is_empty() || cache.is_some() {
                     system.push(CoreContent::Text { text, cache });
@@ -92,6 +93,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
+                    ttl: None,
                 });
                 let mut content = Vec::new();
                 if !text.is_empty() || cache.is_some() {

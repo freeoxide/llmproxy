@@ -283,11 +283,38 @@ impl Stream for IdleTimeoutStream {
     }
 }
 
+const MAX_UPSTREAM_REDIRECTS: usize = 5;
+
+/// Follows a redirect only within the request's own origin. A hop to any other
+/// scheme, host or port fails, because reqwest strips `Authorization` on such a
+/// hop but still resends `x-api-key` and the request body.
+pub(crate) fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= MAX_UPSTREAM_REDIRECTS {
+            return attempt.error("too many upstream redirects");
+        }
+        let next = attempt.url();
+        if !matches!(next.scheme(), "http" | "https") {
+            return attempt.stop();
+        }
+        if let Some(origin) = attempt.previous().first() {
+            let cross_origin = next.host_str() != origin.host_str()
+                || next.port_or_known_default() != origin.port_or_known_default()
+                || next.scheme() != origin.scheme();
+            if cross_origin {
+                return attempt.error("upstream redirect leaves the origin host");
+            }
+        }
+        attempt.follow()
+    })
+}
+
 fn pooled_http_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .pool_max_idle_per_host(20)
         .pool_idle_timeout(Duration::from_secs(90))
         .connect_timeout(Duration::from_secs(10))
+        .redirect(same_origin_redirect_policy())
 }
 
 const EGRESS_PROXY_SCHEMES: [&str; 4] = ["socks5h", "socks5", "http", "https"];
@@ -532,6 +559,147 @@ mod tests {
             !text.contains("x-api-key"),
             "Bearer auth style must NOT set x-api-key header: {}",
             text
+        );
+    }
+
+    /// Counts the requests that reach a server, keeping the last body and headers.
+    #[derive(Clone, Default)]
+    struct RequestLog(std::sync::Arc<std::sync::Mutex<Vec<(HeaderMap, bytes::Bytes)>>>);
+
+    async fn record_request(
+        State(log): State<RequestLog>,
+        headers: HeaderMap,
+        body: bytes::Bytes,
+    ) -> &'static str {
+        log.0.lock().unwrap().push((headers, body));
+        "reached"
+    }
+
+    fn redirect_to(location: String) -> Router {
+        Router::new().route(
+            "/start",
+            post(move || {
+                let location = location.clone();
+                async move {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                }
+            }),
+        )
+    }
+
+    fn secret_request(url: String, style: AuthStyle) -> ProxyRequest {
+        ProxyRequest {
+            url,
+            auth: AuthHeaders {
+                style,
+                api_key: SecretString::from("secret-upstream-key"),
+            },
+            body: br#"{"prompt":"private"}"#.to_vec(),
+            stream: false,
+            extra_headers: std::collections::HashMap::from([(
+                "x-custom-secret".to_owned(),
+                "secret-extra-header".to_owned(),
+            )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_to_another_origin_sends_nothing_there() {
+        let log = RequestLog::default();
+        let other_origin = start_test_server(
+            Router::new()
+                .route("/capture", post(record_request))
+                .with_state(log.clone()),
+        )
+        .await;
+        let origin = start_test_server(redirect_to(format!("{other_origin}/capture"))).await;
+        let client = ProxyClient::new();
+
+        for style in [
+            AuthStyle::Bearer,
+            AuthStyle::XApiKey,
+            AuthStyle::XGoogleApiKey,
+            AuthStyle::Both,
+        ] {
+            let error = client
+                .send(secret_request(format!("{origin}/start"), style))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ProviderError::Http { redirect: true, .. }),
+                "unexpected error: {error:?}"
+            );
+        }
+        assert!(
+            client
+                .send_stream(secret_request(
+                    format!("{origin}/start"),
+                    AuthStyle::XApiKey
+                ))
+                .await
+                .is_err()
+        );
+
+        assert!(
+            log.0.lock().unwrap().is_empty(),
+            "the other origin must receive no request"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_within_the_origin_keeps_credentials_and_body() {
+        let log = RequestLog::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let routes = redirect_to(format!("http://{addr}/capture")).merge(
+            Router::new()
+                .route("/capture", post(record_request))
+                .with_state(log.clone()),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        wait_for_ready(addr).await;
+
+        let reply = ProxyClient::new()
+            .send(secret_request(
+                format!("http://{addr}/start"),
+                AuthStyle::XApiKey,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(reply, b"reached");
+        let requests = log.0.lock().unwrap();
+        let (headers, body) = requests.first().unwrap();
+        assert_eq!(headers["x-api-key"], "secret-upstream-key");
+        assert_eq!(body.as_ref(), br#"{"prompt":"private"}"#);
+    }
+
+    #[tokio::test]
+    async fn redirect_chain_that_never_ends_is_an_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let routes = redirect_to(format!("http://{addr}/start"));
+        tokio::spawn(async move {
+            axum::serve(listener, routes).await.unwrap();
+        });
+        wait_for_ready(addr).await;
+
+        let error = ProxyClient::new()
+            .send(secret_request(
+                format!("http://{addr}/start"),
+                AuthStyle::Bearer,
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ProviderError::Http { redirect: true, .. }),
+            "unexpected error: {error:?}"
         );
     }
 

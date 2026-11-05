@@ -42,7 +42,8 @@ The phase sections remain as design and implementation history.
 
 ## Locked Decisions
 
-These decisions are part of the implementation plan:
+These decisions are part of the implementation plan. Decisions 1 and 2 are
+amended by `docs/goal.md`, which adds pools and an opt-in bare `/v1/*`.
 
 1. Provider selection is URL-only. Do not add `X-LLM-Provider`.
 2. Bare `/v1/*` API routes are not registered. Provider choice must be present

@@ -4,6 +4,10 @@ These notes summarize compatibility lessons from the projects under `ref/`.
 They are design input, not a claim that every provider or endpoint is already
 implemented.
 
+Some claims here are known to be wrong. Read the
+[research audit](audit-2026-11-05/REPORT.md) alongside these notes until
+[plan 11](../plans/11-research-corrections.md) is done.
+
 The current proxy exposes OpenAI Chat Completions and Anthropic Messages client
 routes. Upstream adapters support OpenAI Chat Completions, Anthropic Messages,
 OpenAI Responses, and Gemini GenerateContent. The notes also cover useful

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::serve::{Listener, ListenerExt};
@@ -6,6 +7,7 @@ use llm_proxy_core::LogFormat;
 use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{admin_router, build_router, shutdown_signal};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::info;
 
 use crate::config_validation::validate_toml_extension;
@@ -79,16 +81,18 @@ pub async fn cmd_serve(
         "llm-proxy listening"
     );
 
+    let shutdown = spawn_shutdown_listener();
+
     let serve = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal());
+    .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()));
 
     let admin_serve = async {
         if let Some((listener, router)) = admin {
             if let Err(error) = axum::serve(listener, router.into_make_service())
-                .with_graceful_shutdown(shutdown_signal())
+                .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()))
                 .await
             {
                 tracing::error!(%error, "admin usage listener failed");
@@ -96,7 +100,19 @@ pub async fn cmd_serve(
         }
     };
 
-    let result = serve_with_deadline(serve.into_future(), admin_serve, shutdown_deadline).await;
+    let servers = async {
+        let (main, ()) = tokio::join!(serve.into_future(), admin_serve);
+        main
+    };
+    let Some(result) = drain_within_deadline(
+        servers,
+        wait_for_shutdown(shutdown.clone()),
+        shutdown_deadline,
+    )
+    .await
+    else {
+        force_exit_after_deadline(shutdown_deadline);
+    };
 
     if let Err(e) = remove_pid() {
         tracing::warn!(error = %e, "failed to remove PID file during shutdown");
@@ -118,36 +134,51 @@ pub async fn cmd_serve(
     }
 }
 
-async fn serve_with_deadline<F, A>(
-    serve: F,
-    admin_serve: A,
-    shutdown_deadline: std::time::Duration,
-) -> std::io::Result<()>
-where
-    F: std::future::Future<Output = std::io::Result<()>>,
-    A: std::future::Future<Output = ()>,
-{
-    if shutdown_deadline.is_zero() {
-        let (main, ()) = tokio::join!(serve, admin_serve);
-        return main;
+/// Starts the one signal listener shared by every shutdown waiter, so the drain
+/// deadline begins at the moment the servers begin to drain.
+fn spawn_shutdown_listener() -> watch::Receiver<bool> {
+    let (started, shutdown) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        started.send_replace(true);
+    });
+    shutdown
+}
+
+async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
+    if let Err(error) = shutdown.wait_for(|started| *started).await {
+        tracing::error!(%error, "shutdown listener stopped; beginning graceful shutdown");
     }
-    match tokio::time::timeout(shutdown_deadline, async {
-        tokio::join!(serve, admin_serve)
-    })
-    .await
-    {
-        Ok((main, ())) => main,
-        Err(_) => {
-            tracing::error!(
-                deadline = ?shutdown_deadline,
-                "graceful-shutdown deadline elapsed; forcing exit with in-flight connections dropped"
-            );
-            if let Err(e) = remove_pid() {
-                tracing::warn!(error = %e, "failed to remove PID file during shutdown");
-            }
-            std::process::exit(1);
-        }
+}
+
+/// Runs `servers` to completion, allowing `deadline` for the drain once
+/// `shutdown` fires. Returns `None` when connections outlast the deadline; a
+/// zero `deadline` waits for the drain however long it takes.
+async fn drain_within_deadline<T>(
+    servers: impl Future<Output = T>,
+    shutdown: impl Future<Output = ()>,
+    deadline: Duration,
+) -> Option<T> {
+    tokio::pin!(servers);
+    tokio::select! {
+        finished = &mut servers => return Some(finished),
+        () = shutdown => {}
     }
+    if deadline.is_zero() {
+        return Some(servers.await);
+    }
+    tokio::time::timeout(deadline, servers).await.ok()
+}
+
+fn force_exit_after_deadline(deadline: Duration) -> ! {
+    tracing::error!(
+        ?deadline,
+        "graceful-shutdown deadline elapsed; forcing exit with in-flight connections dropped"
+    );
+    if let Err(e) = remove_pid() {
+        tracing::warn!(error = %e, "failed to remove PID file during shutdown");
+    }
+    std::process::exit(1);
 }
 
 async fn bind_admin_listener(
@@ -301,4 +332,57 @@ fn spawn_daemon(config_path: Option<&Path>, port_override: Option<u16>) -> Resul
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::{pending, ready};
+    use std::time::Duration;
+
+    use super::drain_within_deadline;
+
+    async fn finishes_after(delay: Duration) -> u8 {
+        tokio::time::sleep(delay).await;
+        7
+    }
+
+    #[tokio::test]
+    async fn deadline_does_not_run_before_shutdown() {
+        let result = drain_within_deadline(
+            finishes_after(Duration::from_millis(50)),
+            pending::<()>(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(result, Some(7));
+    }
+
+    #[tokio::test]
+    async fn drain_that_outlasts_the_deadline_is_cut_off() {
+        let result =
+            drain_within_deadline(pending::<u8>(), ready(()), Duration::from_millis(10)).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn drain_within_the_deadline_returns_its_result() {
+        let result = drain_within_deadline(
+            finishes_after(Duration::from_millis(5)),
+            ready(()),
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(result, Some(7));
+    }
+
+    #[tokio::test]
+    async fn zero_deadline_waits_for_the_whole_drain() {
+        let result = drain_within_deadline(
+            finishes_after(Duration::from_millis(30)),
+            ready(()),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(result, Some(7));
+    }
 }
