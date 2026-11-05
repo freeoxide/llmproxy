@@ -1,7 +1,9 @@
-//! PID file management helpers.
-//!
-//! Delegates to `llm_proxy_core::PidManager` and adds PID validation
-//! (reject 0, overflow) plus restrictive file permissions.
+//! PID file management for the daemon: create, read, validate, and remove
+//! the PID file, plus restrictive file permissions. Daemon bookkeeping lives
+//! in the app crate (plan 03, step 7), not in the shared libraries.
+
+pub mod manager;
+pub use manager::{PidError, PidManager};
 
 use std::io::Write;
 
@@ -17,15 +19,15 @@ pub const STOP_MAX_POLLS: u32 = 50;
 /// Interval between polls when waiting for graceful shutdown.
 pub const STOP_POLL_INTERVAL_MS: u64 = 200;
 
-pub(crate) fn pid_manager() -> llm_proxy_core::PidManager {
-    llm_proxy_core::PidManager::new(config_dir())
+pub(crate) fn pid_manager() -> PidManager {
+    PidManager::new(config_dir())
 }
 
 /// Read the PID from the PID file via the given manager.
 ///
 /// Returns `None` if the file does not exist. Rejects PID 0 and PIDs above
 /// `i32::MAX` as corrupt.
-pub fn read_pid_from(mgr: &llm_proxy_core::PidManager) -> Result<Option<u32>> {
+pub fn read_pid_from(mgr: &PidManager) -> Result<Option<u32>> {
     let pid = mgr.read_pid()?;
     if let Some(p) = pid {
         if p == 0 {
@@ -98,7 +100,7 @@ pub fn is_process_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    llm_proxy_core::PidManager::is_process_running(pid)
+    PidManager::is_process_running(pid)
 }
 
 #[cfg(test)]
@@ -111,7 +113,7 @@ mod tests {
         let pid_path = dir.path().join("llm-proxy.pid");
         std::fs::write(&pid_path, "0").unwrap();
 
-        let mgr = llm_proxy_core::PidManager::new(dir.path());
+        let mgr = PidManager::new(dir.path());
         let result = read_pid_from(&mgr);
         assert!(
             result.is_err(),

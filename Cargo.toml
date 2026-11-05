@@ -4,10 +4,13 @@ members = [
     "apps/llm-proxy",
     "crates/llm-proxy-core",
     "crates/llm-proxy-protocol",
-    "crates/llm-proxy-provider",
+    "crates/llm-proxy-adapters",
+    "crates/llm-proxy-transport",
     "crates/llm-proxy-storage",
+    "crates/llm-proxy-engine",
     "crates/llm-proxy-api",
     "crates/llm-proxy-server",
+    "crates/llm-proxy-sdk",
 ]
 
 [workspace.package]
@@ -20,13 +23,21 @@ keywords = ["llm", "proxy", "openai", "anthropic", "ai"]
 categories = ["web-programming::http-server", "api-bindings"]
 
 [workspace.dependencies]
-# Internal
-llm-proxy-core = { path = "crates/llm-proxy-core" }
-llm-proxy-server = { path = "crates/llm-proxy-server" }
+# Internal. Version keys are required for `cargo publish` (path-only
+# dependencies cannot be packaged) and must match each crate's version.
+llm-proxy-core = { path = "crates/llm-proxy-core", version = "0.1.0" }
+llm-proxy-protocol = { path = "crates/llm-proxy-protocol", version = "0.1.0" }
+llm-proxy-adapters = { path = "crates/llm-proxy-adapters", version = "0.1.0" }
+llm-proxy-transport = { path = "crates/llm-proxy-transport", version = "0.1.0" }
+llm-proxy-storage = { path = "crates/llm-proxy-storage", version = "0.1.0", default-features = false }
+llm-proxy-engine = { path = "crates/llm-proxy-engine", version = "0.1.0" }
+llm-proxy-api = { path = "crates/llm-proxy-api", version = "0.1.0" }
+llm-proxy-server = { path = "crates/llm-proxy-server", version = "0.1.0" }
 
 # Async / runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
 
 # Web
 axum = { version = "0.8", features = ["macros", "json"] }
@@ -39,7 +50,7 @@ serde_json = "1"
 toml = "0.8"
 humantime-serde = "1"
 regex = "1"
-time = { version = "=0.3.44", features = ["formatting", "parsing", "serde", "serde-well-known"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

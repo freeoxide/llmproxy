@@ -17,11 +17,12 @@ mod tests {
         response::IntoResponse,
         routing::post,
     };
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, build_router};
+    use llm_proxy_transport::ProxyClient;
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -237,6 +238,7 @@ mod tests {
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -635,12 +637,14 @@ mod tests {
         // thought signature the proxy previously returned for a Gemini upstream.
         let adapter = ProviderAdapterRegistry::builtin();
         let gemini = adapter
-            .get(llm_proxy_provider::adapter::ProviderProtocol::GeminiGenerateContent)
+            .get(llm_proxy_adapters::protocols::GEMINI_GENERATE_CONTENT)
             .expect("gemini adapter");
-        let mut target = llm_proxy_provider::adapter::ProviderAdapterTarget {
+        let mut target = llm_proxy_adapters::ProviderAdapterTarget {
             provider_name: "fixture-provider".into(),
             adapter_name: "upstream".into(),
-            protocol: llm_proxy_provider::adapter::ProviderProtocol::GeminiGenerateContent,
+            protocol: llm_proxy_adapters::ProtocolName::new(
+                llm_proxy_adapters::protocols::GEMINI_GENERATE_CONTENT,
+            ),
             // The test asserts only the encoded body; no request is sent.
             endpoint: "https://gemini.example/v1beta/models/{model}:generateContent".into(),
             auth_style: AuthStyle::Bearer,
@@ -649,6 +653,7 @@ mod tests {
             upstream_model: "gemini-2.5-pro".into(),
             headers: Arc::new(HashMap::new()),
             lossy: false,
+            forward_inbound_headers: std::sync::Arc::new(Vec::new()),
         };
         target.upstream_model = "gemini-2.5-pro".into();
 
@@ -688,8 +693,8 @@ mod tests {
             metadata: RequestMetadata::default(),
             provider_hints: ProviderHints::default(),
         };
-        let wire = llm_proxy_provider::adapter::ClientWireRequest::new(
-            llm_proxy_provider::adapter::ClientWireFormat::AnthropicMessages,
+        let wire = llm_proxy_adapters::ClientWireRequest::new(
+            llm_proxy_adapters::ClientWireFormat::AnthropicMessages,
             serde_json::json!({"model": "gemini-2.5-pro", "messages": []}),
         );
         let proxy_req = gemini

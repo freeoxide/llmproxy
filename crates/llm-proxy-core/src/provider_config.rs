@@ -174,6 +174,47 @@ pub struct ServerConfig {
     /// listener ONLY — no dedicated socket is attempted.
     #[serde(default)]
     pub admin_on_main_listener: bool,
+    /// Per-endpoint-family overrides (audit conflict 16): a chat family and
+    /// an audio/file family do not share one body limit or one timeout. Keys
+    /// are family names (`"messages"`, `"chat_completions"`, `"models"`,
+    /// `"count_tokens"`); absent families use the server-wide defaults.
+    #[serde(default)]
+    pub endpoint_families: std::collections::HashMap<String, EndpointFamilyConfig>,
+}
+
+/// Per-endpoint-family settings (audit conflict 16): the body limit and
+/// request timeout one family applies, independent of other families.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointFamilyConfig {
+    /// Maximum request body this family accepts, in bytes.
+    pub max_body_bytes: usize,
+    /// Maximum request duration this family applies.
+    #[serde(with = "humantime_serde")]
+    pub request_timeout: Duration,
+}
+
+/// Default body limit for one request: 32 MiB (as before the family split).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The body limit a family applies, given the server defaults.
+#[must_use]
+pub fn family_max_body_bytes(server: &ServerConfig, family: &str) -> usize {
+    server
+        .endpoint_families
+        .get(family)
+        .map_or(DEFAULT_MAX_BODY_BYTES, |family_cfg| {
+            family_cfg.max_body_bytes
+        })
+}
+
+/// The request timeout a family applies, given the server default.
+#[must_use]
+pub fn family_request_timeout(server: &ServerConfig, family: &str) -> Duration {
+    server
+        .endpoint_families
+        .get(family)
+        .map_or(server.request_timeout, |cfg| cfg.request_timeout)
 }
 
 impl ServerConfig {

@@ -1,6 +1,9 @@
-//! Provider error types shared across transport, adapters, and routes.
+//! Provider error types shared across adapters, transport, and the engine.
+//! This crate has no networking: HTTP client failures are reported by the
+//! transport crate through [`ProviderError::Http`] without a reqwest
+//! dependency here.
 
-/// Errors produced by provider transport and adapter operations; the enum is
+/// Errors produced by provider adapter and transport operations; the enum is
 /// non-exhaustive, so downstream match arms must include a catch-all.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -15,10 +18,10 @@ pub enum ProviderError {
     Http {
         /// URL-free transport error text.
         message: String,
-        /// Whether reqwest classified the failure as a timeout.
+        /// Whether the transport classified the failure as a timeout.
         timeout: bool,
-        /// Whether reqwest classified the failure as a redirect-policy violation;
-        /// deterministic, so [`DiscoveryClient::is_transient`] must not retry it.
+        /// Whether the transport classified the failure as a redirect-policy
+        /// violation; deterministic, so it must not be retried.
         redirect: bool,
     },
 
@@ -54,42 +57,6 @@ pub enum ProviderError {
     /// fields and must surface to the client as a 400, not a 502.
     #[error("request not representable for this provider: {0}")]
     InvalidRequest(String),
-}
-
-impl From<reqwest::Error> for ProviderError {
-    fn from(error: reqwest::Error) -> Self {
-        let timeout = error.is_timeout();
-        let redirect = error.is_redirect();
-        Self::Http {
-            message: error.without_url().to_string(),
-            timeout,
-            redirect,
-        }
-    }
-}
-
-pub(crate) async fn read_error_body_bounded(resp: reqwest::Response, cap: usize) -> String {
-    use futures::TryStreamExt;
-    let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::with_capacity(cap.min(2048));
-    loop {
-        match stream.try_next().await {
-            Ok(Some(bytes)) => {
-                let remaining = cap.saturating_sub(buf.len());
-                if remaining == 0 {
-                    break;
-                }
-                let take = bytes.len().min(remaining);
-                buf.extend_from_slice(&bytes[..take]);
-                if buf.len() >= cap {
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(error) => return format!("<failed to read error body: {error}>"),
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 pub(crate) const MAX_API_ERROR_BODY_LEN: usize = 512;
@@ -402,19 +369,5 @@ mod tests {
             result.contains("\"}"),
             "trailing quote/brace must be preserved, got: {result}"
         );
-    }
-
-    #[tokio::test]
-    async fn http_error_does_not_expose_request_url_or_query_secret() {
-        let secret = "query-secret-that-must-not-leak";
-        let error = reqwest::Client::new()
-            .get(format!("http://127.0.0.1:0/models?key={secret}"))
-            .send()
-            .await
-            .expect_err("port zero must fail");
-        let rendered = ProviderError::from(error).to_string();
-        assert!(!rendered.contains(secret));
-        assert!(!rendered.contains("127.0.0.1"));
-        assert!(!rendered.contains("models?key="));
     }
 }

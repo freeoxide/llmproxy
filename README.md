@@ -7,13 +7,16 @@ catalogs, and optional live model discovery.
 ## Layout
 
 ~~~
-apps/llm-proxy                 main binary
-crates/llm-proxy-core          config, types, traits
+apps/llm-proxy                 daemon and CLI (binary: llm-proxy)
+crates/llm-proxy-core          config, routing, registry, metrics
 crates/llm-proxy-protocol      OpenAI / Claude / Gemini wire types
-crates/llm-proxy-provider      upstream channel implementations
-crates/llm-proxy-storage       persistence
-crates/llm-proxy-api           admin and user HTTP API
-crates/llm-proxy-server        axum wiring
+crates/llm-proxy-adapters      provider codecs (no I/O)
+crates/llm-proxy-transport     HTTP egress, credentials, discovery
+crates/llm-proxy-engine        request lifecycle (no HTTP) + traits
+crates/llm-proxy-storage       usage ledger
+crates/llm-proxy-api           read-only /usage API
+crates/llm-proxy-server        axum routes and error mapping
+crates/llm-proxy-sdk           facade crate (published as llm-proxy-sdk)
 ~~~
 
 ## Build

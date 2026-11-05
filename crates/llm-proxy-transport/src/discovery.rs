@@ -11,7 +11,7 @@ use reqwest::{Client, RequestBuilder, Url};
 use secrecy::ExposeSecret;
 use serde_json::Value;
 
-use crate::ProviderError;
+use llm_proxy_adapters::ProviderError;
 
 const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
 const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -31,8 +31,9 @@ impl DiscoveryClient {
         let http = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
-            .redirect(crate::transport::same_origin_redirect_policy())
-            .build()?;
+            .redirect(crate::client::same_origin_redirect_policy())
+            .build()
+            .map_err(crate::client::provider_error_from_reqwest)?;
         Ok(Self { http })
     }
 
@@ -184,17 +185,24 @@ impl DiscoveryClient {
         request: RequestBuilder,
         max_response_bytes: usize,
     ) -> Result<Value, ProviderError> {
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(crate::client::provider_error_from_reqwest)?;
         let status = response.status();
         if !status.is_success() {
             let body_prefix =
-                crate::error::read_error_body_bounded(response, MAX_DISCOVERY_ERROR_BODY_BYTES)
+                crate::client::read_error_body_bounded(response, MAX_DISCOVERY_ERROR_BODY_BYTES)
                     .await;
             return Err(ProviderError::api(status.as_u16(), body_prefix));
         }
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
-        while let Some(chunk) = stream.try_next().await? {
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(crate::client::provider_error_from_reqwest)?
+        {
             if bytes.len() + chunk.len() > max_response_bytes {
                 return Err(ProviderError::InvalidConfig(format!(
                     "discovery response exceeded {} bytes",

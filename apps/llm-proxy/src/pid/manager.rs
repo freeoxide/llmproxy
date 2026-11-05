@@ -1,7 +1,5 @@
-//! PID file management for daemon mode.
-//!
-//! [`PidManager`] handles creating, reading, and removing the PID file used
-//! to track a running daemon process.
+//! The PID-file manager, moved from `llm-proxy-core` (plan 03, step 7):
+//! daemon concerns belong to the app crate.
 
 use std::io::Write;
 use std::num::ParseIntError;

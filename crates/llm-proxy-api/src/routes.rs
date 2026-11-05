@@ -13,7 +13,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{AdminAuth, require_admin};
-use crate::reader::{GroupBy, MAX_PAGE_LIMIT, RequestFilter, UsageReader, now_unix_millis};
+use llm_proxy_storage::{GroupBy, MAX_PAGE_LIMIT, RequestFilter, UsageReader, now_unix_millis};
 
 const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
@@ -67,7 +67,7 @@ impl UsageApi {
 #[derive(Debug)]
 pub(crate) enum UsageApiError {
     InvalidParam(String),
-    Query(crate::reader::UsageQueryError),
+    Query(llm_proxy_storage::UsageQueryError),
 }
 
 #[derive(Serialize)]
@@ -122,7 +122,7 @@ struct SummaryBody {
     since_ms: i64,
     until_ms: i64,
     group_by: &'static str,
-    groups: Vec<crate::reader::SummaryGroup>,
+    groups: Vec<llm_proxy_storage::SummaryGroup>,
 }
 
 async fn summary(
@@ -179,7 +179,7 @@ struct RequestsParams {
 
 #[derive(Serialize)]
 struct RequestsBody {
-    rows: Vec<crate::reader::RequestRow>,
+    rows: Vec<llm_proxy_storage::RequestRow>,
     next_cursor: Option<String>,
 }
 
@@ -265,7 +265,7 @@ async fn requests(
 
 #[derive(Serialize)]
 struct KeysBody {
-    callers: Vec<crate::reader::CallerSummary>,
+    callers: Vec<llm_proxy_storage::CallerSummary>,
 }
 
 async fn keys(State(state): State<UsageState>) -> Result<Json<KeysBody>, UsageApiError> {

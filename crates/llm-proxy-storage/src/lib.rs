@@ -1,6 +1,7 @@
 //! Event types and the [`EventBus`] trait for the per-request usage ledger.
 //! Backends: [`NoopBus`] (default), [`RecordingBus`] (behind the `test-utils`
-//! feature), and [`SqliteEventBus`] (persistent SQLite ledger).
+//! feature), and [`SqliteEventBus`] (persistent SQLite ledger, behind the
+//! `sqlite` feature which is on by default).
 
 #![deny(missing_docs)]
 
@@ -8,9 +9,18 @@ use llm_proxy_protocol::core::{Cost, ModelRef, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+#[cfg(feature = "sqlite")]
 mod sqlite;
+#[cfg(feature = "sqlite")]
+mod usage_query;
 
+#[cfg(feature = "sqlite")]
 pub use sqlite::{RetentionPolicy, SqliteEventBus, StorageError, run_retention_pass};
+#[cfg(feature = "sqlite")]
+pub use usage_query::{
+    CallerSummary, CostTotals, GroupBy, MAX_PAGE_LIMIT, RequestFilter, RequestRow, RequestsPage,
+    SummaryGroup, TokenCounts, UsageQueryError, UsageReader, now_unix_millis,
+};
 
 /// One request/response lifecycle event, ready to persist or emit.
 #[derive(Debug, Clone, Serialize, Deserialize)]

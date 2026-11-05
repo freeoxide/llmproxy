@@ -14,20 +14,26 @@ categories.workspace = true
 workspace = true
 
 [features]
+default = ["sqlite"]
+# The persistent SQLite usage ledger (bundled C). Disabling leaves the event
+# types and in-process buses only, so embedders can run without rusqlite.
+sqlite = ["dep:rusqlite"]
 # Exposes `RecordingBus` so downstream crates' integration tests can assert on
 # the event sequence. Not enabled in release builds.
 test-utils = []
 
 [dependencies]
-llm-proxy-protocol = { path = "../llm-proxy-protocol" }
-rusqlite = { workspace = true }
+llm-proxy-protocol = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+rust_decimal = { workspace = true }
 
 [dev-dependencies]
 rust_decimal = { workspace = true }
+rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"

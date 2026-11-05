@@ -129,19 +129,41 @@ fn openai_error_response(error: &RouteError) -> Response<Body> {
     );
     response
 }
-pub(super) fn openai_stream_error_json_with_type(
-    message: &str,
-    error_type: &str,
-) -> Option<String> {
-    let body = OpenAiErrorBody {
-        error: OpenAiErrorDetail {
-            message: truncate_error_body(message),
-            r#type: error_type.to_owned(),
-            code: serde_json::Value::Null,
-        },
-    };
-    serde_json::to_string(&body).ok()
+impl From<llm_proxy_engine::EngineError> for RouteError {
+    fn from(error: llm_proxy_engine::EngineError) -> Self {
+        use llm_proxy_engine::EngineError as E;
+        match error {
+            E::InvalidProviderName(m) => Self::InvalidProviderName(m),
+            E::UnknownProvider(m) => Self::UnknownProvider(m),
+            E::UnsupportedRoute(m) => Self::UnsupportedRoute(m),
+            E::ModelNotAllowed(m) => Self::ModelNotAllowed(m),
+            E::Unauthorized => Self::Unauthorized,
+            E::InvalidRequest(m) => Self::InvalidRequest(m),
+            E::ProviderDecode(m) => Self::ProviderDecode(m),
+            E::Upstream {
+                status,
+                body,
+                auth_owner,
+            } => {
+                let owner = match auth_owner {
+                    llm_proxy_engine::AuthOwner::Client => AuthOwner::Client,
+                    llm_proxy_engine::AuthOwner::Operator => AuthOwner::Operator,
+                };
+                let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                Self::Upstream {
+                    status: code,
+                    body,
+                    auth_owner: owner,
+                }
+            }
+            E::UpstreamTimeout(m) => Self::UpstreamTimeout(m),
+            E::RateLimited(m) => Self::InvalidRequest(m),
+            E::Internal(m) => Self::Internal(m),
+            other => Self::Internal(other.to_string()),
+        }
+    }
 }
+
 pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
     match error {
         RouteError::InvalidRequest(_) => "InvalidRequest",
@@ -255,26 +277,28 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
     }
 }
 fn map_upstream_status(upstream: StatusCode, auth_owner: AuthOwner) -> StatusCode {
-    match upstream.as_u16() {
-        400 | 413 | 429 => upstream,
-        401 | 403 if auth_owner == AuthOwner::Client => upstream,
-        code => {
-            if matches!(code, 401 | 403 | 404) {
-                tracing::warn!(
-                    upstream_status = code,
-                    auth_owner = ?auth_owner,
-                    "upstream returned a status that may indicate a configuration \
-                     issue (auth, forbidden, or not found); mapping to 502 for client"
-                );
-            } else if code < 400 {
-                tracing::debug!(
-                    upstream_status = code,
-                    "unexpected 1xx/2xx/3xx upstream status in error path; mapping to 502"
-                );
-            }
-            StatusCode::BAD_GATEWAY
-        }
+    // One policy, defined in the engine (audit conflict 14): the server only
+    // translates it to `StatusCode` and keeps the diagnostics.
+    let code = upstream.as_u16();
+    let owner = match auth_owner {
+        AuthOwner::Client => llm_proxy_engine::AuthOwner::Client,
+        AuthOwner::Operator => llm_proxy_engine::AuthOwner::Operator,
+    };
+    let mapped = llm_proxy_engine::map_upstream_status(code, owner);
+    if matches!(code, 401 | 403 | 404) && mapped != code {
+        tracing::warn!(
+            upstream_status = code,
+            auth_owner = ?auth_owner,
+            "upstream returned a status that may indicate a configuration \
+             issue (auth, forbidden, or not found); mapping to 502 for client"
+        );
+    } else if code < 400 && mapped != code {
+        tracing::debug!(
+            upstream_status = code,
+            "unexpected 1xx/2xx/3xx upstream status in error path; mapping to 502"
+        );
     }
+    StatusCode::from_u16(mapped).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 const MAX_ERROR_MESSAGE_LEN: usize = 512;
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
@@ -966,23 +990,5 @@ mod tests {
     fn client_protocol_equality() {
         assert_eq!(ClientProtocol::Anthropic, ClientProtocol::Anthropic);
         assert_ne!(ClientProtocol::Anthropic, ClientProtocol::OpenAiChat);
-    }
-
-    #[test]
-    fn stream_error_json_produces_valid_structure() {
-        let json_str = openai_stream_error_json_with_type("test error", "server_error");
-        assert!(json_str.is_some());
-        let json: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
-        assert_eq!(json["error"]["message"], "test error");
-        assert_eq!(json["error"]["type"], "server_error");
-        assert!(json["error"]["code"].is_null());
-    }
-
-    #[test]
-    fn stream_error_json_with_empty_message() {
-        let json_str = openai_stream_error_json_with_type("", "api_error");
-        assert!(json_str.is_some());
-        let json: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
-        assert_eq!(json["error"]["message"], "");
     }
 }

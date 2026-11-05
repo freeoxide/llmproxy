@@ -13,13 +13,14 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use axum::routing::post;
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AdminAuthConfig, AppConfig, AuthMode, AuthStyle, ProviderAdapterConfig, ProviderConfig,
         ProviderRegistry, ProviderRoutesConfig, ServerConfig, StorageConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, ClientAuth, admin_router, build_router};
     use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus, SqliteEventBus};
+    use llm_proxy_transport::ProxyClient;
     use tower::ServiceExt;
 
     const LAPTOP_TOKEN: &str = "prx6-laptop-client-token-4f1a9c73";
@@ -142,6 +143,7 @@ mod tests {
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: on_main,
+                    endpoint_families: Default::default(),
                 },
                 auth: llm_proxy_core::AuthConfig {
                     mode: AuthMode::None,

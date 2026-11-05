@@ -16,7 +16,9 @@ use super::{
     ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, build_usage_from_openai,
     expand_url_template, map_openai_finish_reason, response_model_ref,
 };
+use crate::ProtocolName;
 use crate::error::ProviderError;
+use crate::protocols;
 use crate::sse::SseFrame;
 
 /// Adapter for the OpenAI Chat Completions API.
@@ -435,7 +437,7 @@ impl OpenAiChatAdapter {
         client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
         let url = expand_url_template(&target.endpoint, target)?;
-        let req = if client.same_format_as(super::ProviderProtocol::OpenAiChatCompletions)
+        let req = if client.same_format_as(&ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS))
             && let Some(raw) = client.body_object()
         {
             edit_raw_chat_request(raw, core, target)?
@@ -513,7 +515,7 @@ fn encode_normalized_request(
 ) -> Result<serde_json::Value, ProviderError> {
     let carried = super::client_wire::apply_field_policy(
         client,
-        super::ProviderProtocol::OpenAiChatCompletions,
+        &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
         target.lossy,
     )?;
     let mut messages = Vec::new();
@@ -916,7 +918,7 @@ fn collect_text(content: &[CoreContent]) -> String {
 mod tests {
     use super::*;
 
-    use crate::adapter::client_wire::{ClientWireFormat, ClientWireRequest};
+    use crate::client_wire::{ClientWireFormat, ClientWireRequest};
 
     /// An Anthropic-dialect client wire: never the same format as the Chat
     /// adapter, so tests exercise the cross-format normalized encode.
@@ -934,7 +936,7 @@ mod tests {
         ProviderAdapterTarget {
             provider_name: "test-openai".into(),
             adapter_name: "openai-chat".into(),
-            protocol: super::super::ProviderProtocol::OpenAiChatCompletions,
+            protocol: super::ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
             endpoint: "https://api.openai.com/v1/chat/completions".into(),
             auth_style: AuthStyle::Bearer,
             api_key: secrecy::SecretString::from("test-key"),
@@ -942,6 +944,7 @@ mod tests {
             upstream_model: "gpt-4o-2024-08-06".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
             lossy: false,
+            forward_inbound_headers: std::sync::Arc::new(Vec::new()),
         }
     }
 

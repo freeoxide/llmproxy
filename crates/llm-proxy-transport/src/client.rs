@@ -9,73 +9,17 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::Stream;
 use futures::TryStreamExt;
+use llm_proxy_adapters::ProviderError;
+use llm_proxy_adapters::request::{AuthHeaders, ProxyRequest};
 use llm_proxy_core::AuthStyle;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use tokio::time::Sleep;
-
-use crate::error::ProviderError;
 
 /// Default time-to-first-byte (response headers) deadline for upstream requests;
 /// bounds the headers phase without capping the streaming body.
 pub const DEFAULT_UPSTREAM_HEADERS_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
-
-/// Authentication headers for an upstream request; `api_key` is redacted in
-/// [`fmt::Debug`] output so logs and snapshots never leak the secret.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
-pub struct AuthHeaders {
-    /// Which header style to use for the API key.
-    pub style: AuthStyle,
-    /// The API key value, wrapped in [`SecretString`] (redacted in Debug,
-    /// zeroized on drop).
-    pub api_key: SecretString,
-}
-
-/// A protocol-neutral request to an upstream provider; the transport sends
-/// `body` byte-for-byte and does not serialize typed request structs.
-#[derive(Clone)]
-#[non_exhaustive]
-pub struct ProxyRequest {
-    /// Full upstream URL.
-    pub url: String,
-    /// Authentication headers.
-    pub auth: AuthHeaders,
-    /// Raw request body bytes.
-    pub body: Vec<u8>,
-    /// Informational only: NOT read by [`ProxyClient`], which the caller picks
-    /// (`send` vs `send_stream`); exists for structured logging and metrics.
-    pub stream: bool,
-    /// Static adapter headers from config (e.g. `anthropic-version`), applied to every upstream request.
-    pub extra_headers: std::collections::HashMap<String, String>,
-    /// Inbound client headers the per-provider allowlist selected for
-    /// forwarding; already filtered, so the transport applies them verbatim.
-    /// Applied before `extra_headers`, so a static config header with the same
-    /// name wins.
-    pub forwarded_headers: std::collections::HashMap<String, String>,
-}
-
-impl fmt::Debug for ProxyRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProxyRequest")
-            .field("url", &endpoint_without_query(&self.url))
-            .field("auth", &self.auth)
-            .field("body_len", &self.body.len())
-            .field("stream", &self.stream)
-            .field(
-                "forwarded_header_names",
-                &self.forwarded_headers.keys().collect::<Vec<_>>(),
-            )
-            .finish()
-    }
-}
-
-pub(crate) fn endpoint_without_query(endpoint: &str) -> &str {
-    endpoint
-        .split_once('?')
-        .map_or(endpoint, |(base, _query)| base)
-}
 
 /// Default per-chunk idle read timeout for streaming responses; a stream
 /// silent for longer than this is a dead or wedged upstream.
@@ -121,7 +65,9 @@ impl ProxyClient {
     /// Creates a transport client, returning an error if the HTTP client cannot
     /// be built (custom TLS backends, proxy environment validation).
     pub fn try_new() -> Result<Self, ProviderError> {
-        let http = pooled_http_builder().build()?;
+        let http = pooled_http_builder()
+            .build()
+            .map_err(provider_error_from_reqwest)?;
 
         Ok(Self {
             http,
@@ -134,8 +80,11 @@ impl ProxyClient {
     /// timeouts as [`Self::try_new`]; `proxy_url` must be socks5h/socks5/http(s) with a host.
     pub fn try_with_egress_proxy(proxy_url: &str) -> Result<Self, ProviderError> {
         validate_egress_proxy_url(proxy_url)?;
-        let proxy = reqwest::Proxy::all(proxy_url)?;
-        let http = pooled_http_builder().proxy(proxy).build()?;
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(provider_error_from_reqwest)?;
+        let http = pooled_http_builder()
+            .proxy(proxy)
+            .build()
+            .map_err(provider_error_from_reqwest)?;
 
         Ok(Self {
             http,
@@ -197,7 +146,8 @@ impl ProxyClient {
                     ),
                     timeout: true,
                     redirect: false,
-                })??;
+                })
+                .and_then(|result| result.map_err(provider_error_from_reqwest))?;
 
         check_status(resp).await
     }
@@ -225,17 +175,17 @@ impl ProxyClient {
                     ),
                     timeout: true,
                     redirect: false,
-                })??;
+                })
+                .and_then(|result| result.map_err(provider_error_from_reqwest))?;
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
-            let body_text =
-                crate::error::read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+            let body_text = read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
             return Err(ProviderError::api(status, body_text));
         }
 
         let stream = resp.bytes_stream();
-        let mapped = stream.map_err(ProviderError::from);
+        let mapped = stream.map_err(provider_error_from_reqwest);
         let inner: Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send>> =
             Box::pin(mapped);
         Ok(Box::pin(IdleTimeoutStream::new(
@@ -379,17 +329,53 @@ fn apply_auth(mut builder: reqwest::RequestBuilder, auth: &AuthHeaders) -> reqwe
 async fn check_status(resp: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
     if resp.status().as_u16() >= 400 {
         let status = resp.status().as_u16();
-        let body_text =
-            crate::error::read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+        let body_text = read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
         return Err(ProviderError::api(status, body_text));
     }
-    let body = resp.bytes().await?;
+    let body = resp.bytes().await.map_err(provider_error_from_reqwest)?;
     Ok(body.to_vec())
+}
+
+/// Converts a reqwest failure into a [`ProviderError::Http`], dropping the
+/// request URL so query credentials cannot leak into logs.
+pub(crate) fn provider_error_from_reqwest(error: reqwest::Error) -> ProviderError {
+    let timeout = error.is_timeout();
+    let redirect = error.is_redirect();
+    ProviderError::Http {
+        message: error.without_url().to_string(),
+        timeout,
+        redirect,
+    }
+}
+
+/// Reads an upstream error body, capped at `cap` bytes.
+pub(crate) async fn read_error_body_bounded(resp: reqwest::Response, cap: usize) -> String {
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::with_capacity(cap.min(2048));
+    loop {
+        match stream.try_next().await {
+            Ok(Some(bytes)) => {
+                let remaining = cap.saturating_sub(buf.len());
+                if remaining == 0 {
+                    break;
+                }
+                let take = bytes.len().min(remaining);
+                buf.extend_from_slice(&bytes[..take]);
+                if buf.len() >= cap {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => return format!("<failed to read error body: {error}>"),
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::SecretString;
 
     #[test]
     fn auth_headers_debug_redacts_api_key() {
@@ -1399,7 +1385,7 @@ mod tests {
     }
 
     fn prod_source() -> &'static str {
-        let source = include_str!("transport.rs");
+        let source = include_str!("client.rs");
         source
             .split_once("#[cfg(test)]")
             .map(|(prod, _)| prod)
@@ -1411,11 +1397,11 @@ mod tests {
         let source = prod_source();
         assert!(
             !source.contains("EndpointType"),
-            "transport.rs must not mention EndpointType"
+            "client.rs must not mention EndpointType"
         );
         assert!(
             !source.contains("classify_endpoint"),
-            "transport.rs must not mention classify_endpoint"
+            "client.rs must not mention classify_endpoint"
         );
     }
 
@@ -1424,27 +1410,27 @@ mod tests {
         let source = prod_source();
         assert!(
             !source.contains("OpenCodeClient"),
-            "transport.rs must not mention OpenCodeClient"
+            "client.rs must not mention OpenCodeClient"
         );
         assert!(
             !source.contains("opencode_go"),
-            "transport.rs must not mention provider names"
+            "client.rs must not mention provider names"
         );
         assert!(
             !source.contains("opencode_zen"),
-            "transport.rs must not mention provider names"
+            "client.rs must not mention provider names"
         );
         assert!(
             !source.contains("is_anthropic_model"),
-            "transport.rs must not mention model classification"
+            "client.rs must not mention model classification"
         );
         assert!(
             !source.contains("is_gemini_model"),
-            "transport.rs must not mention model classification"
+            "client.rs must not mention model classification"
         );
         assert!(
             !source.contains("is_responses_model"),
-            "transport.rs must not mention model classification"
+            "client.rs must not mention model classification"
         );
     }
 

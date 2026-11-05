@@ -21,53 +21,6 @@ const MAX_DEDUP_ENTRIES: usize = 10_000;
 /// per-provider allowlist: client credentials, hop-by-hop and content headers
 /// the transport owns, and browser headers that leak the caller's environment
 /// or break upstreams (row 12, backlog 10).
-const NEVER_FORWARDED_PREFIXES: [&str; 3] = ["sec-", "access-control-", "browser-"];
-
-fn header_is_never_forwarded(lower: &str) -> bool {
-    llm_proxy_core::provider_config::NEVER_FORWARDED_HEADERS.contains(&lower)
-        || NEVER_FORWARDED_PREFIXES
-            .iter()
-            .any(|p| lower.starts_with(p))
-}
-
-/// Selects the inbound client headers to forward upstream: the allowlist
-/// (per-provider config or protocol default), minus the never-forwarded set.
-/// The result is already filtered; the transport applies it verbatim.
-///
-/// Values are checked for CRLF so a hostile header value cannot inject
-/// additional headers upstream.
-pub(crate) fn select_forwarded_headers(
-    headers: &axum::http::HeaderMap,
-    allowlist: &[String],
-) -> HashMap<String, String> {
-    let mut selected = HashMap::new();
-    for name in allowlist {
-        let lower = name.to_ascii_lowercase();
-        if header_is_never_forwarded(&lower) {
-            if headers.contains_key(lower.as_str()) {
-                tracing::warn!(
-                    header = %lower,
-                    "inbound header is on the never-forwarded list; dropping"
-                );
-            }
-            continue;
-        }
-        let Some(value) = headers.get(lower.as_str()) else {
-            continue;
-        };
-        let Ok(text) = value.to_str() else {
-            tracing::warn!(header = %lower, "inbound header value is not UTF-8; dropping");
-            continue;
-        };
-        if text.contains('\r') || text.contains('\n') {
-            tracing::warn!(header = %lower, "inbound header value contains CR/LF; dropping");
-            continue;
-        }
-        selected.insert(lower, text.to_owned());
-    }
-    selected
-}
-
 const MAX_DEDUP_BODY_SIZE: usize = 64 * 1024;
 
 /// Deduplicates requests by SHA-256 hash of the request path and body.
@@ -684,79 +637,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn forwarded_headers_honour_the_allowlist_case_insensitively() {
-        let headers = axum::http::HeaderMap::from_iter([
-            (
-                axum::http::HeaderName::from_static("anthropic-beta"),
-                axum::http::HeaderValue::from_static("context-1m-2025-08-07"),
-            ),
-            (
-                axum::http::HeaderName::from_static("x-claude-code-session-id"),
-                axum::http::HeaderValue::from_static("sess-1"),
-            ),
-            (
-                axum::http::HeaderName::from_static("user-agent"),
-                axum::http::HeaderValue::from_static("probe/1"),
-            ),
-        ]);
-        let allow = vec![
-            "Anthropic-Beta".to_owned(),
-            "x-claude-code-session-id".to_owned(),
-        ];
-        let forwarded = select_forwarded_headers(&headers, &allow);
-        assert_eq!(
-            forwarded.get("anthropic-beta").map(String::as_str),
-            Some("context-1m-2025-08-07")
-        );
-        assert_eq!(
-            forwarded
-                .get("x-claude-code-session-id")
-                .map(String::as_str),
-            Some("sess-1")
-        );
-        assert_eq!(forwarded.len(), 2, "unlisted headers must not forward");
-    }
-
-    #[test]
-    fn client_auth_origin_and_browser_headers_are_never_forwarded() {
-        let headers = axum::http::HeaderMap::from_iter([
-            (
-                axum::http::HeaderName::from_static("authorization"),
-                axum::http::HeaderValue::from_static("Bearer client-secret"),
-            ),
-            (
-                axum::http::HeaderName::from_static("x-api-key"),
-                axum::http::HeaderValue::from_static("client-key"),
-            ),
-            (
-                axum::http::HeaderName::from_static("origin"),
-                axum::http::HeaderValue::from_static("https://evil.example"),
-            ),
-            (
-                axum::http::HeaderName::from_static("user-agent"),
-                axum::http::HeaderValue::from_static("probe/1"),
-            ),
-            (
-                axum::http::HeaderName::from_static("sec-fetch-mode"),
-                axum::http::HeaderValue::from_static("cors"),
-            ),
-            (
-                axum::http::HeaderName::from_static("x-request-id"),
-                axum::http::HeaderValue::from_static("client-id"),
-            ),
-        ]);
-        let allow: Vec<String> = headers
-            .keys()
-            .map(|name| name.as_str().to_owned())
-            .collect();
-        let forwarded = select_forwarded_headers(&headers, &allow);
-        assert!(
-            forwarded.is_empty(),
-            "client auth, Origin, browser headers and client request ids must never forward, got {forwarded:?}"
-        );
-    }
 
     #[test]
     fn crlf_header_values_cannot_exist_at_the_http_layer() {

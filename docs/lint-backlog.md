@@ -16,20 +16,20 @@ not raise the thresholds — split the functions.
 | Lines | Location | Function |
 |---|---|---|
 | 410 | `crates/llm-proxy-server/src/routes/core_pipeline.rs:1510` | `build_sse_output_stream` |
-| 214 | `crates/llm-proxy-provider/tests/fixture_tests.rs:962` | `run_stream_decode_fixture` |
-| 211 | `crates/llm-proxy-provider/src/adapter/openai_chat.rs:414` | `OpenAiChatAdapter::encode_request` |
+| 214 | `crates/llm-proxy-adapters/tests/fixture_tests.rs:962` | `run_stream_decode_fixture` |
+| 211 | `crates/llm-proxy-adapters/src/openai_chat.rs:414` | `OpenAiChatAdapter::encode_request` |
 | 200 | `crates/llm-proxy-server/src/routes/core_pipeline.rs:694` | — |
-| 196 | `crates/llm-proxy-provider/tests/fixture_tests.rs:708` | `run_decode_response_fixture` |
+| 196 | `crates/llm-proxy-adapters/tests/fixture_tests.rs:708` | `run_decode_response_fixture` |
 | 190 | `crates/llm-proxy-protocol/src/client/openai_chat.rs:94` | `decode_request` |
 | 186 | `crates/llm-proxy-server/src/routes/core_pipeline.rs:997` | — |
 | 171 | `crates/llm-proxy-protocol/src/client/openai_chat.rs:628` | `StreamEncoder::encode_event` |
-| 152 | `crates/llm-proxy-provider/src/adapter/responses.rs:79` | `ResponsesStreamDecoder::decode_frame` |
+| 152 | `crates/llm-proxy-adapters/src/responses.rs:79` | `ResponsesStreamDecoder::decode_frame` |
 | 145 | `crates/llm-proxy-server/src/routes/token_count.rs:102` | — |
 | 132 | `crates/llm-proxy-protocol/src/client/anthropic.rs:788` | `StreamEncoder::encode_event` |
-| 129 | `crates/llm-proxy-provider/src/adapter/responses.rs:537` | `ResponsesAdapter::encode_request` |
-| 124 | `crates/llm-proxy-provider/src/adapter/gemini.rs:363` | `GeminiAdapter::encode_request` |
+| 129 | `crates/llm-proxy-adapters/src/responses.rs:537` | `ResponsesAdapter::encode_request` |
+| 124 | `crates/llm-proxy-adapters/src/gemini.rs:363` | `GeminiAdapter::encode_request` |
 | 113 | `crates/llm-proxy-protocol/src/client/openai_chat.rs:370` | `encode_response` |
-| 105 | `crates/llm-proxy-provider/tests/fixture_tests.rs:565` | `run_encode_request_fixture` |
+| 105 | `crates/llm-proxy-adapters/tests/fixture_tests.rs:565` | `run_encode_request_fixture` |
 | 105 | `crates/llm-proxy-server/tests/chat_completions.rs:958` | — |
 | 101 | `crates/llm-proxy-server/tests/chat_completions.rs:2012` | — |
 
@@ -50,7 +50,7 @@ decomposition that has worked so far is one named private helper per arm, or per
 coherent group of arms, taking exactly the state that arm needs. Established
 examples from the completed passes:
 
-- `crates/llm-proxy-provider/src/adapter/anthropic.rs` — `encode_system`,
+- `crates/llm-proxy-adapters/src/anthropic.rs` — `encode_system`,
   `encode_messages`, `encode_tools`, `encode_tool_choice`,
   `push_content_block_delta`, `tool_field_or_sentinel`
 - `crates/llm-proxy-protocol/src/client/anthropic.rs` — `decode_tool_result_blocks`,

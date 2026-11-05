@@ -6,11 +6,12 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{
     AppConfig, LogFormat, ProviderConfig, ProviderRegistry, merge_catalog, parse_catalog_file,
 };
-use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{AppState, BuildInfo};
+use llm_proxy_transport::ProxyClient;
 use tracing::info;
 
 use crate::paths::providers_dir_for;
@@ -434,8 +435,8 @@ path = \"{}\"
 
         let state = load_toml_state(
             &path,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::try_new().unwrap(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect("state with [storage]");
@@ -482,8 +483,8 @@ path = \"{}\"
 
         let state = load_toml_state(
             &path,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::try_new().unwrap(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect("state without [storage]");
@@ -550,8 +551,8 @@ chat_completions = "chat"
 
         let state = load_toml_state(
             &path,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::try_new().unwrap(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect("state builds with an egress provider");
@@ -587,8 +588,8 @@ chat_completions = "chat"
 
         let err = load_toml_state(
             &path,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::try_new().unwrap(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect_err("unusable egress proxy must be a startup error");
@@ -624,6 +625,7 @@ chat_completions = "chat"
                 log_format: Default::default(),
                 admin_bind,
                 admin_on_main_listener: on_main,
+                endpoint_families: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,

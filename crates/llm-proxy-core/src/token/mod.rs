@@ -6,6 +6,8 @@
 //! compile time, so counting is offline-safe.
 
 pub mod counter;
+#[cfg(feature = "tiktoken")]
 pub mod tiktoken;
+pub mod tokenizer;
 
 pub use counter::{Counter, MessageContent};

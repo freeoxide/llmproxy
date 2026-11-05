@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use llm_proxy_adapters::ProviderError;
 use llm_proxy_core::{
     CatalogFile, CatalogFileMetadata, ProviderConfig, StaticModelCatalogEntry, merge_catalog,
 };
-use llm_proxy_provider::{DiscoveryClient, ProviderError};
+use llm_proxy_transport::DiscoveryClient;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 
 #[derive(Debug, Clone)]

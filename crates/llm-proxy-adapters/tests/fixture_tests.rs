@@ -4,14 +4,13 @@
 #[cfg(test)]
 mod tests {
 
+    use llm_proxy_adapters::{
+        ProtocolName, ProviderAdapter, ProviderAdapterRegistry, ProviderAdapterTarget, SseFrame,
+    };
     use llm_proxy_core::AuthStyle;
     use llm_proxy_protocol::core::{
         CacheControl, CacheControlType, CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole,
         CoreTool, CoreToolChoice, ModelRef, SamplingOptions,
-    };
-    use llm_proxy_provider::{
-        AnthropicAdapter, GeminiAdapter, OpenAiChatAdapter, ProviderAdapter, ProviderAdapterTarget,
-        ProviderProtocol, ProviderStreamDecoder, ResponsesAdapter, SseFrame,
     };
 
     use std::fs;
@@ -38,24 +37,24 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
     }
 
-    fn make_target(protocol: ProviderProtocol) -> ProviderAdapterTarget {
-        let (endpoint, auth_style, model): (String, AuthStyle, String) = match protocol {
-            ProviderProtocol::OpenAiChatCompletions => (
+    fn make_target(protocol: &ProtocolName) -> ProviderAdapterTarget {
+        let (endpoint, auth_style, model): (String, AuthStyle, String) = match protocol.as_str() {
+            llm_proxy_adapters::protocols::OPENAI_CHAT_COMPLETIONS => (
                 "https://api.openai.com/v1/chat/completions".into(),
                 AuthStyle::Bearer,
                 "gpt-4o".into(),
             ),
-            ProviderProtocol::AnthropicMessages => (
+            llm_proxy_adapters::protocols::ANTHROPIC_MESSAGES => (
                 "https://api.anthropic.com/v1/messages".into(),
                 AuthStyle::XApiKey,
                 "claude-sonnet-4-20250514".into(),
             ),
-            ProviderProtocol::OpenAiResponses => (
+            llm_proxy_adapters::protocols::OPENAI_RESPONSES => (
                 "https://api.openai.com/v1/responses".into(),
                 AuthStyle::Bearer,
                 "gpt-4o".into(),
             ),
-            ProviderProtocol::GeminiGenerateContent => (
+            llm_proxy_adapters::protocols::GEMINI_GENERATE_CONTENT => (
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     .into(),
                 AuthStyle::Bearer,
@@ -69,8 +68,8 @@ mod tests {
         };
         ProviderAdapterTarget {
             provider_name: "test".into(),
-            adapter_name: protocol.name().into(),
-            protocol,
+            adapter_name: protocol.to_string(),
+            protocol: protocol.clone(),
             endpoint,
             auth_style,
             api_key: secrecy::SecretString::from("test-key"),
@@ -78,25 +77,24 @@ mod tests {
             upstream_model: model,
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
             lossy: false,
+            forward_inbound_headers: std::sync::Arc::new(Vec::new()),
         }
     }
 
-    fn get_adapter(name: &str) -> ProviderAdapter {
-        match name {
-            OPENAI_CHAT => ProviderAdapter::OpenAiChat(OpenAiChatAdapter),
-            ANTHROPIC => ProviderAdapter::Anthropic(AnthropicAdapter::new()),
-            RESPONSES => ProviderAdapter::Responses(ResponsesAdapter),
-            GEMINI => ProviderAdapter::Gemini(GeminiAdapter),
-            _ => panic!("unknown adapter: {name}"),
-        }
+    fn get_adapter(name: &str) -> std::sync::Arc<dyn ProviderAdapter> {
+        ProviderAdapterRegistry::builtin()
+            .get(get_protocol(name).as_str())
+            .unwrap_or_else(|| panic!("unknown adapter: {name}"))
     }
 
-    fn get_protocol(name: &str) -> ProviderProtocol {
+    fn get_protocol(name: &str) -> ProtocolName {
         match name {
-            OPENAI_CHAT => ProviderProtocol::OpenAiChatCompletions,
-            ANTHROPIC => ProviderProtocol::AnthropicMessages,
-            RESPONSES => ProviderProtocol::OpenAiResponses,
-            GEMINI => ProviderProtocol::GeminiGenerateContent,
+            OPENAI_CHAT => {
+                ProtocolName::new(llm_proxy_adapters::protocols::OPENAI_CHAT_COMPLETIONS)
+            }
+            ANTHROPIC => ProtocolName::new(llm_proxy_adapters::protocols::ANTHROPIC_MESSAGES),
+            RESPONSES => ProtocolName::new(llm_proxy_adapters::protocols::OPENAI_RESPONSES),
+            GEMINI => ProtocolName::new(llm_proxy_adapters::protocols::GEMINI_GENERATE_CONTENT),
             _ => panic!("unknown adapter: {name}"),
         }
     }
@@ -522,18 +520,18 @@ mod tests {
 
         let core = build_core_request(&core_json);
         let protocol = get_protocol(adapter_name);
-        let target = make_target(protocol);
+        let target = make_target(&protocol);
         let adapter = get_adapter(adapter_name);
 
         // The opposite dialect of the target protocol, so fixtures exercise
         // the cross-format normalized encode.
-        let client_format = match protocol {
-            llm_proxy_provider::adapter::ProviderProtocol::AnthropicMessages => {
-                llm_proxy_provider::adapter::ClientWireFormat::OpenAiChatCompletions
+        let client_format = match protocol.as_str() {
+            llm_proxy_adapters::protocols::ANTHROPIC_MESSAGES => {
+                llm_proxy_adapters::ClientWireFormat::OpenAiChatCompletions
             }
-            _ => llm_proxy_provider::adapter::ClientWireFormat::AnthropicMessages,
+            _ => llm_proxy_adapters::ClientWireFormat::AnthropicMessages,
         };
-        let client = llm_proxy_provider::adapter::ClientWireRequest::new(
+        let client = llm_proxy_adapters::ClientWireRequest::new(
             client_format,
             serde_json::json!({"model": core.model.requested, "messages": []}),
         );
@@ -654,7 +652,7 @@ mod tests {
         let output_json = read_fixture(&dir, "output.json");
 
         let protocol = get_protocol(adapter_name);
-        let target = make_target(protocol);
+        let target = make_target(&protocol);
         let adapter = get_adapter(adapter_name);
 
         let bytes = serde_json::to_vec(&input_json)
@@ -870,7 +868,7 @@ mod tests {
         let core_events_raw = read_fixture_raw(&dir, "core-events.json");
 
         let protocol = get_protocol(adapter_name);
-        let target = make_target(protocol);
+        let target = make_target(&protocol);
         let adapter = get_adapter(adapter_name);
         let mut decoder = adapter.new_stream_decoder(&target);
 
@@ -1186,7 +1184,7 @@ mod tests {
             .join("malformed_response");
         let input_raw = read_fixture_raw(&dir, "input.json");
         let protocol = get_protocol(OPENAI_CHAT);
-        let target = make_target(protocol);
+        let target = make_target(&protocol);
         let adapter = get_adapter(OPENAI_CHAT);
         let result = adapter.decode_response(input_raw.as_bytes(), &target);
         assert!(
@@ -1282,7 +1280,7 @@ mod tests {
             .join("malformed_response");
         let input_raw = read_fixture_raw(&dir, "input.json");
         let protocol = get_protocol(ANTHROPIC);
-        let target = make_target(protocol);
+        let target = make_target(&protocol);
         let adapter = get_adapter(ANTHROPIC);
         let result = adapter.decode_response(input_raw.as_bytes(), &target);
         assert!(
@@ -1368,7 +1366,7 @@ mod tests {
             .join("malformed_response");
         let input_raw = read_fixture_raw(&dir, "input.json");
         let protocol = get_protocol(RESPONSES);
-        let target = make_target(protocol);
+        let target = make_target(&protocol);
         let adapter = get_adapter(RESPONSES);
         let result = adapter.decode_response(input_raw.as_bytes(), &target);
         assert!(
@@ -1449,7 +1447,7 @@ mod tests {
             .join("malformed_response");
         let input_raw = read_fixture_raw(&dir, "input.json");
         let protocol = get_protocol(GEMINI);
-        let target = make_target(protocol);
+        let target = make_target(&protocol);
         let adapter = get_adapter(GEMINI);
         let result = adapter.decode_response(input_raw.as_bytes(), &target);
         assert!(

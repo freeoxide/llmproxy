@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::serve::{Listener, ListenerExt};
+use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::LogFormat;
-use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
 use llm_proxy_server::{admin_router, build_router, shutdown_signal};
+use llm_proxy_transport::ProxyClient;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;

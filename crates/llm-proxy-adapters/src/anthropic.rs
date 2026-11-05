@@ -13,7 +13,9 @@ use super::{
     ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, expand_url_template,
     response_model_ref,
 };
+use crate::ProtocolName;
 use crate::error::ProviderError;
+use crate::protocols;
 use crate::sse::SseFrame;
 
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
@@ -457,7 +459,7 @@ impl AnthropicAdapter {
         client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
         let url = expand_url_template(&target.endpoint, target)?;
-        let req = if client.same_format_as(super::ProviderProtocol::AnthropicMessages)
+        let req = if client.same_format_as(&ProtocolName::new(protocols::ANTHROPIC_MESSAGES))
             && let Some(raw) = client.body_object()
         {
             edit_raw_anthropic_request(raw, core, target)?
@@ -645,7 +647,7 @@ fn encode_normalized_request(
 ) -> Result<serde_json::Value, ProviderError> {
     let carried = super::client_wire::apply_field_policy(
         client,
-        super::ProviderProtocol::AnthropicMessages,
+        &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
         target.lossy,
     )?;
 
@@ -1143,7 +1145,7 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::client_wire::{ClientWireFormat, ClientWireRequest};
+    use crate::client_wire::{ClientWireFormat, ClientWireRequest};
     use llm_proxy_protocol::core::SamplingOptions;
 
     /// An OpenAI-Chat-dialect client wire for the raw body: never the same
@@ -1160,7 +1162,7 @@ mod tests {
         ProviderAdapterTarget {
             provider_name: "test-anthropic".into(),
             adapter_name: "anthropic".into(),
-            protocol: super::super::ProviderProtocol::AnthropicMessages,
+            protocol: super::ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
             endpoint: "https://api.anthropic.com/v1/messages".into(),
             auth_style: llm_proxy_core::AuthStyle::XApiKey,
             api_key: secrecy::SecretString::from("test-key"),
@@ -1168,6 +1170,7 @@ mod tests {
             upstream_model: "claude-sonnet-4-20250514".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
             lossy: false,
+            forward_inbound_headers: std::sync::Arc::new(Vec::new()),
         }
     }
 

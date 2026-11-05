@@ -31,20 +31,27 @@ mod token_count;
 
 use chat::handle_chat_completions;
 use health::{health, ready, version};
+use llm_proxy_core::{family_max_body_bytes, family_request_timeout};
 use messages::handle_messages;
 use models::handle_models;
 use token_count::count_tokens;
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Endpoint families (audit conflict 16): admission, routing and accounting
+/// are generic; the body limit and timeout are per-family settings.
+pub(crate) const FAMILY_MESSAGES: &str = "messages";
+pub(crate) const FAMILY_COUNT_TOKENS: &str = "count_tokens";
+pub(crate) const FAMILY_CHAT_COMPLETIONS: &str = "chat_completions";
+pub(crate) const FAMILY_MODELS: &str = "models";
+
 const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 
 /// Build the full HTTP router: `/health`, `/ready`, `/version`, provider API
 /// routes under `/providers/{provider}/v1/*`, and the 404/405 fallbacks. The
 /// admin `/usage` surface merges in only under the `admin_on_main_listener` opt-in.
 pub fn router(state: AppState) -> Router {
-    let timeout = state.request_timeout();
     let id_gen = Arc::clone(&state.request_id_gen);
     let event_bus = Arc::clone(&state.event_bus);
-    let state_arc = state.clone();
+    let config = &state.app_config().server;
     let trace = TraceLayer::new_for_http().make_span_with(make_request_span);
     let lightweight = Router::new()
         .route("/health", get(health))
@@ -55,29 +62,45 @@ pub fn router(state: AppState) -> Router {
                 .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
                 .layer(trace.clone()),
         );
-    let api_middleware = ServiceBuilder::new()
-        .layer(from_fn_with_state(id_gen, inject_request_id))
-        .layer(from_fn_with_state(state_arc, require_client_auth))
-        .layer(from_fn_with_state(event_bus, normalize_error_responses))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(trace)
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            timeout,
-        ));
 
-    let api = Router::new()
+    // Shared admission middleware; the body limit and timeout layer on top
+    // are per endpoint family (conflict 16), so each family composes its own.
+    let admission = |family: &'static str| {
+        ServiceBuilder::new()
+            .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
+            .layer(from_fn_with_state(state.clone(), require_client_auth))
+            .layer(from_fn_with_state(
+                Arc::clone(&event_bus),
+                normalize_error_responses,
+            ))
+            .layer(DefaultBodyLimit::max(family_max_body_bytes(config, family)))
+            .layer(trace.clone())
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                family_request_timeout(config, family),
+            ))
+    };
+
+    let messages = Router::new()
         .route("/providers/{provider}/v1/messages", post(handle_messages))
+        .layer(admission(FAMILY_MESSAGES));
+    let count_tokens = Router::new()
         .route(
             "/providers/{provider}/v1/messages/count_tokens",
             post(count_tokens),
         )
+        .layer(admission(FAMILY_COUNT_TOKENS));
+    let chat = Router::new()
         .route(
             "/providers/{provider}/v1/chat/completions",
             post(handle_chat_completions),
         )
+        .layer(admission(FAMILY_CHAT_COMPLETIONS));
+    let models = Router::new()
         .route("/providers/{provider}/v1/models", get(handle_models))
-        .layer(api_middleware);
+        .layer(admission(FAMILY_MODELS));
+
+    let api = messages.merge(count_tokens).merge(chat).merge(models);
 
     let router = Router::new()
         .merge(lightweight)
@@ -397,6 +420,7 @@ mod auth_gate_tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::ClientKeys,
@@ -409,8 +433,8 @@ mod auth_gate_tests {
         let state = crate::state::AppState::new(
             app_config,
             llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry"),
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",

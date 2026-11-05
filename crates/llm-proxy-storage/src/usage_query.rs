@@ -1,3 +1,7 @@
+//! Read-only queries over the persistent usage ledger (the `requests`
+//! table written by [`crate::SqliteEventBus`]). The admin API crate surfaces
+//! these over HTTP; nothing here writes.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,22 +14,31 @@ use time::OffsetDateTime;
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) const MAX_PAGE_LIMIT: i64 = 1000;
+/// Ceiling on the number of rows one `/usage/requests` page may return.
+pub const MAX_PAGE_LIMIT: i64 = 1000;
 
+/// Failures from querying the usage ledger.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum UsageQueryError {
+pub enum UsageQueryError {
+    /// The SQLite query failed.
     #[error("usage ledger query failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A stored cost value is not a valid decimal.
     #[error("usage ledger cost value is not a valid decimal: {0}")]
     Cost(String),
+    /// The blocking query task failed.
     #[error("usage ledger query task failed: {0}")]
     Task(String),
 }
 
+/// The grouping key for usage summaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GroupBy {
+pub enum GroupBy {
+    /// Group by provider name.
     Provider,
+    /// Group by requested model.
     Model,
+    /// Group by caller identity.
     Caller,
 }
 
@@ -38,7 +51,8 @@ impl GroupBy {
         }
     }
 
-    pub(crate) fn parse(value: &str) -> Option<Self> {
+    /// Parse the query-parameter spelling (`provider`, `model`, `caller`).
+    pub fn parse(value: &str) -> Option<Self> {
         match value {
             "provider" => Some(Self::Provider),
             "model" => Some(Self::Model),
@@ -47,7 +61,8 @@ impl GroupBy {
         }
     }
 
-    pub(crate) const fn as_str(self) -> &'static str {
+    /// The query-parameter spelling of this grouping.
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Provider => "provider",
             Self::Model => "model",
@@ -56,22 +71,35 @@ impl GroupBy {
     }
 }
 
+/// Token totals over a summary window.
 #[derive(Debug, Clone, Default, Serialize)]
-pub(crate) struct TokenCounts {
+pub struct TokenCounts {
+    /// Input tokens.
     pub input: i64,
+    /// Output tokens.
     pub output: i64,
+    /// Reasoning tokens.
     pub reasoning: i64,
+    /// Cache-read tokens.
     pub cache_read: i64,
+    /// Cache-creation tokens.
     pub cache_creation: i64,
 }
 
+/// Cost totals over a summary window, as decimal strings.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct CostTotals {
+pub struct CostTotals {
+    /// Input cost.
     pub input: String,
+    /// Output cost.
     pub output: String,
+    /// Cache-read cost.
     pub cache_read: String,
+    /// Cache-creation cost.
     pub cache_creation: String,
+    /// Reasoning cost.
     pub reasoning: String,
+    /// Sum of all cost components.
     pub total: String,
 }
 
@@ -88,62 +116,110 @@ impl CostTotals {
     }
 }
 
+/// One summary group: the grouped key plus its totals.
 #[derive(Debug, Serialize)]
-pub(crate) struct SummaryGroup {
+pub struct SummaryGroup {
+    /// The grouped key (`None` groups rows with a NULL key).
     pub key: Option<String>,
+    /// Completed requests.
+    /// Completed requests.
     pub requests: i64,
+    /// Failed requests.
+    /// Failed requests.
     pub errors: i64,
+    /// Token totals.
+    /// Token totals, when usage was reported.
     pub tokens: TokenCounts,
+    /// Cost totals.
+    /// Computed cost, when pricing was configured.
     pub cost: CostTotals,
 }
 
+/// One request's ledger row (identifiers and totals only; no bodies).
 #[derive(Debug, Serialize)]
-pub(crate) struct RequestRow {
+pub struct RequestRow {
+    /// Proxy-generated request identifier.
     pub request_id: String,
+    /// When the request was received, UNIX-epoch milliseconds.
     pub received_at_ms: Option<i64>,
+    /// When the response completed or failed, if it did.
     pub completed_at_ms: Option<i64>,
+    /// Authenticated caller identity, when known.
+    /// The caller identity (`None` groups rows with no caller).
     pub caller: Option<String>,
+    /// Provider name from the URL.
     pub provider: Option<String>,
+    /// Endpoint family (`chat_completions` or `messages`).
     pub route_kind: Option<String>,
+    /// Client dialect (`openai_chat` or `anthropic`).
     pub client_protocol: Option<String>,
+    /// Whether the request asked for a stream.
     pub streaming: Option<bool>,
+    /// The model the client asked for.
     pub model_requested: Option<String>,
+    /// The model that served the request, when aliased.
     pub model_upstream: Option<String>,
+    /// Token totals, when usage was reported.
     pub tokens: Option<TokenCounts>,
+    /// How the usage numbers were obtained.
     pub usage_provenance: Option<String>,
+    /// Computed cost, when pricing was configured.
     pub cost: Option<CostTotals>,
+    /// Why the model stopped generating.
     pub stop_reason: Option<String>,
+    /// Error kind for failed rows.
     pub error_kind: Option<String>,
+    /// HTTP status returned to the client.
     pub http_status: Option<i64>,
+    /// Request latency in milliseconds.
     pub latency_ms: Option<i64>,
+    /// SHA-256 of the raw client body.
     pub body_hash: Option<String>,
 }
 
+/// One page of request rows plus the cursor for the next page.
 #[derive(Debug, Serialize)]
-pub(crate) struct RequestsPage {
+pub struct RequestsPage {
+    /// The rows in this page.
     pub rows: Vec<RequestRow>,
+    /// Cursor for the next page; `None` on the last page.
     pub next_cursor: Option<String>,
 }
 
+/// Per-caller request and error counts with last-seen time.
 #[derive(Debug, Serialize)]
-pub(crate) struct CallerSummary {
+pub struct CallerSummary {
+    /// Authenticated caller identity, when known.
+    /// The caller identity (`None` groups rows with no caller).
     pub caller: Option<String>,
+    /// Completed requests.
     pub requests: i64,
+    /// Failed requests.
     pub errors: i64,
+    /// When this caller was last seen, UNIX-epoch milliseconds.
     pub last_seen_ms: Option<i64>,
 }
 
+/// Filters for the request-row query.
 #[derive(Debug, Default)]
-pub(crate) struct RequestFilter {
+pub struct RequestFilter {
+    /// Only rows at or after this UNIX-epoch millisecond timestamp.
     pub since_ms: Option<i64>,
+    /// Only rows before this UNIX-epoch millisecond timestamp.
     pub until_ms: Option<i64>,
+    /// Only rows for this provider.
+    /// Provider name from the URL.
     pub provider: Option<String>,
+    /// Page size (bounded by [`MAX_PAGE_LIMIT`]).
     pub limit: i64,
+    /// Cursor: `(received_at_ms, request_id)` of the last row of the
+    /// previous page.
     pub cursor: Option<(i64, String)>,
 }
 
+/// Read-only query interface over the SQLite usage ledger.
 #[derive(Debug, Clone)]
-pub(crate) struct UsageReader {
+pub struct UsageReader {
     path: PathBuf,
 }
 
@@ -153,16 +229,23 @@ fn offset_to_unix_millis(ts: OffsetDateTime) -> i64 {
         .saturating_add(i64::from(ts.millisecond()))
 }
 
-pub(crate) fn now_unix_millis() -> i64 {
+/// The current UNIX-epoch time in milliseconds.
+pub fn now_unix_millis() -> i64 {
     offset_to_unix_millis(OffsetDateTime::now_utc())
 }
 
 impl UsageReader {
-    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+    /// Open the reader over the ledger at `path` (read-only).
+    pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    pub(crate) async fn summary(
+    /// Aggregated usage grouped by `group` since `since_ms`.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageQueryError`] when the ledger cannot be read.
+    pub async fn summary(
         &self,
         since_ms: i64,
         group: GroupBy,
@@ -171,15 +254,22 @@ impl UsageReader {
         run_blocking(move || summary_sync(&path, since_ms, group)).await
     }
 
-    pub(crate) async fn requests(
-        &self,
-        filter: RequestFilter,
-    ) -> Result<RequestsPage, UsageQueryError> {
+    /// One page of request rows matching `filter`.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageQueryError`] when the ledger cannot be read.
+    pub async fn requests(&self, filter: RequestFilter) -> Result<RequestsPage, UsageQueryError> {
         let path = self.path.clone();
         run_blocking(move || requests_sync(&path, &filter)).await
     }
 
-    pub(crate) async fn callers(&self) -> Result<Vec<CallerSummary>, UsageQueryError> {
+    /// Per-caller totals.
+    ///
+    /// # Errors
+    ///
+    /// [`UsageQueryError`] when the ledger cannot be read.
+    pub async fn callers(&self) -> Result<Vec<CallerSummary>, UsageQueryError> {
         let path = self.path.clone();
         run_blocking(move || callers_sync(&path)).await
     }

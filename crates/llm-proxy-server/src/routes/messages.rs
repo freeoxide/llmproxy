@@ -82,8 +82,8 @@ async fn handle_messages_inner(
         .inspect_err(&emit_failed)?;
     // The raw body rides along so same-format routes can forward it verbatim
     // and the cross-format policy can name leftover fields.
-    let wire = llm_proxy_provider::adapter::ClientWireRequest::new(
-        llm_proxy_provider::adapter::ClientWireFormat::AnthropicMessages,
+    let wire = llm_proxy_adapters::ClientWireRequest::new(
+        llm_proxy_adapters::ClientWireFormat::AnthropicMessages,
         raw,
     );
 

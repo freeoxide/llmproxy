@@ -17,7 +17,9 @@ use super::{
     ProviderAdapterTarget, ProviderStreamDecoder, build_proxy_request, expand_url_template,
     map_gemini_finish_reason, response_model_ref,
 };
+use crate::ProtocolName;
 use crate::error::ProviderError;
+use crate::protocols;
 use crate::sse::SseFrame;
 
 /// Adapter for the Google Gemini GenerateContent API.
@@ -364,7 +366,7 @@ impl GeminiAdapter {
         // cross-format: settle the leftover client fields first.
         let carried = super::client_wire::apply_field_policy(
             client,
-            super::ProviderProtocol::GeminiGenerateContent,
+            &ProtocolName::new(protocols::GEMINI_GENERATE_CONTENT),
             target.lossy,
         )?;
         if !carried.is_empty() {
@@ -693,7 +695,7 @@ fn build_gemini_usage(usage: &GeminiUsage) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::client_wire::{ClientWireFormat, ClientWireRequest};
+    use crate::client_wire::{ClientWireFormat, ClientWireRequest};
     use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions};
 
     /// An Anthropic-dialect client wire: never the same format as the Gemini
@@ -709,7 +711,7 @@ mod tests {
         ProviderAdapterTarget {
             provider_name: "test-gemini".into(),
             adapter_name: "gemini".into(),
-            protocol: super::super::ProviderProtocol::GeminiGenerateContent,
+            protocol: super::ProtocolName::new(protocols::GEMINI_GENERATE_CONTENT),
             endpoint:
                 "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
                     .into(),
@@ -719,6 +721,7 @@ mod tests {
             upstream_model: "gemini-2.5-pro".into(),
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
             lossy: false,
+            forward_inbound_headers: std::sync::Arc::new(Vec::new()),
         }
     }
 

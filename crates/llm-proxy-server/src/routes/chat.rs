@@ -81,8 +81,8 @@ async fn handle_chat_completions_inner(
         .inspect_err(&emit_failed)?;
     // The raw body rides along so same-format routes can forward it verbatim
     // and the cross-format policy can name leftover fields.
-    let wire = llm_proxy_provider::adapter::ClientWireRequest::new(
-        llm_proxy_provider::adapter::ClientWireFormat::OpenAiChatCompletions,
+    let wire = llm_proxy_adapters::ClientWireRequest::new(
+        llm_proxy_adapters::ClientWireFormat::OpenAiChatCompletions,
         raw,
     );
 

@@ -1,5 +1,5 @@
 [package]
-name = "llm-proxy"
+name = "llm-proxy-app"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -22,12 +22,15 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-llm-proxy-server = { workspace = true }
+llm-proxy-server = { workspace = true, features = ["admin"] }
 llm-proxy-core = { workspace = true }
-llm-proxy-provider = { path = "../../crates/llm-proxy-provider" }
-llm-proxy-storage = { path = "../../crates/llm-proxy-storage" }
+llm-proxy-adapters = { workspace = true }
+llm-proxy-transport = { workspace = true }
+llm-proxy-engine = { workspace = true }
+llm-proxy-storage = { workspace = true, features = ["sqlite"] }
 
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
@@ -44,7 +47,7 @@ vergen-gix = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1.42", features = ["yaml", "filters"] }
-llm-proxy-protocol = { path = "../../crates/llm-proxy-protocol" }
+llm-proxy-protocol = { workspace = true }
 secrecy = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }

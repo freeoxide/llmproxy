@@ -4,8 +4,8 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
+use llm_proxy_adapters::ProviderError;
 use llm_proxy_protocol::core::ModelRef;
-use llm_proxy_provider::ProviderError;
 use serde::Serialize;
 use tracing::warn;
 
@@ -184,7 +184,7 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
             timeout: false,
             ..
         } => {
-            let sanitized = super::core_pipeline::sanitize_upstream_error_body(&message);
+            let sanitized = llm_proxy_engine::sanitize_upstream_error_body(&message);
             RouteError::Upstream {
                 status: StatusCode::BAD_GATEWAY,
                 body: sanitized,
@@ -276,13 +276,14 @@ mod tests {
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
             },
             registry,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -324,13 +325,14 @@ mod tests {
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
             },
             registry,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",

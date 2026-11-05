@@ -15,8 +15,9 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::adapter::ProviderProtocol;
+use crate::ProtocolName;
 use crate::error::ProviderError;
+use crate::protocols;
 
 /// The wire dialect a client request arrived in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,15 +84,15 @@ impl ClientWireRequest {
     /// Whether this request's dialect matches the provider's protocol, i.e.
     /// same-format passthrough applies.
     #[must_use]
-    pub fn same_format_as(&self, protocol: ProviderProtocol) -> bool {
+    pub fn same_format_as(&self, protocol: &ProtocolName) -> bool {
         matches!(
-            (self.format, protocol),
+            (self.format, protocol.as_str()),
             (
                 ClientWireFormat::AnthropicMessages,
-                ProviderProtocol::AnthropicMessages
+                protocols::ANTHROPIC_MESSAGES
             ) | (
                 ClientWireFormat::OpenAiChatCompletions,
-                ProviderProtocol::OpenAiChatCompletions
+                protocols::OPENAI_CHAT_COMPLETIONS
             )
         )
     }
@@ -190,23 +191,26 @@ pub enum FieldDisposition {
 /// (messages, sampling, tools, ...) are mapped by the adapters and are not
 /// named here; this table answers for the leftover client fields.
 #[must_use]
-pub fn field_disposition(provider: ProviderProtocol, field: &str) -> FieldDisposition {
-    match provider {
-        ProviderProtocol::AnthropicMessages => match field {
+pub fn field_disposition(provider: &ProtocolName, field: &str) -> FieldDisposition {
+    // The table covers the built-in protocols; a protocol added by an SDK
+    // user has no policy table, so leftover client fields are rejected by
+    // name unless the custom adapter's own same-format path handles them.
+    match provider.as_str() {
+        protocols::ANTHROPIC_MESSAGES => match field {
             // Anthropic accepts these OpenAI Chat fields with the same shape.
             "service_tier" | "top_k" => FieldDisposition::Carried,
             // Mapped by the Anthropic adapter from the raw client body.
             "parallel_tool_calls" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
-        ProviderProtocol::OpenAiChatCompletions => match field {
+        protocols::OPENAI_CHAT_COMPLETIONS => match field {
             // The Chat Completions API accepts these with the same shape.
             "service_tier" => FieldDisposition::Carried,
             // Mapped by the chat adapter from the raw client body.
             "output_config" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
-        ProviderProtocol::OpenAiResponses => match field {
+        protocols::OPENAI_RESPONSES => match field {
             // The Responses API accepts these with the same shape.
             "service_tier" | "parallel_tool_calls" | "store" | "prompt_cache_key" => {
                 FieldDisposition::Carried
@@ -215,11 +219,12 @@ pub fn field_disposition(provider: ProviderProtocol, field: &str) -> FieldDispos
             "output_config" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
-        ProviderProtocol::GeminiGenerateContent => match field {
+        protocols::GEMINI_GENERATE_CONTENT => match field {
             // Mapped by the Gemini adapter into generationConfig.topK.
             "top_k" => FieldDisposition::Mapped,
             _ => FieldDisposition::Rejected,
         },
+        _ => FieldDisposition::Rejected,
     }
 }
 
@@ -231,7 +236,7 @@ pub fn field_disposition(provider: ProviderProtocol, field: &str) -> FieldDispos
 /// warning instead.
 pub fn apply_field_policy(
     client: &ClientWireRequest,
-    provider: ProviderProtocol,
+    provider: &ProtocolName,
     lossy: bool,
 ) -> Result<serde_json::Map<String, Value>, ProviderError> {
     let mut carried = serde_json::Map::new();
@@ -261,16 +266,15 @@ pub fn apply_field_policy(
         for field in &rejected {
             tracing::warn!(
                 field,
-                provider = provider.name(),
+                provider = %provider,
                 "lossy route: dropping client field with no provider equivalent"
             );
         }
         return Ok(carried);
     }
     Err(ProviderError::InvalidRequest(format!(
-        "field(s) {} have no {} equivalent; remove them or enable the route's lossy mode",
+        "field(s) {} have no {provider} equivalent; remove them or enable the route's lossy mode",
         rejected.join(", "),
-        provider.name()
     )))
 }
 
@@ -280,7 +284,7 @@ pub fn apply_field_policy(
 /// `lossy`, which the caller must then also drop from the tools list).
 fn check_cross_format_tools(
     client: &ClientWireRequest,
-    provider: ProviderProtocol,
+    provider: &ProtocolName,
     lossy: bool,
 ) -> Result<(), ProviderError> {
     if client.format != ClientWireFormat::AnthropicMessages {
@@ -308,15 +312,14 @@ fn check_cross_format_tools(
     if lossy {
         tracing::warn!(
             tools = ?server_tools,
-            provider = provider.name(),
+            provider = %provider,
             "lossy route: dropping server tools with no provider equivalent"
         );
         return Ok(());
     }
     Err(ProviderError::InvalidRequest(format!(
-        "server tool(s) [{}] have no {} equivalent; remove them or enable the route's lossy mode",
+        "server tool(s) [{}] have no {provider} equivalent; remove them or enable the route's lossy mode",
         server_tools.join(", "),
-        provider.name()
     )))
 }
 
@@ -333,7 +336,7 @@ const OUTPUT_CONFIG_MAPPED_SUBKEYS: &[&str] = &["effort"];
 /// `output_config` (which no mapping can read) is treated the same way.
 fn check_output_config_subkeys(
     client: &ClientWireRequest,
-    provider: ProviderProtocol,
+    provider: &ProtocolName,
     lossy: bool,
 ) -> Result<(), ProviderError> {
     if field_disposition(provider, "output_config") != FieldDisposition::Mapped {
@@ -354,14 +357,13 @@ fn check_output_config_subkeys(
         if lossy {
             tracing::warn!(
                 field = "output_config",
-                provider = provider.name(),
+                provider = %provider,
                 "lossy route: dropping non-object output_config"
             );
             return Ok(());
         }
         return Err(ProviderError::InvalidRequest(format!(
-            "output_config must be an object to be translated for {}",
-            provider.name()
+            "output_config must be an object to be translated for {provider}"
         )));
     };
     let unmapped: Vec<&str> = subkeys
@@ -376,16 +378,15 @@ fn check_output_config_subkeys(
         for key in &unmapped {
             tracing::warn!(
                 field = %format!("output_config.{key}"),
-                provider = provider.name(),
+                provider = %provider,
                 "lossy route: dropping client field with no provider equivalent"
             );
         }
         return Ok(());
     }
     Err(ProviderError::InvalidRequest(format!(
-        "output_config subfield(s) {} have no {} equivalent; remove them or enable the route's lossy mode",
+        "output_config subfield(s) {} have no {provider} equivalent; remove them or enable the route's lossy mode",
         unmapped.join(", "),
-        provider.name()
     )))
 }
 
@@ -415,10 +416,10 @@ mod tests {
     fn same_format_detection() {
         let anthropic = wire(ClientWireFormat::AnthropicMessages, json!({}));
         let chat = wire(ClientWireFormat::OpenAiChatCompletions, json!({}));
-        assert!(anthropic.same_format_as(ProviderProtocol::AnthropicMessages));
-        assert!(!anthropic.same_format_as(ProviderProtocol::OpenAiChatCompletions));
-        assert!(chat.same_format_as(ProviderProtocol::OpenAiChatCompletions));
-        assert!(!chat.same_format_as(ProviderProtocol::AnthropicMessages));
+        assert!(anthropic.same_format_as(&ProtocolName::new(protocols::ANTHROPIC_MESSAGES)));
+        assert!(!anthropic.same_format_as(&ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS)));
+        assert!(chat.same_format_as(&ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS)));
+        assert!(!chat.same_format_as(&ProtocolName::new(protocols::ANTHROPIC_MESSAGES)));
     }
 
     #[test]
@@ -443,8 +444,12 @@ mod tests {
             ClientWireFormat::OpenAiChatCompletions,
             json!({"model": "m", "messages": [], "service_tier": "flex"}),
         );
-        let carried = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, false)
-            .expect("service_tier is carried");
+        let carried = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            false,
+        )
+        .expect("service_tier is carried");
         assert_eq!(carried.get("service_tier"), Some(&json!("flex")));
     }
 
@@ -454,8 +459,12 @@ mod tests {
             ClientWireFormat::OpenAiChatCompletions,
             json!({"model": "m", "messages": [], "seed": 7, "logprobs": true}),
         );
-        let err = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, false)
-            .expect_err("seed and logprobs must be rejected");
+        let err = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            false,
+        )
+        .expect_err("seed and logprobs must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("seed"), "error must name seed: {msg}");
         assert!(msg.contains("logprobs"), "error must name logprobs: {msg}");
@@ -467,8 +476,12 @@ mod tests {
             ClientWireFormat::OpenAiChatCompletions,
             json!({"model": "m", "messages": [], "seed": 7}),
         );
-        let carried = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, true)
-            .expect("lossy drops instead of rejecting");
+        let carried = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            true,
+        )
+        .expect("lossy drops instead of rejecting");
         assert!(carried.is_empty());
     }
 
@@ -478,8 +491,12 @@ mod tests {
             ClientWireFormat::OpenAiChatCompletions,
             json!({"model": "m", "messages": [], "parallel_tool_calls": false}),
         );
-        let carried = apply_field_policy(&client, ProviderProtocol::AnthropicMessages, false)
-            .expect("parallel_tool_calls is mapped, not rejected");
+        let carried = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+            false,
+        )
+        .expect("parallel_tool_calls is mapped, not rejected");
         assert!(carried.is_empty());
     }
 
@@ -489,8 +506,12 @@ mod tests {
             ClientWireFormat::AnthropicMessages,
             json!({"model": "m", "max_tokens": 8, "messages": [], "output_config": {"effort": "high"}}),
         );
-        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
-            .expect("the effort subkey is the mapped one");
+        apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            false,
+        )
+        .expect("the effort subkey is the mapped one");
     }
 
     #[test]
@@ -502,15 +523,23 @@ mod tests {
                 "output_config": {"effort": "high", "format": {"type": "json_schema"}}
             }),
         );
-        let err = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
-            .expect_err("output_config.format has no chat translation");
+        let err = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            false,
+        )
+        .expect_err("output_config.format has no chat translation");
         assert!(
             err.to_string().contains("format"),
             "error must name the subfield: {err}"
         );
         // Same contract on the Responses path.
-        let err = apply_field_policy(&client, ProviderProtocol::OpenAiResponses, false)
-            .expect_err("output_config.format has no Responses translation");
+        let err = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_RESPONSES),
+            false,
+        )
+        .expect_err("output_config.format has no Responses translation");
         assert!(
             err.to_string().contains("format"),
             "error must name the subfield: {err}"
@@ -526,8 +555,12 @@ mod tests {
                 "output_config": {"format": {"type": "json_schema"}}
             }),
         );
-        let carried = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, true)
-            .expect("lossy drops the unmapped subkey instead of rejecting");
+        let carried = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            true,
+        )
+        .expect("lossy drops the unmapped subkey instead of rejecting");
         assert!(carried.is_empty());
     }
 
@@ -537,8 +570,12 @@ mod tests {
             ClientWireFormat::AnthropicMessages,
             json!({"model": "m", "max_tokens": 8, "messages": [], "output_config": "high"}),
         );
-        let err = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
-            .expect_err("a non-object output_config cannot be translated");
+        let err = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            false,
+        )
+        .expect_err("a non-object output_config cannot be translated");
         assert!(
             err.to_string().contains("output_config"),
             "error must name the field: {err}"
@@ -548,8 +585,12 @@ mod tests {
             ClientWireFormat::AnthropicMessages,
             json!({"model": "m", "max_tokens": 8, "messages": [], "output_config": null}),
         );
-        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
-            .expect("null output_config is absent");
+        apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            false,
+        )
+        .expect("null output_config is absent");
     }
 
     #[test]
@@ -561,8 +602,12 @@ mod tests {
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}]
             }),
         );
-        let err = apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false)
-            .expect_err("server tools must be rejected cross-format");
+        let err = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            false,
+        )
+        .expect_err("server tools must be rejected cross-format");
         assert!(
             err.to_string().contains("web_search_20250305"),
             "error must name the server tool: {err}"
@@ -578,7 +623,12 @@ mod tests {
                 "tools": [{"type": "web_search_20250305", "name": "web_search"}]
             }),
         );
-        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, true).unwrap();
+        apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            true,
+        )
+        .unwrap();
         assert!(anthropic_body_has_server_tools(&client.body));
     }
 
@@ -591,7 +641,12 @@ mod tests {
                 "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}]
             }),
         );
-        apply_field_policy(&client, ProviderProtocol::OpenAiChatCompletions, false).unwrap();
+        apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            false,
+        )
+        .unwrap();
         assert!(!anthropic_body_has_server_tools(&client.body));
     }
 
@@ -601,8 +656,12 @@ mod tests {
             ClientWireFormat::OpenAiChatCompletions,
             json!({"model": "m", "messages": [], "store": false, "prompt_cache_key": "k"}),
         );
-        let carried = apply_field_policy(&client, ProviderProtocol::OpenAiResponses, false)
-            .expect("store and prompt_cache_key are native Responses fields");
+        let carried = apply_field_policy(
+            &client,
+            &ProtocolName::new(protocols::OPENAI_RESPONSES),
+            false,
+        )
+        .expect("store and prompt_cache_key are native Responses fields");
         assert_eq!(carried.get("store"), Some(&json!(false)));
         assert_eq!(carried.get("prompt_cache_key"), Some(&json!("k")));
     }

@@ -10,20 +10,27 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+# Mounts the read-only admin /usage API (requires the SQLite ledger stack).
+admin = ["dep:llm-proxy-api", "llm-proxy-storage/sqlite"]
+
 [lints]
 workspace = true
 
 [dependencies]
 llm-proxy-core = { workspace = true }
-llm-proxy-protocol = { path = "../llm-proxy-protocol" }
-llm-proxy-provider = { path = "../llm-proxy-provider" }
-llm-proxy-storage = { path = "../llm-proxy-storage" }
-llm-proxy-api = { path = "../llm-proxy-api" }
+llm-proxy-protocol = { workspace = true }
+llm-proxy-adapters = { workspace = true }
+llm-proxy-transport = { workspace = true }
+llm-proxy-storage = { workspace = true }
+llm-proxy-engine = { workspace = true }
+# The admin /usage surface: optional so the server (and anything embedding it)
+# builds without pulling rusqlite through llm-proxy-api -> llm-proxy-storage.
+llm-proxy-api = { workspace = true, optional = true }
 
 axum = { workspace = true, features = ["macros", "json"] }
 tokio = { workspace = true, features = ["fs"] }
-tokio-stream = "0.1"
-tokio-util = { workspace = true }
 tower = { workspace = true }
 tower-http = { version = "0.6", features = ["trace", "timeout", "catch-panic", "set-header", "cors"] }
 serde = { workspace = true }
@@ -31,18 +38,17 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-bytes = "1"
 futures = "0.3"
-regex = { workspace = true }
 sha2 = "0.10"
 argon2 = { workspace = true }
-toml = { workspace = true }
 time = { workspace = true }
 secrecy = { workspace = true }
-rust_decimal = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
-llm-proxy-storage = { path = "../llm-proxy-storage", features = ["test-utils"] }
+llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
+bytes = "1"
+rust_decimal = { workspace = true }
+toml = { workspace = true }

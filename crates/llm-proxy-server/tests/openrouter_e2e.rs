@@ -18,11 +18,12 @@ mod tests {
         routing::post,
     };
     use futures::FutureExt;
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, build_router};
+    use llm_proxy_transport::ProxyClient;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -299,6 +300,7 @@ mod tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -930,6 +932,7 @@ mod tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
             },
             auth: Default::default(),
             storage: None,

@@ -9,10 +9,14 @@
 //! `num_tokens_from_messages` convention (4 tokens/message for the `gpt-3.5`
 //! family, 3 otherwise, plus a trailing +3).
 
+#[cfg(feature = "tiktoken")]
 use std::collections::HashMap;
+#[cfg(feature = "tiktoken")]
 use std::sync::{Arc, Mutex};
 
-use crate::token::tiktoken::{self, Encoding, HeuristicTokenizer, TiktokenTokenizer, Tokenizer};
+#[cfg(feature = "tiktoken")]
+use crate::token::tiktoken::{self, Encoding, TiktokenTokenizer};
+use crate::token::tokenizer::{HeuristicTokenizer, Tokenizer};
 
 /// A single chat message with a role and content string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -42,12 +46,16 @@ impl MessageContent {
 #[derive(Clone, Default)]
 pub struct Counter {
     heuristic: HeuristicTokenizer,
+    #[cfg(feature = "tiktoken")]
     cache: Arc<Mutex<HashMap<Encoding, Arc<TiktokenTokenizer>>>>,
 }
 
 impl std::fmt::Debug for Counter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[cfg(feature = "tiktoken")]
         let loaded = self.cache.lock().map(|m| m.len()).unwrap_or(0);
+        #[cfg(not(feature = "tiktoken"))]
+        let loaded = 0;
         f.debug_struct("Counter")
             .field("backend", &"bpe+heuristic")
             .field("loaded_encodings", &loaded)
@@ -56,7 +64,9 @@ impl std::fmt::Debug for Counter {
 }
 
 impl Counter {
-    /// Create a new counter with an empty BPE cache (encodings load lazily).
+    /// Create a new counter. With the `tiktoken` feature this starts with an
+    /// empty BPE cache (encodings load lazily); without it, the heuristic
+    /// backend is the only one.
     pub fn new() -> Self {
         Self::default()
     }
@@ -68,17 +78,20 @@ impl Counter {
     /// for subsequent calls. If an encoding cannot be loaded (offline, corrupt
     /// ranks), the heuristic is used so a request never fails on the tokenizer.
     pub fn count_tokens(&self, model: &str, text: &str) -> usize {
-        match tiktoken::encoding_for_model(model) {
-            Some(encoding) => match self.bpe_for(encoding) {
+        #[cfg(feature = "tiktoken")]
+        if let Some(encoding) = tiktoken::encoding_for_model(model) {
+            return match self.bpe_for(encoding) {
                 Some(tokenizer) => tokenizer.count_tokens(text),
                 None => self.heuristic.count_tokens(text),
-            },
-            None => self.heuristic.count_tokens(text),
+            };
         }
+        let _ = model;
+        self.heuristic.count_tokens(text)
     }
 
     /// Get the cached BPE tokenizer for an encoding, loading it lazily on first
     /// use. Returns `None` only if the ranks could not be loaded.
+    #[cfg(feature = "tiktoken")]
     fn bpe_for(&self, encoding: Encoding) -> Option<Arc<TiktokenTokenizer>> {
         if let Ok(cache) = self.cache.lock() {
             if let Some(tokenizer) = cache.get(&encoding).cloned() {

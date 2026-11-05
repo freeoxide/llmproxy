@@ -12,12 +12,13 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
         ProviderRoutesConfig, ServerConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, build_router};
+    use llm_proxy_transport::ProxyClient;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -37,6 +38,7 @@ mod tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -103,6 +105,7 @@ mod tests {
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -834,6 +837,7 @@ mod tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -954,13 +958,14 @@ mod tests {
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
             },
             registry,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             llm_proxy_server::BuildInfo {
                 name: "test",
                 version: "0.0.0",

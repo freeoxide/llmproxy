@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config};
-use llm_proxy_provider::ProviderAdapterRegistry;
 
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{providers_dir_for, resolve_config};

@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{AppConfig, Counter, Metrics, ProviderRegistry};
-use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
+use llm_proxy_engine::{Engine, EngineBuilder, ModelCatalogService};
 use llm_proxy_storage::{EventBus, NoopBus};
+use llm_proxy_transport::ProxyClient;
 
-use crate::ModelCatalogService;
 use crate::middleware::{ClientAuth, RateLimiter, RequestDeduplicator, RequestIdGenerator};
 
 /// Static information about this binary.
@@ -43,6 +44,7 @@ pub struct AppState {
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
     pub(crate) event_bus: Arc<dyn EventBus>,
     pub(crate) client_auth: Arc<ClientAuth>,
+    engine: OnceLock<Result<Arc<Engine>, llm_proxy_engine::EngineError>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -62,6 +64,14 @@ impl std::fmt::Debug for AppState {
             .field("model_catalogs", &self.model_catalogs)
             .field("event_bus", &self.event_bus)
             .field("client_auth", &self.client_auth)
+            .field(
+                "engine",
+                &self
+                    .engine
+                    .get()
+                    .map(|result| result.as_ref().map_or("<build failed>", |_| "<engine>"))
+                    .unwrap_or("<not materialized>"),
+            )
             .finish()
     }
 }
@@ -124,6 +134,7 @@ impl AppState {
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
             client_auth,
+            engine: OnceLock::new(),
         }
     }
 
@@ -194,25 +205,45 @@ impl AppState {
         &self.providers
     }
 
-    /// The transport client for an upstream request to `provider`: its wired
-    /// `[provider.egress]` client, or the shared default client otherwise.
-    /// An egress-configured-but-unwired provider logs a loud warning per request.
-    pub fn upstream_client_for(&self, provider: &str) -> &ProxyClient {
-        if let Some(client) = self.egress_clients.get(provider) {
-            return client;
-        }
-        if self
-            .providers
-            .get(provider)
-            .is_some_and(|config| config.egress.is_some())
-        {
-            tracing::warn!(
-                provider,
-                "provider has [provider.egress] configured but no egress client was wired; \
-                 its upstream traffic is leaving directly, not through the configured proxy"
-            );
-        }
-        &self.proxy_client
+    /// The request engine: the shared lifecycle (admission, routing,
+    /// credentials, egress, settlement). Materialized once, on first use,
+    /// from this state's config — the daemon's config loader validates
+    /// provider protocols at startup, while an embedder assembling its own
+    /// stack materializes lazily and sees build errors per request.
+    ///
+    /// # Errors
+    ///
+    /// [`llm_proxy_engine::EngineError`] when the provider set names a
+    /// protocol no registered adapter serves (surfaced per request as a 500).
+    pub fn engine(&self) -> Result<&Arc<Engine>, llm_proxy_engine::EngineError> {
+        let built = self.engine.get_or_init(|| {
+            let mut builder = EngineBuilder::from_parts(
+                Arc::new(llm_proxy_engine::StaticConfigSource::new(Arc::clone(
+                    &self.app_config,
+                ))),
+                Arc::clone(&self.providers),
+                Arc::clone(&self.provider_adapters),
+                Arc::clone(&self.proxy_client),
+            )
+            .metrics(Arc::clone(&self.metrics))
+            .catalogs(Arc::clone(&self.model_catalogs))
+            .event_bus(Arc::clone(&self.event_bus));
+            let egress = (*self.egress_clients).clone();
+            for provider in self.providers.iter() {
+                if provider.egress.is_some() && !egress.contains_key(&provider.name) {
+                    tracing::warn!(
+                        provider = %provider.name,
+                        "provider has [provider.egress] configured but no egress client was wired; \
+                         its upstream traffic is leaving directly, not through the configured proxy"
+                    );
+                }
+            }
+            if !egress.is_empty() {
+                builder = builder.egress_clients(egress);
+            }
+            builder.build().map(Arc::new)
+        });
+        built.as_ref().map_err(std::clone::Clone::clone)
     }
 
     /// Access the provider model catalog service.
@@ -261,6 +292,7 @@ mod tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -292,60 +324,6 @@ mod tests {
         assert_eq!(state.server_name(), "test-proxy");
         assert_eq!(state.request_timeout(), Duration::from_secs(300));
         assert_eq!(state.shutdown_timeout(), Duration::from_secs(30));
-    }
-
-    #[test]
-    fn upstream_client_for_returns_the_shared_client_without_egress() {
-        let state = AppState::new(
-            make_app_config(),
-            make_provider_registry(),
-            ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
-            make_build_info(),
-        );
-        for provider in ["opencode-go", "opencode-zen", "anything-else"] {
-            assert!(
-                std::ptr::eq(
-                    state.upstream_client_for(provider),
-                    state.proxy_client.as_ref()
-                ),
-                "provider {provider} without egress must use the shared client"
-            );
-        }
-    }
-
-    #[test]
-    fn upstream_client_for_returns_the_wired_client_only_for_that_provider() {
-        let egress_client = Arc::new(
-            ProxyClient::try_with_egress_proxy("socks5h://127.0.0.1:1080")
-                .expect("egress proxy client builds"),
-        );
-        let state = AppState::new(
-            make_app_config(),
-            make_provider_registry(),
-            ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
-            make_build_info(),
-        )
-        .with_egress_clients(HashMap::from([(
-            "opencode-go".to_owned(),
-            Arc::clone(&egress_client),
-        )]));
-
-        assert!(
-            std::ptr::eq(
-                state.upstream_client_for("opencode-go"),
-                egress_client.as_ref()
-            ),
-            "the provider with egress must use its wired client"
-        );
-        assert!(
-            std::ptr::eq(
-                state.upstream_client_for("opencode-zen"),
-                state.proxy_client.as_ref()
-            ),
-            "providers without egress must keep the shared client"
-        );
     }
 
     #[test]
@@ -444,11 +422,15 @@ mod tests {
             len = protocol_names.len()
         );
         assert!(
-            protocol_names.contains(&"openai_chat_completions"),
+            protocol_names
+                .iter()
+                .any(|name| name == "openai_chat_completions"),
             "missing openai_chat_completions adapter"
         );
         assert!(
-            protocol_names.contains(&"anthropic_messages"),
+            protocol_names
+                .iter()
+                .any(|name| name == "anthropic_messages"),
             "missing anthropic_messages adapter"
         );
     }

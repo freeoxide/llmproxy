@@ -69,6 +69,7 @@ mod tests {
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: on_main_listener,
+                endpoint_families: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,
@@ -88,8 +89,8 @@ mod tests {
         AppState::new(
             config,
             llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry"),
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -134,6 +135,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "admin")]
     #[tokio::test]
     async fn main_listener_optin_serves_usage_behind_the_admin_token() {
         let dir = tempfile::tempdir().unwrap();
@@ -173,6 +175,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "admin")]
     #[tokio::test]
     async fn dedicated_admin_router_serves_usage_behind_the_admin_token() {
         let dir = tempfile::tempdir().unwrap();

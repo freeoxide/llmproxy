@@ -14,14 +14,11 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+llm-proxy-storage = { workspace = true, features = ["sqlite"] }
 axum = { workspace = true }
 serde = { workspace = true }
-thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
-rusqlite = { workspace = true }
-rust_decimal = { workspace = true }
 sha2 = "0.10"
 humantime = "2.3"
 tower-http = { version = "0.6", features = ["trace", "catch-panic", "set-header"] }
@@ -31,5 +28,6 @@ serde_json = { workspace = true }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true }
-llm-proxy-storage = { path = "../llm-proxy-storage" }
-llm-proxy-protocol = { path = "../llm-proxy-protocol" }
+llm-proxy-protocol = { workspace = true }
+rust_decimal = { workspace = true }
+tokio = { workspace = true }

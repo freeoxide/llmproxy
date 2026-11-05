@@ -14,7 +14,7 @@ enum PidOwnership {
 }
 
 #[cfg(unix)]
-fn classify_pid_ownership(mgr: &llm_proxy_core::PidManager, expected: u32) -> PidOwnership {
+fn classify_pid_ownership(mgr: &crate::pid::PidManager, expected: u32) -> PidOwnership {
     match read_pid_from(mgr) {
         Ok(Some(current)) if current == expected => PidOwnership::StillOurs,
         Ok(Some(other)) => PidOwnership::Changed(other),
