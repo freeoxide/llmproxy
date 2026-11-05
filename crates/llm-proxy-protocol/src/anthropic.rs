@@ -515,6 +515,9 @@ impl Serialize for ContentBlock {
                 if let Some(is_error) = self.is_error {
                     map.serialize_entry("is_error", &is_error)?;
                 }
+                if let Some(ref cc) = self.cache_control {
+                    map.serialize_entry("cache_control", cc)?;
+                }
                 map.end()
             }
             "thinking" => {
@@ -618,13 +621,17 @@ pub struct MessageResponse {
 }
 
 /// Token usage statistics returned with every response; counts are `i32`,
-/// matching the Anthropic JSON integer wire format.
+/// matching the Anthropic JSON integer wire format. `message_delta` usage
+/// objects carry only `output_tokens` (cumulative), so every field defaults
+/// rather than failing the whole event's parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Usage {
     /// Number of tokens in the input prompt.
+    #[serde(default)]
     pub input_tokens: i32,
     /// Number of tokens in the generated output.
+    #[serde(default)]
     pub output_tokens: i32,
     /// Tokens used to create a new cache entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,6 +639,31 @@ pub struct Usage {
     /// Tokens read from an existing cache entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<i32>,
+    /// Breakdown of cache creation tokens by TTL window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// Per-TTL breakdown of cache-creation tokens on an Anthropic usage object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CacheCreation {
+    /// Tokens written to a 5-minute ephemeral cache entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<i32>,
+    /// Tokens written to a 1-hour ephemeral cache entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<i32>,
+}
+
+impl CacheCreation {
+    /// Total tokens across both TTL windows, saturating on overflow.
+    #[must_use]
+    pub fn total_input_tokens(&self) -> i32 {
+        self.ephemeral_5m_input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.ephemeral_1h_input_tokens.unwrap_or(0))
+    }
 }
 
 /// A streaming delta event for a content block.

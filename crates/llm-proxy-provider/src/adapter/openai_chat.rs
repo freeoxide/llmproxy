@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use llm_proxy_protocol::core::{
     ContentKind, CoreContent, CoreEvent, CoreRequest, CoreResponse, CoreRole, CoreToolChoice,
-    ModelRef, StopReason,
+    ModelRef, StopReason, Usage,
 };
 use llm_proxy_protocol::openai::{
     ChatCompletionChunk, ChatCompletionRequest, ChatMessage, FunctionCall, FunctionDef,
@@ -33,6 +33,28 @@ pub struct OpenAiChatStreamDecoder {
     reasoning_started: bool,
     tool_blocks: HashMap<usize, usize>,
     stop_sent: bool,
+    saw_terminal: bool,
+}
+
+/// Maps an OpenAI-compatible in-band `{"error": ...}` SSE frame to a core
+/// error event. Returns `None` when the payload is not an error object.
+fn decode_stream_error_frame(data: &str) -> Option<CoreEvent> {
+    let err: llm_proxy_protocol::openai::ErrorResponse = serde_json::from_str(data).ok()?;
+    let kind = match err.error.code.as_deref() {
+        Some("invalid_api_key") | Some("invalid_request_error") | Some("400") => {
+            llm_proxy_protocol::core::CoreStreamErrorKind::InvalidRequest
+        }
+        Some("rate_limit_exceeded") | Some("429") => {
+            llm_proxy_protocol::core::CoreStreamErrorKind::RateLimit
+        }
+        Some("insufficient_quota") | Some("403") => {
+            llm_proxy_protocol::core::CoreStreamErrorKind::Permission
+        }
+        _ => llm_proxy_protocol::core::CoreStreamErrorKind::Upstream,
+    };
+    Some(CoreEvent::Error {
+        error: llm_proxy_protocol::core::CoreStreamError::new(kind, err.error.message),
+    })
 }
 
 impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
@@ -45,6 +67,9 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         let chunk: ChatCompletionChunk = match serde_json::from_str(data) {
             Ok(c) => c,
             Err(_) => {
+                if let Some(error_event) = decode_stream_error_frame(data) {
+                    return Ok(vec![error_event]);
+                }
                 let truncated = super::truncate_str_safe(data, 200);
                 tracing::warn!(data = truncated, "malformed OpenAI chunk, skipping");
                 return Ok(vec![]);
@@ -64,12 +89,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         if chunk.choices.is_empty() {
             if let Some(ref usage) = chunk.usage {
                 events.push(CoreEvent::UsageDelta {
-                    usage: build_usage_from_openai(
-                        usage.prompt_tokens,
-                        usage.completion_tokens,
-                        usage.prompt_cache_hit_tokens,
-                        usage.prompt_cache_miss_tokens,
-                    ),
+                    usage: build_usage_from_openai(usage),
                 });
             }
             return Ok(events);
@@ -131,12 +151,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
 
                 if let Some(ref usage) = chunk.usage {
                     events.push(CoreEvent::UsageDelta {
-                        usage: build_usage_from_openai(
-                            usage.prompt_tokens,
-                            usage.completion_tokens,
-                            usage.prompt_cache_hit_tokens,
-                            usage.prompt_cache_miss_tokens,
-                        ),
+                        usage: build_usage_from_openai(usage),
                     });
                 }
 
@@ -145,6 +160,7 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
                     stop_sequence: None,
                 });
                 self.stop_sent = true;
+                self.saw_terminal = true;
             }
         }
 
@@ -179,6 +195,10 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
         }
 
         Ok(events)
+    }
+
+    fn saw_terminal(&self) -> bool {
+        self.saw_terminal
     }
 }
 
@@ -513,9 +533,11 @@ impl OpenAiChatAdapter {
             .collect();
 
         let tool_choice = core.tool_choice.as_ref().and_then(|tc| match tc {
-            CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
-            CoreToolChoice::Any => Some(serde_json::json!({"type": "required"})),
-            CoreToolChoice::None => Some(serde_json::json!({"type": "none"})),
+            // The Chat Completions API documents tool_choice as a string for
+            // the generic modes and an object only for naming a function.
+            CoreToolChoice::Auto => Some(serde_json::json!("auto")),
+            CoreToolChoice::Any => Some(serde_json::json!("required")),
+            CoreToolChoice::None => Some(serde_json::json!("none")),
             CoreToolChoice::Tool { name } => Some(serde_json::json!({
                 "type": "function",
                 "function": {"name": name}
@@ -555,15 +577,11 @@ impl OpenAiChatAdapter {
         };
 
         if core.stream {
-            let include_usage = core
-                .provider_hints
-                .raw
-                .get("stream_options")
-                .and_then(|v| v.get("include_usage"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            // Always ask for usage on streams so the ledger records real
+            // numbers; whether the client sees a usage chunk is decided by
+            // the client encoder, not by this request.
             req.stream_options = Some(StreamOptions {
-                include_usage: Some(include_usage),
+                include_usage: Some(true),
             });
         }
 
@@ -663,12 +681,13 @@ impl OpenAiChatAdapter {
             .map(map_openai_finish_reason)
             .unwrap_or(StopReason::Unknown("absent".to_owned()));
 
-        let usage = build_usage_from_openai(
-            resp.usage.prompt_tokens,
-            resp.usage.completion_tokens,
-            resp.usage.prompt_cache_hit_tokens,
-            resp.usage.prompt_cache_miss_tokens,
-        );
+        // An absent/null usage decodes as None: label it missing rather than
+        // booking provider-reported zeros.
+        let usage = resp
+            .usage
+            .as_ref()
+            .map(build_usage_from_openai)
+            .unwrap_or_else(Usage::synthetic_zero);
 
         Ok(CoreResponse {
             id: Some(resp.id),
@@ -692,6 +711,7 @@ impl OpenAiChatAdapter {
             reasoning_started: false,
             tool_blocks: HashMap::new(),
             stop_sent: false,
+            saw_terminal: false,
         }
     }
 }
@@ -723,7 +743,7 @@ fn collect_text(content: &[CoreContent]) -> String {
 mod tests {
     use super::*;
     use llm_proxy_core::AuthStyle;
-    use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions};
+    use llm_proxy_protocol::core::{CoreMessage, CoreTool, SamplingOptions, UsageProvenance};
     use llm_proxy_protocol::openai::{Choice, UsageInfo};
 
     fn make_target() -> ProviderAdapterTarget {
@@ -843,7 +863,7 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        assert_eq!(body.tool_choice, Some(serde_json::json!({"type": "auto"})));
+        assert_eq!(body.tool_choice, Some(serde_json::json!("auto")));
     }
 
     #[test]
@@ -873,6 +893,7 @@ mod tests {
                         cache: None,
                     }],
                     is_error: false,
+                    cache: None,
                 }],
             },
         ]);
@@ -919,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_stream_without_usage_hint_omits_usage() {
+    fn encode_stream_always_requests_usage_from_upstream() {
         let mut core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
             content: vec![CoreContent::Text {
@@ -934,8 +955,10 @@ mod tests {
 
         let body: ChatCompletionRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.stream, Some(true));
+        // Usage is always requested from the upstream on streams; whether
+        // the client sees a usage chunk is the client encoder's decision.
         assert!(body.stream_options.is_some());
-        assert_eq!(body.stream_options.unwrap().include_usage, Some(false));
+        assert_eq!(body.stream_options.unwrap().include_usage, Some(true));
     }
 
     #[test]
@@ -983,6 +1006,42 @@ mod tests {
     }
 
     #[test]
+    fn error_frame_decodes_to_core_error_event() {
+        let target = make_target();
+        let mut decoder = OpenAiChatAdapter.new_stream_decoder(&target);
+        let frame = SseFrame {
+            event: None,
+            id: None,
+            data: r#"{"error":{"message":"upstream overloaded","type":"server_error","code":"overloaded"}}"#.to_owned(),
+        };
+        let events = decoder.decode_frame(&frame).unwrap();
+        assert!(
+            matches!(
+                &events[0],
+                CoreEvent::Error { error } if error.message() == "upstream overloaded"
+            ),
+            "the error frame must surface as a core error event, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn truncated_chat_stream_has_no_terminal() {
+        let target = make_target();
+        let mut decoder = OpenAiChatAdapter.new_stream_decoder(&target);
+        let frame = SseFrame {
+            event: None,
+            id: None,
+            data: r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#.to_owned(),
+        };
+        decoder.decode_frame(&frame).unwrap();
+        decoder.finish().unwrap();
+        assert!(
+            !decoder.saw_terminal(),
+            "a stream cut before finish_reason must not count as terminal"
+        );
+    }
+
+    #[test]
     fn decode_text_response() {
         let target = make_target();
         let resp = llm_proxy_protocol::openai::ChatCompletionResponse {
@@ -1006,13 +1065,15 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 delta: None,
             }],
-            usage: UsageInfo {
+            usage: Some(UsageInfo {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
                 prompt_cache_hit_tokens: Some(10),
                 prompt_cache_miss_tokens: Some(20),
-            },
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
             extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
@@ -1022,8 +1083,13 @@ mod tests {
         assert_eq!(core_resp.id, Some("chatcmpl-test".to_owned()));
         assert_eq!(core_resp.model.requested, "gpt-4o");
         assert_eq!(core_resp.stop_reason, StopReason::EndTurn);
-        assert_eq!(core_resp.usage.input_tokens, 70);
+        assert_eq!(core_resp.usage.input_tokens, 90);
         assert_eq!(core_resp.usage.output_tokens, 50);
+        assert_eq!(
+            core_resp.usage.cache_read_input_tokens,
+            Some(10),
+            "prompt_cache_hit_tokens must map to cache reads"
+        );
         assert_eq!(core_resp.content.len(), 1);
         assert_eq!(
             core_resp.content[0],
@@ -1031,6 +1097,37 @@ mod tests {
                 text: "hello world".into(),
                 cache: None,
             }
+        );
+    }
+
+    #[test]
+    fn decode_response_absent_or_null_usage_is_labelled_synthetic_zero() {
+        // "The provider did not report usage" must be distinguishable from
+        // "the provider reported zeros": only the latter is bookable as real.
+        let target = make_target();
+        let adapter = OpenAiChatAdapter;
+        for body in [
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}"#,
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":null}"#,
+        ] {
+            let core_resp = adapter.decode_response(body.as_bytes(), &target).unwrap();
+            assert_eq!(
+                core_resp.usage.provenance,
+                UsageProvenance::SyntheticZero,
+                "absent/null usage must be labelled synthetic, not provider-reported: {body}"
+            );
+            assert_eq!(core_resp.usage.input_tokens, 0, "body: {body}");
+            assert_eq!(core_resp.usage.output_tokens, 0, "body: {body}");
+        }
+
+        let reported_zeros = r#"{"id":"c","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#;
+        let core_resp = adapter
+            .decode_response(reported_zeros.as_bytes(), &target)
+            .unwrap();
+        assert_eq!(
+            core_resp.usage.provenance,
+            UsageProvenance::ProviderReported,
+            "explicit provider zeros are real reports, not synthetic: {reported_zeros}"
         );
     }
 
@@ -1066,13 +1163,15 @@ mod tests {
                 finish_reason: Some("tool_calls".into()),
                 delta: None,
             }],
-            usage: UsageInfo {
+            usage: Some(UsageInfo {
                 prompt_tokens: 200,
                 completion_tokens: 80,
                 total_tokens: 280,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
-            },
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
             extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
@@ -1115,13 +1214,15 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 delta: None,
             }],
-            usage: UsageInfo {
+            usage: Some(UsageInfo {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
-            },
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
             extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
@@ -1350,13 +1451,15 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 delta: None,
             }],
-            usage: UsageInfo {
+            usage: Some(UsageInfo {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
-            },
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
             extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
@@ -1401,13 +1504,15 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 delta: None,
             }],
-            usage: UsageInfo {
+            usage: Some(UsageInfo {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
-            },
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
             extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
@@ -1430,13 +1535,15 @@ mod tests {
             created: 0,
             model: "gpt-4o".into(),
             choices: vec![],
-            usage: UsageInfo {
+            usage: Some(UsageInfo {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
-            },
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
             extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
@@ -1630,13 +1737,15 @@ mod tests {
                 finish_reason: Some("stop".into()),
                 delta: None,
             }],
-            usage: UsageInfo {
+            usage: Some(UsageInfo {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
-            },
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
             extra: serde_json::Map::new(),
         };
         let bytes = serde_json::to_vec(&resp).unwrap();

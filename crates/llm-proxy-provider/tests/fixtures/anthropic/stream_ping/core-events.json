@@ -1,7 +1,24 @@
 [
-  { "type": "ping" },
-  { "type": "message_start" },
-  { "type": "content_start" },
-  { "type": "text_delta" },
-  { "type": "message_stop" }
+  {
+    "type": "ping"
+  },
+  {
+    "type": "message_start"
+  },
+  {
+    "type": "content_start"
+  },
+  {
+    "type": "text_delta"
+  },
+  {
+    "type": "usage_delta",
+    "usage": {
+      "input_tokens": 10,
+      "output_tokens": 3
+    }
+  },
+  {
+    "type": "message_stop"
+  }
 ]

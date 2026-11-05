@@ -33,6 +33,7 @@ pub struct ResponsesStreamDecoder {
     tool_blocks: HashMap<usize, usize>,
     saw_tool_call: bool,
     stop_sent: bool,
+    saw_terminal: bool,
 }
 
 impl ProviderStreamDecoder for ResponsesStreamDecoder {
@@ -72,6 +73,14 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
             }
             "response.output_item.added" => {
                 let oi = chunk.output_index.unwrap_or(0);
+                // Documented shape: the added item arrives as `item`.
+                if let Some(item) = chunk.item.as_ref() {
+                    if item.r#type == "message" {
+                        self.start_text_block_if_needed(item, &mut events);
+                    } else if item.r#type == "function_call" {
+                        self.start_function_call(oi, item, &mut events);
+                    }
+                }
                 for output in chunk.output.iter().flatten() {
                     if output.r#type == "message" {
                         self.start_text_block_if_needed(output, &mut events);
@@ -130,31 +139,18 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                     events.push(CoreEvent::ToolCallStop { index: block_idx });
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.done" => {
                 self.close_content_if_open();
                 self.close_tool_blocks(&mut events);
 
-                if let Some(ref usage) = chunk.usage {
-                    events.push(CoreEvent::UsageDelta {
-                        usage: build_responses_usage(usage),
-                    });
-                }
-
-                let stop_reason = self.infer_stop_reason(chunk.output.as_deref());
-
-                if !self.stop_sent {
-                    self.stop_sent = true;
-                    events.push(CoreEvent::MessageStop {
-                        stop_reason,
-                        stop_sequence: None,
-                    });
-                }
-            }
-            "response.done" => {
-                self.close_content_if_open();
-                self.close_tool_blocks(&mut events);
-
-                if let Some(ref usage) = chunk.usage {
+                // Documented shape: terminal events carry the whole response
+                // object, with usage and output inside it.
+                let usage = chunk
+                    .response
+                    .as_ref()
+                    .and_then(|r| r.usage.as_ref())
+                    .or(chunk.usage.as_ref());
+                if let Some(usage) = usage {
                     events.push(CoreEvent::UsageDelta {
                         usage: build_responses_usage(usage),
                     });
@@ -162,7 +158,13 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
 
                 if !self.stop_sent {
                     self.stop_sent = true;
-                    let stop_reason = self.infer_stop_reason(chunk.output.as_deref());
+                    self.saw_terminal = true;
+                    let outputs = chunk
+                        .response
+                        .as_ref()
+                        .map(|r| r.output.as_slice())
+                        .or(chunk.output.as_deref());
+                    let stop_reason = self.infer_stop_reason(outputs);
                     events.push(CoreEvent::MessageStop {
                         stop_reason,
                         stop_sequence: None,
@@ -170,15 +172,15 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
                 }
             }
             "response.failed" => {
-                let message = chunk
+                let error_obj = chunk
                     .error
                     .as_ref()
+                    .or(chunk.response.as_ref().and_then(|r| r.error.as_ref()));
+                let message = error_obj
                     .and_then(|e| e.get("message").and_then(|m| m.as_str()))
                     .unwrap_or("response failed")
                     .to_owned();
-                let kind = chunk
-                    .error
-                    .as_ref()
+                let kind = error_obj
                     .and_then(|e| e.get("code").and_then(|c| c.as_str()))
                     .map(|code| match code {
                         "rate_limit_exceeded" | "429" => {
@@ -235,6 +237,10 @@ impl ProviderStreamDecoder for ResponsesStreamDecoder {
         }
 
         Ok(events)
+    }
+
+    fn saw_terminal(&self) -> bool {
+        self.saw_terminal
     }
 }
 
@@ -369,7 +375,7 @@ fn encode_content_item<'a>(
             input: tool_input,
         } => {
             if !text_parts.is_empty() {
-                input.push(ResponsesInput {
+                input.push(ResponsesInput::Message {
                     role: role.to_owned(),
                     content: Some(serde_json::Value::String(text_parts.join(""))),
                 });
@@ -383,14 +389,11 @@ fn encode_content_item<'a>(
                 );
                 "{}".to_owned()
             });
-            input.push(ResponsesInput {
-                role: role.to_owned(),
-                content: Some(serde_json::json!({
-                    "type": "function_call",
-                    "call_id": id.clone(),
-                    "name": name.clone(),
-                    "arguments": arguments,
-                })),
+            input.push(ResponsesInput::FunctionCall {
+                r#type: "function_call".to_owned(),
+                call_id: id.clone(),
+                name: name.clone(),
+                arguments,
             });
         }
         CoreContent::ToolResult {
@@ -412,13 +415,10 @@ fn encode_content_item<'a>(
                     }
                 })
                 .collect();
-            input.push(ResponsesInput {
-                role: role.to_owned(),
-                content: Some(serde_json::json!({
-                    "type": "function_call_output",
-                    "call_id": tool_use_id,
-                    "output": result_text,
-                })),
+            input.push(ResponsesInput::FunctionCallOutput {
+                r#type: "function_call_output".to_owned(),
+                call_id: tool_use_id.clone(),
+                output: result_text,
             });
         }
         _ => {
@@ -487,7 +487,7 @@ impl ResponsesAdapter {
                     acc
                 });
             if !system_text.is_empty() {
-                input.push(ResponsesInput {
+                input.push(ResponsesInput::Message {
                     role: "developer".to_owned(),
                     content: Some(serde_json::Value::String(system_text)),
                 });
@@ -511,7 +511,7 @@ impl ResponsesAdapter {
 
             if !text_parts.is_empty() {
                 let text: String = text_parts.join("");
-                input.push(ResponsesInput {
+                input.push(ResponsesInput::Message {
                     role: role.to_owned(),
                     content: Some(serde_json::Value::String(text)),
                 });
@@ -548,26 +548,11 @@ impl ResponsesAdapter {
             tools,
             reasoning,
             tool_choice: None,
+            temperature: core.sampling.temperature,
+            top_p: core.sampling.top_p,
+            max_output_tokens: core.sampling.max_tokens,
         };
 
-        if core.sampling.temperature.is_some() {
-            tracing::warn!(
-                "Responses: temperature specified but not forwarded; \
-                 the Responses API does not support this parameter"
-            );
-        }
-        if core.sampling.top_p.is_some() {
-            tracing::warn!(
-                "Responses: top_p specified but not forwarded; \
-                 the Responses API does not support this parameter"
-            );
-        }
-        if core.sampling.max_tokens.is_some() {
-            tracing::warn!(
-                "Responses: max_tokens specified but not forwarded; \
-                 the Responses API does not support this parameter"
-            );
-        }
         if core.sampling.stop.as_ref().is_some_and(|s| !s.is_empty()) {
             tracing::warn!(
                 "Responses: stop sequences specified but not forwarded; \
@@ -583,9 +568,9 @@ impl ResponsesAdapter {
 
         if let Some(ref tc) = core.tool_choice {
             req.tool_choice = match tc {
-                CoreToolChoice::Auto => Some(serde_json::json!({"type": "auto"})),
-                CoreToolChoice::Any => Some(serde_json::json!({"type": "required"})),
-                CoreToolChoice::None => Some(serde_json::json!({"type": "none"})),
+                CoreToolChoice::Auto => Some(serde_json::json!("auto")),
+                CoreToolChoice::Any => Some(serde_json::json!("required")),
+                CoreToolChoice::None => Some(serde_json::json!("none")),
                 CoreToolChoice::Tool { name } => Some(serde_json::json!({
                     "type": "function",
                     "name": name
@@ -658,7 +643,11 @@ impl ResponsesAdapter {
             _ => StopReason::EndTurn,
         };
 
-        let usage = build_responses_usage(&resp.usage);
+        let usage = resp
+            .usage
+            .as_ref()
+            .map(build_responses_usage)
+            .unwrap_or_else(Usage::synthetic_zero);
 
         Ok(CoreResponse {
             id: Some(resp.id),
@@ -682,17 +671,27 @@ impl ResponsesAdapter {
             tool_blocks: HashMap::new(),
             saw_tool_call: false,
             stop_sent: false,
+            saw_terminal: false,
         }
     }
 }
 
 fn build_responses_usage(usage: &ResponsesUsage) -> Usage {
+    let cache_read = usage
+        .input_tokens_details
+        .as_ref()
+        .and_then(|d| d.cached_tokens);
+    let cache_read_i64 = cache_read.unwrap_or(0) as i64;
+    let input = (usage.input_tokens as i64) - cache_read_i64;
     Usage {
-        input_tokens: usage.input_tokens,
+        input_tokens: i32::try_from(input.max(0)).unwrap_or(i32::MAX),
         output_tokens: usage.output_tokens,
-        reasoning_tokens: None,
+        reasoning_tokens: usage
+            .output_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens),
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        cache_read_input_tokens: cache_read,
         provenance: UsageProvenance::ProviderReported,
     }
 }
@@ -736,6 +735,85 @@ mod tests {
     }
 
     #[test]
+    fn documented_output_item_added_starts_tool_call_with_real_identity() {
+        // The documented SSE shape puts the added item under `item`; the
+        // decoder must not synthesize "<missing_function_name>" identities.
+        let target = make_target();
+        let mut decoder = ResponsesAdapter.new_stream_decoder(&target);
+        let frame = SseFrame {
+            event: None,
+            id: None,
+            data: r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_9","name":"get_weather","arguments":""}}"#.to_owned(),
+        };
+        let events = decoder.decode_frame(&frame).unwrap();
+        let start = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::ToolCallStart { id, name, .. } => Some((id.clone(), name.clone())),
+                _ => None,
+            })
+            .expect("ToolCallStart from output_item.added item");
+        assert_eq!(start.0, "call_9");
+        assert_eq!(start.1, "get_weather");
+    }
+
+    #[test]
+    fn documented_completed_event_carries_usage_inside_response() {
+        let target = make_target();
+        let mut decoder = ResponsesAdapter.new_stream_decoder(&target);
+        let frame = SseFrame {
+            event: None,
+            id: None,
+            data: r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created":1,"model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5,"input_tokens_details":{"cached_tokens":3}}}}"#.to_owned(),
+        };
+        let events = decoder.decode_frame(&frame).unwrap();
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UsageDelta { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage from response.completed");
+        assert_eq!(usage.input_tokens, 7);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.cache_read_input_tokens, Some(3));
+        assert!(decoder.saw_terminal());
+    }
+
+    #[test]
+    fn documented_failed_event_carries_error_inside_response() {
+        let target = make_target();
+        let mut decoder = ResponsesAdapter.new_stream_decoder(&target);
+        let frame = SseFrame {
+            event: None,
+            id: None,
+            data: r#"{"type":"response.failed","response":{"id":"resp_f","error":{"code":"rate_limit_exceeded","message":"slow down"}}}"#.to_owned(),
+        };
+        let events = decoder.decode_frame(&frame).unwrap();
+        assert!(matches!(
+            &events[0],
+            CoreEvent::Error { error } if error.message() == "slow down"
+        ));
+    }
+
+    #[test]
+    fn truncated_responses_stream_has_no_terminal() {
+        let target = make_target();
+        let mut decoder = ResponsesAdapter.new_stream_decoder(&target);
+        let frame = SseFrame {
+            event: None,
+            id: None,
+            data: r#"{"type":"response.output_text.delta","delta":"hi"}"#.to_owned(),
+        };
+        decoder.decode_frame(&frame).unwrap();
+        decoder.finish().unwrap();
+        assert!(
+            !decoder.saw_terminal(),
+            "a stream cut before response.completed must not count as terminal"
+        );
+    }
+
+    #[test]
     fn encode_text_request() {
         let core = make_core_request(vec![CoreMessage {
             role: CoreRole::User,
@@ -751,7 +829,10 @@ mod tests {
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.model, "gpt-4o-2024-08-06");
         assert_eq!(body.input.len(), 1);
-        assert_eq!(body.input[0].role, "user");
+        match &body.input[0] {
+            ResponsesInput::Message { role, .. } => assert_eq!(role, "user"),
+            other => panic!("expected Message input item, got {other:?}"),
+        }
     }
 
     #[test]
@@ -772,7 +853,10 @@ mod tests {
         let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-        assert_eq!(body.input[0].role, "developer");
+        match &body.input[0] {
+            ResponsesInput::Message { role, .. } => assert_eq!(role, "developer"),
+            other => panic!("expected Message input item, got {other:?}"),
+        }
     }
 
     #[test]
@@ -856,11 +940,14 @@ mod tests {
                 name: None,
                 arguments: None,
             }],
-            usage: ResponsesUsage {
+            usage: Some(ResponsesUsage {
                 input_tokens: 100,
                 output_tokens: 50,
-            },
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
             status: None,
+            error: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -870,6 +957,37 @@ mod tests {
         assert_eq!(core_resp.stop_reason, StopReason::EndTurn);
         assert_eq!(core_resp.usage.input_tokens, 100);
         assert_eq!(core_resp.content.len(), 1);
+    }
+
+    #[test]
+    fn decode_response_absent_or_null_usage_is_labelled_synthetic_zero() {
+        // "The provider did not report usage" must be distinguishable from
+        // "the provider reported zeros": only the latter is bookable as real.
+        let target = make_target();
+        let adapter = ResponsesAdapter;
+        for body in [
+            r#"{"id":"resp_1","object":"response","created":1,"model":"gpt-4o","status":"completed","output":[]}"#,
+            r#"{"id":"resp_1","object":"response","created":1,"model":"gpt-4o","status":"completed","output":[],"usage":null}"#,
+        ] {
+            let core_resp = adapter.decode_response(body.as_bytes(), &target).unwrap();
+            assert_eq!(
+                core_resp.usage.provenance,
+                UsageProvenance::SyntheticZero,
+                "absent/null usage must be labelled synthetic, not provider-reported: {body}"
+            );
+            assert_eq!(core_resp.usage.input_tokens, 0, "body: {body}");
+            assert_eq!(core_resp.usage.output_tokens, 0, "body: {body}");
+        }
+
+        let reported_zeros = r#"{"id":"resp_1","object":"response","created":1,"model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":0,"output_tokens":0}}"#;
+        let core_resp = adapter
+            .decode_response(reported_zeros.as_bytes(), &target)
+            .unwrap();
+        assert_eq!(
+            core_resp.usage.provenance,
+            UsageProvenance::ProviderReported,
+            "explicit provider zeros are real reports, not synthetic: {reported_zeros}"
+        );
     }
 
     #[test]
@@ -889,11 +1007,14 @@ mod tests {
                 name: Some("get_weather".into()),
                 arguments: Some(r#"{"city":"SF"}"#.into()),
             }],
-            usage: ResponsesUsage {
+            usage: Some(ResponsesUsage {
                 input_tokens: 200,
                 output_tokens: 80,
-            },
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
             status: None,
+            error: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -932,11 +1053,14 @@ mod tests {
                 name: None,
                 arguments: None,
             }],
-            usage: ResponsesUsage {
+            usage: Some(ResponsesUsage {
                 input_tokens: 10,
                 output_tokens: 5,
-            },
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
             status: None,
+            error: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -1188,7 +1312,7 @@ mod tests {
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.tool_choice.is_some(), "tool_choice must be forwarded");
         let tc = body.tool_choice.unwrap();
-        assert_eq!(tc["type"], "auto");
+        assert_eq!(tc, serde_json::json!("auto"));
     }
 
     #[test]
@@ -1207,9 +1331,15 @@ mod tests {
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.input.len(), 1);
-        let content = body.input[0].content.as_ref().unwrap();
-        assert_eq!(content["type"], "function_call");
-        assert_eq!(content["name"], "get_weather");
+        match &body.input[0] {
+            ResponsesInput::FunctionCall {
+                name, arguments, ..
+            } => {
+                assert_eq!(name, "get_weather");
+                assert!(arguments.contains("SF"));
+            }
+            other => panic!("expected FunctionCall input item, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1223,6 +1353,7 @@ mod tests {
                     cache: None,
                 }],
                 is_error: false,
+                cache: None,
             }],
         }]);
         let adapter = ResponsesAdapter;
@@ -1231,10 +1362,15 @@ mod tests {
 
         let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
         assert_eq!(body.input.len(), 1);
-        let content = body.input[0].content.as_ref().unwrap();
-        assert_eq!(content["type"], "function_call_output");
-        assert_eq!(content["call_id"], "call_1");
-        assert_eq!(content["output"], "72F sunny");
+        match &body.input[0] {
+            ResponsesInput::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(output, "72F sunny");
+            }
+            other => panic!("expected FunctionCallOutput input item, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1342,11 +1478,14 @@ mod tests {
             created: 0,
             model: "gpt-4o".into(),
             output: vec![],
-            usage: ResponsesUsage {
+            usage: Some(ResponsesUsage {
                 input_tokens: 10,
                 output_tokens: 5,
-            },
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
             status: None,
+            error: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -1364,9 +1503,9 @@ mod tests {
 
     #[test]
     fn encode_tool_choice_any_and_none() {
-        for (tc, expected_type) in [
-            (CoreToolChoice::Any, "required"),
-            (CoreToolChoice::None, "none"),
+        for (tc, expected_value) in [
+            (CoreToolChoice::Any, serde_json::json!("required")),
+            (CoreToolChoice::None, serde_json::json!("none")),
         ] {
             let mut core = make_core_request(vec![CoreMessage {
                 role: CoreRole::User,
@@ -1381,7 +1520,7 @@ mod tests {
             let proxy_req = adapter.encode_request(&core, &target).unwrap();
 
             let body: ResponsesRequest = serde_json::from_slice(&proxy_req.body).unwrap();
-            assert_eq!(body.tool_choice.unwrap()["type"], expected_type);
+            assert_eq!(body.tool_choice.unwrap(), expected_value);
         }
     }
 
@@ -1460,11 +1599,14 @@ mod tests {
             created: 0,
             model: "gpt-4o".into(),
             output: vec![],
-            usage: ResponsesUsage {
+            usage: Some(ResponsesUsage {
                 input_tokens: 0,
                 output_tokens: 0,
-            },
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
             status: Some("failed".into()),
+            error: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;
@@ -1481,11 +1623,14 @@ mod tests {
             created: 0,
             model: "gpt-4o".into(),
             output: vec![],
-            usage: ResponsesUsage {
+            usage: Some(ResponsesUsage {
                 input_tokens: 0,
                 output_tokens: 0,
-            },
+                input_tokens_details: None,
+                output_tokens_details: None,
+            }),
             status: Some("incomplete".into()),
+            error: None,
         };
         let bytes = serde_json::to_vec(&resp).unwrap();
         let adapter = ResponsesAdapter;

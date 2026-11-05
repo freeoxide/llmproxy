@@ -4,7 +4,7 @@
       "content": {
         "role": "model",
         "parts": [
-          { "function_call": { "name": "get_weather", "args": { "city": "SF" } } }
+          { "functionCall": { "name": "get_weather", "args": { "city": "SF" } } }
         ]
       },
       "finishReason": "STOP"

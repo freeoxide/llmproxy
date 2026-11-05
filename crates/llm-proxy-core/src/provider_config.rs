@@ -1628,6 +1628,41 @@ fn validate_admin_mount(cfg: &AppConfig) -> Result<(), CoreError> {
 /// attribution becomes ambiguous.
 pub const ANONYMOUS_CALLER: &str = "anonymous";
 
+/// Refuses `passthrough_auth` providers combined with client-key auth.
+///
+/// With client keys on, the inbound token that `passthrough_auth` forwards
+/// upstream is the proxy's own client key — the very secret that
+/// authenticated the caller — so the provider would receive it. A token that
+/// authenticated the caller must never be sent upstream; until a separate
+/// upstream-key header exists, this combination is a configuration error.
+pub fn validate_passthrough_auth_combination(
+    auth: &AuthConfig,
+    providers: &[ProviderConfig],
+) -> Result<(), CoreError> {
+    if auth.mode != AuthMode::ClientKeys {
+        return Ok(());
+    }
+    let passthrough: Vec<&str> = providers
+        .iter()
+        .filter(|p| p.passthrough_auth)
+        .map(|p| p.name.as_str())
+        .collect();
+    if passthrough.is_empty() {
+        return Ok(());
+    }
+    Err(CoreError::ConfigValidation {
+        message: format!(
+            "auth.mode = \"client-keys\" cannot be combined with \
+             passthrough_auth providers ({}): the forwarded inbound token would \
+             be the proxy's own client key, leaking it to the provider. Remove \
+             [auth.clients] / set auth.mode = \"none\", or configure an api_key \
+             for these providers",
+            passthrough.join(", ")
+        ),
+        source: None,
+    })
+}
+
 fn validate_auth_config(auth: &AuthConfig, bind: SocketAddr) -> Result<(), CoreError> {
     let clients_empty = auth.clients.is_empty();
     match auth.mode {
@@ -1744,6 +1779,84 @@ pub fn load_provider_config(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn passthrough_providers_with_client_keys_are_refused() {
+        let auth = AuthConfig {
+            mode: AuthMode::ClientKeys,
+            clients: HashMap::from([(
+                "laptop".to_owned(),
+                secrecy::SecretString::from("argon2id$hash"),
+            )]),
+            admin: None,
+        };
+        let mut provider = make_minimal_provider("passthrough-provider");
+        provider.passthrough_auth = true;
+
+        let err = validate_passthrough_auth_combination(&auth, &[provider])
+            .expect_err("passthrough + client keys must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("passthrough-provider"),
+            "the error must name the provider: {message}"
+        );
+        assert!(
+            message.contains("client key"),
+            "the error must say why: {message}"
+        );
+    }
+
+    #[test]
+    fn passthrough_providers_with_anonymous_auth_stay_allowed() {
+        let auth = AuthConfig {
+            mode: AuthMode::None,
+            clients: HashMap::new(),
+            admin: None,
+        };
+        let mut provider = make_minimal_provider("passthrough-provider");
+        provider.passthrough_auth = true;
+
+        validate_passthrough_auth_combination(&auth, &[provider])
+            .expect("passthrough with anonymous auth is the intended use");
+    }
+
+    #[test]
+    fn keyed_providers_with_client_keys_stay_allowed() {
+        let auth = AuthConfig {
+            mode: AuthMode::ClientKeys,
+            clients: HashMap::from([(
+                "laptop".to_owned(),
+                secrecy::SecretString::from("argon2id$hash"),
+            )]),
+            admin: None,
+        };
+        let provider = make_minimal_provider("keyed-provider");
+
+        validate_passthrough_auth_combination(&auth, &[provider])
+            .expect("provider api keys with client keys are fine");
+    }
+
+    fn make_minimal_provider(name: &str) -> ProviderConfig {
+        let mut provider = toml::from_str::<ProviderFile>(
+            r#"[provider]
+name = "placeholder"
+api_key = "k"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .expect("minimal provider parses")
+        .provider;
+        provider.name = name.to_owned();
+        provider
+    }
+
     use super::*;
 
     #[test]

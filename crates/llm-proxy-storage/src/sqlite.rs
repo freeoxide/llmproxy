@@ -376,14 +376,21 @@ fn signal_done(done: &DoneFlag) {
     done.1.notify_all();
 }
 
+/// Shared writer-side state handed to [`writer_task`].
+struct WriterState {
+    dropped: Arc<AtomicU64>,
+    done: DoneFlag,
+}
+
 async fn writer_task(
     path: PathBuf,
     conn: Connection,
     mut rx: mpsc::Receiver<ProxyEvent>,
     mut shutdown: watch::Receiver<bool>,
     retention: RetentionPolicy,
-    done: DoneFlag,
+    state: WriterState,
 ) {
+    let WriterState { dropped, done } = state;
     let pruning = retention.is_bounded();
     let mut prune = tokio::time::interval(retention.prune_every.max(Duration::from_secs(1)));
     prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -406,18 +413,20 @@ async fn writer_task(
                     break;
                 }
                 let Some(conn) = conn_slot.take() else { break };
-                match exec_on_conn(
-                    &path,
-                    conn,
-                    WriterOp::Write { events: std::mem::take(&mut buf) },
-                )
-                .await
-                {
+                let events = std::mem::take(&mut buf);
+                let batch_len = events.len();
+                match exec_on_conn(&path, conn, WriterOp::Write { events }).await {
                     Some((c, result)) => {
                         conn_slot = Some(c);
                         if let Err(error) = result {
+                            let lost = dropped.fetch_add(
+                                u64::try_from(batch_len).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            ) + u64::try_from(batch_len).unwrap_or(u64::MAX);
                             tracing::error!(
                                 error = %error,
+                                events = batch_len,
+                                dropped_total = lost,
                                 "usage-ledger batch write failed; batch events lost"
                             );
                         }
@@ -460,10 +469,20 @@ async fn writer_task(
     }
     if !buf.is_empty() {
         if let Some(conn) = conn_slot.take() {
+            let batch_len = buf.len();
             match exec_on_conn(&path, conn, WriterOp::Write { events: buf }).await {
                 Some((_conn, Ok(_))) => {}
                 Some((_conn, Err(error))) => {
-                    tracing::error!(error = %error, "usage-ledger final drain failed");
+                    let lost = dropped.fetch_add(
+                        u64::try_from(batch_len).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    ) + u64::try_from(batch_len).unwrap_or(u64::MAX);
+                    tracing::error!(
+                        error = %error,
+                        events = batch_len,
+                        dropped_total = lost,
+                        "usage-ledger final drain failed; batch events lost"
+                    );
                 }
                 None => {}
             }
@@ -481,7 +500,10 @@ pub struct SqliteEventBus {
     tx: Sender<ProxyEvent>,
     shutdown_tx: Mutex<watch::Sender<bool>>,
     done: DoneFlag,
-    dropped: AtomicU64,
+    /// Events lost before reaching the ledger: dropped by a full channel in
+    /// `emit`, or by a failed batch in the writer task. Shared with the
+    /// writer so both loss paths feed [`SqliteEventBus::dropped_events`].
+    dropped: Arc<AtomicU64>,
     path: PathBuf,
 }
 
@@ -511,19 +533,23 @@ impl SqliteEventBus {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let done: DoneFlag = Arc::new((Mutex::new(false), Condvar::new()));
+        let dropped = Arc::new(AtomicU64::new(0));
         tokio::spawn(writer_task(
             path.to_path_buf(),
             conn,
             rx,
             shutdown_rx,
             retention,
-            Arc::clone(&done),
+            WriterState {
+                dropped: Arc::clone(&dropped),
+                done: Arc::clone(&done),
+            },
         ));
         Ok(Self {
             tx,
             shutdown_tx: Mutex::new(shutdown_tx),
             done,
-            dropped: AtomicU64::new(0),
+            dropped,
             path: path.to_path_buf(),
         })
     }
@@ -537,7 +563,7 @@ impl SqliteEventBus {
             tx,
             shutdown_tx: Mutex::new(shutdown_tx),
             done: Arc::new((Mutex::new(false), Condvar::new())),
-            dropped: AtomicU64::new(0),
+            dropped: Arc::new(AtomicU64::new(0)),
             path: PathBuf::new(),
         }
     }
@@ -561,14 +587,14 @@ impl EventBus for SqliteEventBus {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(
+                tracing::warn!(
                     dropped,
                     "usage-ledger channel full; event dropped (never backpressure a response)"
                 );
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(dropped, "usage-ledger writer is gone; event dropped");
+                tracing::warn!(dropped, "usage-ledger writer is gone; event dropped");
             }
         }
     }
@@ -1161,6 +1187,43 @@ mod tests {
 
         let deleted = run_retention_pass(&mut conn, &unbounded()).expect("no-op pass");
         assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_batch_write_counts_its_lost_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        let bus = Arc::new(
+            SqliteEventBus::open_with_capacity(&db, unbounded(), 1024).expect("open ledger"),
+        );
+        // Wait for the schema to be committed, then drop the table so the
+        // writer's batch INSERT fails.
+        wait_until("schema exists", || {
+            let conn = reader(&db);
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='requests'",
+            ) > 0
+        })
+        .await;
+        {
+            let conn = reader(&db);
+            conn.execute("DROP TABLE requests", []).expect("drop table");
+        }
+
+        bus.emit(&received_event("lost-1", "laptop"));
+        bus.emit(&completed_event("lost-1"));
+        wait_until("batch failure is counted", || bus.dropped_events() >= 2).await;
+
+        let closer = Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close");
+        assert!(
+            bus.dropped_events() >= 2,
+            "a failed batch must count every event it lost: {}",
+            bus.dropped_events()
+        );
     }
 
     #[tokio::test]

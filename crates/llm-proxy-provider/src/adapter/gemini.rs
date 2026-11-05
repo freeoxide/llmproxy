@@ -34,6 +34,7 @@ pub struct GeminiStreamDecoder {
     tool_blocks_closed: Vec<bool>,
     tool_id_counter: usize,
     stop_sent: bool,
+    saw_terminal: bool,
 }
 
 impl ProviderStreamDecoder for GeminiStreamDecoder {
@@ -93,6 +94,7 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
         if let Some(ref reason) = candidate.finish_reason {
             if !reason.is_empty() && !self.stop_sent {
                 self.close_content_if_open();
+                self.saw_terminal = true;
 
                 let stop_reason = map_gemini_finish_reason(reason);
 
@@ -145,6 +147,10 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
         }
 
         Ok(events)
+    }
+
+    fn saw_terminal(&self) -> bool {
+        self.saw_terminal
     }
 }
 
@@ -233,6 +239,7 @@ fn encode_content_part(
             tool_use_id,
             content: result_content,
             is_error,
+            ..
         } => {
             if *is_error {
                 tracing::warn!(
@@ -430,7 +437,7 @@ impl GeminiAdapter {
         };
 
         let body = serde_json::to_vec(&req)?;
-        let url = expand_url_template(&target.endpoint, target)?;
+        let url = gemini_stream_url(expand_url_template(&target.endpoint, target)?, core.stream);
 
         Ok(build_proxy_request(body, target, core.stream, url))
     }
@@ -530,8 +537,28 @@ impl GeminiAdapter {
             tool_blocks_closed: Vec::new(),
             tool_id_counter: 0,
             stop_sent: false,
+            saw_terminal: false,
         }
     }
+}
+
+/// Selects the Gemini streaming endpoint for stream requests: streaming is
+/// chosen by calling `:streamGenerateContent?alt=sse` instead of
+/// `:generateContent`; the request body has no `stream` field.
+fn gemini_stream_url(url: String, stream: bool) -> String {
+    if !stream {
+        return url;
+    }
+    let mut url = url;
+    if let Some(base) = url.strip_suffix(":generateContent") {
+        url = format!("{base}:streamGenerateContent");
+    }
+    if url.contains('?') {
+        url.push_str("&alt=sse");
+    } else {
+        url.push_str("?alt=sse");
+    }
+    url
 }
 
 fn build_tool_name_map(core: &CoreRequest) -> HashMap<String, String> {
@@ -746,6 +773,90 @@ mod tests {
     }
 
     #[test]
+    fn stream_requests_use_stream_generate_content_with_alt_sse() {
+        let mut core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        core.stream = true;
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        assert!(
+            proxy_req.url.ends_with(":streamGenerateContent?alt=sse"),
+            "streaming URL must select streamGenerateContent with alt=sse: {}",
+            proxy_req.url
+        );
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        assert!(
+            body.get("stream").is_none(),
+            "the Gemini request body must not carry a stream field: {body}"
+        );
+    }
+
+    #[test]
+    fn non_stream_requests_keep_generate_content_url() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hi".into(),
+                cache: None,
+            }],
+        }]);
+        let adapter = GeminiAdapter;
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+        assert!(
+            proxy_req.url.ends_with(":generateContent"),
+            "non-streaming URL must keep generateContent: {}",
+            proxy_req.url
+        );
+        assert!(!proxy_req.url.contains("alt=sse"));
+    }
+
+    #[test]
+    fn camel_case_function_call_parts_decode_to_tool_use() {
+        let target = make_target();
+        let resp = GeminiAdapter
+            .decode_response(
+                br#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+                &target,
+            )
+            .unwrap();
+        let tool = resp
+            .content
+            .iter()
+            .find_map(|c| match c {
+                CoreContent::ToolUse { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("functionCall part must decode to ToolUse");
+        assert_eq!(tool.0, "get_weather");
+        assert_eq!(tool.1["city"], "SF");
+    }
+
+    #[test]
+    fn truncated_gemini_stream_has_no_terminal() {
+        let target = make_target();
+        let mut decoder = GeminiAdapter.new_stream_decoder(&target);
+        let frame = SseFrame {
+            event: None,
+            id: None,
+            data: r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]}}]}"#
+                .to_owned(),
+        };
+        decoder.decode_frame(&frame).unwrap();
+        decoder.finish().unwrap();
+        assert!(
+            !decoder.saw_terminal(),
+            "a stream cut before finishReason must not count as terminal"
+        );
+    }
+
+    #[test]
     fn decode_text_response() {
         let target = make_target();
         let resp_json = serde_json::json!({
@@ -780,7 +891,7 @@ mod tests {
             "candidates": [{
                 "content": {
                     "role": "model",
-                    "parts": [{"function_call": {"name": "get_weather", "args": {"city": "SF"}}}]
+                    "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}]
                 },
                 "finishReason": "STOP"
             }],
@@ -924,7 +1035,7 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frame = make_frame(
-            r#"{"candidates":[{"content":{"role":"model","parts":[{"function_call":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
         );
 
         let events = decoder.decode_frame(&frame).unwrap();
@@ -1013,6 +1124,7 @@ mod tests {
                         cache: None,
                     }],
                     is_error: false,
+                    cache: None,
                 }],
             },
         ]);
@@ -1205,6 +1317,7 @@ mod tests {
                         cache: None,
                     }],
                     is_error: false,
+                    cache: None,
                 }],
             },
         ]);
@@ -1303,7 +1416,7 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frame = make_frame(
-            r#"{"candidates":[{"content":{"role":"model","parts":[{"function_call":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":null}],"usageMetadata":null}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"get_weather","args":{"city":"SF"}}}]},"finishReason":null}],"usageMetadata":null}"#,
         );
         decoder.decode_frame(&frame).unwrap();
 
@@ -1343,7 +1456,7 @@ mod tests {
             "candidates": [{
                 "content": {
                     "role": "model",
-                    "parts": [{"function_call": {"name": "search", "args": {"q": "test"}}}]
+                    "parts": [{"functionCall": {"name": "search", "args": {"q": "test"}}}]
                 },
                 "finishReason": "STOP"
             }],
@@ -1437,7 +1550,7 @@ mod tests {
         let mut decoder = adapter.new_stream_decoder(&target);
 
         let frames = vec![make_frame(
-            r#"{"candidates":[{"content":{"role":"model","parts":[{"function_call":{"name":"search","args":{"q":"rust"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"search","args":{"q":"rust"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}"#,
         )];
 
         let mut all_events = Vec::new();

@@ -44,6 +44,10 @@ pub(crate) fn load_toml_state(
         .validate_protocols(known_protocols)
         .with_context(|| "validating provider protocols")?;
 
+    let providers: Vec<llm_proxy_core::ProviderConfig> = registry.iter().cloned().collect();
+    llm_proxy_core::validate_passthrough_auth_combination(&app_config.auth, &providers)
+        .with_context(|| "validating auth against provider passthrough configuration")?;
+
     let cache_dir = providers_dir.join(".catalog");
     for provider in registry.iter() {
         if let Some(warning) = catalog_enforcement_warning(provider, &cache_dir) {

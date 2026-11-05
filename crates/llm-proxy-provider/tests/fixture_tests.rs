@@ -215,6 +215,7 @@ mod tests {
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.iter().map(parse_core_content).collect())
                     .unwrap_or_default(),
+                cache: None,
             },
             "thinking" => CoreContent::Thinking {
                 text: obj

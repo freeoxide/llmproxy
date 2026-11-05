@@ -57,6 +57,10 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
         .validate_protocols(known_protocols)
         .with_context(|| "validating provider protocols")?;
 
+    let providers: Vec<llm_proxy_core::ProviderConfig> = registry.iter().cloned().collect();
+    llm_proxy_core::validate_passthrough_auth_combination(&app_config.auth, &providers)
+        .with_context(|| "validating auth against provider passthrough configuration")?;
+
     println!();
     println!("=== Providers ({} loaded) ===", registry.len());
     if registry.is_empty() {

@@ -178,6 +178,8 @@ pub enum CoreContent {
         content: Vec<CoreContent>,
         /// Whether this result represents an error.
         is_error: bool,
+        /// Optional cache-control directive carried on the `tool_result` block.
+        cache: Option<CacheControl>,
     },
     /// Extended thinking content.
     Thinking {
@@ -234,11 +236,13 @@ impl fmt::Debug for CoreContent {
                 tool_use_id,
                 content,
                 is_error,
+                cache,
             } => f
                 .debug_struct("ToolResult")
                 .field("tool_use_id", &tool_use_id)
                 .field("content", &content)
                 .field("is_error", &is_error)
+                .field("cache", &cache)
                 .finish(),
             CoreContent::Thinking { text, signature } => f
                 .debug_struct("Thinking")
@@ -1028,12 +1032,14 @@ mod tests {
                 cache: None,
             }],
             is_error: false,
+            cache: None,
         };
         match result {
             CoreContent::ToolResult {
                 content,
                 is_error,
                 tool_use_id,
+                ..
             } => {
                 assert!(!is_error);
                 assert_eq!(tool_use_id, "call_123");
@@ -1527,6 +1533,7 @@ mod tests {
                 tool_use_id: String::new(),
                 content: vec![],
                 is_error: false,
+                cache: None,
             },
             CoreContent::Thinking {
                 text: String::new(),
@@ -1679,6 +1686,7 @@ mod tests {
                 cache: None,
             }],
             is_error: true,
+            cache: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: CoreContent = serde_json::from_str(&json).unwrap();
@@ -1691,6 +1699,7 @@ mod tests {
             tool_use_id: "call_empty".into(),
             content: vec![],
             is_error: true,
+            cache: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: CoreContent = serde_json::from_str(&json).unwrap();
@@ -1706,11 +1715,13 @@ mod tests {
                 cache: None,
             }],
             is_error: false,
+            cache: None,
         };
         let outer = CoreContent::ToolResult {
             tool_use_id: "outer".into(),
             content: vec![inner],
             is_error: false,
+            cache: None,
         };
         let json = serde_json::to_string(&outer).unwrap();
         let back: CoreContent = serde_json::from_str(&json).unwrap();
@@ -1748,6 +1759,7 @@ mod tests {
                     cache: None,
                 }],
                 is_error: false,
+                cache: None,
             },
             CoreContent::Thinking {
                 text: "hmm".into(),
@@ -2103,6 +2115,7 @@ mod tests {
                 tool_use_id: format!("level_{i}"),
                 content: vec![content],
                 is_error: false,
+                cache: None,
             };
         }
         let json = serde_json::to_string(&content).unwrap();

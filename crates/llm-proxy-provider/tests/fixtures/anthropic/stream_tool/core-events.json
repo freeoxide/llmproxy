@@ -1,8 +1,27 @@
 [
-  { "type": "message_start" },
-  { "type": "tool_call_start" },
-  { "type": "tool_call_delta" },
-  { "type": "tool_call_delta" },
-  { "type": "tool_call_stop" },
-  { "type": "message_stop" }
+  {
+    "type": "message_start"
+  },
+  {
+    "type": "tool_call_start"
+  },
+  {
+    "type": "tool_call_delta"
+  },
+  {
+    "type": "tool_call_delta"
+  },
+  {
+    "type": "tool_call_stop"
+  },
+  {
+    "type": "usage_delta",
+    "usage": {
+      "input_tokens": 50,
+      "output_tokens": 25
+    }
+  },
+  {
+    "type": "message_stop"
+  }
 ]

@@ -37,7 +37,7 @@ pub use provider_config::{
     ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig, ProviderDiscoveryConfig,
     ProviderDiscoveryKind, ProviderEgressConfig, ProviderFile, ProviderRouteKind,
     ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry, StorageConfig, load_app_config,
-    load_provider_config, validate_provider_config,
+    load_provider_config, validate_passthrough_auth_combination, validate_provider_config,
 };
 pub use provider_registry::{
     ProviderAdapterTargetConfig, ProviderRegistry, ProviderRouteResolutionError,

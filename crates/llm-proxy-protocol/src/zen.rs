@@ -21,15 +21,52 @@ pub struct ResponsesRequest {
     /// Controls which (if any) tool the model must call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// Sampling temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Nucleus sampling threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// Upper bound on tokens generated in the response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i32>,
 }
 
-/// A single message in the conversation input.
+/// One entry in the Responses API `input` array: either a conversational
+/// message or a typed item (`function_call` / `function_call_output`) per
+/// the documented request shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponsesInput {
-    /// Speaker role (e.g. `"user"`, `"assistant"`).
-    pub role: String,
-    /// Arbitrary JSON content payload.
-    pub content: Option<serde_json::Value>,
+#[serde(untagged)]
+pub enum ResponsesInput {
+    /// A conversational message (`{"role": ..., "content": ...}`).
+    Message {
+        /// Speaker role (e.g. `"user"`, `"assistant"`, `"developer"`).
+        role: String,
+        /// Arbitrary JSON content payload.
+        content: Option<serde_json::Value>,
+    },
+    /// A function call the model previously emitted.
+    FunctionCall {
+        /// Always `"function_call"`.
+        #[serde(rename = "type")]
+        r#type: String,
+        /// The call identifier echoed back from the response.
+        call_id: String,
+        /// Function name.
+        name: String,
+        /// JSON-encoded function arguments.
+        arguments: String,
+    },
+    /// The result of a function call, fed back to the model.
+    FunctionCallOutput {
+        /// Always `"function_call_output"`.
+        #[serde(rename = "type")]
+        r#type: String,
+        /// The call identifier this output belongs to.
+        call_id: String,
+        /// The function output payload.
+        output: String,
+    },
 }
 
 /// A tool definition offered to the model.
@@ -53,25 +90,34 @@ pub struct ResponsesReasoning {
     pub effort: Option<String>,
 }
 
-/// Non-streaming response from the Responses API; unknown provider fields
-/// are silently ignored rather than failing decode.
+/// Non-streaming response from the Responses API, also embedded in stream
+/// terminal events (`response.completed` / `response.done`); unknown
+/// provider fields are silently ignored rather than failing decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesResponse {
     /// Unique response identifier.
     pub id: String,
     /// Object type discriminator (e.g. `"response"`).
+    #[serde(default)]
     pub object: String,
     /// Unix timestamp (seconds) of creation.
+    #[serde(default)]
     pub created: i64,
     /// Model that produced the response.
+    #[serde(default)]
     pub model: String,
     /// Ordered list of output items (messages, tool calls, etc.).
+    #[serde(default)]
     pub output: Vec<ResponsesOutput>,
-    /// Token usage statistics.
-    pub usage: ResponsesUsage,
+    /// Token usage statistics; `None` on non-terminal events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponsesUsage>,
     /// Response status (e.g. `"completed"`, `"failed"`, `"incomplete"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Error object present when the response failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
 }
 
 /// A single output item in a Responses API response.
@@ -108,9 +154,17 @@ pub struct ResponsesContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesUsage {
     /// Number of tokens in the prompt.
+    #[serde(default)]
     pub input_tokens: i32,
     /// Number of tokens in the completion.
+    #[serde(default)]
     pub output_tokens: i32,
+    /// OpenAI-documented prompt token breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<crate::openai::PromptTokensDetails>,
+    /// OpenAI-documented completion token breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<crate::openai::CompletionTokensDetails>,
 }
 
 /// A single chunk in a streaming Responses API response; `delta` carries
@@ -122,20 +176,35 @@ pub struct ResponsesChunk {
     #[serde(rename = "type")]
     pub r#type: String,
     /// Response / item identifier.
+    #[serde(default)]
     pub id: Option<String>,
     /// Incremental text delta.
+    #[serde(default)]
     pub delta: Option<String>,
     /// Complete output items (emitted at certain events).
+    #[serde(default)]
     pub output: Option<Vec<ResponsesOutput>>,
     /// Token usage (usually present on the final chunk).
+    #[serde(default)]
     pub usage: Option<ResponsesUsage>,
     /// Error object present on `response.failed` events.
+    #[serde(default)]
     pub error: Option<serde_json::Value>,
     /// Upstream output-item index carried on function-call events; parallel
     /// function-call argument deltas are disambiguated via this index.
     /// Defaults to `None` so legacy/non-indexed chunks still parse.
     #[serde(default)]
     pub output_index: Option<usize>,
+    /// The complete added output item on `response.output_item.added`
+    /// (`{"type":"function_call","call_id":...,"name":...,"arguments":""}`),
+    /// per the documented SSE shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<ResponsesOutput>,
+    /// The complete response object on `response.created` /
+    /// `response.completed` / `response.done` / `response.failed`, carrying
+    /// `usage` and `output` per the documented SSE shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponsesResponse>,
 }
 
 /// Top-level request body for the Gemini generate-content endpoint;
@@ -148,9 +217,11 @@ pub struct GeminiRequest {
     pub generation_config: Option<GeminiGenerationConfig>,
     /// Tools available to the model.
     pub tools: Vec<GeminiTool>,
-    /// When `Some(true)` the server streams chunked responses; the Gemini API
-    /// usually takes streaming as the `?alt=sse` query parameter, which the
-    /// adapter constructs from this field.
+    /// Streaming control for the adapter only; the Gemini wire format has no
+    /// body field for it — streaming is selected by calling
+    /// `:streamGenerateContent?alt=sse` instead of `:generateContent`, which
+    /// the adapter does from this flag. Never serialized.
+    #[serde(skip)]
     pub stream: Option<bool>,
 }
 
@@ -173,11 +244,21 @@ pub struct GeminiPart {
     /// Text content of this part.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// Function call (present when the model invokes a tool).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Function call (present when the model invokes a tool); camelCase
+    /// `functionCall` per the Gemini wire format.
+    #[serde(
+        rename = "functionCall",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub function_call: Option<GeminiFunctionCall>,
-    /// Function response (present when sending a tool result back to the model).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Function response (present when sending a tool result back to the
+    /// model); camelCase `functionResponse` per the Gemini wire format.
+    #[serde(
+        rename = "functionResponse",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub function_response: Option<GeminiFunctionResponse>,
 }
 
@@ -318,7 +399,7 @@ mod tests {
     fn responses_request_round_trip() {
         let req = ResponsesRequest {
             model: "gpt-4o".into(),
-            input: vec![ResponsesInput {
+            input: vec![ResponsesInput::Message {
                 role: "user".into(),
                 content: Some(serde_json::json!("hello")),
             }],
@@ -326,11 +407,96 @@ mod tests {
             tools: vec![],
             reasoning: None,
             tool_choice: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: ResponsesRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.model, "gpt-4o");
         assert_eq!(back.input.len(), 1);
+    }
+
+    #[test]
+    fn responses_input_function_call_items_round_trip() {
+        let json = r#"[
+            {"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"SF\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"72F and sunny"}
+        ]"#;
+        let items: Vec<ResponsesInput> = serde_json::from_str(json).unwrap();
+        match &items[0] {
+            ResponsesInput::FunctionCall {
+                call_id,
+                name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(name, "get_weather");
+                assert!(arguments.contains("SF"));
+            }
+            other => panic!("expected FunctionCall item, got {other:?}"),
+        }
+        match &items[1] {
+            ResponsesInput::FunctionCallOutput {
+                call_id, output, ..
+            } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(output, "72F and sunny");
+            }
+            other => panic!("expected FunctionCallOutput item, got {other:?}"),
+        }
+        let back = serde_json::to_string(&items).unwrap();
+        assert!(back.contains("\"function_call\""), "{back}");
+        assert!(back.contains("\"function_call_output\""), "{back}");
+    }
+
+    #[test]
+    fn responses_chunk_parses_documented_completed_event() {
+        let json = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","created":1,"model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":5,"input_tokens_details":{"cached_tokens":3}}}}"#;
+        let chunk: ResponsesChunk = serde_json::from_str(json).unwrap();
+        let response = chunk.response.as_ref().expect("response object");
+        let usage = response.usage.as_ref().expect("usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(
+            usage
+                .input_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn responses_chunk_parses_documented_output_item_added() {
+        let json = r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"get_weather","arguments":""}}"#;
+        let chunk: ResponsesChunk = serde_json::from_str(json).unwrap();
+        let item = chunk.item.as_ref().expect("item");
+        assert_eq!(item.r#type, "function_call");
+        assert_eq!(item.call_id.as_deref(), Some("call_1"));
+        assert_eq!(item.name.as_deref(), Some("get_weather"));
+    }
+
+    #[test]
+    fn gemini_part_parses_camel_case_function_call() {
+        let json = r#"{"functionCall":{"name":"get_weather","args":{"city":"SF"}}}"#;
+        let part: GeminiPart = serde_json::from_str(json).unwrap();
+        assert_eq!(part.function_call.as_ref().unwrap().name, "get_weather");
+        let back = serde_json::to_string(&part).unwrap();
+        assert!(back.contains("functionCall"), "{back}");
+        assert!(!back.contains("function_call"), "{back}");
+    }
+
+    #[test]
+    fn gemini_request_stream_is_not_serialized() {
+        let req = GeminiRequest {
+            contents: vec![],
+            generation_config: None,
+            tools: vec![],
+            stream: Some(true),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("stream"), "{json}");
     }
 
     #[test]
@@ -353,6 +519,18 @@ mod tests {
         let back: GeminiRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.contents.len(), 1);
         assert!(back.generation_config.is_some());
+    }
+
+    #[test]
+    fn gemini_function_response_serializes_camel_case() {
+        let part = GeminiPart::function_response(
+            "get_weather".into(),
+            serde_json::json!({"result": "72F"}),
+        );
+        let json = serde_json::to_string(&part).unwrap();
+        assert!(json.contains("functionResponse"), "{json}");
+        let back: GeminiPart = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.function_response.as_ref().unwrap().name, "get_weather");
     }
 
     #[test]
@@ -411,6 +589,8 @@ mod tests {
             usage: None,
             error: None,
             output_index: None,
+            item: None,
+            response: None,
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let back: ResponsesChunk = serde_json::from_str(&json).unwrap();

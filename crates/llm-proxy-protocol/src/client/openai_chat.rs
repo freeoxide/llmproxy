@@ -83,7 +83,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
-                    ttl: None,
+                    ttl: cc.ttl,
                 });
                 if !text.is_empty() || cache.is_some() {
                     system.push(CoreContent::Text { text, cache });
@@ -93,7 +93,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
-                    ttl: None,
+                    ttl: cc.ttl,
                 });
                 let mut content = Vec::new();
                 if !text.is_empty() || cache.is_some() {
@@ -170,6 +170,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         tool_use_id,
                         content: inner_content,
                         is_error,
+                        cache: None,
                     }],
                 });
             }
@@ -431,7 +432,7 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
             finish_reason: Some(finish_reason),
             delta: None,
         }],
-        usage,
+        usage: Some(usage),
         extra: serde_json::Map::new(),
     })
 }
@@ -472,12 +473,18 @@ fn encode_usage(usage: &Usage) -> UsageInfo {
         total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         prompt_cache_hit_tokens: usage.cache_read_input_tokens,
         prompt_cache_miss_tokens: usage.cache_creation_input_tokens,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     }
 }
 
 /// Stateful encoder that converts [`CoreEvent`] values into OpenAI
 /// [`ChatCompletionChunk`] values, reusing a stable `id`/`model`/`created`
 /// across chunks (stored as `Arc<str>` so cloning is a refcount bump).
+/// The terminal `finish_reason` chunk is held back until
+/// [`StreamEncoder::finish`] because providers send the usage chunk after
+/// the finish chunk; flushing early would report zeros to clients that
+/// asked for usage.
 #[derive(Debug)]
 pub struct StreamEncoder {
     id: Arc<str>,
@@ -486,6 +493,7 @@ pub struct StreamEncoder {
     include_usage: bool,
     finished: bool,
     pending_usage: Option<UsageInfo>,
+    pending_stop: Option<String>,
 }
 
 impl StreamEncoder {
@@ -499,6 +507,7 @@ impl StreamEncoder {
             include_usage,
             finished: false,
             pending_usage: None,
+            pending_stop: None,
         }
     }
 
@@ -515,6 +524,27 @@ impl StreamEncoder {
         event: CoreEvent,
     ) -> Result<Vec<ChatCompletionChunk>, ProtocolError> {
         if self.finished {
+            return Ok(Vec::new());
+        }
+
+        if self.pending_stop.is_some() {
+            if let CoreEvent::Error { .. } = event {
+                // The error itself cannot be a chunk — the route emits it as
+                // a bare error-object data line — but the buffered finish
+                // chunk is still owed to the client: flush it (with usage,
+                // when the client asked) and stop encoding.
+                return self.finish();
+            }
+            // The finish chunk is buffered; only a trailing usage update is
+            // still meaningful (it becomes the final usage chunk).
+            if let CoreEvent::UsageDelta { usage } = event {
+                self.pending_usage = Some(encode_usage(&usage));
+            } else {
+                tracing::trace!(
+                    event = ?event,
+                    "StreamEncoder: dropping event after buffered MessageStop"
+                );
+            }
             return Ok(Vec::new());
         }
 
@@ -652,36 +682,10 @@ impl StreamEncoder {
             }
 
             CoreEvent::MessageStop { stop_reason, .. } => {
-                let finish = encode_finish_reason(stop_reason);
-                chunks.push(self.make_chunk(Choice {
-                    index: 0,
-                    message: None,
-                    finish_reason: Some(finish),
-                    delta: Some(ChatMessage {
-                        role: String::new(),
-                        content: serde_json::Value::String(String::new()),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        name: None,
-                        tool_call_id: None,
-                        cache_control: None,
-                        refusal: None,
-                        is_error: None,
-                    }),
-                }));
-
-                if self.include_usage {
-                    let usage = self.pending_usage.take().unwrap_or(UsageInfo {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                        prompt_cache_hit_tokens: None,
-                        prompt_cache_miss_tokens: None,
-                    });
-                    chunks.push(self.make_usage_chunk(usage));
-                }
-
-                self.finished = true;
+                // Hold the finish chunk back: the usage chunk routinely
+                // arrives after it and must carry real numbers, not zeros.
+                // `finish()` flushes both, in OpenAI's documented order.
+                self.pending_stop = Some(encode_finish_reason(stop_reason));
             }
 
             CoreEvent::Error { error } => {
@@ -698,25 +702,32 @@ impl StreamEncoder {
         Ok(chunks)
     }
 
-    /// Flush remaining buffered events when the stream ended without a
-    /// `MessageStop`: emits a synthetic `finish_reason = "stop"` chunk (with
-    /// a warning), plus the final usage chunk when `include_usage` is set.
+    /// Flush remaining buffered events: a buffered `MessageStop` emits the
+    /// finish chunk plus the final usage chunk when `include_usage` is set;
+    /// a stream that ended without one emits a synthetic
+    /// `finish_reason = "stop"` chunk (with a warning) instead.
     pub fn finish(&mut self) -> Result<Vec<ChatCompletionChunk>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
 
-        tracing::warn!(
-            "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal chunk"
-        );
+        let finish_reason = match self.pending_stop.take() {
+            Some(finish) => finish,
+            None => {
+                tracing::warn!(
+                    "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal chunk"
+                );
+                "stop".to_owned()
+            }
+        };
 
         let mut chunks = Vec::new();
 
         chunks.push(self.make_chunk(Choice {
             index: 0,
             message: None,
-            finish_reason: Some("stop".to_owned()),
+            finish_reason: Some(finish_reason),
             delta: Some(ChatMessage {
                 role: String::new(),
                 content: serde_json::Value::String(String::new()),
@@ -737,6 +748,8 @@ impl StreamEncoder {
                 total_tokens: 0,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             });
             chunks.push(self.make_usage_chunk(usage));
         }
@@ -767,9 +780,12 @@ impl StreamEncoder {
     }
 
     /// Mark the encoder as finished so subsequent `finish()` calls return
-    /// empty; used after emitting an in-band error.
+    /// empty; used after emitting an in-band error. Any buffered finish
+    /// chunk has already been flushed by the `Error` event (see
+    /// [`StreamEncoder::encode_event`]).
     pub fn mark_finished(&mut self) {
         self.finished = true;
+        self.pending_stop = None;
     }
 }
 
@@ -1041,6 +1057,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages[0].cache_control = Some(OpenAICacheControl {
             r#type: "ephemeral".into(),
+            ttl: None,
         });
         let core = decode_request(req).unwrap();
         match &core.messages[0].content[0] {
@@ -1135,6 +1152,7 @@ mod tests {
         req.messages[0].content = serde_json::Value::String(String::new());
         req.messages[0].cache_control = Some(OpenAICacheControl {
             r#type: "ephemeral".into(),
+            ttl: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(
@@ -1169,6 +1187,7 @@ mod tests {
                 tool_call_id: None,
                 cache_control: Some(OpenAICacheControl {
                     r#type: "ephemeral".into(),
+                    ttl: None,
                 }),
                 refusal: None,
                 is_error: None,
@@ -1417,8 +1436,54 @@ mod tests {
                 stop_sequence: None,
             })
             .unwrap();
+        assert!(
+            chunks.is_empty(),
+            "finish chunk is held back until finish(): got {chunks:?}"
+        );
+        let chunks = enc.finish().unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn streaming_error_after_message_stop_flushes_finish_chunk() {
+        // The error itself is a route-level data line (the chunk schema cannot
+        // carry it), but the buffered finish chunk must still reach the client
+        // before the error ends the stream — not be dropped by it.
+        let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, true);
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let chunks = enc
+            .encode_event(CoreEvent::Error {
+                error: CoreStreamError::new(
+                    CoreStreamErrorKind::Upstream,
+                    "connection reset after terminal".into(),
+                ),
+            })
+            .unwrap();
+        let finish_pos = chunks
+            .iter()
+            .position(|c| {
+                c.choices
+                    .first()
+                    .is_some_and(|ch| ch.finish_reason.is_some())
+            })
+            .expect("buffered finish chunk must flush ahead of the error");
+        assert_eq!(
+            chunks[finish_pos].choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        assert!(
+            chunks.iter().any(|c| c.usage.is_some()),
+            "include_usage clients still get the usage chunk: {chunks:?}"
+        );
+        assert!(
+            enc.finish().unwrap().is_empty(),
+            "no synthetic second terminal after the error"
+        );
     }
 
     #[test]
@@ -1428,12 +1493,12 @@ mod tests {
             usage: Usage::provider_reported(50, 100),
         })
         .unwrap();
-        let chunks = enc
-            .encode_event(CoreEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                stop_sequence: None,
-            })
-            .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let chunks = enc.finish().unwrap();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].choices.len(), 1);
         assert!(chunks[1].usage.is_some());
@@ -1441,19 +1506,69 @@ mod tests {
     }
 
     #[test]
-    fn streaming_no_usage_when_not_included() {
+    fn usage_after_finish_chunk_reaches_include_usage_clients() {
+        // OpenAI's documented chunk order: finish_reason chunk first, then
+        // the usage chunk. A client that asked for usage must see the real
+        // numbers, not the zeros buffered at finish time.
+        let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, true);
+        enc.encode_event(CoreEvent::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::UsageDelta {
+            usage: Usage::provider_reported(100, 5),
+        })
+        .unwrap();
+
+        let chunks = enc.finish().unwrap();
+        let usage_chunk = chunks
+            .iter()
+            .find(|c| c.usage.is_some())
+            .expect("usage chunk after finish()");
+        let usage = usage_chunk.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 5);
+        let finish_pos = chunks
+            .iter()
+            .position(|c| {
+                c.choices
+                    .first()
+                    .is_some_and(|ch| ch.finish_reason.is_some())
+            })
+            .expect("finish chunk");
+        let usage_pos = chunks
+            .iter()
+            .position(|c| c.usage.is_some())
+            .expect("usage chunk");
+        assert!(
+            finish_pos < usage_pos,
+            "finish chunk must precede the usage chunk: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_no_usage_chunk_when_client_did_not_ask() {
+        // The proxy always asks the upstream for usage, but a client that did
+        // not set stream_options.include_usage must not receive a usage chunk.
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
         enc.encode_event(CoreEvent::UsageDelta {
             usage: Usage::provider_reported(50, 100),
         })
         .unwrap();
-        let chunks = enc
-            .encode_event(CoreEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                stop_sequence: None,
-            })
-            .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let chunks = enc.finish().unwrap();
         assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].usage.is_none());
     }
 
     #[test]
@@ -1517,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_finish_after_stop_is_empty() {
+    fn streaming_finish_after_stop_flushes_buffered_terminal_once() {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
         enc.encode_event(CoreEvent::MessageStop {
             stop_reason: StopReason::EndTurn,
@@ -1525,7 +1640,13 @@ mod tests {
         })
         .unwrap();
         let remaining = enc.finish().unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(
+            remaining.len(),
+            1,
+            "buffered finish chunk flushes on finish()"
+        );
+        let again = enc.finish().unwrap();
+        assert!(again.is_empty(), "second finish() must be empty");
     }
 
     #[test]
@@ -1737,6 +1858,7 @@ mod tests {
                 tool_use_id: "call_1".into(),
                 content: vec![],
                 is_error: false,
+                cache: None,
             }],
             stop_reason: StopReason::EndTurn,
             stop_sequence: None,

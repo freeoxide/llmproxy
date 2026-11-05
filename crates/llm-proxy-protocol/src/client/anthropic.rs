@@ -219,10 +219,12 @@ fn decode_tool_result_block(block: ContentBlock) -> Result<CoreContent, Protocol
             "tool_result block missing required 'tool_use_id' field".into(),
         ));
     }
+    let cache = block.cache_control.map(decode_cache_control);
     Ok(CoreContent::ToolResult {
         tool_use_id,
         content: inner_content,
         is_error,
+        cache,
     })
 }
 
@@ -389,6 +391,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             tool_use_id,
             content,
             is_error,
+            cache,
         } => {
             let content_val = if content.len() == 1 {
                 if let CoreContent::Text { ref text, .. } = content[0] {
@@ -401,11 +404,12 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             } else {
                 Some(serde_json::to_value(&content).unwrap_or(serde_json::Value::Null))
             };
-            Ok(ContentBlock::new_tool_result(
-                tool_use_id,
-                content_val,
-                Some(is_error),
-            ))
+            let mut block = ContentBlock::new_tool_result(tool_use_id, content_val, Some(is_error));
+            block.cache_control = cache.map(|c| AnthropicCacheControl {
+                r#type: c.r#type.as_str().to_owned(),
+                ttl: c.ttl,
+            });
+            Ok(block)
         }
         CoreContent::Thinking { text, signature } => {
             let mut block = ContentBlock::new_thinking(text);
@@ -497,6 +501,7 @@ fn encode_usage(usage: &Usage) -> anthropic::Usage {
         output_tokens: usage.output_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation: None,
     }
 }
 
@@ -548,15 +553,26 @@ fn encode_error_event(error: &CoreStreamError) -> MessageEvent {
 
 /// Stateful encoder that converts [`CoreEvent`] values into Anthropic SSE
 /// [`MessageEvent`] values, buffering the latest `UsageDelta` and coalescing
-/// it into the terminal `message_delta` + `message_stop` pair.
+/// it into the terminal `message_delta` + `message_stop` pair. The terminal
+/// pair is held back until [`StreamEncoder::finish`] because providers send
+/// usage after the finish event; flushing on `MessageStop` would report the
+/// buffered (zero) usage instead of the real numbers.
 #[derive(Debug)]
 pub struct StreamEncoder {
     msg_id: String,
     model: String,
     pending_usage: Option<anthropic::Usage>,
+    pending_stop: Option<PendingStop>,
     started: bool,
     finished: bool,
     open_text_blocks: Vec<usize>,
+}
+
+/// A `MessageStop` waiting for the trailing usage event before it is flushed.
+#[derive(Debug)]
+struct PendingStop {
+    stop_reason: StopReason,
+    stop_sequence: Option<String>,
 }
 
 impl StreamEncoder {
@@ -567,6 +583,7 @@ impl StreamEncoder {
             msg_id,
             model,
             pending_usage: None,
+            pending_stop: None,
             started: false,
             finished: false,
             open_text_blocks: Vec::new(),
@@ -595,6 +612,7 @@ impl StreamEncoder {
                     output_tokens: 0,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    cache_creation: None,
                 },
             }),
             index: None,
@@ -617,6 +635,7 @@ impl StreamEncoder {
             output_tokens: 0,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_creation: None,
         });
 
         self.open_text_blocks.sort_unstable();
@@ -676,6 +695,29 @@ impl StreamEncoder {
                 event = ?event,
                 "StreamEncoder: dropping event after stream finished"
             );
+            return Ok(Vec::new());
+        }
+
+        if self.pending_stop.is_some() {
+            if let CoreEvent::Error { error } = event {
+                // An error after the buffered terminal must neither swallow
+                // the terminal nor be swallowed by it: flush the buffered
+                // pair ahead of the error event, then stop encoding. This is
+                // the wire shape clients saw before the terminal was buffered.
+                let mut events = self.finish()?;
+                events.push(encode_error_event(&error));
+                return Ok(events);
+            }
+            // The terminal pair is buffered; only a trailing usage update is
+            // still meaningful (it lands in the terminal message_delta).
+            if let CoreEvent::UsageDelta { usage } = event {
+                self.pending_usage = Some(encode_usage(&usage));
+            } else {
+                tracing::trace!(
+                    event = ?event,
+                    "StreamEncoder: dropping event after buffered MessageStop"
+                );
+            }
             return Ok(Vec::new());
         }
 
@@ -795,7 +837,14 @@ impl StreamEncoder {
                 stop_reason,
                 stop_sequence,
             } => {
-                self.encode_message_stop(stop_reason, stop_sequence, &mut events);
+                // Hold the terminal pair back: usage routinely arrives after
+                // the finish event and belongs in the terminal message_delta.
+                // Nothing is lost — `finish()` flushes it with the freshest
+                // buffered usage.
+                self.pending_stop = Some(PendingStop {
+                    stop_reason,
+                    stop_sequence,
+                });
             }
 
             CoreEvent::Error { error } => {
@@ -819,19 +868,30 @@ impl StreamEncoder {
     }
 
     /// Mark the encoder as finished without emitting synthetic terminal
-    /// events; later `finish()` calls return an empty vec.
+    /// events; later `finish()` calls return an empty vec. A buffered
+    /// `MessageStop` is dropped: callers are the error paths, which have
+    /// already delivered the buffered terminal ahead of the error event (an
+    /// `Error` event flushes it) or a terminal error event on its own.
     pub fn mark_finished(&mut self) {
         self.finished = true;
+        self.pending_stop = None;
     }
 
-    /// Flush remaining buffered events when the stream ended without a
-    /// `MessageStop`: emits a synthetic `message_delta` (stop reason
-    /// `"end_turn"`, with a warning) + `message_stop` pair.
+    /// Flush remaining buffered events: a buffered `MessageStop` is emitted
+    /// with the freshest usage; a stream that ended without one emits a
+    /// synthetic `message_delta` (stop reason `"end_turn"`, with a warning) +
+    /// `message_stop` pair.
     pub fn finish(&mut self) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
+
+        if let Some(pending) = self.pending_stop.take() {
+            let mut events = Vec::new();
+            self.encode_message_stop(pending.stop_reason, pending.stop_sequence, &mut events);
+            return Ok(events);
+        }
 
         tracing::warn!(
             "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal events"
@@ -842,6 +902,7 @@ impl StreamEncoder {
             output_tokens: 0,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_creation: None,
         });
 
         let events = vec![
@@ -1543,12 +1604,12 @@ mod tests {
             text: "hi".into(),
         })
         .unwrap();
-        let stop = enc
-            .encode_event(CoreEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                stop_sequence: None,
-            })
-            .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let stop = enc.finish().unwrap();
 
         assert!(
             stop.iter()
@@ -1581,7 +1642,12 @@ mod tests {
                 stop_sequence: None,
             })
             .unwrap();
+        assert!(
+            events.is_empty(),
+            "terminal pair is held back until finish(): got {events:?}"
+        );
 
+        let events = enc.finish().unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].r#type, "message_delta");
         assert!(events[0].usage.is_some());
@@ -1591,6 +1657,37 @@ mod tests {
             Some("end_turn")
         );
         assert_eq!(events[1].r#type, "message_stop");
+    }
+
+    #[test]
+    fn usage_arriving_after_message_stop_reaches_the_client() {
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+
+        enc.encode_event(CoreEvent::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        // Standard OpenAI-style ordering: usage arrives after the finish
+        // event. It must land in the terminal message_delta the client sees.
+        enc.encode_event(CoreEvent::UsageDelta {
+            usage: Usage::provider_reported(100, 5),
+        })
+        .unwrap();
+
+        let events = enc.finish().unwrap();
+        let delta = events
+            .iter()
+            .find(|e| e.r#type == "message_delta")
+            .expect("terminal message_delta after finish");
+        let usage = delta.usage.as_ref().expect("usage on terminal delta");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 5);
     }
 
     #[test]
@@ -1643,7 +1740,46 @@ mod tests {
         })
         .unwrap();
         let remaining = enc.finish().unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(remaining.len(), 2, "buffered stop flushes on finish()");
+        assert_eq!(remaining[0].r#type, "message_delta");
+        assert_eq!(remaining[1].r#type, "message_stop");
+        let again = enc.finish().unwrap();
+        assert!(again.is_empty(), "second finish() must be empty");
+    }
+
+    #[test]
+    fn streaming_error_after_message_stop_flushes_terminal_then_error() {
+        // A transport error or in-band error frame arriving after the
+        // upstream terminal must neither be dropped nor drop the buffered
+        // terminal pair: the client sees the terminal, then the error.
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let events = enc
+            .encode_event(CoreEvent::Error {
+                error: CoreStreamError::new(
+                    CoreStreamErrorKind::Upstream,
+                    "connection reset after terminal".into(),
+                ),
+            })
+            .unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.r#type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["message_delta", "message_stop", "error"],
+            "terminal pair must flush ahead of the error event: {events:?}"
+        );
+        assert!(
+            events.last().is_some_and(|e| e.error.is_some()),
+            "the error event must carry the failure: {events:?}"
+        );
+        assert!(
+            enc.finish().unwrap().is_empty(),
+            "no synthetic second terminal after the error"
+        );
     }
 
     #[test]

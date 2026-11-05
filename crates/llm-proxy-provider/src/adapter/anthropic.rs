@@ -170,6 +170,11 @@ pub struct AnthropicStreamDecoder {
     tool_blocks: Vec<usize>,
     tool_blocks_closed: Vec<bool>,
     stop_sent: bool,
+    saw_terminal: bool,
+    /// Input-side usage captured from `message_start`; `message_delta` usage
+    /// objects carry only the cumulative `output_tokens`, so the input count
+    /// must be merged in from here.
+    start_usage: Option<llm_proxy_protocol::anthropic::Usage>,
 }
 
 fn tool_field_or_sentinel(value: Option<&str>, field: &str, sentinel: &str) -> String {
@@ -302,13 +307,10 @@ impl AnthropicStreamDecoder {
 
     fn push_message_delta(&mut self, event: &MessageEvent, events: &mut Vec<CoreEvent>) {
         if let Some(ref usage) = event.usage {
+            // The documented message_delta usage carries only output_tokens;
+            // input-side counts come from message_start.
             events.push(CoreEvent::UsageDelta {
-                usage: build_anthropic_usage(
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cache_creation_input_tokens,
-                    usage.cache_read_input_tokens,
-                ),
+                usage: merge_delta_usage(self.start_usage.as_ref(), usage),
             });
         }
         if let Some(ref delta) = event.delta
@@ -317,6 +319,7 @@ impl AnthropicStreamDecoder {
             && !self.stop_sent
         {
             self.stop_sent = true;
+            self.saw_terminal = true;
             let stop_reason = map_anthropic_stop_reason(reason);
             let stop_sequence = delta.stop_sequence.clone();
             events.push(CoreEvent::MessageStop {
@@ -354,6 +357,9 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
                         .as_ref()
                         .filter(|m| !m.id.is_empty())
                         .map(|m| m.id.clone());
+                    if let Some(message) = event.message.as_ref() {
+                        self.start_usage = Some(message.usage.clone());
+                    }
                     events.push(CoreEvent::MessageStart {
                         id,
                         model: self.model_ref.clone(),
@@ -375,6 +381,7 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
             "message_stop" => {
                 if !self.stop_sent {
                     self.stop_sent = true;
+                    self.saw_terminal = true;
                     events.push(CoreEvent::MessageStop {
                         stop_reason: if !self.tool_blocks.is_empty() {
                             StopReason::ToolUse
@@ -428,6 +435,10 @@ impl ProviderStreamDecoder for AnthropicStreamDecoder {
         }
 
         Ok(events)
+    }
+
+    fn saw_terminal(&self) -> bool {
+        self.saw_terminal
     }
 }
 
@@ -570,12 +581,7 @@ impl AnthropicAdapter {
             .map(map_anthropic_stop_reason)
             .unwrap_or(StopReason::Unknown("absent".to_owned()));
 
-        let usage = build_anthropic_usage(
-            resp.usage.input_tokens,
-            resp.usage.output_tokens,
-            resp.usage.cache_creation_input_tokens,
-            resp.usage.cache_read_input_tokens,
-        );
+        let usage = build_anthropic_usage(&resp.usage);
 
         Ok(CoreResponse {
             id: if resp.id.is_empty() {
@@ -602,6 +608,8 @@ impl AnthropicAdapter {
             tool_blocks: Vec::new(),
             tool_blocks_closed: Vec::new(),
             stop_sent: false,
+            saw_terminal: false,
+            start_usage: None,
         }
     }
 }
@@ -617,12 +625,20 @@ fn map_anthropic_stop_reason(reason: &str) -> StopReason {
     }
 }
 
-fn build_anthropic_usage(
+/// Builds core usage from resolved Anthropic usage fields; the cache-creation
+/// total prefers the plain field and falls back to the 5m+1h split.
+fn core_usage_from_fields(
     input_tokens: i32,
     output_tokens: i32,
-    cache_creation: Option<i32>,
+    cache_creation_plain: Option<i32>,
+    cache_creation_split: Option<&llm_proxy_protocol::anthropic::CacheCreation>,
     cache_read: Option<i32>,
 ) -> llm_proxy_protocol::core::Usage {
+    let cache_creation = cache_creation_plain.or_else(|| {
+        cache_creation_split
+            .map(|split| split.total_input_tokens())
+            .filter(|total| *total != 0)
+    });
     llm_proxy_protocol::core::Usage {
         input_tokens,
         output_tokens,
@@ -633,23 +649,90 @@ fn build_anthropic_usage(
     }
 }
 
+/// Fills a `message_delta` usage object with the input-side counts captured
+/// at `message_start`. The documented delta usage carries only the cumulative
+/// `output_tokens`; every other field takes the `message_start` value unless
+/// the provider explicitly repeated it.
+fn merge_delta_usage(
+    start: Option<&llm_proxy_protocol::anthropic::Usage>,
+    delta: &llm_proxy_protocol::anthropic::Usage,
+) -> llm_proxy_protocol::core::Usage {
+    let Some(start) = start else {
+        return build_anthropic_usage(delta);
+    };
+    core_usage_from_fields(
+        if delta.input_tokens == 0 {
+            start.input_tokens
+        } else {
+            delta.input_tokens
+        },
+        if delta.output_tokens == 0 {
+            start.output_tokens
+        } else {
+            delta.output_tokens
+        },
+        delta
+            .cache_creation_input_tokens
+            .or(start.cache_creation_input_tokens),
+        delta
+            .cache_creation
+            .as_ref()
+            .or(start.cache_creation.as_ref()),
+        delta
+            .cache_read_input_tokens
+            .or(start.cache_read_input_tokens),
+    )
+}
+
+fn build_anthropic_usage(
+    usage: &llm_proxy_protocol::anthropic::Usage,
+) -> llm_proxy_protocol::core::Usage {
+    core_usage_from_fields(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_creation_input_tokens,
+        usage.cache_creation.as_ref(),
+        usage.cache_read_input_tokens,
+    )
+}
+
+/// Encodes a core cache-control directive into the Anthropic wire shape,
+/// including the `ttl` window.
+fn encode_cache_control_marker(
+    cache: &llm_proxy_protocol::core::CacheControl,
+) -> serde_json::Value {
+    let mut marker = serde_json::json!({"type": cache.r#type.as_str()});
+    if let Some(ttl) = &cache.ttl {
+        json_object(&mut marker).insert("ttl".to_owned(), serde_json::Value::String(ttl.clone()));
+    }
+    marker
+}
+
 fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = content
         .iter()
         .filter_map(|c| match c {
-            CoreContent::Text { text, .. } => {
+            CoreContent::Text { text, cache } => {
                 if text.is_empty() {
                     return None;
                 }
-                Some(serde_json::json!({
+                let mut block = serde_json::json!({
                     "type": "text",
                     "text": text,
-                }))
+                });
+                if let Some(cache) = cache {
+                    json_object(&mut block).insert(
+                        "cache_control".to_owned(),
+                        encode_cache_control_marker(cache),
+                    );
+                }
+                Some(block)
             }
             CoreContent::ToolResult {
                 tool_use_id,
                 content: result_content,
                 is_error,
+                cache,
             } => {
                 let result_text = result_content
                     .iter()
@@ -673,6 +756,12 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
                 });
                 if *is_error {
                     json_object(&mut block).insert("is_error".to_owned(), serde_json::json!(true));
+                }
+                if let Some(cache) = cache {
+                    json_object(&mut block).insert(
+                        "cache_control".to_owned(),
+                        encode_cache_control_marker(cache),
+                    );
                 }
                 Some(block)
             }
@@ -709,11 +798,8 @@ fn encode_system(system: &[CoreContent]) -> Option<serde_json::Value> {
                     "text": text,
                 });
                 if let Some(cc) = cache {
-                    let mut marker = serde_json::json!({"type": cc.r#type});
-                    if let Some(ttl) = &cc.ttl {
-                        json_object(&mut marker).insert("ttl".to_owned(), ttl.clone().into());
-                    }
-                    json_object(&mut block).insert("cache_control".to_owned(), marker);
+                    json_object(&mut block)
+                        .insert("cache_control".to_owned(), encode_cache_control_marker(cc));
                 }
                 Some(block)
             }
@@ -823,14 +909,21 @@ fn encode_assistant_content(content: &[CoreContent]) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = content
         .iter()
         .filter_map(|c| match c {
-            CoreContent::Text { text, .. } => {
+            CoreContent::Text { text, cache } => {
                 if text.is_empty() {
                     return None;
                 }
-                Some(serde_json::json!({
+                let mut block = serde_json::json!({
                     "type": "text",
                     "text": text,
-                }))
+                });
+                if let Some(cache) = cache {
+                    json_object(&mut block).insert(
+                        "cache_control".to_owned(),
+                        encode_cache_control_marker(cache),
+                    );
+                }
+                Some(block)
             }
             CoreContent::Thinking { text, signature } => {
                 if text.is_empty() {
@@ -971,6 +1064,110 @@ mod tests {
     #[test]
     fn sanitize_tool_use_id_empty_becomes_default() {
         assert_eq!(sanitize_tool_use_id(""), "tool_result");
+    }
+
+    #[test]
+    fn documented_message_delta_usage_and_stop_reason_survive() {
+        // Documented stream: message_start carries input usage, the final
+        // message_delta carries only cumulative output_tokens plus the stop
+        // reason. Both must reach core events.
+        let target = make_target();
+        let mut decoder = AnthropicAdapter::new().new_stream_decoder(&target);
+        let frames = [
+            SseFrame {
+                event: None,
+                id: None,
+                data: r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-20250514","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#.to_owned(),
+            },
+            SseFrame {
+                event: None,
+                id: None,
+                data: r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":15}}"#.to_owned(),
+            },
+        ];
+        let mut events = Vec::new();
+        for frame in &frames {
+            events.extend(decoder.decode_frame(frame).unwrap());
+        }
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UsageDelta { usage } => Some(usage.clone()),
+                _ => None,
+            })
+            .expect("usage from message_delta");
+        assert_eq!(usage.input_tokens, 25, "input comes from message_start");
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.cache_read_input_tokens, Some(7));
+        assert_eq!(usage.cache_creation_input_tokens, Some(3));
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::MessageStop { stop_reason, .. } => Some(stop_reason.clone()),
+                _ => None,
+            })
+            .expect("stop reason from message_delta");
+        assert_eq!(stop, StopReason::MaxTokens);
+    }
+
+    #[test]
+    fn anthropic_cache_creation_split_maps_to_total() {
+        let target = make_target();
+        let resp = AnthropicAdapter::new()
+            .decode_response(
+                br#"{"id":"msg_c","type":"message","role":"assistant","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2,"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":6}}}"#,
+                &target,
+            )
+            .unwrap();
+        assert_eq!(resp.usage.cache_creation_input_tokens, Some(10));
+    }
+
+    #[test]
+    fn message_level_and_tool_result_cache_markers_reach_upstream() {
+        let core = make_core_request(vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![
+                CoreContent::Text {
+                    text: "KEEP ME".into(),
+                    cache: None,
+                },
+                CoreContent::Text {
+                    text: "MUST NOT LOSE ITS MARKER".into(),
+                    cache: Some(llm_proxy_protocol::core::CacheControl {
+                        r#type: llm_proxy_protocol::core::CacheControlType::Ephemeral,
+                        ttl: Some("1h".to_owned()),
+                    }),
+                },
+                CoreContent::ToolResult {
+                    tool_use_id: "toolu_1".into(),
+                    content: vec![CoreContent::Text {
+                        text: "ok".into(),
+                        cache: None,
+                    }],
+                    is_error: false,
+                    cache: Some(llm_proxy_protocol::core::CacheControl {
+                        r#type: llm_proxy_protocol::core::CacheControlType::Ephemeral,
+                        ttl: None,
+                    }),
+                },
+            ],
+        }]);
+        let adapter = AnthropicAdapter::new();
+        let target = make_target();
+        let proxy_req = adapter.encode_request(&core, &target).unwrap();
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+            "message-level text markers must survive: {content:?}"
+        );
+        assert_eq!(
+            content[2]["cache_control"],
+            serde_json::json!({"type": "ephemeral"}),
+            "tool_result markers must survive: {content:?}"
+        );
     }
 
     #[test]
@@ -1686,6 +1883,7 @@ mod tests {
                     cache: None,
                 }],
                 is_error: false,
+                cache: None,
             }],
         }]);
         let adapter = AnthropicAdapter::new();
@@ -1713,6 +1911,7 @@ mod tests {
                     cache: None,
                 }],
                 is_error: true,
+                cache: None,
             }],
         }]);
         let adapter = AnthropicAdapter::new();

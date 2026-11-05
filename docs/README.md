@@ -9,7 +9,6 @@ Each plan is one stage of work, with its scope, steps and finish line.
 
 | # | Plan | Status | Depends on |
 |---|---|---|---|
-| 01 | [Bug fixes](plans/01-bug-fixes.md) | In progress | None |
 | 02 | [Request fidelity](plans/02-request-fidelity.md) | Not started | 01 |
 | 03 | [Engine and crate split](plans/03-engine.md) | Not started | 02 |
 | 04 | [Routing and failover](plans/04-routing-and-failover.md) | Not started | 03 |
@@ -66,4 +65,5 @@ Plan headers point to the [research audit](research/audit-2026-11-05/REPORT.md):
 
 ## Completed
 
+- [01. Bug fixes](completed/01-bug-fixes.md)
 - [Provider-scoped remodel](completed/remodel-proxy.md)

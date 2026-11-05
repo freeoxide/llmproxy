@@ -28,8 +28,9 @@ prompt caches from the proxy's own edits.
 6. **Mutation phases (conflict 5).** Run request edits in a fixed order. Nothing
    changes bytes before the last cache breakpoint without an explicit opt-in.
 7. **Prompt-cache hygiene (backlog 15).** Opt-in removal of volatile bytes and marker
-   injection, at the provider edge. This depends on the marker fix in plan 01 and
-   excludes fingerprinting.
+   injection, at the provider edge. This depends on the marker fix in
+   [plan 01](../completed/01-bug-fixes.md), which is done, and excludes
+   fingerprinting.
 
 ## Done when
 

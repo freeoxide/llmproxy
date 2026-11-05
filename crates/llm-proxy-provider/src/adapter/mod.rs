@@ -196,6 +196,12 @@ pub trait ProviderStreamDecoder: fmt::Debug + Send {
 
     /// Flush any remaining buffered state at stream end.
     fn finish(&mut self) -> Result<Vec<CoreEvent>, ProviderError>;
+
+    /// Whether the provider itself signalled the end of the response (a
+    /// finish reason, `message_stop`, or `response.completed`). `false` after
+    /// a stream the upstream cut off, whose synthetic terminal from
+    /// [`ProviderStreamDecoder::finish`] must be reported as a failure.
+    fn saw_terminal(&self) -> bool;
 }
 
 /// Owned, stack-resident stream decoder covering the closed 4-adapter set;
@@ -228,6 +234,15 @@ impl ProviderStreamDecoder for ProviderStreamDecoderKind {
             Self::Anthropic(d) => d.finish(),
             Self::Responses(d) => d.finish(),
             Self::Gemini(d) => d.finish(),
+        }
+    }
+
+    fn saw_terminal(&self) -> bool {
+        match self {
+            Self::OpenAiChat(d) => d.saw_terminal(),
+            Self::Anthropic(d) => d.saw_terminal(),
+            Self::Responses(d) => d.saw_terminal(),
+            Self::Gemini(d) => d.saw_terminal(),
         }
     }
 }
@@ -344,23 +359,33 @@ pub(crate) fn map_gemini_finish_reason(reason: &str) -> StopReason {
     }
 }
 
-pub(crate) fn build_usage_from_openai(
-    prompt_tokens: i32,
-    completion_tokens: i32,
-    cache_hit: Option<i32>,
-    cache_miss: Option<i32>,
-) -> Usage {
-    let cache_hit_i64 = cache_hit.unwrap_or(0) as i64;
-    let cache_miss_i64 = cache_miss.unwrap_or(0) as i64;
-    let input = (prompt_tokens as i64) - cache_hit_i64 - cache_miss_i64;
+/// Builds core usage from the OpenAI/DeepSeek chat usage shape.
+///
+/// `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` are DeepSeek fields
+/// where `prompt_tokens = hit + miss`: hit tokens map to cache reads and the
+/// miss tokens stay plain input — they are **not** cache creation. OpenAI's
+/// own `prompt_tokens_details.cached_tokens` maps to cache reads the same way.
+pub(crate) fn build_usage_from_openai(usage: &llm_proxy_protocol::openai::UsageInfo) -> Usage {
+    let cache_read = usage.prompt_cache_hit_tokens.or_else(|| {
+        usage
+            .prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+    });
+    let cache_read_i64 = cache_read.unwrap_or(0) as i64;
+    let input = (usage.prompt_tokens as i64) - cache_read_i64;
     let input_tokens = i32::try_from(input.max(0)).unwrap_or(i32::MAX);
+    let reasoning_tokens = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|d| d.reasoning_tokens);
 
     Usage {
         input_tokens,
-        output_tokens: completion_tokens,
-        reasoning_tokens: None,
-        cache_creation_input_tokens: cache_miss,
-        cache_read_input_tokens: cache_hit,
+        output_tokens: usage.completion_tokens,
+        reasoning_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: cache_read,
         provenance: UsageProvenance::ProviderReported,
     }
 }
@@ -663,25 +688,91 @@ mod tests {
 
     #[test]
     fn usage_from_openai_basic() {
-        let usage = build_usage_from_openai(100, 50, Some(10), Some(20));
-        assert_eq!(usage.input_tokens, 70);
+        let usage = build_usage_from_openai(&llm_proxy_protocol::openai::UsageInfo {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_cache_hit_tokens: Some(10),
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        assert_eq!(usage.input_tokens, 90);
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.cache_read_input_tokens, Some(10));
-        assert_eq!(usage.cache_creation_input_tokens, Some(20));
+        assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.provenance, UsageProvenance::ProviderReported);
     }
 
     #[test]
     fn usage_from_openai_no_cache() {
-        let usage = build_usage_from_openai(100, 50, None, None);
+        let usage = build_usage_from_openai(&llm_proxy_protocol::openai::UsageInfo {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
     }
 
     #[test]
     fn usage_from_openai_clamps_to_zero() {
-        let usage = build_usage_from_openai(5, 10, Some(80), Some(20));
+        let usage = build_usage_from_openai(&llm_proxy_protocol::openai::UsageInfo {
+            prompt_tokens: 5,
+            completion_tokens: 10,
+            total_tokens: 15,
+            prompt_cache_hit_tokens: Some(80),
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
         assert_eq!(usage.input_tokens, 0);
+    }
+
+    #[test]
+    fn deepseek_miss_tokens_stay_plain_input_not_cache_creation() {
+        // DeepSeek reports prompt_tokens = cache_hit + cache_miss; the miss
+        // tokens are uncached input, not tokens written to a cache.
+        let usage = build_usage_from_openai(&llm_proxy_protocol::openai::UsageInfo {
+            prompt_tokens: 100,
+            completion_tokens: 5,
+            total_tokens: 105,
+            prompt_cache_hit_tokens: Some(30),
+            prompt_cache_miss_tokens: Some(70),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(
+            usage.cache_creation_input_tokens, None,
+            "DeepSeek miss tokens must not be booked as cache creation"
+        );
+    }
+
+    #[test]
+    fn openai_cached_tokens_details_map_to_cache_read() {
+        let usage = build_usage_from_openai(&llm_proxy_protocol::openai::UsageInfo {
+            prompt_tokens: 100,
+            completion_tokens: 5,
+            total_tokens: 105,
+            prompt_cache_hit_tokens: None,
+            prompt_cache_miss_tokens: None,
+            prompt_tokens_details: Some(llm_proxy_protocol::openai::PromptTokensDetails {
+                cached_tokens: Some(30),
+            }),
+            completion_tokens_details: Some(llm_proxy_protocol::openai::CompletionTokensDetails {
+                reasoning_tokens: Some(2),
+            }),
+        });
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.cache_read_input_tokens, Some(30));
+        assert_eq!(usage.reasoning_tokens, Some(2));
+        assert_eq!(usage.output_tokens, 5);
     }
 
     #[test]

@@ -699,6 +699,17 @@ pub(crate) async fn handle_core_once(
     Ok(response)
 }
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
+/// Client-facing message when the upstream ends a stream without a terminal
+/// event; deliberately generic (no upstream body) since it is sent in-band.
+const TRUNCATED_STREAM_MESSAGE: &str = "upstream stream ended before the response completed";
+
+/// The sanitized message of a `CoreEvent::Error`, for in-band re-emission.
+fn core_event_message(event: &CoreEvent) -> &str {
+    match event {
+        CoreEvent::Error { error } => error.message(),
+        _ => "",
+    }
+}
 enum FirstByteResult {
     FirstEvent(Event),
     PreStreamError(RouteError),
@@ -972,13 +983,23 @@ impl StreamContext {
             false
         }
     }
+    /// The model ref recorded on ledger rows: the requested model plus the
+    /// upstream model actually serving it, so alias rows stay attributable.
+    fn ledger_model(&self) -> ModelRef {
+        let mut model = self.core.model.clone();
+        if model.upstream.is_none() && self.stream_metrics.upstream_model != model.requested {
+            model.upstream = Some(self.stream_metrics.upstream_model.clone());
+        }
+        model
+    }
+
     fn emit_client_cancelled(&self) {
         self.event_bus
             .emit(&ProxyEvent::ResponseFailed(ResponseFailed {
                 request_id: self.request_id.clone(),
                 timestamp: time::OffsetDateTime::now_utc(),
                 provider: Some(self.stream_metrics.provider_name.clone()),
-                model: Some(self.core.model.clone()),
+                model: Some(self.ledger_model()),
                 error_kind: "ClientCancelled".to_owned(),
                 message: "client disconnected before the stream completed".to_owned(),
                 http_status: StatusCode::OK.as_u16(),
@@ -1099,14 +1120,19 @@ fn build_sse_output_stream(
         let mut ctx = ctx;
         let mut stream_succeeded = false;
         let mut stream_errored = false;
+        let mut stream_failed = false;
         let mut pending: Vec<CoreEvent> = Vec::new();
         'buffer: loop {
             tokio::select! {
                 _ = cancel_clone.cancelled() => {
                     ctx.stream_metrics.metrics.record_client_cancel();
-                    ctx.send_pre_stream_error(
+                    if !ctx.send_pre_stream_error(
                         RouteError::Internal("client disconnected before first byte".to_owned()),
-                    );
+                    ) {
+                        // The caller is gone, so nobody else will settle the
+                        // RequestReceived row; write it here.
+                        ctx.emit_client_cancelled();
+                    }
                     return;
                 }
                 chunk = stream.next() => match chunk {
@@ -1183,9 +1209,16 @@ fn build_sse_output_stream(
                 None
             };
             let client_events = encode_core_event(&mut encoder, core_event);
-            if client_events.is_empty()
-                && let Some(stream_error) = leading_openai_error
-            {
+            for event in client_events {
+                if !ctx.emit_event(event, &tx).await {
+                    return;
+                }
+            }
+            if let Some(stream_error) = leading_openai_error {
+                // A leading error crosses the first-byte boundary as a bare
+                // error-object data line (the chunk schema cannot carry it);
+                // any buffered finish chunk was flushed into client_events
+                // above, so it precedes the error and [DONE].
                 let Some(json_str) = openai_chat::stream_error_sse_payload(&stream_error) else {
                     continue;
                 };
@@ -1210,11 +1243,6 @@ fn build_sse_output_stream(
                 );
                 continue;
             }
-            for event in client_events {
-                if !ctx.emit_event(event, &tx).await {
-                    return;
-                }
-            }
         }
         if !stream_errored {
         'outer: loop {
@@ -1222,9 +1250,11 @@ fn build_sse_output_stream(
                 _ = cancel_clone.cancelled() => {
                     ctx.stream_metrics.metrics.record_client_cancel();
                     if !ctx.first_byte_sent {
-                        ctx.send_pre_stream_error(
-                            RouteError::Internal("client disconnected before first byte".to_owned()),
-                        );
+                        if !ctx.send_pre_stream_error(RouteError::Internal(
+                            "client disconnected before first byte".to_owned(),
+                        )) {
+                            ctx.emit_client_cancelled();
+                        }
                     } else {
                         ctx.emit_client_cancelled();
                     }
@@ -1316,6 +1346,34 @@ fn build_sse_output_stream(
 
                                 for core_event in core_events {
                                     capture_lifecycle(&mut ctx, &core_event);
+                                    if matches!(core_event, CoreEvent::Error { .. }) {
+                                        // In-band upstream failure after visible
+                                        // output: mark it for the client and the
+                                        // ledger, then keep the framing valid.
+                                        stream_failed = true;
+                                        ctx.stream_metrics.metrics.record_failure();
+                                        emit_response_failed(
+                                            &ctx.event_bus,
+                                            &ctx.request_id,
+                                            Some(ctx.stream_metrics.provider_name.as_str()),
+                                            Some(&ctx.ledger_model()),
+                                            &RouteError::ProviderDecode(
+                                                PROVIDER_DECODE_CLIENT_MESSAGE.to_owned(),
+                                            ),
+                                            ctx.stream_metrics.start,
+                                        );
+                                        if !emit_unterminal_error(
+                                            &mut ctx,
+                                            &mut encoder,
+                                            &tx,
+                                            core_event_message(&core_event),
+                                        )
+                                        .await
+                                        {
+                                            return;
+                                        }
+                                        continue;
+                                    }
                                     let client_events = encode_core_event(
                                         &mut encoder,
                                         core_event,
@@ -1373,6 +1431,31 @@ fn build_sse_output_stream(
             if !finalize_sse_framer(&mut ctx, &mut encoder, &tx).await {
                 return;
             }
+            if !ctx.provider_decoder.saw_terminal() {
+                // The upstream ended without a terminal event. Keep valid
+                // client framing (synthetic terminal below) but mark the
+                // failure in-band and in the ledger.
+                stream_failed = true;
+                ctx.stream_metrics.metrics.record_failure();
+                emit_response_failed(
+                    &ctx.event_bus,
+                    &ctx.request_id,
+                    Some(ctx.stream_metrics.provider_name.as_str()),
+                    Some(&ctx.ledger_model()),
+                    &RouteError::ProviderDecode(TRUNCATED_STREAM_MESSAGE.to_owned()),
+                    ctx.stream_metrics.start,
+                );
+                if !emit_unterminal_error(
+                    &mut ctx,
+                    &mut encoder,
+                    &tx,
+                    TRUNCATED_STREAM_MESSAGE,
+                )
+                .await
+                {
+                    return;
+                }
+            }
             match ctx.provider_decoder.finish() {
                 Ok(final_events) => {
                     if !emit_finalization_events(&mut ctx, &mut encoder, &tx, final_events).await {
@@ -1392,7 +1475,9 @@ fn build_sse_output_stream(
                     if !emit_encoder_finish(&mut ctx, &tx, final_encoded_events).await {
                         return;
                     }
-                    stream_succeeded = true;
+                    if !stream_failed {
+                        stream_succeeded = true;
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -1425,7 +1510,7 @@ fn build_sse_output_stream(
                     timestamp: time::OffsetDateTime::now_utc(),
                     provider: ctx.stream_metrics.provider_name.clone(),
                     upstream_message_id: ctx.upstream_message_id.clone(),
-                    model: ctx.core.model.clone(),
+                    model: ctx.ledger_model(),
                     usage,
                     cost,
                     stop_reason: ctx.stop_reason.clone().unwrap_or(StopReason::EndTurn),
@@ -1511,6 +1596,39 @@ fn encode_core_event(client_encoder: &mut ClientStreamEncoder, event: CoreEvent)
         }
     }
 }
+/// Emits an in-band error event without finishing the encoder and without
+/// a trailing `[DONE]`: used when the upstream cut the stream, so the
+/// synthetic terminal (and `[DONE]`) still follow and the client framing
+/// stays valid while the failure is marked. When a terminal is already
+/// buffered in the encoder, it is flushed ahead of the error event (and the
+/// encoder finishes itself), so no synthetic terminal follows.
+async fn emit_unterminal_error(
+    ctx: &mut StreamContext,
+    encoder: &mut ClientStreamEncoder,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+    message: &str,
+) -> bool {
+    use llm_proxy_protocol::core::{CoreStreamError, CoreStreamErrorKind};
+
+    let error = CoreStreamError::new(CoreStreamErrorKind::Upstream, message.to_owned());
+    match ctx.client_protocol {
+        ClientProtocol::OpenAiChat => {
+            let Some(json) = openai_chat::stream_error_sse_payload(&error) else {
+                return true;
+            };
+            ctx.emit_event(Event::default().data(json), tx).await
+        }
+        ClientProtocol::Anthropic => {
+            for event in encode_core_event(encoder, CoreEvent::Error { error }) {
+                if !ctx.emit_event(event, tx).await {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+}
+
 async fn emit_stream_error(
     client_encoder: &mut ClientStreamEncoder,
     tx: &tokio::sync::mpsc::Sender<Event>,
@@ -1523,24 +1641,25 @@ async fn emit_stream_error(
         error: CoreStreamError::new(CoreStreamErrorKind::Upstream, message.to_owned()),
     };
 
-    let events = encode_core_event(client_encoder, error_event);
-    if events.is_empty() && matches!(client_protocol, ClientProtocol::OpenAiChat) {
+    // With a terminal buffered, the encoders flush it ahead of the error so
+    // the client keeps the finish framing it is owed (an Anthropic client
+    // gets the terminal pair plus the error event here).
+    for event in encode_core_event(client_encoder, error_event) {
+        if tx.send(event).await.is_err() {
+            return;
+        }
+    }
+    if matches!(client_protocol, ClientProtocol::OpenAiChat) {
+        // The chunk schema cannot carry the error itself; the failure crosses
+        // the wire as a bare error-object data line followed by [DONE].
         if let Some(json_str) = openai_stream_error_json_with_type(message, "server_error")
             && tx.send(Event::default().data(json_str)).await.is_err()
         {
             return;
         }
-    } else {
-        for event in events {
-            if tx.send(event).await.is_err() {
-                return;
-            }
+        if tx.send(openai_done_event()).await.is_err() {
+            return;
         }
-    }
-    if matches!(client_protocol, ClientProtocol::OpenAiChat)
-        && tx.send(openai_done_event()).await.is_err()
-    {
-        return;
     }
     client_encoder.mark_finished();
 }

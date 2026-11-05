@@ -652,7 +652,9 @@ mod tests {
         assert_eq!(upstream_json["top_p"], 0.9);
         assert!(upstream_json["tools"].is_array(), "tools must be preserved");
         assert_eq!(upstream_json["tools"][0]["function"]["name"], "get_weather");
-        assert_eq!(upstream_json["tool_choice"]["type"], "auto");
+        // The Chat Completions API documents the generic tool_choice modes
+        // as plain strings; only a named function uses the object form.
+        assert_eq!(upstream_json["tool_choice"], "auto");
         assert_eq!(upstream_json["reasoning_effort"], "high");
         assert_eq!(upstream_json["user"], "test-user-123");
         assert_eq!(upstream_json["thinking"]["type"], "enabled");
