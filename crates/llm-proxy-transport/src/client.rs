@@ -1293,6 +1293,69 @@ mod tests {
         }
     }
 
+    /// An upstream that accepts the request, then delays its response headers:
+    /// separates a first-byte deadline that must fire from one that must not.
+    async fn slow_headers_handler() -> axum::response::Response {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (StatusCode::OK, "late").into_response()
+    }
+
+    fn timed_out_request(base: &str) -> ProxyRequest {
+        ProxyRequest {
+            url: format!("{base}/test"),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: SecretString::from("key"),
+            },
+            body: vec![],
+            stream: false,
+            extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
+        }
+    }
+
+    /// BUG-14 / backlog 8 regression: the first-byte deadline comes from
+    /// `[server.upstream_timeouts]` via `try_with_timeouts`, not the fixed
+    /// 60-second constant — a client built with a sub-second first-byte
+    /// budget must fail against an upstream that answers late, while one with
+    /// a generous budget gets the same upstream's answer.
+    #[tokio::test]
+    async fn a_configured_first_byte_deadline_governs_the_send() {
+        let app = Router::new().route("/test", post(slow_headers_handler));
+        let base = start_test_server(app).await;
+
+        let tight = llm_proxy_core::UpstreamTimeoutsConfig {
+            connect: Duration::from_secs(5),
+            first_byte: Duration::from_millis(80),
+            idle: Duration::from_secs(5),
+            total: None,
+        };
+        let client = ProxyClient::try_with_timeouts(&tight)
+            .expect("client with a tight first-byte budget builds");
+        let error = client
+            .send(timed_out_request(&base))
+            .await
+            .expect_err("the configured first-byte deadline must fire");
+        assert!(
+            error.is_timeout(),
+            "a late answer under a tight first-byte budget is a timeout, got {error:?}"
+        );
+
+        let generous = llm_proxy_core::UpstreamTimeoutsConfig {
+            connect: Duration::from_secs(5),
+            first_byte: Duration::from_secs(10),
+            idle: Duration::from_secs(5),
+            total: None,
+        };
+        let client = ProxyClient::try_with_timeouts(&generous)
+            .expect("client with a generous first-byte budget builds");
+        let body = client
+            .send(timed_out_request(&base))
+            .await
+            .expect("the same late answer arrives under a generous budget");
+        assert_eq!(body, bytes::Bytes::from_static(b"late"));
+    }
+
     async fn partial_disconnect_handler() -> axum::response::Response {
         let stream = futures::stream::unfold(0u32, |i| async move {
             if i >= 2 {

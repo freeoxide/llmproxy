@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::classification::{ErrorClass, classify, next_wait};
-use crate::error::{EngineError, map_provider_error, sanitize_upstream_error_body};
+use crate::error::{AuthOwner, EngineError, map_provider_error, sanitize_upstream_error_body};
 use crate::headers::select_forwarded_headers;
 use crate::traits::{
     AdmissionOutcome, AdmissionTicket, CacheEntry, CacheKey, CredentialFeedback, CredentialPick,
@@ -267,6 +267,9 @@ async fn resolve_attempt(
         .get(&configured.provider_name)
         .is_some_and(|p| p.passthrough_auth);
     let keys = credential_pool(inner, &configured.provider_name);
+    let cooling = inner
+        .health
+        .cooling_credentials(&configured.provider_name, Instant::now());
     let pick: CredentialPick = inner
         .credentials
         .pick(&CredentialQuery {
@@ -275,6 +278,7 @@ async fn resolve_attempt(
             passthrough,
             inbound,
             avoid: avoid_credential,
+            cooling: &cooling,
         })
         .await?;
 
@@ -471,15 +475,19 @@ fn class_for_ladder(inner: &EngineInner, member: &str, error: &EngineError) -> E
     }
 }
 
-/// Updates passive health (plan 04 step 9): a 429 with real reset advice
-/// cools the member until the reported reset; any other transient failure
-/// cools it for the ladder's configured cooldown.
+/// Updates passive health (plan 04 step 9): a throttle with real reset
+/// advice cools until the reported reset; any other transient failure cools
+/// for the ladder's configured cooldown. A failure that belongs to one
+/// operator key cools that key, and the member only while it has no other
+/// key to serve with; a failure deterministic for this request (a
+/// client-side 4xx, the client's own passthrough token being rejected)
+/// cools nothing — see [`member_cooldown_applies`].
 fn apply_cooldowns(
     inner: &EngineInner,
+    ladder: &Ladder,
     provider: &str,
     error: &EngineError,
-    cooldown: Duration,
-    credential_id: Option<&str>,
+    class: &ErrorClass,
     feedback: CredentialFeedback,
 ) {
     let now = Instant::now();
@@ -487,15 +495,71 @@ fn apply_cooldowns(
         EngineError::Upstream { retry_after, .. } => *retry_after,
         _ => None,
     };
-    let provider_until = now + advised.unwrap_or(cooldown);
-    inner.health.cooldown_provider(provider, provider_until);
+    let until = now + advised.unwrap_or(ladder.plan.retry.cooldown);
+    let credential_id = ladder.current_credential.as_deref();
     if feedback == CredentialFeedback::Rejected
         && let Some(id) = credential_id
     {
-        inner
-            .health
-            .cooldown_credential(provider, id, provider_until);
+        inner.health.cooldown_credential(provider, id, until);
     }
+    if member_cooldown_applies(
+        class,
+        error,
+        feedback,
+        another_key_available(inner, provider, credential_id, now),
+    ) {
+        inner.health.cooldown_provider(provider, until);
+    }
+}
+
+/// Whether a failed attempt should cool the member itself. An upstream
+/// fault (5xx, timeout, connect, throttle without key attribution) says the
+/// member is unhealthy; a rejected operator credential says only that key
+/// is; a client fault says nothing about the member — one client's
+/// malformed request must not demote the member for everyone else.
+fn member_cooldown_applies(
+    class: &ErrorClass,
+    error: &EngineError,
+    feedback: CredentialFeedback,
+    another_key_available: bool,
+) -> bool {
+    if operator_credential_rejected(error, feedback) {
+        return !another_key_available;
+    }
+    matches!(class, ErrorClass::Transient { .. })
+}
+
+/// A failure that belongs to the operator's credential rather than to the
+/// member or the client: an auth rejection or an advised throttle on a key
+/// the operator configured. Never a passthrough client token — rejecting
+/// that is between the upstream and the client.
+fn operator_credential_rejected(error: &EngineError, feedback: CredentialFeedback) -> bool {
+    feedback == CredentialFeedback::Rejected
+        && matches!(
+            error,
+            EngineError::Upstream {
+                status: 401 | 403 | 429,
+                auth_owner: AuthOwner::Operator,
+                ..
+            }
+        )
+}
+
+/// Whether the member has a key other than the one this failure rejected
+/// that is not itself cooling (so the member can still serve). A pick that
+/// recorded no credential id had no pool to rotate — nothing else to try.
+/// Reads the store after the rejected key's cooldown was written, so that
+/// key counts as unavailable.
+fn another_key_available(
+    inner: &EngineInner,
+    provider: &str,
+    rejected_credential: Option<&str>,
+    now: Instant,
+) -> bool {
+    if rejected_credential.is_none() {
+        return false;
+    }
+    credential_pool(inner, provider).len() > inner.health.cooling_credentials(provider, now).len()
 }
 
 /// Whether the RetryExhausted wrap applies: only when the route had a real
@@ -563,22 +627,16 @@ async fn record_attempt_failure(
             latency: attempt_start.elapsed(),
         },
     );
-    apply_cooldowns(
-        inner,
-        member,
-        error,
-        ladder.plan.retry.cooldown,
-        ladder.current_credential.as_deref(),
-        feedback,
-    );
+    apply_cooldowns(inner, ladder, member, error, &class, feedback);
     inner
         .credentials
         .feedback(member, ladder.current_credential.as_deref(), feedback);
 }
 
 /// Refuses the failover when the route's affinity policy says so (conflict
-/// 6): a session pinned to one member may not silently land on another with
-/// state it cannot honour.
+/// 6): a session pinned to one member may not land on another with state it
+/// cannot honour — not after a failed first attempt, and not because the
+/// pinned member was cooling down when the ladder ordered its candidates.
 fn refuse_switch(inner: &EngineInner, ladder: &Ladder, member: &str) -> Result<(), EngineError> {
     if ladder.plan.affinity.on_conflict != AffinityConflictPolicy::Refuse {
         return Ok(());
@@ -589,7 +647,7 @@ fn refuse_switch(inner: &EngineInner, ladder: &Ladder, member: &str) -> Result<(
     let Some(pinned) = inner.affinity.pinned_provider(session) else {
         return Ok(());
     };
-    if pinned != member && ladder.first_member.is_some() {
+    if pinned != member {
         return Err(EngineError::AffinityRefused {
             pinned,
             session: session.clone(),
@@ -761,7 +819,6 @@ async fn run_ladder_once(
         plan,
     };
     let mut last_error: Option<EngineError> = None;
-    let mut avoid_credential: Option<String> = None;
     let order = ladder.order.clone();
 
     'ladder: for &member_index in &order {
@@ -775,6 +832,10 @@ async fn run_ladder_once(
         if ladder.first_member.is_none() {
             ladder.first_member = Some(member.clone());
         }
+        // Pool credential ids are positional (`key-<i>`): an id that failed
+        // against the previous member names a different secret here, so the
+        // avoid hint lives and dies with one member's attempts.
+        let mut avoid_credential: Option<String> = None;
 
         for attempt_in_member in 0..ladder.attempts_per_member() {
             if ladder.deadline_passed() {
@@ -903,7 +964,11 @@ async fn run_ladder_once(
             };
             inner.cache.store(cache_key, &entry).await;
 
-            if let Some(session) = &ladder.session_id {
+            // Pinning is the pool's opt-in (`affinity.sticky`); a direct
+            // route or a non-sticky pool leaves the session's pin alone.
+            if ladder.plan.affinity.sticky
+                && let Some(session) = &ladder.session_id
+            {
                 inner.affinity.pin(session, &member);
             }
             inner.credentials.feedback(
@@ -1316,6 +1381,9 @@ fn build_core_event_stream(
     let supervise_route = req.provider_name.clone();
     let supervise_model = req.core.model.clone();
     let supervise_start = req.start;
+    // The task settles its reservation on every path it completes; the
+    // supervisor keeps its own handle for the paths it does not.
+    let supervise_ticket = ticket.clone();
     let stream_span = tracing::info_span!("stream_task", request_id = %supervise_request_id);
 
     let task_inner = Arc::clone(&inner);
@@ -1358,7 +1426,6 @@ fn build_core_event_stream(
         .instrument(stream_span),
     );
 
-    let _ = failure_recorded;
     tokio::spawn(async move {
         match stream_task.await {
             Ok(()) => {}
@@ -1389,6 +1456,10 @@ fn build_core_event_stream(
                         supervise_start,
                     );
                 }
+                // The row above is deduplicated with the caller's first-byte
+                // error path; the reservation is not — only the task settles
+                // it, and it never reached that point.
+                settle(&inner, &supervise_ticket, false, None);
             }
         }
     });
@@ -1440,7 +1511,10 @@ async fn commit_and_stream(
     for core_event in head.iter() {
         capture_lifecycle(&mut committed.ctx, core_event);
     }
-    if let Some(session) = &ladder.session_id {
+    // Same opt-in as the non-streaming path: only sticky pools pin.
+    if ladder.plan.affinity.sticky
+        && let Some(session) = &ladder.session_id
+    {
         inner.affinity.pin(session, &member);
     }
     emit_attempt(
@@ -1518,6 +1592,12 @@ async fn stream_attempt(
     if stream.ladder.first_member.is_none() {
         stream.ladder.first_member = Some(member.clone());
     }
+    // Same boundary rule as the non-streaming ladder: `current_credential`
+    // doubles as the avoid hint, and a positional id from another member
+    // must not skip this member's key at the same index. It is re-set right
+    // after each pick, so record rows for this member's attempts are
+    // unaffected.
+    stream.ladder.current_credential = None;
 
     for attempt_in_member in 0..stream.ladder.attempts_per_member() {
         if stream.ladder.deadline_passed() {
@@ -2127,5 +2207,87 @@ async fn stream_committed(
     } else {
         record_stream_success(inner, ctx);
         settle(inner, &ctx.ticket, true, ctx.pending_usage.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upstream(status: u16, retry_after: Option<Duration>, auth_owner: AuthOwner) -> EngineError {
+        EngineError::Upstream {
+            status,
+            body: String::new(),
+            auth_owner,
+            retry_after,
+        }
+    }
+
+    /// The decision as the attempt loop makes it: classification and
+    /// credential feedback derived from the error itself.
+    fn cools_member(error: &EngineError, another_key_available: bool) -> bool {
+        let class = classify(error);
+        let feedback = credential_feedback(&class, error);
+        member_cooldown_applies(&class, error, feedback, another_key_available)
+    }
+
+    #[test]
+    fn client_faults_never_cool_the_member() {
+        for status in [400, 404, 413, 422] {
+            assert!(
+                !cools_member(&upstream(status, None, AuthOwner::Operator), false),
+                "a {status} is deterministic for this request, not a verdict on the member"
+            );
+        }
+        assert!(
+            !cools_member(&upstream(401, None, AuthOwner::Client), false),
+            "a rejected passthrough token is the client's to fix"
+        );
+    }
+
+    #[test]
+    fn upstream_faults_cool_the_member() {
+        assert!(cools_member(
+            &upstream(500, None, AuthOwner::Operator),
+            true
+        ));
+        assert!(cools_member(
+            &EngineError::UpstreamTimeout("first byte".to_owned()),
+            true
+        ));
+        assert!(
+            cools_member(&upstream(429, None, AuthOwner::Operator), true),
+            "a throttle without reset advice is not attributed to one key"
+        );
+        assert!(
+            cools_member(
+                &upstream(503, Some(Duration::from_secs(5)), AuthOwner::Operator),
+                true
+            ),
+            "a 5xx with Retry-After is still the member's fault"
+        );
+        assert!(
+            cools_member(
+                &upstream(429, Some(Duration::from_secs(5)), AuthOwner::Client),
+                true
+            ),
+            "a throttled passthrough token cannot be pinned on one operator key"
+        );
+    }
+
+    #[test]
+    fn a_rejected_operator_key_cools_the_member_only_when_no_other_key_can_serve() {
+        let rejected = upstream(401, None, AuthOwner::Operator);
+        let throttled = upstream(429, Some(Duration::from_secs(30)), AuthOwner::Operator);
+        for error in [&rejected, &throttled] {
+            assert!(
+                !cools_member(error, true),
+                "with a spare key the member keeps serving: {error:?}"
+            );
+            assert!(
+                cools_member(error, false),
+                "with no spare key the member cannot serve: {error:?}"
+            );
+        }
     }
 }

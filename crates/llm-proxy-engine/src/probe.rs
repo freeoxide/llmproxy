@@ -45,9 +45,9 @@ pub(crate) fn spawn_pool_probes(inner: &Arc<EngineInner>) {
 }
 
 /// Probes every cooled-down member of one pool: a successful synthetic
-/// request clears the member's cooldown; a failure extends it by the
-/// member's configured cooldown (the probe's own view of the failure, not
-/// the ladder's).
+/// request clears the member's cooldown; a failure leaves the existing
+/// cooldown standing, to expire at its advertised reset (the probe never
+/// lengthens a cooldown — only real traffic through the ladder does).
 async fn probe_members(inner: &Arc<EngineInner>, pool_name: &str, members: &[String]) {
     for member in members {
         if inner
@@ -104,6 +104,9 @@ async fn probe_member(inner: &Arc<EngineInner>, member: &str) -> Result<(), Engi
         ))
     })?;
     let keys = probe_credential_pool(inner, member);
+    let cooling = inner
+        .health
+        .cooling_credentials(member, std::time::Instant::now());
     let credential = inner
         .credentials
         .pick(&crate::traits::CredentialQuery {
@@ -112,6 +115,7 @@ async fn probe_member(inner: &Arc<EngineInner>, member: &str) -> Result<(), Engi
             passthrough: false,
             inbound: None,
             avoid: None,
+            cooling: &cooling,
         })
         .await?;
 

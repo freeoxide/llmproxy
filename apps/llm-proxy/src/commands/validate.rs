@@ -61,6 +61,18 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     llm_proxy_core::validate_passthrough_auth_combination(&app_config.auth, &providers)
         .with_context(|| "validating auth against provider passthrough configuration")?;
 
+    let bare_problems =
+        llm_proxy_core::bare_v1_target_problems(&app_config.server.bare_v1, |name| {
+            registry.contains_route(name)
+        });
+    if !bare_problems.is_empty() {
+        bail!(
+            "[server.bare_v1] has {} target error(s): {}",
+            bare_problems.len(),
+            bare_problems.join("; ")
+        );
+    }
+
     println!();
     println!("=== Providers ({} loaded) ===", registry.len());
     if registry.is_empty() {
@@ -169,5 +181,35 @@ mod tests {
 
         let result = cmd_validate(Some(&config));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cmd_validate_rejects_a_bare_v1_target_naming_no_provider_or_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+
+[server.bare_v1]
+enabled = true
+[server.bare_v1.models]
+"claude-sonnet-4-6" = "ghost-pool"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let err = result.expect_err("a bare /v1 model mapping to an unknown target is invalid");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("bare_v1") && message.contains("ghost-pool"),
+            "the validate error names the section and the unknown target: {message}"
+        );
     }
 }

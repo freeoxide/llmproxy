@@ -145,6 +145,11 @@ pub fn rate_limit_reset(headers: &[(String, String)]) -> Option<Duration> {
     best
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
+              error caught the moment this static is first used, not a runtime input"
+)]
 static DURATION_PAIR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)").expect("valid duration regex")
 });
@@ -181,7 +186,7 @@ pub fn parse_duration_suffix(value: &str) -> Option<Duration> {
         };
         total_ns += number * mult;
         progressed = true;
-        rest = &rest[whole_end..];
+        rest = rest.get(whole_end..)?;
     }
     if !progressed {
         return None;
@@ -318,6 +323,11 @@ mod tests {
         );
         assert_eq!(parse_duration_suffix("2ms"), Some(Duration::from_millis(2)));
         assert_eq!(parse_duration_suffix("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(
+            parse_duration_suffix("1ms2µs"),
+            Some(Duration::from_micros(1002)),
+            "a compound value continues past the multi-byte µs unit"
+        );
         let frac = parse_duration_suffix("0.403s").unwrap_or(Duration::ZERO);
         assert!(
             (frac.as_millis() as i64 - 403).abs() <= 1,

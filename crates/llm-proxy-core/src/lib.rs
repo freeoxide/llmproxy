@@ -35,9 +35,10 @@ pub use provider_config::{
     PoolFile, ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig,
     ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderEgressConfig, ProviderFile,
     ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig, StaticModelCatalogEntry,
-    StorageConfig, UpstreamTimeoutsConfig, family_max_body_bytes, family_request_timeout,
-    load_app_config, load_provider_config, validate_passthrough_auth_combination,
-    validate_pool_config, validate_provider_config, validate_upstream_timeouts,
+    StorageConfig, UpstreamTimeoutsConfig, bare_v1_target_problems, family_max_body_bytes,
+    family_request_timeout, load_app_config, load_provider_config,
+    validate_passthrough_auth_combination, validate_pool_config, validate_provider_config,
+    validate_upstream_timeouts,
 };
 pub use provider_registry::{
     ProviderAdapterTargetConfig, ProviderRegistry, ProviderRouteResolutionError,

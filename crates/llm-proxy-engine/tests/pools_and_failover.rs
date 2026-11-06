@@ -176,6 +176,15 @@ fn upstream_key_check(
     expected_key: &'static str,
     seen: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> Router {
+    upstream_key_check_tagged(expected_key, "upstream", seen)
+}
+
+/// [`upstream_key_check`] whose success body names the member (`from-{tag}`).
+fn upstream_key_check_tagged(
+    expected_key: &'static str,
+    tag: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+) -> Router {
     Router::new().route(
         "/{*path}",
         post(move |headers: axum::http::HeaderMap| async move {
@@ -189,16 +198,24 @@ fn upstream_key_check(
                 (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "application/json")],
-                    ANTHROPIC_OK_BODY,
+                    tagged_ok_body(tag),
                 )
             } else {
                 (
                     StatusCode::UNAUTHORIZED,
                     [(header::CONTENT_TYPE, "application/json")],
-                    r#"{"type":"error","error":{"type":"authentication_error","message":"bad key"}}"#,
+                    r#"{"type":"error","error":{"type":"authentication_error","message":"bad key"}}"#
+                        .to_owned(),
                 )
             }
         }),
+    )
+}
+
+/// A successful Anthropic body whose text names the member that served it.
+fn tagged_ok_body(tag: &str) -> String {
+    format!(
+        r#"{{"id":"msg_{tag}","type":"message","role":"assistant","content":[{{"type":"text","text":"from-{tag}"}}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":10,"output_tokens":4}}}}"#
     )
 }
 
@@ -809,6 +826,93 @@ async fn credential_pools_rotate_away_from_a_rejected_key() {
 }
 
 #[tokio::test]
+async fn a_rejected_key_stays_out_of_rotation_for_later_requests_while_it_cools() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream = spawn_upstream(upstream_key_check("good-key", Arc::clone(&seen))).await;
+    let (engine, bus) = build_engine(
+        vec![member("keys", upstream, Some(vec!["good-key"]))],
+        vec![pool(
+            "keyed",
+            vec!["keys"],
+            RetryConfig {
+                max_attempts: 3,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_secs(30),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    // First request: the base key is rejected (and cools down for the
+    // configured 30s); rotation moves on to the working key.
+    engine
+        .execute(engine_request("keyed", false))
+        .await
+        .expect("rotation finds the working key");
+    assert_eq!(
+        seen.lock().expect("seen lock").clone(),
+        vec!["base-key".to_owned(), "good-key".to_owned()]
+    );
+
+    // Second request: round-robin would come back to the base key, but it
+    // is still cooling from the rejection — the pick must skip it without
+    // spending an upstream call on it.
+    engine
+        .execute(engine_request("keyed", false))
+        .await
+        .expect("served by the working key alone");
+    assert_eq!(
+        seen.lock().expect("seen lock").clone(),
+        vec![
+            "base-key".to_owned(),
+            "good-key".to_owned(),
+            "good-key".to_owned()
+        ],
+        "a cooling key is not retried on a later request"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.len(),
+        3,
+        "two attempts for the first request, one for the second"
+    );
+    assert_eq!(rows[2].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(rows[2].credential_id.as_deref(), Some("key-1"));
+}
+
+/// A [`CredentialSource`] call against the default source, outside the
+/// engine: the pick must still hand back a key when every key is excluded.
+#[tokio::test]
+async fn the_default_pick_falls_back_to_rotation_when_every_key_is_cooling() {
+    use llm_proxy_engine::{ConfigCredentialSource, CredentialQuery, CredentialSource};
+
+    let source = ConfigCredentialSource::new();
+    let keys = vec![
+        SecretString::from("k0".to_owned()),
+        SecretString::from("k1".to_owned()),
+    ];
+    let cooling = vec!["key-0".to_owned(), "key-1".to_owned()];
+    let pick = source
+        .pick(&CredentialQuery {
+            provider: "p",
+            keys: &keys,
+            passthrough: false,
+            inbound: None,
+            avoid: Some("key-1"),
+            cooling: &cooling,
+        })
+        .await
+        .expect("cooldowns reorder, they never refuse service");
+    assert_eq!(
+        pick.credential_id.as_deref(),
+        Some("key-0"),
+        "the key that just failed is still the last resort"
+    );
+}
+
+#[tokio::test]
 async fn session_ids_land_on_usage_rows_from_header_and_metadata() {
     let good = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
     let (engine, bus) = build_engine(vec![member("solo", good, None)], vec![]);
@@ -843,6 +947,15 @@ async fn session_ids_land_on_usage_rows_from_header_and_metadata() {
 
 /// An upstream whose body names its member, failing its first N requests.
 fn upstream_tagged(tag: &'static str, fail_first: u32) -> (Router, Arc<std::sync::Mutex<u32>>) {
+    upstream_tagged_failing_with(tag, fail_first, StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// [`upstream_tagged`] with the status its first `fail_first` calls answer.
+fn upstream_tagged_failing_with(
+    tag: &'static str,
+    fail_first: u32,
+    status: StatusCode,
+) -> (Router, Arc<std::sync::Mutex<u32>>) {
     let counter = Arc::new(std::sync::Mutex::new(0u32));
     let seen = Arc::clone(&counter);
     let router = Router::new().route(
@@ -857,18 +970,15 @@ fn upstream_tagged(tag: &'static str, fail_first: u32) -> (Router, Arc<std::sync
                 };
                 if calls <= fail_first {
                     (
-                        StatusCode::INTERNAL_SERVER_ERROR,
+                        status,
                         [(header::CONTENT_TYPE, "application/json")],
                         r#"{"error":"warming up"}"#.to_owned(),
                     )
                 } else {
-                    let body = format!(
-                        r#"{{"id":"msg_{tag}","type":"message","role":"assistant","content":[{{"type":"text","text":"from-{tag}"}}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":10,"output_tokens":4}}}}"#
-                    );
                     (
                         StatusCode::OK,
                         [(header::CONTENT_TYPE, "application/json")],
-                        body,
+                        tagged_ok_body(tag),
                     )
                 }
             }
@@ -1036,6 +1146,429 @@ async fn refuse_policy_fails_the_switch_instead_of_serving_elsewhere() {
         "expected AffinityRefused, got {error:?}"
     );
     assert_eq!(error.status_code(), 503);
+}
+
+#[tokio::test]
+async fn refuse_policy_holds_when_the_pinned_member_is_already_cooling() {
+    // alpha serves exactly one request, then 500s; a long cooldown keeps it
+    // out of the candidate order for the rest of the test.
+    let alpha = spawn_upstream(upstream_dies_after("alpha", 1)).await;
+    let beta = spawn_upstream(upstream_dies_after("beta", u32::MAX)).await;
+    let (engine, bus) = build_engine(
+        vec![member("alpha", alpha, None), member("beta", beta, None)],
+        vec![pool(
+            "strict",
+            vec!["alpha", "beta"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_secs(30),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            AffinityConfig {
+                sticky: true,
+                on_conflict: AffinityConflictPolicy::Refuse,
+            },
+        )],
+    );
+
+    let with_session = || {
+        let mut request = engine_request("strict", false);
+        request.inbound.headers.insert(
+            "x-claude-code-session-id".to_owned(),
+            "sess-cool".to_owned(),
+        );
+        request
+    };
+
+    // The session pins to alpha.
+    let first = engine.execute(with_session()).await.expect("served");
+    assert_eq!(response_text(&first), "from-alpha");
+
+    // A session-less request burns alpha's health: alpha 500s, enters its
+    // cooldown, and the anonymous request fails over to beta.
+    let anonymous = engine
+        .execute(engine_request("strict", false))
+        .await
+        .expect("served by beta");
+    assert_eq!(response_text(&anonymous), "from-beta");
+    let rows_before = attempts(&bus).len();
+
+    // alpha is cooling when the pinned session's next request orders its
+    // candidates, so beta would be the ladder's *first* attempt. The refuse
+    // policy must stop that switch too, without ever reaching beta.
+    let error = engine
+        .execute(with_session())
+        .await
+        .expect_err("the switch is refused before any attempt");
+    assert!(
+        matches!(error, EngineError::AffinityRefused { .. }),
+        "expected AffinityRefused, got {error:?}"
+    );
+    assert_eq!(
+        attempts(&bus).len(),
+        rows_before,
+        "no attempt may be sent to a member other than the pinned one"
+    );
+}
+
+#[tokio::test]
+async fn a_client_fault_does_not_demote_the_pool_member() {
+    // alpha answers its first call with a 400, then serves; beta always
+    // serves. A long cooldown would keep alpha demoted if a 400 counted.
+    let (alpha_router, _alpha_calls) =
+        upstream_tagged_failing_with("alpha", 1, StatusCode::BAD_REQUEST);
+    let (beta_router, _beta_calls) = upstream_tagged("beta", 0);
+    let alpha = spawn_upstream(alpha_router).await;
+    let beta = spawn_upstream(beta_router).await;
+    let (engine, bus) = build_engine(
+        vec![member("alpha", alpha, None), member("beta", beta, None)],
+        vec![pool(
+            "both",
+            vec!["alpha", "beta"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_secs(30),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    // One client's malformed request: terminal for that request, and no
+    // failover.
+    let error = engine
+        .execute(engine_request("both", false))
+        .await
+        .expect_err("a 400 is terminal");
+    assert!(
+        matches!(error, EngineError::Upstream { status: 400, .. }),
+        "got {error:?}"
+    );
+
+    // Everyone else's next request still reaches alpha first: a fault
+    // deterministic for one request is no verdict on the member.
+    let response = engine
+        .execute(engine_request("both", false))
+        .await
+        .expect("served");
+    assert_eq!(
+        response_text(&response),
+        "from-alpha",
+        "a 400 must not cool the member for every other client"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 2, "the 400, then the served request");
+    assert_eq!(rows[0].provider, "alpha");
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[1].provider, "alpha");
+    assert_eq!(rows[1].outcome, AttemptOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn a_rejected_key_cools_the_key_not_the_member() {
+    // "keyed" has two keys and only accepts the second; "spare" always
+    // serves. A rejected key must not push the whole member behind spare.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let keyed = spawn_upstream(upstream_key_check_tagged(
+        "good-key",
+        "keyed",
+        Arc::clone(&seen),
+    ))
+    .await;
+    let (spare_router, _spare_calls) = upstream_tagged("spare", 0);
+    let spare = spawn_upstream(spare_router).await;
+    let (engine, bus) = build_engine(
+        vec![
+            member("keyed", keyed, Some(vec!["good-key"])),
+            member("spare", spare, None),
+        ],
+        vec![pool(
+            "pooled",
+            vec!["keyed", "spare"],
+            RetryConfig {
+                max_attempts: 2,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_secs(30),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    // key-0 is rejected; the member rotates to its working key and serves.
+    let first = engine
+        .execute(engine_request("pooled", false))
+        .await
+        .expect("served after rotation");
+    assert_eq!(response_text(&first), "from-keyed");
+
+    // Only key-0 cooled: the member stays first in the order and serves
+    // the next request with its working key in one attempt.
+    let second = engine
+        .execute(engine_request("pooled", false))
+        .await
+        .expect("served");
+    assert_eq!(
+        response_text(&second),
+        "from-keyed",
+        "a rejected key must not demote the whole member"
+    );
+    assert_eq!(
+        seen.lock().expect("seen lock").clone(),
+        vec![
+            "base-key".to_owned(),
+            "good-key".to_owned(),
+            "good-key".to_owned()
+        ]
+    );
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 3, "rejection, rotation, then one direct hit");
+    assert_eq!(rows[2].provider, "keyed");
+    assert_eq!(rows[2].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(rows[2].credential_id.as_deref(), Some("key-1"));
+}
+
+fn strict_pool() -> PoolConfig {
+    pool(
+        "strict",
+        vec!["alpha", "beta"],
+        RetryConfig {
+            max_attempts: 1,
+            backoff: Duration::from_millis(5),
+            cooldown: Duration::from_millis(50),
+            total_timeout: Duration::ZERO,
+            hold: Duration::ZERO,
+        },
+        AffinityConfig {
+            sticky: true,
+            on_conflict: AffinityConflictPolicy::Refuse,
+        },
+    )
+}
+
+fn with_session(route: &str, session: &str) -> EngineRequest {
+    let mut request = engine_request(route, false);
+    request
+        .inbound
+        .headers
+        .insert("x-claude-code-session-id".to_owned(), session.to_owned());
+    request
+}
+
+#[tokio::test]
+async fn a_direct_route_does_not_pin_the_session() {
+    let solo = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let (alpha_router, _) = upstream_tagged("alpha", 0);
+    let (beta_router, _) = upstream_tagged("beta", 0);
+    let alpha = spawn_upstream(alpha_router).await;
+    let beta = spawn_upstream(beta_router).await;
+    let (engine, _bus) = build_engine(
+        vec![
+            member("solo", solo, None),
+            member("alpha", alpha, None),
+            member("beta", beta, None),
+        ],
+        vec![strict_pool()],
+    );
+
+    // Served by a direct provider route: pinning is a sticky pool's
+    // opt-in, so this leaves no pin behind.
+    engine
+        .execute(with_session("solo", "sess-direct"))
+        .await
+        .expect("served directly");
+
+    // The same session on a Refuse pool whose members do not include
+    // "solo" is served by the pool's first member, not refused.
+    let response = engine
+        .execute(with_session("strict", "sess-direct"))
+        .await
+        .expect("a direct route leaves no pin to refuse against");
+    assert_eq!(response_text(&response), "from-alpha");
+}
+
+#[tokio::test]
+async fn a_non_sticky_pool_does_not_pin_the_session() {
+    let (gamma_router, _) = upstream_tagged("gamma", 0);
+    let (alpha_router, _) = upstream_tagged("alpha", 0);
+    let (beta_router, _) = upstream_tagged("beta", 0);
+    let gamma = spawn_upstream(gamma_router).await;
+    let alpha = spawn_upstream(alpha_router).await;
+    let beta = spawn_upstream(beta_router).await;
+    let (engine, _bus) = build_engine(
+        vec![
+            member("gamma", gamma, None),
+            member("alpha", alpha, None),
+            member("beta", beta, None),
+        ],
+        vec![
+            pool(
+                "loose",
+                vec!["gamma"],
+                ladder_retry(),
+                AffinityConfig {
+                    sticky: false,
+                    on_conflict: AffinityConflictPolicy::Strip,
+                },
+            ),
+            strict_pool(),
+        ],
+    );
+
+    // Served by a pool that did not opt into pinning.
+    let first = engine
+        .execute(with_session("loose", "sess-loose"))
+        .await
+        .expect("served by the loose pool");
+    assert_eq!(response_text(&first), "from-gamma");
+
+    // No pin was recorded, so the Refuse pool serves the session normally.
+    let response = engine
+        .execute(with_session("strict", "sess-loose"))
+        .await
+        .expect("a non-sticky pool leaves no pin to refuse against");
+    assert_eq!(response_text(&response), "from-alpha");
+}
+
+/// A streaming upstream that only answers when the right key arrives; 401
+/// otherwise.
+fn upstream_key_check_stream(
+    expected_key: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move |headers: axum::http::HeaderMap| async move {
+            let got = headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            seen.lock().expect("seen lock").push(got.clone());
+            if got == expected_key {
+                let events = vec![
+                    Event::default()
+                        .event("message_start")
+                        .data(r#"{"type":"message_start","message":{"id":"msg_k","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}"#),
+                    Event::default()
+                        .event("message_stop")
+                        .data(r#"{"type":"message_stop"}"#),
+                ];
+                let stream = futures::stream::iter(
+                    events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                );
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Sse::new(stream).into_response(),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"type":"error","error":{"type":"authentication_error","message":"bad key"}}"#,
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+/// Two members, each with a two-key pool. The first member fails every
+/// call transiently, so the ladder moves on with its `key-0` as the failed
+/// credential; the second member only accepts its own `key-0` (the shared
+/// base key). A hint that leaked across the member boundary would skip
+/// that key and the request would fail.
+fn two_members_with_key_pools(
+    first_endpoint: String,
+    second_endpoint: String,
+) -> (Engine, Arc<RecordingBus>) {
+    build_engine(
+        vec![
+            member("first", first_endpoint, Some(vec!["first-extra"])),
+            member("second", second_endpoint, Some(vec!["second-extra"])),
+        ],
+        vec![pool(
+            "keyed-pair",
+            vec!["first", "second"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    )
+}
+
+#[tokio::test]
+async fn a_failed_key_on_one_member_does_not_skip_the_next_members_key() {
+    let first = spawn_upstream(upstream_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":"down"}"#,
+    ))
+    .await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let second = spawn_upstream(upstream_key_check("base-key", Arc::clone(&seen))).await;
+    let (engine, bus) = two_members_with_key_pools(first, second);
+
+    engine
+        .execute(engine_request("keyed-pair", false))
+        .await
+        .expect("the second member serves with its own first key");
+
+    assert_eq!(
+        seen.lock().expect("seen lock").clone(),
+        vec!["base-key".to_owned()],
+        "the second member's first pick is its own key-0, not key-1"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 2, "one failed attempt, then the serving one");
+    assert_eq!(rows[0].provider, "first");
+    assert_eq!(rows[0].credential_id.as_deref(), Some("key-0"));
+    assert_eq!(rows[1].provider, "second");
+    assert_eq!(rows[1].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(rows[1].credential_id.as_deref(), Some("key-0"));
+}
+
+#[tokio::test]
+async fn a_failed_key_on_one_member_does_not_skip_the_next_members_key_when_streaming() {
+    let first = spawn_upstream(upstream_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":"down"}"#,
+    ))
+    .await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let second = spawn_upstream(upstream_key_check_stream("base-key", Arc::clone(&seen))).await;
+    let (engine, bus) = two_members_with_key_pools(first, second);
+
+    let stream = engine
+        .execute_stream(engine_request("keyed-pair", true))
+        .await
+        .expect("the second member's stream commits with its own first key");
+    let mut tail = stream.tail;
+    while tail.next().await.is_some() {}
+
+    assert_eq!(
+        seen.lock().expect("seen lock").clone(),
+        vec!["base-key".to_owned()],
+        "the second member's first pick is its own key-0, not key-1"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 2, "one failed attempt, then the commit");
+    assert_eq!(rows[0].provider, "first");
+    assert_eq!(rows[0].credential_id.as_deref(), Some("key-0"));
+    assert_eq!(rows[1].provider, "second");
+    assert_eq!(rows[1].outcome, AttemptOutcome::Streaming);
+    assert_eq!(rows[1].credential_id.as_deref(), Some("key-0"));
 }
 
 #[tokio::test]

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -175,19 +176,46 @@ CREATE INDEX IF NOT EXISTS idx_attempts_created
     ON attempts (created_at);
 ";
 
+/// Columns appended to `requests` after its first release, as `(name, type)`.
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing table's columns alone, so
+/// a ledger created by an earlier build gets them from [`migrate_schema`].
+const REQUESTS_COLUMNS_ADDED: &[(&str, &str)] =
+    &[("session_id", "TEXT"), ("credential_id", "TEXT")];
+
 fn open_connection(path: &Path) -> Result<Connection, StorageError> {
     let open_err = |source: rusqlite::Error| StorageError::Open {
         path: path.display().to_string(),
         source,
     };
-    let conn = Connection::open(path).map_err(open_err)?;
+    let mut conn = Connection::open(path).map_err(open_err)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(open_err)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(open_err)?;
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(open_err)?;
     conn.execute_batch(SCHEMA_SQL).map_err(open_err)?;
+    migrate_schema(&mut conn).map_err(open_err)?;
     Ok(conn)
+}
+
+/// Brings a ledger created by an earlier build up to the current schema by
+/// adding the `requests` columns it lacks. Runs under an immediate
+/// transaction so two processes opening one file cannot both add a column.
+fn migrate_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let existing: HashSet<String> = {
+        let mut stmt = tx.prepare("SELECT name FROM pragma_table_info('requests')")?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        names.collect::<Result<_, _>>()?
+    };
+    for (name, column_type) in REQUESTS_COLUMNS_ADDED {
+        if !existing.contains(*name) {
+            tx.execute_batch(&format!(
+                "ALTER TABLE requests ADD COLUMN {name} {column_type}"
+            ))?;
+        }
+    }
+    tx.commit()
 }
 
 fn unix_millis(ts: OffsetDateTime) -> i64 {
@@ -894,6 +922,161 @@ mod tests {
         assert_eq!(
             rows[1],
             (1, "healthy".to_owned(), "succeeded".to_owned(), None, None)
+        );
+    }
+
+    /// The `requests` table exactly as the build before plan 04 created it:
+    /// no `session_id`, no `credential_id`, and no `attempts` table at all.
+    const PRE_PLAN04_SCHEMA_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS requests (
+    request_id            TEXT PRIMARY KEY,
+    received_at           INTEGER,
+    completed_at          INTEGER,
+    caller                TEXT,
+    provider              TEXT,
+    route_kind            TEXT,
+    client_protocol       TEXT,
+    streaming             INTEGER,
+    model_requested       TEXT,
+    model_upstream        TEXT,
+    input_tokens          INTEGER,
+    output_tokens         INTEGER,
+    reasoning_tokens      INTEGER,
+    cache_read_tokens     INTEGER,
+    cache_creation_tokens INTEGER,
+    usage_provenance      TEXT,
+    cost_input            TEXT,
+    cost_output           TEXT,
+    cost_cache_creation   TEXT,
+    cost_cache_read       TEXT,
+    cost_reasoning        TEXT,
+    cost_total            TEXT,
+    stop_reason           TEXT,
+    error_kind            TEXT,
+    http_status           INTEGER,
+    latency_ms            INTEGER,
+    body_hash             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_requests_timestamp
+    ON requests (received_at);
+CREATE INDEX IF NOT EXISTS idx_requests_provider_timestamp
+    ON requests (provider, received_at);
+CREATE INDEX IF NOT EXISTS idx_requests_caller_timestamp
+    ON requests (caller, received_at);
+";
+
+    #[tokio::test]
+    async fn opening_a_pre_plan04_ledger_migrates_it_and_keeps_recording_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        {
+            let legacy = Connection::open(&db).expect("create legacy ledger");
+            legacy
+                .execute_batch(PRE_PLAN04_SCHEMA_SQL)
+                .expect("legacy schema");
+            legacy
+                .execute(
+                    "INSERT INTO requests (request_id, received_at, caller, body_hash)
+                     VALUES ('req-legacy', ?1, 'laptop', 'legacy-hash')",
+                    rusqlite::params![RECEIVED_MS],
+                )
+                .expect("legacy row");
+        }
+
+        let bus = Arc::new(SqliteEventBus::open(&db, unbounded()).expect("open legacy ledger"));
+        let received = match received_event("req-new", "laptop") {
+            ProxyEvent::RequestReceived(mut event) => {
+                event.session_id = Some("sess-9".to_owned());
+                ProxyEvent::RequestReceived(event)
+            }
+            other => other,
+        };
+        bus.emit(&received);
+        bus.emit(&ProxyEvent::AttemptCompleted(crate::AttemptCompleted {
+            request_id: "req-new".to_owned(),
+            timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                .expect("valid unix timestamp"),
+            attempt: 0,
+            route: "team".to_owned(),
+            provider: "prov-a".to_owned(),
+            model: "claude-3".to_owned(),
+            credential_id: Some("key-2".to_owned()),
+            outcome: crate::AttemptOutcome::Succeeded,
+            error_kind: None,
+            http_status: None,
+            message: None,
+            latency_ms: 40,
+        }));
+        let completed = match completed_event("req-new") {
+            ProxyEvent::ResponseCompleted(mut event) => {
+                event.credential_id = Some("key-2".to_owned());
+                ProxyEvent::ResponseCompleted(event)
+            }
+            other => other,
+        };
+        bus.emit(&completed);
+        let closer = Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close");
+
+        assert_eq!(
+            bus.dropped_events(),
+            0,
+            "no batch may be lost to the legacy schema"
+        );
+        let conn = reader(&db);
+        assert_eq!(
+            text_column(
+                &conn,
+                "SELECT body_hash FROM requests WHERE request_id = 'req-legacy'"
+            ),
+            Some("legacy-hash".to_owned()),
+            "rows written before the upgrade survive it"
+        );
+        assert_eq!(
+            text_column(
+                &conn,
+                "SELECT session_id FROM requests WHERE request_id = 'req-new'"
+            ),
+            Some("sess-9".to_owned())
+        );
+        assert_eq!(
+            text_column(
+                &conn,
+                "SELECT credential_id FROM requests WHERE request_id = 'req-new'"
+            ),
+            Some("key-2".to_owned())
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM attempts WHERE request_id = 'req-new'"
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_a_current_ledger_leaves_its_schema_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        for _ in 0..2 {
+            let bus = Arc::new(SqliteEventBus::open(&db, unbounded()).expect("open ledger"));
+            let closer = Arc::clone(&bus);
+            tokio::task::spawn_blocking(move || closer.close())
+                .await
+                .expect("close");
+        }
+        let conn = reader(&db);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('requests')
+                 WHERE name IN ('session_id', 'credential_id')"
+            ),
+            2,
+            "each added column exists exactly once after a second open"
         );
     }
 

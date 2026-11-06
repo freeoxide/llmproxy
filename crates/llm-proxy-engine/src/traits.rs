@@ -429,6 +429,11 @@ pub struct CredentialQuery<'a> {
     /// The id of the credential that failed the previous attempt against
     /// this member, if that attempt used one.
     pub avoid: Option<&'a str>,
+    /// Ids of this member's credentials still cooling down from an earlier
+    /// rejection (the engine's [`CooldownStore`](crate::health::CooldownStore)
+    /// view). A pick skips them while another key exists; they are the ids
+    /// the source itself returned, so any naming scheme round-trips.
+    pub cooling: &'a [String],
 }
 
 /// How an attempt that used a credential ended, for
@@ -447,10 +452,11 @@ pub enum CredentialFeedback {
 
 /// The default [`CredentialSource`]: the configured static key, or the
 /// client's token on `passthrough_auth` providers (which requires one).
-/// With a multi-key pool it rotates round-robin and avoids the key that just
-/// failed; cross-request key cooldowns live in the engine's
-/// [`crate::health::CooldownStore`], which the attempt loop updates from
-/// the same feedback.
+/// With a multi-key pool it rotates round-robin, avoiding the key that just
+/// failed and the keys the engine's
+/// [`CooldownStore`](crate::health::CooldownStore) reports as cooling
+/// (`query.cooling`, fed by the attempt loop's feedback) while another key
+/// exists.
 #[derive(Debug)]
 pub struct ConfigCredentialSource {
     last_pick: Mutex<HashMap<String, usize>>,
@@ -495,19 +501,26 @@ impl CredentialSource for ConfigCredentialSource {
                 credential_id: None,
             });
         }
-        // Multi-key pool (the base key plus extras): rotate round-robin,
-        // skipping the key that just failed when another exists.
+        // Multi-key pool (the base key plus extras): walk the rotation from
+        // the key after the last pick. The key that just failed is skipped
+        // first, cooling keys next; when every key is excluded the plain
+        // rotation stands — cooldowns reorder, they never refuse service.
         let total = query.keys.len();
         let mut guard = self.last_pick.lock().unwrap_or_else(|e| e.into_inner());
         let last = guard.get(query.provider).copied().unwrap_or(total - 1);
-        let mut next = (last + 1) % total;
-        if let Some(avoid) = query.avoid
-            && let Some(avoid_idx) = parse_key_index(avoid)
-            && avoid_idx == next
-            && total > 1
-        {
-            next = (next + 1) % total;
-        }
+        let start = (last + 1) % total;
+        let avoid = query.avoid.and_then(parse_key_index);
+        let cooling: Vec<usize> = query
+            .cooling
+            .iter()
+            .filter_map(|id| parse_key_index(id))
+            .collect();
+        let rotation = (0..total).map(|step| (start + step) % total);
+        let next = rotation
+            .clone()
+            .find(|index| avoid != Some(*index) && !cooling.contains(index))
+            .or_else(|| rotation.clone().find(|index| avoid != Some(*index)))
+            .unwrap_or(start);
         guard.insert(query.provider.to_owned(), next);
         let secret = query.keys.get(next).cloned().ok_or(EngineError::Internal(
             "credential pool index out of range".to_owned(),

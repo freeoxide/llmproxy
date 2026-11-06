@@ -1544,23 +1544,21 @@ fn validate_api_key(provider: &ProviderConfig, name: &str) -> Result<(), ConfigV
     if provider.passthrough_auth {
         return Ok(());
     }
-    if let Some(var) = find_unresolved_env_var(provider.api_key.expose_secret()) {
-        return Err(ConfigValidationError::UnresolvedEnvVar {
-            provider: name.to_owned(),
-            var,
-        });
-    }
-    if provider.api_key.expose_secret().trim().is_empty() {
-        return Err(ConfigValidationError::EmptyApiKey {
-            provider: name.to_owned(),
-        });
-    }
-    if let Some(keys) = &provider.api_keys
-        && keys.iter().any(|k| k.expose_secret().trim().is_empty())
-    {
-        return Err(ConfigValidationError::EmptyApiKey {
-            provider: name.to_owned(),
-        });
+    // Every key in the pool reaches the upstream verbatim, so each gets the
+    // same checks as the base key.
+    let extras = provider.api_keys.iter().flatten();
+    for key in std::iter::once(&provider.api_key).chain(extras) {
+        if let Some(var) = find_unresolved_env_var(key.expose_secret()) {
+            return Err(ConfigValidationError::UnresolvedEnvVar {
+                provider: name.to_owned(),
+                var,
+            });
+        }
+        if key.expose_secret().trim().is_empty() {
+            return Err(ConfigValidationError::EmptyApiKey {
+                provider: name.to_owned(),
+            });
+        }
     }
     if let Some(retry) = &provider.retry
         && retry.max_attempts == 0
@@ -2026,10 +2024,12 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     Ok(cfg)
 }
 
-/// Bare `/v1/*` validation: every configured target must name a loadable
-/// provider or pool (checked against `known_routes`, the registry's provider
-/// and pool names), and the model map must not be empty while enabled without
-/// a default target (it could never resolve anything).
+/// Bare `/v1/*` validation within the app config alone: the model map must
+/// not be empty while enabled without a default target (it could never
+/// resolve anything). Targets are cross-checked against the loaded registry
+/// where it is available — startup and `llm-proxy validate` — via
+/// [`bare_v1_target_problems`], because provider files load after this runs;
+/// an unresolved target still 404s at request time naming the target.
 fn validate_bare_v1(cfg: &AppConfig) -> Result<(), CoreError> {
     let bare = &cfg.server.bare_v1;
     if !bare.enabled {
@@ -2044,6 +2044,37 @@ fn validate_bare_v1(cfg: &AppConfig) -> Result<(), CoreError> {
         });
     }
     Ok(())
+}
+
+/// Cross-checks every configured bare `/v1/*` target against `route_exists`
+/// (the registry's provider and pool names). Returns one message per target
+/// that names nothing loadable; a disabled [`BareV1Config`] has no targets to
+/// check. Called by the startup path and the validate command, which see both
+/// the app config and the registry.
+#[must_use]
+pub fn bare_v1_target_problems(
+    bare: &BareV1Config,
+    route_exists: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    if !bare.enabled {
+        return Vec::new();
+    }
+    let mut problems = Vec::new();
+    for (model, target) in &bare.models {
+        if !route_exists(target) {
+            problems.push(format!(
+                "server.bare_v1 model \"{model}\" targets unknown provider or pool \"{target}\""
+            ));
+        }
+    }
+    if let Some(target) = &bare.default_target
+        && !route_exists(target)
+    {
+        problems.push(format!(
+            "server.bare_v1 default_target \"{target}\" names no configured provider or pool"
+        ));
+    }
+    problems
 }
 
 /// Validates one pool definition in isolation: non-empty name and members,
@@ -2524,6 +2555,55 @@ enabled = true
             err.to_string().contains("bare_v1"),
             "the load error names bare_v1: {err}"
         );
+    }
+
+    #[test]
+    fn bare_v1_targets_naming_nothing_loadable_are_reported() {
+        let bare = BareV1Config {
+            enabled: true,
+            models: std::collections::HashMap::from([
+                ("claude-sonnet-4-6".to_owned(), "real".to_owned()),
+                ("gpt-4o".to_owned(), "ghost".to_owned()),
+            ]),
+            default_target: Some("also-ghost".to_owned()),
+        };
+        let problems = bare_v1_target_problems(&bare, |name| name == "real");
+        assert_eq!(problems.len(), 2, "one problem per unknown target");
+        assert!(
+            problems[0].contains("gpt-4o") && problems[0].contains("ghost"),
+            "the problem names the model and its target: {}",
+            problems[0]
+        );
+        assert!(
+            problems[1].contains("also-ghost"),
+            "the default target is checked too: {}",
+            problems[1]
+        );
+    }
+
+    #[test]
+    fn bare_v1_targets_that_name_loadable_routes_have_no_problems() {
+        let bare = BareV1Config {
+            enabled: true,
+            models: std::collections::HashMap::from([("m".to_owned(), "pool-a".to_owned())]),
+            default_target: Some("provider-b".to_owned()),
+        };
+        assert!(
+            bare_v1_target_problems(&bare, |name| { name == "pool-a" || name == "provider-b" })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn disabled_bare_v1_targets_are_not_checked() {
+        // Off by default: even targets that name nothing are not problems,
+        // because the routes they would serve are not mounted.
+        let bare = BareV1Config {
+            enabled: false,
+            models: std::collections::HashMap::from([("m".to_owned(), "ghost".to_owned())]),
+            default_target: None,
+        };
+        assert!(bare_v1_target_problems(&bare, |_| false).is_empty());
     }
 
     #[test]
@@ -3826,6 +3906,35 @@ input = 0.0000025
             validate_provider_config(&provider, None),
             Err(ConfigValidationError::EmptyApiKey { .. })
         ));
+    }
+
+    #[test]
+    fn validate_rejects_an_unresolved_env_var_in_the_extra_keys() {
+        let provider = ProviderConfig {
+            name: "test".to_owned(),
+            api_key: SecretString::from("base-key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: Some(vec![
+                SecretString::from("second-key"),
+                SecretString::from("${LLM_PROXY_TEST_MISSING_KEY}"),
+            ]),
+            retry: None,
+            egress: None,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+        };
+        match validate_provider_config(&provider, None) {
+            Err(ConfigValidationError::UnresolvedEnvVar { provider, var }) => {
+                assert_eq!(provider, "test");
+                assert_eq!(var, "LLM_PROXY_TEST_MISSING_KEY");
+            }
+            other => panic!("an unresolved extra key must fail validation, got {other:?}"),
+        }
     }
 
     fn write_app_config(extra_storage: &str) -> (tempfile::TempDir, std::path::PathBuf) {

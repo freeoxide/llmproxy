@@ -49,6 +49,20 @@ pub(crate) fn load_toml_state(
         .validate_protocols(known_protocols)
         .with_context(|| "validating provider protocols")?;
 
+    // Bare `/v1/*` targets (plan 04 step 11) must name a loaded provider or
+    // pool; the app config loads before provider files, so the cross-check
+    // runs here, where both are known.
+    let bare_problems =
+        llm_proxy_core::bare_v1_target_problems(&app_config.server.bare_v1, |name| {
+            registry.contains_route(name)
+        });
+    if !bare_problems.is_empty() {
+        anyhow::bail!(
+            "validating [server.bare_v1] against the loaded providers and pools: {}",
+            bare_problems.join("; ")
+        );
+    }
+
     let providers: Vec<llm_proxy_core::ProviderConfig> = registry.iter().cloned().collect();
     llm_proxy_core::validate_passthrough_auth_combination(&app_config.auth, &providers)
         .with_context(|| "validating auth against provider passthrough configuration")?;
@@ -608,6 +622,64 @@ chat_completions = "chat"
             message.contains("egress-test"),
             "the error must name the provider: {message}"
         );
+    }
+
+    fn write_bare_v1_config(dir: &std::path::Path, model_target: &str) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "bare-v1-test"
+
+[server.bare_v1]
+enabled = true
+[server.bare_v1.models]
+"claude-sonnet-4-6" = "{model_target}"
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn load_toml_state_rejects_a_bare_v1_target_naming_nothing_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_file(dir.path(), None);
+        let path = write_bare_v1_config(dir.path(), "ghost-pool");
+
+        let err = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .expect_err("a bare /v1 model mapping to an unknown target must fail startup");
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("bare_v1") && message.contains("ghost-pool"),
+            "the error names the section and the unknown target: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_toml_state_builds_with_a_bare_v1_target_that_is_a_real_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_file(dir.path(), None);
+        let path = write_bare_v1_config(dir.path(), "egress-test");
+
+        load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .expect("a bare /v1 target naming a configured provider builds the state");
     }
 
     fn admin_app_config(

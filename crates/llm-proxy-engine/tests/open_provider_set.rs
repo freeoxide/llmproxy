@@ -516,6 +516,64 @@ async fn the_engine_drives_admission_reserve_then_settle() {
     );
 }
 
+/// Panics inside the stream task (the pick runs there), standing in for
+/// any bug that unwinds the task after the reservation was taken.
+#[derive(Debug)]
+struct PanickingCredential;
+
+#[async_trait]
+impl CredentialSource for PanickingCredential {
+    async fn pick(
+        &self,
+        _query: &llm_proxy_engine::CredentialQuery<'_>,
+    ) -> Result<llm_proxy_engine::CredentialPick, EngineError> {
+        panic!("injected stream-task panic");
+    }
+}
+
+#[tokio::test]
+async fn a_stream_task_that_panics_still_settles_its_reservation() {
+    let admission = Arc::new(RecordingAdmission::default());
+    let engine = EngineBuilder::new(config())
+        .register_adapter(Arc::new(EchoAdapter))
+        .expect("adapter registers")
+        .providers(Arc::new(
+            ProviderRegistry::from_providers(vec![echo_provider(
+                "http://127.0.0.1:9/echo".to_owned(),
+            )])
+            .expect("registry"),
+        ))
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .credentials(Arc::new(PanickingCredential) as Arc<dyn CredentialSource>)
+        .event_bus(Arc::new(NoopBus) as Arc<dyn EventBus>)
+        .build()
+        .expect("engine builds");
+
+    let error = engine
+        .execute_stream(streaming_request("hello"))
+        .await
+        .expect_err("the stream task died before its first byte");
+    assert!(
+        matches!(error, EngineError::Internal(_)),
+        "a dead task surfaces as an internal error, got {error:?}"
+    );
+
+    // The supervisor settles once the task's join handle resolves, which
+    // happens after `execute_stream` has already returned.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let events = admission.events.lock().expect("admission lock").clone();
+        if events == ["reserve", "settle-failed"] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the panicked task's reservation must be settled exactly once as failed, got {events:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn a_custom_credential_source_rotates_keys() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -61,13 +61,18 @@ impl CooldownStore {
         guard.get(provider).is_none_or(|until| now >= *until)
     }
 
-    /// Whether credential `credential_id` of `provider` is past its cooldown.
+    /// The ids of `provider`'s credentials still cooling at `now`, sorted,
+    /// for a credential pick to skip while another key exists.
     #[must_use]
-    pub fn credential_available(&self, provider: &str, credential_id: &str, now: Instant) -> bool {
+    pub fn cooling_credentials(&self, provider: &str, now: Instant) -> Vec<String> {
         let guard = self.credentials.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .get(&(provider.to_owned(), credential_id.to_owned()))
-            .is_none_or(|until| now >= *until)
+        let mut cooling: Vec<String> = guard
+            .iter()
+            .filter(|((owner, _), until)| owner == provider && now < **until)
+            .map(|((_, id), _)| id.clone())
+            .collect();
+        cooling.sort();
+        cooling
     }
 
     /// How much longer `provider` stays unavailable, if it is cooling.
@@ -129,8 +134,9 @@ impl AffinityTable {
         }
     }
 
-    /// Record that `session` was last served by `provider`. Called when an
-    /// attempt against `provider` is committed to the client.
+    /// Record that `session` was last served by `provider`. Called by sticky
+    /// pools when an attempt against `provider` is committed to the client;
+    /// direct routes and non-sticky pools never pin.
     pub fn pin(&self, session: &str, provider: &str) {
         let mut guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() >= self.capacity && !guard.contains_key(session) {
@@ -203,8 +209,21 @@ mod tests {
         let store = CooldownStore::new();
         let now = Instant::now();
         store.cooldown_credential("p", "key-0", now + Duration::from_secs(10));
-        assert!(!store.credential_available("p", "key-0", now));
-        assert!(store.credential_available("p", "key-1", now));
+        assert_eq!(
+            store.cooling_credentials("p", now),
+            vec!["key-0".to_owned()],
+            "only the rejected key is cooling"
+        );
+        assert!(
+            store
+                .cooling_credentials("p", now + Duration::from_secs(11))
+                .is_empty(),
+            "the cooldown passes"
+        );
+        assert!(
+            store.cooling_credentials("other", now).is_empty(),
+            "cooldowns are per provider"
+        );
     }
 
     #[test]
