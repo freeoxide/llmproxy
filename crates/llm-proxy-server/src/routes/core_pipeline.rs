@@ -577,11 +577,22 @@ fn encode_head(
         match &core_event {
             CoreEvent::Error { error } if matches!(protocol, ClientProtocol::OpenAiChat) => {
                 // A leading error crosses the first-byte boundary as a bare
-                // error-object data line (the chunk schema cannot carry it);
-                // any buffered finish chunk was flushed by encode_event
-                // above it, so it precedes the error and [DONE].
-                if let Ok(encoded) = encoder.encode_event(core_event.clone()) {
-                    events.append(&mut encoded.into_iter().map(client_event_to_sse).collect());
+                // error-object data line (the chunk schema cannot carry it).
+                // encode_event only succeeds here when a finish chunk was
+                // buffered, flushing it ahead of the error; its refusal
+                // otherwise is the codec's documented behaviour, not a
+                // failure — the bare error object and [DONE] below carry
+                // the error to the client.
+                match encoder.encode_event(core_event.clone()) {
+                    Ok(encoded) => {
+                        events.append(&mut encoded.into_iter().map(client_event_to_sse).collect());
+                    }
+                    Err(e) => {
+                        tracing::trace!(
+                            error = %e,
+                            "openai codec refused the leading error event; no buffered finish chunk to flush"
+                        );
+                    }
                 }
                 if let Some(json_str) = openai_chat::stream_error_sse_payload(error) {
                     events.push(Event::default().data(json_str));
@@ -590,11 +601,14 @@ fn encode_head(
                 encoder.mark_finished();
                 return events;
             }
-            _ => {
-                if let Ok(encoded) = encoder.encode_event(core_event) {
+            _ => match encoder.encode_event(core_event) {
+                Ok(encoded) => {
                     events.append(&mut encoded.into_iter().map(client_event_to_sse).collect());
                 }
-            }
+                Err(e) => {
+                    warn!(error = %e, "failed to encode buffered head event; dropping");
+                }
+            },
         }
     }
     events
@@ -622,8 +636,13 @@ fn encode_one(
         return events;
     }
     let mut events = Vec::new();
-    if let Ok(encoded) = encoder.encode_event(core_event) {
-        events.extend(encoded.into_iter().map(client_event_to_sse));
+    match encoder.encode_event(core_event) {
+        Ok(encoded) => {
+            events.extend(encoded.into_iter().map(client_event_to_sse));
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to encode stream event; dropping");
+        }
     }
     events
 }
@@ -640,11 +659,21 @@ fn encode_terminal_error(
     let mut events = Vec::new();
     // The encoder first: with a terminal buffered it flushes the finish
     // chunk the client is still owed ahead of the error; without one it
-    // self-finishes and returns nothing.
-    if let Ok(encoded) = encoder.encode_event(CoreEvent::Error {
+    // self-finishes and returns nothing. The OpenAI codec refuses the bare
+    // error event itself by design — the bare error object and [DONE] below
+    // carry the error — so a refusal is traced, not warned.
+    match encoder.encode_event(CoreEvent::Error {
         error: error.clone(),
     }) {
-        events.extend(encoded.into_iter().map(client_event_to_sse));
+        Ok(encoded) => {
+            events.extend(encoded.into_iter().map(client_event_to_sse));
+        }
+        Err(e) => {
+            tracing::trace!(
+                error = %e,
+                "codec refused the terminal error event; error framing follows"
+            );
+        }
     }
     if matches!(protocol, ClientProtocol::OpenAiChat) {
         if let Some(json_str) = openai_chat::stream_error_sse_payload(error) {

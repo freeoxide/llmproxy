@@ -271,27 +271,41 @@ async fn streaming_pipeline_yields_core_events_and_marks_truncation() {
     );
 }
 
+/// The pause the fake upstream takes before each SSE chunk. An engine that
+/// buffered the stream before yielding could not deliver anything until
+/// every chunk had arrived; incremental delivery hands the first event over
+/// after one gap and each later event within one gap of its predecessor.
+const UPSTREAM_CHUNK_GAP: Duration = Duration::from_millis(300);
+/// The most `execute_stream` may take: one chunk gap to commit the first
+/// event plus headroom — comfortably below the four gaps a whole-stream
+/// buffer would need.
+const START_DEADLINE: Duration = Duration::from_millis(750);
+/// The most one tail event may lag the previous: comfortably above one
+/// chunk gap, comfortably below the three a tail dumped only after the
+/// upstream ended would impose on its first event.
+const PER_EVENT_DEADLINE: Duration = Duration::from_millis(600);
+
 #[tokio::test]
 async fn streaming_pipeline_delivers_events_incrementally_not_buffered() {
-    // A slow upstream that emits one event at a time: the engine must yield
-    // each decoded event as it arrives, not buffer the stream.
     let app = Router::new().route(
         "/{*path}",
         post(|| async {
-            let body_stream = futures::stream::iter(vec![
-                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(
+            let chunks = vec![
+                bytes::Bytes::from(
                     "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_i\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
-                )),
-                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(
+                ),
+                bytes::Bytes::from(
                     "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"a\"}}\n\n",
-                )),
-                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(
+                ),
+                bytes::Bytes::from(
                     "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
-                )),
-                Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(
-                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
-                )),
-            ]);
+                ),
+                bytes::Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"),
+            ];
+            let body_stream = futures::stream::iter(chunks).then(|chunk| async move {
+                tokio::time::sleep(UPSTREAM_CHUNK_GAP).await;
+                Ok::<bytes::Bytes, std::convert::Infallible>(chunk)
+            });
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/event-stream")],
@@ -303,16 +317,53 @@ async fn streaming_pipeline_delivers_events_incrementally_not_buffered() {
     let bus = Arc::new(RecordingBus::new());
     let engine = build_engine(upstream, Arc::clone(&bus));
 
-    let stream = engine
-        .execute_stream(engine_request(true))
+    // The first chunk must commit the stream: a whole-stream buffer would
+    // hold this future until the last chunk had been sent.
+    let stream = tokio::time::timeout(START_DEADLINE, engine.execute_stream(engine_request(true)))
         .await
+        .expect("execute_stream resolves after the first chunk, not the whole stream")
         .expect("stream starts");
-    let mut count = stream.head.len();
+    assert!(
+        stream
+            .head
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MessageStart { .. })),
+        "the first chunk commits the stream, got head: {:?}",
+        stream.head
+    );
+
+    // Each later event must arrive within one chunk gap of the previous
+    // one; the deadline cannot be met by a tail that is withheld until the
+    // upstream has finished sending.
+    let mut all = stream.head;
     let mut tail = stream.tail;
-    while tail.next().await.is_some() {
-        count += 1;
+    loop {
+        let next = tokio::time::timeout(PER_EVENT_DEADLINE, tail.next())
+            .await
+            .expect("the next event arrives before the per-event deadline: the engine buffered");
+        match next {
+            Some(event) => all.push(event),
+            None => break,
+        }
     }
-    assert!(count >= 4, "all events arrive, got {count}");
+
+    let kinds: Vec<&str> = all
+        .iter()
+        .map(|event| match event {
+            CoreEvent::MessageStart { .. } => "message_start",
+            CoreEvent::TextDelta { .. } => "text_delta",
+            CoreEvent::UsageDelta { .. } => "usage_delta",
+            CoreEvent::MessageStop { .. } => "message_stop",
+            other => {
+                panic!("unexpected event in a clean four-chunk stream: {other:?}");
+            }
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["message_start", "text_delta", "usage_delta", "message_stop"],
+        "every upstream event reaches the caller exactly once, in order"
+    );
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let snapshot = bus.snapshot();

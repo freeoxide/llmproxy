@@ -533,24 +533,6 @@ mod tests {
     }
 
     #[test]
-    fn config_extension_dispatch_classifies_correctly() {
-        fn classify(path: &std::path::Path) -> &'static str {
-            match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
-                "toml" => "toml",
-                "json" => "json",
-                _ => "unsupported",
-            }
-        }
-
-        assert_eq!(classify(std::path::Path::new("config.toml")), "toml");
-        assert_eq!(classify(std::path::Path::new("config.json")), "json");
-        assert_eq!(classify(std::path::Path::new("config.yaml")), "unsupported");
-        assert_eq!(classify(std::path::Path::new("config.txt")), "unsupported");
-        assert_eq!(classify(std::path::Path::new("config")), "unsupported");
-        assert_eq!(classify(std::path::Path::new("config.YAML")), "unsupported");
-    }
-
-    #[test]
     fn app_state_is_send_sync() {
         fn check<T: Send + Sync>() {}
         check::<AppState>();

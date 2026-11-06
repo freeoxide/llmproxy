@@ -10,7 +10,6 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::response::IntoResponse;
 use axum::routing::get;
 use llm_proxy_sdk::prelude::*;
 use tower::ServiceExt;
@@ -266,18 +265,4 @@ async fn a_custom_protocol_registers_through_the_builder_alongside_the_builtins(
         builtin.len() + 1,
         "registration adds exactly the custom protocol, keeping {builtin:?}"
     );
-}
-
-#[tokio::test]
-async fn middleware_style_response_still_works() {
-    // Sanity anchor for the merged-router pattern used above.
-    let app = Router::new().route(
-        "/",
-        get(|| async { (StatusCode::IM_A_TEAPOT, "short").into_response() }),
-    );
-    let response = app
-        .oneshot(Request::get("/").body(Body::empty()).expect("request"))
-        .await
-        .expect("serves");
-    assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
 }

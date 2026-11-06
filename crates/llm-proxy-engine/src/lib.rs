@@ -64,6 +64,11 @@ pub use traits::{
 pub use types::{ClientDialect, EngineRequest, EngineResponse, EngineStream, InboundRequest};
 
 const MAX_PROVIDER_NAME_LEN: usize = 128;
+#[expect(
+    clippy::expect_used,
+    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
+              error caught the moment this static is first used, not a runtime input"
+)]
 static PROVIDER_NAME_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"^[a-z0-9_-]+$").expect("valid provider name regex")
 });

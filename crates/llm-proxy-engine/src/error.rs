@@ -237,6 +237,11 @@ pub fn retry_after_from_headers(headers: &[(String, String)]) -> Option<std::tim
 
 const MAX_SANITIZE_LEN: usize = 512;
 const SANITIZE_SUFFIX: &str = "...[truncated]";
+#[expect(
+    clippy::expect_used,
+    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
+              error caught the moment this static is first used, not a runtime input"
+)]
 static URL_REDACT_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"https?://\S+").expect("valid URL redaction regex")
 });
