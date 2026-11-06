@@ -13,6 +13,42 @@ use crate::state::AppState;
 
 use super::core_pipeline;
 use super::error_response::{ClientProtocol, RouteError, route_error_response};
+/// Bare `/v1/chat/completions` (plan 04 step 11): resolve the model to a
+/// provider or pool, then run the same handler the provider-scoped route
+/// runs.
+pub(crate) async fn handle_bare_chat_completions(
+    state: State<AppState>,
+    meta: RequestMeta,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    if !state.app_config().server.bare_v1.enabled {
+        return route_error_response(ClientProtocol::OpenAiChat, &RouteError::NotFound);
+    }
+    let model = match core_pipeline::bare_model_of(&body) {
+        Ok(model) => model,
+        Err(error) => {
+            warn!(error = %error, "bare /v1/chat/completions request failed");
+            return route_error_response(ClientProtocol::OpenAiChat, &error);
+        }
+    };
+    match core_pipeline::resolve_bare_target(&state, &model) {
+        Ok(target) => {
+            match handle_chat_completions_inner(state.0, meta, target, headers, body).await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(error = %error, "request failed");
+                    route_error_response(ClientProtocol::OpenAiChat, &error)
+                }
+            }
+        }
+        Err(error) => {
+            warn!(error = %error, "bare /v1/chat/completions target resolution failed");
+            route_error_response(ClientProtocol::OpenAiChat, &error)
+        }
+    }
+}
+
 pub(crate) async fn handle_chat_completions(
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -49,7 +85,7 @@ async fn handle_chat_completions_inner(
         );
     };
     core_pipeline::validate_provider_name(&provider).inspect_err(&emit_failed)?;
-    if state.providers().get(&provider).is_none() {
+    if !core_pipeline::route_target_exists(&state, &provider) {
         let err = RouteError::UnknownProvider(provider.clone());
         emit_failed(&err);
         return Err(err);

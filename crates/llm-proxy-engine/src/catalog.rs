@@ -34,7 +34,7 @@ impl PreservedError {
                 message: message.clone(),
                 timeout: *timeout,
             },
-            ProviderError::Api { status, body } => Self::Api {
+            ProviderError::Api { status, body, .. } => Self::Api {
                 status: *status,
                 body: body.clone(),
             },
@@ -52,6 +52,7 @@ impl PreservedError {
             Self::Api { status, body } => ProviderError::Api {
                 status: *status,
                 body: body.clone(),
+                headers: Vec::new(),
             },
             Self::Other(message) => ProviderError::InvalidConfig(message.clone()),
         }
@@ -507,6 +508,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -656,6 +659,8 @@ mod tests {
             api_key: secrecy::SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -980,6 +985,8 @@ mod tests {
             api_key: secrecy::SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),

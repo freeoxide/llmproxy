@@ -52,6 +52,10 @@ pub(crate) async fn handle_models(
         }
     }
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "one handler with per-stage ledger emission; splitting would scatter the failure rows"
+)]
 async fn handle_models_inner(
     state: &AppState,
     provider_name: &str,
@@ -88,36 +92,55 @@ async fn handle_models_inner(
             start,
         )
     })?;
-    let provider = state
-        .providers()
-        .get(provider_name)
-        .ok_or_else(|| RouteError::UnknownProvider(provider_name.to_owned()))
-        .inspect_err(|e| {
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                request_id,
-                Some(provider_name),
-                None::<&ModelRef>,
-                e,
-                start,
-            )
-        })?;
+    // A pool name lists the union of its members' catalogs; a provider name
+    // lists its own (plan 04 step 4: clients use the same URL shape either
+    // way).
+    let member_names: Vec<String> = match state.providers().pool(provider_name) {
+        Some(pool) => pool.members.clone(),
+        None => {
+            if state.providers().get(provider_name).is_none() {
+                let err = RouteError::UnknownProvider(provider_name.to_owned());
+                core_pipeline::emit_response_failed(
+                    &event_bus,
+                    request_id,
+                    Some(provider_name),
+                    None::<&ModelRef>,
+                    &err,
+                    start,
+                );
+                return Err(err);
+            }
+            vec![provider_name.to_owned()]
+        }
+    };
 
-    let entries = state
-        .model_catalogs()
-        .catalog(provider, refresh_live)
-        .await
-        .map_err(map_catalog_error)
-        .inspect_err(|e| {
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                request_id,
-                Some(provider_name),
-                None::<&ModelRef>,
-                e,
-                start,
-            )
-        })?;
+    let mut entries = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for member_name in &member_names {
+        let Some(provider) = state.providers().get(member_name) else {
+            continue;
+        };
+        let member_entries = state
+            .model_catalogs()
+            .catalog(provider, refresh_live)
+            .await
+            .map_err(map_catalog_error)
+            .inspect_err(|e| {
+                core_pipeline::emit_response_failed(
+                    &event_bus,
+                    request_id,
+                    Some(provider_name),
+                    None::<&ModelRef>,
+                    e,
+                    start,
+                )
+            })?;
+        for entry in member_entries {
+            if seen_ids.insert(entry.id.clone()) {
+                entries.push(entry);
+            }
+        }
+    }
     let first_id = entries.first().map(|m| m.id.clone());
     let last_id = entries.last().map(|m| m.id.clone());
 
@@ -127,7 +150,7 @@ async fn handle_models_inner(
             id: entry.id,
             object: "model",
             created: 0,
-            owned_by: provider.name.clone(),
+            owned_by: provider_name.to_owned(),
             model_type: "model",
             display_name: entry.display_name,
             created_at: None,
@@ -162,7 +185,7 @@ async fn handle_models_inner(
 
 fn map_catalog_error(error: ProviderError) -> RouteError {
     match error {
-        ProviderError::Api { status, body } => {
+        ProviderError::Api { status, body, .. } => {
             let status_code = StatusCode::from_u16(status).unwrap_or_else(|_| {
                 tracing::warn!(
                     status,
@@ -226,6 +249,8 @@ mod tests {
             api_key: secrecy::SecretString::from("sk-test"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -277,6 +302,8 @@ mod tests {
                     admin_bind: None,
                     admin_on_main_listener: false,
                     endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -298,6 +325,8 @@ mod tests {
             api_key: secrecy::SecretString::from("sk-test"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -326,6 +355,8 @@ mod tests {
                     admin_bind: None,
                     admin_on_main_listener: false,
                     endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,

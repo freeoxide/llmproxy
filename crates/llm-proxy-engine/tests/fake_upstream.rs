@@ -91,6 +91,8 @@ fn test_config() -> AppConfig {
             admin_bind: None,
             admin_on_main_listener: false,
             endpoint_families: Default::default(),
+            upstream_timeouts: Default::default(),
+            bare_v1: Default::default(),
         },
         auth: Default::default(),
         storage: None,
@@ -118,6 +120,8 @@ fn provider(endpoint: String) -> ProviderConfig {
         api_key: secrecy::SecretString::from("upstream-key"),
         auth_style: AuthStyle::XApiKey,
         passthrough_auth: false,
+        api_keys: None,
+        retry: None,
         egress: None,
         adapters,
         routes,
@@ -203,14 +207,17 @@ async fn non_streaming_pipeline_reaches_the_fake_upstream_and_settles() {
     assert_eq!(response.core.usage.input_tokens, 10);
     assert_eq!(response.core.usage.output_tokens, 4);
 
-    // Settlement: RequestReceived + ResponseCompleted rows on the bus.
+    // Settlement: RequestReceived + attempt + ResponseCompleted rows on
+    // the bus, in order.
     let snapshot = bus.snapshot();
     let mut kinds = snapshot.iter().map(|event| match event {
         ProxyEvent::RequestReceived(_) => "received",
         ProxyEvent::ResponseCompleted(_) => "completed",
         ProxyEvent::ResponseFailed(_) => "failed",
+        ProxyEvent::AttemptCompleted(_) => "attempt",
     });
     assert_eq!(kinds.next(), Some("received"));
+    assert_eq!(kinds.next(), Some("attempt"));
     assert_eq!(kinds.next(), Some("completed"));
     assert!(kinds.next().is_none(), "no failure rows expected");
 }

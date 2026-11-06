@@ -19,7 +19,6 @@ use crate::paths::providers_dir_for;
 pub(crate) fn load_toml_state(
     path: &Path,
     adapter_registry: ProviderAdapterRegistry,
-    proxy_client: ProxyClient,
     port_override: Option<u16>,
 ) -> Result<AppState> {
     let mut app_config: AppConfig = llm_proxy_core::load_app_config(path)
@@ -30,6 +29,11 @@ pub(crate) fn load_toml_state(
         bind.set_port(p);
         app_config.server.bind = bind;
     }
+
+    // Phase-shaped upstream timeouts (backlog 8, BUG-14): the configured
+    // phases replace the fixed connect/headers/idle constants.
+    let proxy_client = ProxyClient::try_with_timeouts(&app_config.server.upstream_timeouts)
+        .with_context(|| "building proxy HTTP client from [server.upstream_timeouts]")?;
 
     let providers_dir = providers_dir_for(path);
     let registry = if providers_dir.exists() {
@@ -62,7 +66,11 @@ pub(crate) fn load_toml_state(
     let mut egress_clients = std::collections::HashMap::new();
     for provider in registry.iter() {
         if let Some(egress) = &provider.egress {
-            let client = ProxyClient::try_with_egress_proxy(&egress.proxy).with_context(|| {
+            let client = ProxyClient::try_with_egress_proxy_and_timeouts(
+                &egress.proxy,
+                &app_config.server.upstream_timeouts,
+            )
+            .with_context(|| {
                 format!(
                     "building egress proxy client for provider \"{}\" from [provider.egress]",
                     provider.name
@@ -436,7 +444,6 @@ path = \"{}\"
         let state = load_toml_state(
             &path,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect("state with [storage]");
@@ -461,6 +468,7 @@ path = \"{}\"
                 },
                 streaming: false,
                 body_hash: "digest".to_owned(),
+                session_id: None,
             });
         let bus = std::sync::Arc::clone(state.event_bus());
         bus.emit(&event);
@@ -484,7 +492,6 @@ path = \"{}\"
         let state = load_toml_state(
             &path,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect("state without [storage]");
@@ -552,7 +559,6 @@ chat_completions = "chat"
         let state = load_toml_state(
             &path,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect("state builds with an egress provider");
@@ -589,7 +595,6 @@ chat_completions = "chat"
         let err = load_toml_state(
             &path,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
-            llm_proxy_transport::ProxyClient::try_new().unwrap(),
             None,
         )
         .expect_err("unusable egress proxy must be a startup error");
@@ -626,6 +631,8 @@ chat_completions = "chat"
                 admin_bind,
                 admin_on_main_listener: on_main,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,

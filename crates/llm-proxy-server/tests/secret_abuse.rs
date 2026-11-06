@@ -102,6 +102,8 @@ mod tests {
             api_key: secrecy::SecretString::from(PROVIDER_KEY),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut adapters = HashMap::new();
@@ -144,6 +146,8 @@ mod tests {
                     admin_bind: None,
                     admin_on_main_listener: on_main,
                     endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
                 },
                 auth: llm_proxy_core::AuthConfig {
                     mode: AuthMode::None,
@@ -624,6 +628,7 @@ mod tests {
                 },
                 streaming: false,
                 body_hash: "seed-digest".to_owned(),
+                session_id: None,
             },
         ));
         close_ledger(Arc::clone(&bus)).await;

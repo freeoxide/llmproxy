@@ -29,10 +29,10 @@ mod messages;
 mod models;
 mod token_count;
 
-use chat::handle_chat_completions;
+use chat::{handle_bare_chat_completions, handle_chat_completions};
 use health::{health, ready, version};
 use llm_proxy_core::{family_max_body_bytes, family_request_timeout};
-use messages::handle_messages;
+use messages::{handle_bare_messages, handle_messages};
 use models::handle_models;
 use token_count::count_tokens;
 
@@ -100,7 +100,20 @@ pub fn router(state: AppState) -> Router {
         .route("/providers/{provider}/v1/models", get(handle_models))
         .layer(admission(FAMILY_MODELS));
 
-    let api = messages.merge(count_tokens).merge(chat).merge(models);
+    let mut api = messages.merge(count_tokens).merge(chat).merge(models);
+
+    // Bare `/v1/*` is off by default (plan 04 step 11): with it off, those
+    // paths fall through to the 404 fallback; enabled, the model name
+    // resolves to a provider or pool through the same engine.
+    if state.app_config().server.bare_v1.enabled {
+        let bare_messages = Router::new()
+            .route("/v1/messages", post(handle_bare_messages))
+            .layer(admission(FAMILY_MESSAGES));
+        let bare_chat = Router::new()
+            .route("/v1/chat/completions", post(handle_bare_chat_completions))
+            .layer(admission(FAMILY_CHAT_COMPLETIONS));
+        api = api.merge(bare_messages).merge(bare_chat);
+    }
 
     let router = Router::new()
         .merge(lightweight)
@@ -421,6 +434,8 @@ mod auth_gate_tests {
                 admin_bind: None,
                 admin_on_main_listener: false,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::ClientKeys,

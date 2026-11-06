@@ -13,6 +13,39 @@ use crate::state::AppState;
 
 use super::core_pipeline;
 use super::error_response::{ClientProtocol, RouteError, route_error_response};
+/// Bare `/v1/messages` (plan 04 step 11): resolve the model to a provider or
+/// pool, then run the same handler the provider-scoped route runs.
+pub(crate) async fn handle_bare_messages(
+    state: State<AppState>,
+    meta: RequestMeta,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    if !state.app_config().server.bare_v1.enabled {
+        return route_error_response(ClientProtocol::Anthropic, &RouteError::NotFound);
+    }
+    let model = match core_pipeline::bare_model_of(&body) {
+        Ok(model) => model,
+        Err(error) => {
+            warn!(error = %error, "bare /v1/messages request failed");
+            return route_error_response(ClientProtocol::Anthropic, &error);
+        }
+    };
+    match core_pipeline::resolve_bare_target(&state, &model) {
+        Ok(target) => match handle_messages_inner(state.0, meta, target, headers, body).await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, "request failed");
+                route_error_response(ClientProtocol::Anthropic, &error)
+            }
+        },
+        Err(error) => {
+            warn!(error = %error, "bare /v1/messages target resolution failed");
+            route_error_response(ClientProtocol::Anthropic, &error)
+        }
+    }
+}
+
 pub(crate) async fn handle_messages(
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -49,7 +82,7 @@ async fn handle_messages_inner(
         );
     };
     core_pipeline::validate_provider_name(&provider).inspect_err(&emit_failed)?;
-    if state.providers().get(&provider).is_none() {
+    if !core_pipeline::route_target_exists(&state, &provider) {
         let err = RouteError::UnknownProvider(provider.clone());
         emit_failed(&err);
         return Err(err);
@@ -183,6 +216,22 @@ mod tests {
         assert!(
             !prod.contains("ScenarioConfig"),
             "messages.rs must not use ScenarioConfig"
+        );
+        // Plan 04 step 4: pools are served at /providers/{pool}/v1/... through
+        // the same engine path — the only allowed route shape stays the
+        // provider-or-pool one; this file registers no routes of its own and
+        // does no member picking (the engine's router owns that).
+        assert!(
+            !prod.contains(".route("),
+            "messages.rs must not register HTTP routes; routing lives in routes/mod.rs"
+        );
+        assert!(
+            !prod.contains("pool.members"),
+            "messages.rs must not read pool members; the engine router resolves the ladder"
+        );
+        assert!(
+            prod.contains("route_target_exists"),
+            "the provider-or-pool route shape is the one allowed lookup"
         );
     }
 }

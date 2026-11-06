@@ -195,6 +195,8 @@ mod tests {
             api_key: secrecy::SecretString::from("operator-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::from([(
                 adapter_name.to_owned(),
@@ -239,6 +241,8 @@ mod tests {
                     admin_bind: None,
                     admin_on_main_listener: false,
                     endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,

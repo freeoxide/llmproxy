@@ -25,6 +25,9 @@ pub(crate) const MAX_UPSTREAM_ERROR_BODY_BYTES: usize = 2048;
 /// silent for longer than this is a dead or wedged upstream.
 pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Default TCP/TLS connect deadline for upstream requests.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Protocol-neutral HTTP client for upstream LLM providers, owning a
 /// connection-pooled [`reqwest::Client`].
 #[derive(Clone)]
@@ -33,6 +36,7 @@ pub struct ProxyClient {
     http: reqwest::Client,
     stream_idle_timeout: Duration,
     upstream_headers_timeout: Duration,
+    connect_timeout: Duration,
 }
 
 impl fmt::Debug for ProxyClient {
@@ -41,6 +45,7 @@ impl fmt::Debug for ProxyClient {
             .field("http", &"<reqwest::Client>")
             .field("stream_idle_timeout", &self.stream_idle_timeout)
             .field("upstream_headers_timeout", &self.upstream_headers_timeout)
+            .field("connect_timeout", &self.connect_timeout)
             .finish()
     }
 }
@@ -65,7 +70,7 @@ impl ProxyClient {
     /// Creates a transport client, returning an error if the HTTP client cannot
     /// be built (custom TLS backends, proxy environment validation).
     pub fn try_new() -> Result<Self, ProviderError> {
-        let http = pooled_http_builder()
+        let http = pooled_http_builder(DEFAULT_CONNECT_TIMEOUT)
             .build()
             .map_err(provider_error_from_reqwest)?;
 
@@ -73,23 +78,37 @@ impl ProxyClient {
             http,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             upstream_headers_timeout: DEFAULT_UPSTREAM_HEADERS_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         })
     }
 
     /// Creates a client routed through a forward proxy with the same pool and
     /// timeouts as [`Self::try_new`]; `proxy_url` must be socks5h/socks5/http(s) with a host.
     pub fn try_with_egress_proxy(proxy_url: &str) -> Result<Self, ProviderError> {
+        Self::try_with_egress_proxy_and_timeouts(
+            proxy_url,
+            &llm_proxy_core::UpstreamTimeoutsConfig::default(),
+        )
+    }
+
+    /// Creates a client routed through a forward proxy with phase-shaped
+    /// timeouts (backlog 8, BUG-14).
+    pub fn try_with_egress_proxy_and_timeouts(
+        proxy_url: &str,
+        timeouts: &llm_proxy_core::UpstreamTimeoutsConfig,
+    ) -> Result<Self, ProviderError> {
         validate_egress_proxy_url(proxy_url)?;
         let proxy = reqwest::Proxy::all(proxy_url).map_err(provider_error_from_reqwest)?;
-        let http = pooled_http_builder()
+        let http = pooled_http_builder(timeouts.connect)
             .proxy(proxy)
             .build()
             .map_err(provider_error_from_reqwest)?;
 
         Ok(Self {
             http,
-            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
-            upstream_headers_timeout: DEFAULT_UPSTREAM_HEADERS_TIMEOUT,
+            stream_idle_timeout: timeouts.idle,
+            upstream_headers_timeout: timeouts.first_byte,
+            connect_timeout: timeouts.connect,
         })
     }
 
@@ -105,6 +124,34 @@ impl ProxyClient {
     pub fn with_upstream_headers_timeout(mut self, deadline: Duration) -> Self {
         self.upstream_headers_timeout = deadline;
         self
+    }
+
+    /// Override the TCP/TLS connect deadline for upstream requests; the
+    /// default is [`DEFAULT_CONNECT_TIMEOUT`].
+    pub fn with_connect_timeout(mut self, connect: Duration) -> Self {
+        self.connect_timeout = connect;
+        self
+    }
+
+    /// Build a client with phase-shaped timeouts (backlog 8, BUG-14): the
+    /// connect deadline goes to the pool builder (reqwest freezes it at
+    /// client construction), first-byte and idle are per-request deadlines.
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError`] when the HTTP client cannot be constructed.
+    pub fn try_with_timeouts(
+        timeouts: &llm_proxy_core::UpstreamTimeoutsConfig,
+    ) -> Result<Self, ProviderError> {
+        let http = pooled_http_builder(timeouts.connect)
+            .build()
+            .map_err(provider_error_from_reqwest)?;
+        Ok(Self {
+            http,
+            stream_idle_timeout: timeouts.idle,
+            upstream_headers_timeout: timeouts.first_byte,
+            connect_timeout: timeouts.connect,
+        })
     }
 
     fn build_request(
@@ -180,8 +227,9 @@ impl ProxyClient {
 
         if resp.status().as_u16() >= 400 {
             let status = resp.status().as_u16();
+            let headers = error_headers(&resp);
             let body_text = read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-            return Err(ProviderError::api(status, body_text));
+            return Err(ProviderError::api_with_headers(status, body_text, headers));
         }
 
         let stream = resp.bytes_stream();
@@ -271,11 +319,11 @@ pub(crate) fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
-fn pooled_http_builder() -> reqwest::ClientBuilder {
+fn pooled_http_builder(connect_timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .pool_max_idle_per_host(20)
         .pool_idle_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(connect_timeout)
         .redirect(same_origin_redirect_policy())
 }
 
@@ -326,11 +374,26 @@ fn apply_auth(mut builder: reqwest::RequestBuilder, auth: &AuthHeaders) -> reqwe
     builder
 }
 
+/// Collects an error response's headers (lowercased names, first value each),
+/// capped in count so a hostile upstream cannot balloon memory.
+fn error_headers(resp: &reqwest::Response) -> Vec<(String, String)> {
+    const MAX_ERROR_HEADERS: usize = 32;
+    resp.headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let text = value.to_str().ok()?;
+            Some((name.to_string().to_ascii_lowercase(), text.to_owned()))
+        })
+        .take(MAX_ERROR_HEADERS)
+        .collect()
+}
+
 async fn check_status(resp: reqwest::Response) -> Result<Vec<u8>, ProviderError> {
     if resp.status().as_u16() >= 400 {
         let status = resp.status().as_u16();
+        let headers = error_headers(&resp);
         let body_text = read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
-        return Err(ProviderError::api(status, body_text));
+        return Err(ProviderError::api_with_headers(status, body_text, headers));
     }
     let body = resp.bytes().await.map_err(provider_error_from_reqwest)?;
     Ok(body.to_vec())
@@ -955,7 +1018,7 @@ mod tests {
 
         let err = client.send(req).await.unwrap_err();
         match err {
-            ProviderError::Api { status, body } => {
+            ProviderError::Api { status, body, .. } => {
                 assert_eq!(status, 429);
                 assert!(body.contains("upstream error"));
             }
@@ -990,7 +1053,7 @@ mod tests {
             Ok(_) => panic!("expected ProviderError::Api"),
         };
         match err {
-            ProviderError::Api { status, body } => {
+            ProviderError::Api { status, body, .. } => {
                 assert_eq!(status, 500);
                 assert!(body.contains("upstream error"));
             }

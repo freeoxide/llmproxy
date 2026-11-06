@@ -87,6 +87,43 @@ pub(super) fn validate_provider_name(name: &str) -> Result<(), RouteError> {
     llm_proxy_engine::validate_provider_name(name).map_err(RouteError::from)
 }
 
+/// Whether `name` addresses a configured provider or pool (plan 04 step 4):
+/// both live under `/providers/{name}/v1/...`.
+pub(crate) fn route_target_exists(state: &AppState, name: &str) -> bool {
+    state.providers().contains_route(name)
+}
+
+/// Bare `/v1/*` model resolution (plan 04 step 11): the configured model map
+/// first, then the default target; an unresolvable model is a 404 naming it.
+/// The caller has already checked that `server.bare_v1.enabled` is on.
+pub(crate) fn resolve_bare_target(state: &AppState, model: &str) -> Result<String, RouteError> {
+    let bare = &state.app_config().server.bare_v1;
+    let target = bare
+        .models
+        .get(model)
+        .cloned()
+        .or_else(|| bare.default_target.clone())
+        .ok_or_else(|| RouteError::UnknownProvider(model.to_owned()))?;
+    if !route_target_exists(state, &target) {
+        return Err(RouteError::UnknownProvider(target));
+    }
+    Ok(target)
+}
+
+/// The `model` field of a raw client body, for bare-route resolution.
+pub(crate) fn bare_model_of(body: &[u8]) -> Result<String, RouteError> {
+    let raw: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|e| RouteError::InvalidRequest(format!("invalid JSON: {e}")))?;
+    raw.get("model")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            RouteError::InvalidRequest(
+                "the bare /v1 routes need a \"model\" field to resolve the target".to_owned(),
+            )
+        })
+}
+
 pub(super) fn validate_json_content_type(headers: &HeaderMap) -> Result<(), RouteError> {
     let Some(value) = headers.get(header::CONTENT_TYPE) else {
         return Ok(());

@@ -128,7 +128,7 @@ async fn count_tokens_inner(
         );
     };
     core_pipeline::validate_provider_name(provider).inspect_err(&emit_failed)?;
-    if state.providers().get(provider).is_none() {
+    if !core_pipeline::route_target_exists(state, provider) {
         let err = RouteError::UnknownProvider(provider.to_owned());
         emit_failed(&err);
         return Err(err);
@@ -164,6 +164,7 @@ async fn count_tokens_inner(
             model: core.model.clone(),
             streaming: false,
             body_hash: super::core_pipeline::body_hash_of_bytes(&body),
+            session_id: None,
         }));
     let (system_text, messages) = extract_countable_text(&core);
     let counter = state.token_counter.clone();
@@ -186,6 +187,7 @@ async fn count_tokens_inner(
             cost: None,
             stop_reason: StopReason::EndTurn,
             latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
+            credential_id: None,
         }));
 
     let response = axum::Json(TokenCountResponse {

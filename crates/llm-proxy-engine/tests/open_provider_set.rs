@@ -163,15 +163,15 @@ struct RotatingCredential {
 
 #[async_trait]
 impl CredentialSource for RotatingCredential {
-    async fn credential(
+    async fn pick(
         &self,
-        _provider: &str,
-        _configured: &SecretString,
-        _passthrough: bool,
-        _inbound: Option<&SecretString>,
-    ) -> Result<SecretString, EngineError> {
+        _query: &llm_proxy_engine::CredentialQuery<'_>,
+    ) -> Result<llm_proxy_engine::CredentialPick, EngineError> {
         let n = self.counter.fetch_add(1, Ordering::SeqCst);
-        Ok(SecretString::from(format!("rotated-key-{n}")))
+        Ok(llm_proxy_engine::CredentialPick {
+            secret: SecretString::from(format!("rotated-key-{n}")),
+            credential_id: Some(format!("rot-{n}")),
+        })
     }
 }
 
@@ -284,6 +284,8 @@ fn echo_provider(endpoint: String) -> ProviderConfig {
         api_key: SecretString::from("configured-key"),
         auth_style: AuthStyle::Bearer,
         passthrough_auth: false,
+        api_keys: None,
+        retry: None,
         egress: None,
         adapters,
         routes,
@@ -311,6 +313,8 @@ fn config() -> AppConfig {
             admin_bind: None,
             admin_on_main_listener: false,
             endpoint_families: Default::default(),
+            upstream_timeouts: Default::default(),
+            bare_v1: Default::default(),
         },
         auth: Default::default(),
         storage: None,

@@ -33,6 +33,7 @@ mod tests {
             },
             streaming: false,
             body_hash: DIGEST_MARKER.to_owned(),
+            session_id: None,
         })
     }
 
@@ -64,6 +65,7 @@ mod tests {
             }),
             stop_reason: StopReason::EndTurn,
             latency_ms: 42,
+            credential_id: None,
         })
     }
 

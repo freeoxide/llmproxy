@@ -1,0 +1,1133 @@
+//! Plan 04 behaviour tests against loopback fake upstreams: pools, the
+//! retry ladder, pre-output failover, hold budgets, credential pools,
+//! session affinity and the exhaustion signals — through the same engine
+//! the server and the SDK run.
+
+#![cfg(test)]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::Router;
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::routing::post;
+use futures::StreamExt;
+use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
+use llm_proxy_core::{
+    AffinityConfig, AffinityConflictPolicy, AppConfig, AuthStyle, PoolConfig,
+    ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ProviderRouteKind,
+    ProviderRoutesConfig, RetryConfig, ServerConfig,
+};
+use llm_proxy_engine::{ClientDialect, Engine, EngineBuilder, EngineError, EngineRequest};
+use llm_proxy_protocol::core::{
+    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
+};
+use llm_proxy_storage::{
+    AttemptCompleted, AttemptOutcome, EventBus, ProxyEvent, RecordingBus, RequestReceived,
+};
+use secrecy::SecretString;
+
+async fn spawn_upstream(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("fake upstream addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "fake upstream stopped");
+        }
+    });
+    format!("http://{addr}/v1/messages")
+}
+
+const ANTHROPIC_OK_BODY: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello from upstream"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":4}}"#;
+
+fn upstream_json(status: StatusCode, body: &'static str) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move || async move { (status, [(header::CONTENT_TYPE, "application/json")], body) }),
+    )
+}
+
+fn upstream_429_with_retry_after(retry_after: &'static str) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move || async move {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (header::CONTENT_TYPE, "application/json"),
+                    (header::RETRY_AFTER, retry_after),
+                ],
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
+            )
+        }),
+    )
+}
+
+fn upstream_ok_stream() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let events = vec![
+                Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":7,"output_tokens":0}}}"#),
+                Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#),
+                Event::default()
+                    .event("message_delta")
+                    .data(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}"#),
+                Event::default()
+                    .event("message_stop")
+                    .data(r#"{"type":"message_stop"}"#),
+            ];
+            let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Sse::new(stream)
+                    .keep_alive(KeepAlive::default())
+                    .into_response(),
+            )
+        }),
+    )
+}
+
+/// A 200 whose first SSE frame is an error event (backlog 2): the stream
+/// rejects in-band before any output.
+fn upstream_stream_leading_error() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let events = vec![Event::default().event("error").data(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#,
+            )];
+            let stream =
+                futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Sse::new(stream).into_response(),
+            )
+        }),
+    )
+}
+
+/// A stream that starts, then ends without a terminal event.
+fn upstream_stream_truncated() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let events = vec![
+                Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_t","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}"#),
+                Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#),
+            ];
+            let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Sse::new(stream).into_response(),
+            )
+        }),
+    )
+}
+
+/// A stream that opens, then stays silent forever: headers arrive, no
+/// event ever does.
+fn upstream_silent_stream() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let never = futures::stream::pending::<Result<Event, std::convert::Infallible>>();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Sse::new(never).into_response(),
+            )
+        }),
+    )
+}
+
+/// A stream that closes without ever emitting an event.
+fn upstream_empty_stream() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let stream = futures::stream::empty::<Result<Event, std::convert::Infallible>>();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Sse::new(stream).into_response(),
+            )
+        }),
+    )
+}
+
+/// An upstream that only answers when the right key arrives; 401 otherwise.
+fn upstream_key_check(
+    expected_key: &'static str,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move |headers: axum::http::HeaderMap| async move {
+            let got = headers
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            seen.lock().expect("seen lock").push(got.clone());
+            if got == expected_key {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    ANTHROPIC_OK_BODY,
+                )
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"type":"error","error":{"type":"authentication_error","message":"bad key"}}"#,
+                )
+            }
+        }),
+    )
+}
+
+fn test_config() -> AppConfig {
+    AppConfig {
+        server: ServerConfig {
+            bind: "127.0.0.1:0".parse().expect("bind addr"),
+            request_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(5),
+            log_level: "info".to_owned(),
+            hot_reload: false,
+            allowed_origins: None,
+            server_name: "engine-test".to_owned(),
+            rate_limit_rpm: 1000,
+            trust_forwarded_headers: false,
+            dedup_window: Duration::ZERO,
+            log_format: Default::default(),
+            admin_bind: None,
+            admin_on_main_listener: false,
+            endpoint_families: Default::default(),
+            upstream_timeouts: Default::default(),
+            bare_v1: Default::default(),
+        },
+        auth: Default::default(),
+        storage: None,
+    }
+}
+
+/// Test aid: a JSON tuple response that also carries `Retry-After`.
+trait IntoResponseWithRetryAfter {
+    fn into_response_with_retry_after(self, retry_after: &'static str) -> axum::response::Response;
+}
+
+impl IntoResponseWithRetryAfter
+    for (
+        StatusCode,
+        [(axum::http::HeaderName, &'static str); 1],
+        &'static str,
+    )
+{
+    fn into_response_with_retry_after(self, retry_after: &'static str) -> axum::response::Response {
+        let (status, headers, body) = self;
+        let mut response = (status, headers, body).into_response();
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static(retry_after),
+        );
+        response
+    }
+}
+
+fn member(name: &str, endpoint: String, api_keys: Option<Vec<&str>>) -> ProviderConfig {
+    let adapters = std::collections::HashMap::from([(
+        "messages".to_owned(),
+        ProviderAdapterConfig {
+            protocol: "anthropic_messages".to_owned(),
+            endpoint,
+            headers: Arc::new(std::collections::HashMap::new()),
+            forward_inbound_headers: None,
+            lossy: false,
+        },
+    )]);
+    ProviderConfig {
+        name: name.to_owned(),
+        api_key: SecretString::from("base-key"),
+        api_keys: api_keys.map(|keys| {
+            keys.into_iter()
+                .map(|k| SecretString::from(k.to_owned()))
+                .collect()
+        }),
+        auth_style: AuthStyle::XApiKey,
+        passthrough_auth: false,
+        retry: None,
+        egress: None,
+        adapters,
+        routes: ProviderRoutesConfig {
+            messages: Some("messages".to_owned()),
+            chat_completions: None,
+        },
+        model_aliases: std::collections::HashMap::new(),
+        discovery: None,
+        catalog: None,
+        pricing: Default::default(),
+    }
+}
+
+fn pool(
+    name: &str,
+    members: Vec<&str>,
+    retry: RetryConfig,
+    affinity: AffinityConfig,
+) -> PoolConfig {
+    PoolConfig {
+        name: name.to_owned(),
+        members: members.into_iter().map(str::to_owned).collect(),
+        retry,
+        affinity,
+        health: Default::default(),
+    }
+}
+
+fn ladder_retry() -> RetryConfig {
+    RetryConfig {
+        max_attempts: 2,
+        backoff: Duration::from_millis(10),
+        cooldown: Duration::from_millis(50),
+        total_timeout: Duration::ZERO,
+        hold: Duration::ZERO,
+    }
+}
+
+fn build_engine(
+    providers: Vec<ProviderConfig>,
+    pools: Vec<PoolConfig>,
+) -> (Engine, Arc<RecordingBus>) {
+    let registry = ProviderRegistry::from_parts(providers, pools).expect("registry with pools");
+    let bus = Arc::new(RecordingBus::new());
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::<RecordingBus>::clone(&bus) as Arc<dyn EventBus>)
+        .build()
+        .expect("engine builds");
+    (engine, bus)
+}
+
+fn core_request(stream: bool) -> CoreRequest {
+    CoreRequest {
+        model: ModelRef {
+            requested: "claude-sonnet-4-6".to_owned(),
+            upstream: None,
+        },
+        messages: vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hello".to_owned(),
+                cache: None,
+            }],
+        }],
+        system: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        sampling: SamplingOptions::default(),
+        stream,
+        metadata: Default::default(),
+        provider_hints: Default::default(),
+    }
+}
+
+fn engine_request(route: &str, stream: bool) -> EngineRequest {
+    EngineRequest::new(
+        route,
+        ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        core_request(stream),
+        llm_proxy_engine::InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(
+                ClientWireFormat::AnthropicMessages,
+                serde_json::json!({}),
+            ),
+        },
+    )
+    .with_request_id("req-plan04")
+    .with_body_hash("hash")
+}
+
+fn attempts(bus: &RecordingBus) -> Vec<AttemptCompleted> {
+    bus.snapshot()
+        .into_iter()
+        .filter_map(|event| match event {
+            ProxyEvent::AttemptCompleted(attempt) => Some(attempt),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn pool_survives_a_429_from_its_first_member_and_the_ledger_shows_every_attempt() {
+    let primary = spawn_upstream(upstream_429_with_retry_after("0")).await;
+    let secondary = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let (engine, bus) = build_engine(
+        vec![
+            member("primary", primary, None),
+            member("secondary", secondary, None),
+        ],
+        vec![pool(
+            "both",
+            vec!["primary", "secondary"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let response = engine
+        .execute(engine_request("both", false))
+        .await
+        .expect("the pool fails over past the 429");
+    assert_eq!(response.core.usage.input_tokens, 10);
+
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.len(),
+        3,
+        "two attempts against the first member (max_attempts=2), then the failover"
+    );
+    assert_eq!(rows[0].provider, "primary");
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[0].http_status, Some(429));
+    assert_eq!(rows[0].route, "both");
+    assert_eq!(rows[0].attempt, 0);
+    assert_eq!(rows[1].provider, "primary");
+    assert_eq!(rows[1].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[1].attempt, 1);
+    assert_eq!(rows[2].provider, "secondary");
+    assert_eq!(rows[2].outcome, AttemptOutcome::Succeeded);
+    assert_eq!(rows[2].attempt, 2);
+    assert!(
+        bus.snapshot()
+            .iter()
+            .any(|event| matches!(event, ProxyEvent::ResponseCompleted(_))),
+        "the successful attempt completes the request row"
+    );
+}
+
+#[tokio::test]
+async fn pool_survives_a_5xx_then_a_connect_error_from_its_first_members() {
+    // Three members: a 500, an unreachable port (connect error), a good one.
+    let broken = spawn_upstream(upstream_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":"boom"}"#,
+    ))
+    .await;
+    let dead_endpoint = "http://127.0.0.1:9/v1/messages".to_owned(); // port 9: refuse
+    let good = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let (engine, _bus) = build_engine(
+        vec![
+            member("broken", broken, None),
+            member("dead", dead_endpoint, None),
+            member("good", good, None),
+        ],
+        vec![pool(
+            "all",
+            vec!["broken", "dead", "good"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let response = engine
+        .execute(engine_request("all", false))
+        .await
+        .expect("the pool survives 5xx and connect errors");
+    assert_eq!(response.core.usage.input_tokens, 10);
+}
+
+#[tokio::test]
+async fn a_direct_provider_route_never_fails_over_or_wraps_the_error() {
+    let provider_upstream = spawn_upstream(upstream_429_with_retry_after("0")).await;
+    let (engine, bus) = build_engine(vec![member("solo", provider_upstream, None)], vec![]);
+
+    let error = engine
+        .execute(engine_request("solo", false))
+        .await
+        .expect_err("the 429 surfaces to the client");
+    assert!(
+        matches!(error, EngineError::Upstream { status: 429, .. }),
+        "a direct provider route returns the raw 429, got {error:?}"
+    );
+    assert_eq!(error.status_code(), 429);
+    assert_eq!(attempts(&bus).len(), 1, "exactly one attempt, no ladder");
+}
+
+#[tokio::test]
+async fn an_exhausted_pool_reports_retries_exhausted_with_a_computed_retry_after() {
+    let first = spawn_upstream(upstream_429_with_retry_after("17")).await;
+    let second = spawn_upstream(upstream_429_with_retry_after("23")).await;
+    let (engine, _bus) = build_engine(
+        vec![member("first", first, None), member("second", second, None)],
+        vec![pool(
+            "limited",
+            vec!["first", "second"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    let error = engine
+        .execute(engine_request("limited", false))
+        .await
+        .expect_err("both members are rate limited");
+    let EngineError::RetryExhausted {
+        attempts,
+        retry_after,
+        ..
+    } = &error
+    else {
+        panic!("expected RetryExhausted, got {error:?}");
+    };
+    assert_eq!(*attempts, 2);
+    assert_eq!(
+        *retry_after,
+        Some(Duration::from_secs(23)),
+        "the longest advertised reset wins"
+    );
+    assert_eq!(error.status_code(), 429);
+    assert!(!error.should_retry(), "the client is told not to retry");
+}
+
+#[tokio::test]
+async fn a_stream_that_fails_before_commit_fails_over() {
+    let bad = spawn_upstream(upstream_stream_leading_error()).await;
+    let good = spawn_upstream(upstream_ok_stream()).await;
+    let (engine, bus) = build_engine(
+        vec![member("bad", bad, None), member("good", good, None)],
+        vec![pool(
+            "streamed",
+            vec!["bad", "good"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let stream = engine
+        .execute_stream(engine_request("streamed", true))
+        .await
+        .expect("failover happens before any byte is committed");
+    assert!(
+        !stream.head.is_empty(),
+        "the head comes from the second member"
+    );
+    let mut all = stream.head.clone();
+    let mut tail = stream.tail;
+    while let Some(event) = tail.next().await {
+        all.push(event);
+    }
+    assert!(
+        all.iter()
+            .any(|event| matches!(event, CoreEvent::MessageStop { .. })),
+        "the good member's terminal arrives"
+    );
+
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.len(),
+        3,
+        "two failed attempts on the bad member, then the commit"
+    );
+    assert_eq!(rows[0].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[1].outcome, AttemptOutcome::Failed);
+    assert_eq!(rows[2].outcome, AttemptOutcome::Streaming);
+    assert_eq!(rows[2].provider, "good");
+}
+
+#[tokio::test]
+async fn a_stream_that_fails_after_commit_ends_with_an_in_band_error_and_a_failed_row() {
+    let bad = spawn_upstream(upstream_stream_truncated()).await;
+    let good = spawn_upstream(upstream_ok_stream()).await;
+    let (engine, bus) = build_engine(
+        vec![member("bad", bad, None), member("good", good, None)],
+        vec![pool(
+            "streamed",
+            vec!["bad", "good"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let stream = engine
+        .execute_stream(engine_request("streamed", true))
+        .await
+        .expect("the first member's prefix commits");
+    assert!(!stream.head.is_empty());
+    let mut all = stream.head.clone();
+    let mut tail = stream.tail;
+    while let Some(event) = tail.next().await {
+        all.push(event);
+    }
+    assert!(
+        all.iter()
+            .any(|event| matches!(event, CoreEvent::Error { .. })),
+        "the truncation is an in-band error, got {all:?}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        bus.snapshot()
+            .iter()
+            .any(|event| matches!(event, ProxyEvent::ResponseFailed(_))),
+        "a committed stream that dies records a failed ledger row"
+    );
+}
+
+#[tokio::test]
+async fn the_hold_budget_commits_a_silent_stream_and_covers_the_gap() {
+    // The upstream opens and stays silent forever: with a hold budget, the
+    // engine commits (empty head) instead of holding the HTTP response
+    // hostage — from there heartbeats cover the silence.
+    let silent = spawn_upstream(upstream_silent_stream()).await;
+    let (engine, bus) = build_engine(
+        vec![member("silent", silent, None)],
+        vec![pool(
+            "held",
+            vec!["silent"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::from_millis(300),
+            },
+            Default::default(),
+        )],
+    );
+
+    let started = std::time::Instant::now();
+    let stream = engine
+        .execute_stream(engine_request("held", true))
+        .await
+        .expect("the hold budget commits the stream");
+    assert!(
+        stream.head.is_empty(),
+        "silence commits with an empty head; heartbeats cover it from here"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "the engine waited out the hold budget before committing"
+    );
+    let rows = attempts(&bus);
+    assert_eq!(
+        rows.last().map(|row| row.outcome),
+        Some(AttemptOutcome::Streaming),
+        "the committed attempt is recorded even though no event arrived"
+    );
+    // Dropping the tail cancels the stream (the client went away).
+    drop(stream.tail);
+}
+
+#[tokio::test]
+async fn without_a_hold_budget_a_silent_stream_keeps_http_error_semantics() {
+    let silent = spawn_upstream(upstream_empty_stream()).await;
+    let (engine, _bus) = build_engine(
+        vec![member("silent", silent, None)],
+        vec![pool(
+            "unheld",
+            vec!["silent"],
+            ladder_retry(),
+            Default::default(),
+        )],
+    );
+
+    let error = engine
+        .execute_stream(engine_request("unheld", true))
+        .await
+        .expect_err("nothing was committed, so the failure keeps its status");
+    assert_eq!(error.status_code(), 502);
+}
+
+#[tokio::test]
+async fn the_ladder_deadline_spans_all_attempts() {
+    // The member fails fast; the backoff between attempts outlives the
+    // ladder's total deadline, so the second attempt must not run.
+    let failing = spawn_upstream(upstream_json(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        r#"{"error":"down"}"#,
+    ))
+    .await;
+    let (engine, _bus) = build_engine(
+        vec![member("failing", failing, None)],
+        vec![pool(
+            "racing",
+            vec!["failing"],
+            RetryConfig {
+                max_attempts: 5,
+                backoff: Duration::from_millis(500),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::from_millis(100),
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    let started = std::time::Instant::now();
+    let error = engine
+        .execute(engine_request("racing", false))
+        .await
+        .expect_err("the deadline stops the ladder");
+    assert!(
+        matches!(error, EngineError::RetryExhausted { .. }),
+        "the deadline exhaustion is reported as an exhausted ladder, got {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "the ladder stopped at its deadline instead of sleeping the full backoff"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_retry_ladder_retries_the_same_member() {
+    // The upstream fails the first request with 500 and succeeds after.
+    let counter = Arc::new(std::sync::Mutex::new(0u32));
+    let seen = Arc::clone(&counter);
+    let app = Router::new().route(
+        "/{*path}",
+        post(move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                let mut n = seen.lock().expect("counter");
+                *n += 1;
+                if *n == 1 {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"first try fails"}"#.to_owned(),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        ANTHROPIC_OK_BODY.to_owned(),
+                    )
+                }
+            }
+        }),
+    );
+    let endpoint = spawn_upstream(app).await;
+    let mut provider = member("flaky", endpoint, None);
+    provider.retry = Some(RetryConfig {
+        max_attempts: 2,
+        backoff: Duration::from_millis(10),
+        cooldown: Duration::from_millis(50),
+        total_timeout: Duration::ZERO,
+        hold: Duration::ZERO,
+    });
+    let registry =
+        llm_proxy_core::ProviderRegistry::from_parts(vec![provider], vec![]).expect("registry");
+    let bus = Arc::new(RecordingBus::new());
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::<RecordingBus>::clone(&bus) as Arc<dyn EventBus>)
+        .build()
+        .expect("engine builds");
+
+    let response = engine
+        .execute(engine_request("flaky", false))
+        .await
+        .expect("the same member is retried");
+    assert_eq!(response.core.usage.input_tokens, 10);
+    let rows = attempts(&bus);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].provider, "flaky");
+    assert_eq!(rows[1].provider, "flaky");
+}
+
+#[tokio::test]
+async fn credential_pools_rotate_away_from_a_rejected_key() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream = spawn_upstream(upstream_key_check("good-key", Arc::clone(&seen))).await;
+    let (engine, bus) = build_engine(
+        vec![member("keys", upstream, Some(vec!["good-key"]))],
+        vec![pool(
+            "keyed",
+            vec!["keys"],
+            RetryConfig {
+                max_attempts: 3,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            Default::default(),
+        )],
+    );
+
+    let response = engine
+        .execute(engine_request("keyed", false))
+        .await
+        .expect("rotation finds the working key");
+
+    let tried = seen.lock().expect("seen lock").clone();
+    assert!(
+        tried.len() >= 2,
+        "the first (base) key must be rejected before rotation, tried {tried:?}"
+    );
+    assert_eq!(*tried.last().expect("at least one try"), "good-key");
+
+    let snapshot = bus.snapshot();
+    let completed = snapshot
+        .iter()
+        .find_map(|event| match event {
+            ProxyEvent::ResponseCompleted(completed) => Some(completed),
+            _ => None,
+        })
+        .expect("completed row");
+    assert_eq!(
+        completed.credential_id.as_deref(),
+        Some("key-1"),
+        "the ledger records which key served the request"
+    );
+    let _ = response;
+}
+
+#[tokio::test]
+async fn session_ids_land_on_usage_rows_from_header_and_metadata() {
+    let good = spawn_upstream(upstream_json(StatusCode::OK, ANTHROPIC_OK_BODY)).await;
+    let (engine, bus) = build_engine(vec![member("solo", good, None)], vec![]);
+
+    let mut request = engine_request("solo", false);
+    request.inbound.headers.insert(
+        "x-claude-code-session-id".to_owned(),
+        "sess-header".to_owned(),
+    );
+    engine.execute(request).await.expect("runs");
+
+    let mut request = engine_request("solo", false);
+    request.core.metadata.user_id = Some("user-42".to_owned());
+    engine.execute(request).await.expect("runs");
+
+    let snapshot = bus.snapshot();
+    let sessions: Vec<Option<String>> = snapshot
+        .iter()
+        .filter_map(|event| match event {
+            ProxyEvent::RequestReceived(RequestReceived { session_id, .. }) => {
+                Some(session_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sessions,
+        vec![Some("sess-header".to_owned()), Some("user-42".to_owned())],
+        "the session header wins; metadata.user_id is the fallback"
+    );
+}
+
+/// An upstream whose body names its member, failing its first N requests.
+fn upstream_tagged(tag: &'static str, fail_first: u32) -> (Router, Arc<std::sync::Mutex<u32>>) {
+    let counter = Arc::new(std::sync::Mutex::new(0u32));
+    let seen = Arc::clone(&counter);
+    let router = Router::new().route(
+        "/{*path}",
+        post(move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                let calls = {
+                    let mut n = seen.lock().expect("counter");
+                    *n += 1;
+                    *n
+                };
+                if calls <= fail_first {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"warming up"}"#.to_owned(),
+                    )
+                } else {
+                    let body = format!(
+                        r#"{{"id":"msg_{tag}","type":"message","role":"assistant","content":[{{"type":"text","text":"from-{tag}"}}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":10,"output_tokens":4}}}}"#
+                    );
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }
+            }
+        }),
+    );
+    (router, counter)
+}
+
+fn response_text(response: &llm_proxy_engine::EngineResponse) -> String {
+    response
+        .core
+        .content
+        .iter()
+        .find_map(|content| match content {
+            CoreContent::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn sticky_affinity_pins_a_session_to_the_member_that_served_it() {
+    let (primary_router, _primary_calls) = upstream_tagged("primary", 1);
+    let (secondary_router, _secondary_calls) = upstream_tagged("secondary", 0);
+    let primary = spawn_upstream(primary_router).await;
+    let secondary = spawn_upstream(secondary_router).await;
+    let (engine, _bus) = build_engine(
+        vec![
+            member("primary", primary, None),
+            member("secondary", secondary, None),
+        ],
+        vec![pool(
+            "sticky",
+            vec!["primary", "secondary"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(80),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            AffinityConfig {
+                sticky: true,
+                on_conflict: AffinityConflictPolicy::Strip,
+            },
+        )],
+    );
+
+    let with_session = || {
+        let mut request = engine_request("sticky", false);
+        request
+            .inbound
+            .headers
+            .insert("x-claude-code-session-id".to_owned(), "sess-1".to_owned());
+        request
+    };
+
+    // First request: primary is warming up (500) and cools down; secondary
+    // serves and gets the pin.
+    let first = engine.execute(with_session()).await.expect("served");
+    assert_eq!(response_text(&first), "from-secondary");
+
+    // Cooldown expiry: primary is healthy again and first in config order.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // A session-less request walks the configured order: primary first.
+    let anonymous = engine
+        .execute(engine_request("sticky", false))
+        .await
+        .expect("served");
+    assert_eq!(
+        response_text(&anonymous),
+        "from-primary",
+        "without a session the configured order stands"
+    );
+
+    // The pinned session goes back to its member.
+    let second = engine.execute(with_session()).await.expect("served");
+    assert_eq!(
+        response_text(&second),
+        "from-secondary",
+        "a sticky session returns to the member that served it"
+    );
+}
+
+/// An upstream that serves its first `healthy_calls` calls, then always
+/// fails: lets a test pin a session to a member before killing it.
+fn upstream_dies_after(tag: &'static str, healthy_calls: u32) -> Router {
+    let counter = Arc::new(std::sync::Mutex::new(0u32));
+    Router::new().route(
+        "/{*path}",
+        post(move || {
+            let counter = Arc::clone(&counter);
+            async move {
+                let calls = {
+                    let mut n = counter.lock().expect("counter");
+                    *n += 1;
+                    *n
+                };
+            if calls <= healthy_calls {
+                let body = format!(
+                    r#"{{"id":"msg_{tag}","type":"message","role":"assistant","content":[{{"type":"text","text":"from-{tag}"}}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":10,"output_tokens":4}}}}"#
+                );
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"error":"died"}"#.to_owned(),
+                )
+            }
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn refuse_policy_fails_the_switch_instead_of_serving_elsewhere() {
+    let alpha = spawn_upstream(upstream_dies_after("alpha", 1)).await;
+    let beta = spawn_upstream(upstream_dies_after("beta", u32::MAX)).await;
+    let (engine, _bus) = build_engine(
+        vec![member("alpha", alpha, None), member("beta", beta, None)],
+        vec![pool(
+            "strict",
+            vec!["alpha", "beta"],
+            RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(500),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            AffinityConfig {
+                sticky: true,
+                on_conflict: AffinityConflictPolicy::Refuse,
+            },
+        )],
+    );
+
+    let with_session = || {
+        let mut request = engine_request("strict", false);
+        request
+            .inbound
+            .headers
+            .insert("x-claude-code-session-id".to_owned(), "sess-r".to_owned());
+        request
+    };
+
+    // The session pins to alpha, which serves exactly one request.
+    let first = engine.execute(with_session()).await.expect("served");
+    assert_eq!(response_text(&first), "from-alpha");
+
+    // alpha now fails; the refuse policy must stop the pinned session from
+    // being switched to beta.
+    let error = engine
+        .execute(with_session())
+        .await
+        .expect_err("the switch is refused");
+    assert!(
+        matches!(error, EngineError::AffinityRefused { .. }),
+        "expected AffinityRefused, got {error:?}"
+    );
+    assert_eq!(error.status_code(), 503);
+}
+
+#[tokio::test]
+async fn the_health_probe_clears_a_members_cooldown_when_it_recovers() {
+    // "probed" 429s once with a long advertised reset, then serves with a
+    // distinguishable body (input_tokens=1); "spare" always serves with
+    // input_tokens=2. The first request fails over to the spare and cools
+    // "probed" for the advertised 300s; the probe (every 50ms) must clear
+    // that cooldown so the next request reaches "probed" again.
+    let probed_endpoint = spawn_upstream(probed_upstream()).await;
+    let spare_endpoint = spawn_upstream(upstream_json(StatusCode::OK, SPARE_OK_BODY)).await;
+    let mut probed_member = member("probed", probed_endpoint, None);
+    // The probe needs a model the member serves.
+    probed_member.model_aliases.insert(
+        "claude-sonnet-4-6".to_owned(),
+        "claude-sonnet-4-6".to_owned(),
+    );
+    let mut spare_member = member("spare", spare_endpoint, None);
+    spare_member.model_aliases.insert(
+        "claude-sonnet-4-6".to_owned(),
+        "claude-sonnet-4-6".to_owned(),
+    );
+    let (engine, _bus) = build_engine(
+        vec![probed_member, spare_member],
+        vec![PoolConfig {
+            name: "probing".to_owned(),
+            members: vec!["probed".to_owned(), "spare".to_owned()],
+            retry: RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::from_millis(50),
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            affinity: Default::default(),
+            health: llm_proxy_core::provider_config::PoolHealthConfig {
+                probe_interval: Some(Duration::from_millis(50)),
+            },
+        }],
+    );
+
+    // First request: probed 429s (300s advertised reset) and the pool fails
+    // over to the spare.
+    let first = engine
+        .execute(engine_request("probing", false))
+        .await
+        .expect("the pool fails over to the spare");
+    assert_eq!(first.core.usage.input_tokens, 2, "the spare served it");
+
+    // Without the probe, the 300s cooldown keeps probed out of rotation.
+    // The probe recovers it within its interval.
+    let mut recovered = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Ok(response) = engine.execute(engine_request("probing", false)).await
+            && response.core.usage.input_tokens == 1
+        {
+            recovered = true;
+            break;
+        }
+    }
+    assert!(
+        recovered,
+        "the probe must restore the cooled member before the advertised reset"
+    );
+}
+
+/// Serves one 429 with `Retry-After: 300`, then a distinguishable 200.
+fn probed_upstream() -> Router {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            let n = CALLS.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"error":"slow"}"#,
+                )
+                    .into_response_with_retry_after("300");
+            }
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                PROBED_OK_BODY,
+            )
+                .into_response()
+        }),
+    )
+}
+
+const PROBED_OK_BODY: &str = r#"{"id":"msg_p","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+const SPARE_OK_BODY: &str = r#"{"id":"msg_s","type":"message","role":"assistant","content":[{"type":"text","text":"spare"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2,"output_tokens":1}}"#;

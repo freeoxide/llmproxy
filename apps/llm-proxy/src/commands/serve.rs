@@ -6,7 +6,6 @@ use axum::serve::{Listener, ListenerExt};
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::LogFormat;
 use llm_proxy_server::{admin_router, build_router, shutdown_signal};
-use llm_proxy_transport::ProxyClient;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;
@@ -38,11 +37,8 @@ pub async fn cmd_serve(
     validate_toml_extension(&path)?;
 
     let adapter_registry = ProviderAdapterRegistry::builtin();
-    let proxy_client = ProxyClient::try_new().with_context(
-        || "building proxy HTTP client (check HTTP_PROXY/HTTPS_PROXY and TLS config)",
-    )?;
 
-    let state = load_toml_state(&path, adapter_registry, proxy_client, port_override)?;
+    let state = load_toml_state(&path, adapter_registry, port_override)?;
 
     let admin = bind_admin_listener(&state).await?;
 

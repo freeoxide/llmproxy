@@ -259,6 +259,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -301,6 +303,8 @@ mod tests {
                 admin_bind: None,
                 admin_on_main_listener: false,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -892,6 +896,8 @@ mod tests {
             api_key: secrecy::SecretString::from(api_key),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -933,6 +939,8 @@ mod tests {
                 admin_bind: None,
                 admin_on_main_listener: false,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: Default::default(),
             storage: None,

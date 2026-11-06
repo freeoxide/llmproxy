@@ -31,9 +31,12 @@
 #![deny(missing_docs)]
 
 pub mod catalog;
+pub mod classification;
 pub mod error;
 pub mod headers;
+pub mod health;
 pub mod lifecycle;
+pub mod probe;
 pub mod traits;
 pub mod types;
 
@@ -46,15 +49,17 @@ use llm_proxy_storage::EventBus;
 use llm_proxy_transport::ProxyClient;
 
 pub use catalog::{ModelCatalogService, write_catalog_atomic};
+pub use classification::{ErrorClass, classify, parse_duration_suffix, parse_retry_after};
 pub use error::{
     AuthOwner, EngineError, map_provider_error, map_upstream_status, sanitize_upstream_error_body,
 };
 pub use headers::select_forwarded_headers;
+pub use health::{AffinityTable, CooldownStore};
 pub use traits::{
     Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, AllowAllAdmission, Cache,
-    CacheEntry, CacheKey, ConfigCredentialSource, ConfigSource, CredentialSource, EventBusSink,
-    Guard, GuardDecision, InboundHeaders, NoCache, RegistryRouter, ResolvedTarget, RouteQuery,
-    Router, StaticConfigSource, UsageSink,
+    CacheEntry, CacheKey, ConfigCredentialSource, ConfigSource, CredentialFeedback, CredentialPick,
+    CredentialQuery, CredentialSource, EventBusSink, Guard, GuardDecision, InboundHeaders, NoCache,
+    RegistryRouter, ResolvedTarget, RoutePlan, RouteQuery, Router, StaticConfigSource, UsageSink,
 };
 pub use types::{ClientDialect, EngineRequest, EngineResponse, EngineStream, InboundRequest};
 
@@ -103,6 +108,11 @@ pub(crate) struct EngineInner {
     pub(crate) usage: EventBusSink,
     pub(crate) catalogs: Arc<ModelCatalogService>,
     pub(crate) metrics: Arc<Metrics>,
+    /// Passive upstream health (plan 04 steps 3, 9): provider and
+    /// credential cooldowns keyed to real reset times.
+    pub(crate) health: Arc<CooldownStore>,
+    /// Sticky-session pins (plan 04 step 10).
+    pub(crate) affinity: Arc<AffinityTable>,
 }
 
 impl std::fmt::Debug for EngineInner {
@@ -119,6 +129,8 @@ impl std::fmt::Debug for EngineInner {
             .field("credentials", &self.credentials)
             .field("usage", &self.usage)
             .field("metrics", &self.metrics)
+            .field("health", &self.health)
+            .field("affinity", &self.affinity)
             .finish()
     }
 }
@@ -403,15 +415,18 @@ impl EngineBuilder {
         self.providers
             .validate_protocols(known_protocols.iter().map(String::as_str))
             .map_err(|error| EngineError::Internal(error.to_string()))?;
-        let router = self.router.unwrap_or_else(|| {
-            Arc::new(RegistryRouter::new(
-                Arc::clone(&self.providers),
-                Arc::clone(&catalogs),
-            ))
-        });
         let usage = self.usage.unwrap_or_else(|| {
             EventBusSink::new(Arc::new(llm_proxy_storage::NoopBus) as Arc<dyn EventBus>)
         });
+        let health = Arc::new(CooldownStore::new());
+        let affinity = Arc::new(AffinityTable::default());
+        let router: Arc<dyn Router> = match self.router {
+            Some(router) => router,
+            None => Arc::new(
+                RegistryRouter::new(Arc::clone(&self.providers), Arc::clone(&catalogs))
+                    .with_affinity(Arc::clone(&affinity)),
+            ),
+        };
         let inner = EngineInner {
             config: self.config,
             providers: self.providers,
@@ -425,14 +440,16 @@ impl EngineBuilder {
             guards: self.guards,
             credentials: self
                 .credentials
-                .unwrap_or_else(|| Arc::new(ConfigCredentialSource)),
+                .unwrap_or_else(|| Arc::new(ConfigCredentialSource::new())),
             usage,
             catalogs,
             metrics: self.metrics.unwrap_or_else(|| Arc::new(Metrics::new())),
+            health,
+            affinity,
         };
-        Ok(Engine {
-            inner: Arc::new(inner),
-        })
+        let inner = Arc::new(inner);
+        crate::probe::spawn_pool_probes(&inner);
+        Ok(Engine { inner })
     }
 }
 

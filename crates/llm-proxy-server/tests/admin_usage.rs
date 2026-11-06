@@ -40,6 +40,7 @@ mod tests {
                 },
                 streaming: false,
                 body_hash: "digest".to_owned(),
+                session_id: None,
             },
         ));
         let closer = std::sync::Arc::new(bus);
@@ -70,6 +71,8 @@ mod tests {
                 admin_bind: None,
                 admin_on_main_listener: on_main_listener,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,

@@ -43,6 +43,7 @@ mod tests {
             },
             streaming: true,
             body_hash: format!("sha256-digest-{id}"),
+            session_id: None,
         })
     }
 
@@ -80,6 +81,7 @@ mod tests {
             }),
             stop_reason: StopReason::EndTurn,
             latency_ms: 4321,
+            credential_id: None,
         })
     }
 

@@ -1,8 +1,12 @@
 //! The engine's error type: transport- and HTTP-free, mapped by the server
 //! crate into client-facing status codes and bodies.
 
+use std::time::Duration;
+
 use llm_proxy_adapters::ProviderError;
 use llm_proxy_core::ProviderRouteResolutionError;
+
+use crate::classification::rate_limit_reset;
 
 /// Who owns the credential an upstream auth failure implicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +56,37 @@ pub enum EngineError {
         body: String,
         /// Whose credential an auth failure implicates.
         auth_owner: AuthOwner,
+        /// The upstream-advised wait parsed from `Retry-After` or a
+        /// rate-limit reset header, when the error response carried one.
+        retry_after: Option<Duration>,
     },
     /// The upstream timed out.
     #[error("upstream request timed out: {0}")]
     UpstreamTimeout(String),
+    /// The retry/failover ladder ran out of attempts (plan 04 step 12,
+    /// backlog 38): the proxy already tried, so the client must not stack
+    /// its own retry loop on top. Status and message delegate to the last
+    /// underlying error.
+    #[error("retries exhausted after {attempts} attempts: {last}")]
+    RetryExhausted {
+        /// Attempts the ladder made, including the failed last one.
+        attempts: u32,
+        /// The error the final attempt produced.
+        last: Box<EngineError>,
+        /// The wait after which another request might succeed: the
+        /// upstream-advised or cooldown-derived reset, when known.
+        retry_after: Option<Duration>,
+    },
+    /// The route's affinity policy refused a failover (plan 04 step 10,
+    /// conflict 6): the session is pinned to a member and switching would
+    /// carry state bound to another account.
+    #[error("session is pinned to provider \"{pinned}\" and the failover policy refuses to switch")]
+    AffinityRefused {
+        /// The member the session is pinned to.
+        pinned: String,
+        /// The session id.
+        session: String,
+    },
     /// An internal invariant broke.
     #[error("internal error: {0}")]
     Internal(String),
@@ -90,6 +121,8 @@ impl EngineError {
             Self::ProviderDecode(_) => "ProviderDecode",
             Self::Upstream { .. } => "Upstream",
             Self::UpstreamTimeout(_) => "UpstreamTimeout",
+            Self::RetryExhausted { .. } => "RetryExhausted",
+            Self::AffinityRefused { .. } => "AffinityRefused",
             Self::Internal(_) => "Internal",
         }
     }
@@ -110,8 +143,29 @@ impl EngineError {
             Self::InvalidRequest(_) => 400,
             Self::ProviderDecode(_) => 502,
             Self::UpstreamTimeout(_) => 504,
+            Self::RetryExhausted { last, .. } => last.status_code(),
+            Self::AffinityRefused { .. } => 503,
             Self::Internal(_) => 500,
         }
+    }
+
+    /// The upstream-advised or ladder-computed wait, when this error carries
+    /// one (the value the server renders as `Retry-After`).
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Upstream { retry_after, .. } => *retry_after,
+            Self::RetryExhausted { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Whether the proxy wants the client to retry this request itself.
+    /// `false` exactly when the ladder already exhausted its own retries
+    /// (backlog 38): the server renders this as `x-should-retry`.
+    #[must_use]
+    pub fn should_retry(&self) -> bool {
+        !matches!(self, Self::RetryExhausted { .. })
     }
 
     /// Sanitized client-facing message.
@@ -139,7 +193,8 @@ pub fn map_upstream_status(upstream: u16, auth_owner: AuthOwner) -> u16 {
 }
 
 /// Maps an adapter/transport error to an engine error, given who owns the
-/// credential.
+/// credential. `Api` errors keep their response headers' reset advice as
+/// `retry_after`.
 #[must_use]
 pub fn map_provider_error(error: &ProviderError, passthrough_auth: bool) -> EngineError {
     let auth_owner = if passthrough_auth {
@@ -148,10 +203,15 @@ pub fn map_provider_error(error: &ProviderError, passthrough_auth: bool) -> Engi
         AuthOwner::Operator
     };
     match error {
-        ProviderError::Api { status, body } => EngineError::Upstream {
+        ProviderError::Api {
+            status,
+            body,
+            headers,
+        } => EngineError::Upstream {
             status: *status,
             body: body.clone(),
             auth_owner,
+            retry_after: retry_after_from_headers(headers),
         },
         other => {
             if other.is_timeout() {
@@ -161,10 +221,18 @@ pub fn map_provider_error(error: &ProviderError, passthrough_auth: bool) -> Engi
                     status: 502,
                     body: fully_sanitize(other),
                     auth_owner,
+                    retry_after: None,
                 }
             }
         }
     }
+}
+
+/// The wait advised by an error response's headers (lowercased names):
+/// `Retry-After` and the rate-limit reset dialects, longest window wins.
+#[must_use]
+pub fn retry_after_from_headers(headers: &[(String, String)]) -> Option<std::time::Duration> {
+    rate_limit_reset(headers)
 }
 
 const MAX_SANITIZE_LEN: usize = 512;

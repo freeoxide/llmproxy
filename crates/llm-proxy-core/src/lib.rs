@@ -29,13 +29,15 @@ pub use catalog::{
 pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
 pub use provider_config::{
-    ANONYMOUS_CALLER, AdminAuthConfig, AdminMountPosture, AppConfig, AuthConfig, AuthMode,
-    AuthStyle, ConfigValidationError, DEFAULT_MAX_BODY_BYTES, EndpointFamilyConfig, LogFormat,
-    ModelId, ModelPricing, ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode,
-    ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderEgressConfig,
-    ProviderFile, ProviderRouteKind, ProviderRoutesConfig, ServerConfig, StaticModelCatalogEntry,
-    StorageConfig, family_max_body_bytes, family_request_timeout, load_app_config,
-    load_provider_config, validate_passthrough_auth_combination, validate_provider_config,
+    ANONYMOUS_CALLER, AdminAuthConfig, AdminMountPosture, AffinityConfig, AffinityConflictPolicy,
+    AppConfig, AuthConfig, AuthMode, AuthStyle, BareV1Config, ConfigValidationError,
+    DEFAULT_MAX_BODY_BYTES, EndpointFamilyConfig, LogFormat, ModelId, ModelPricing, PoolConfig,
+    PoolFile, ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig,
+    ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderEgressConfig, ProviderFile,
+    ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig, StaticModelCatalogEntry,
+    StorageConfig, UpstreamTimeoutsConfig, family_max_body_bytes, family_request_timeout,
+    load_app_config, load_provider_config, validate_passthrough_auth_combination,
+    validate_pool_config, validate_provider_config, validate_upstream_timeouts,
 };
 pub use provider_registry::{
     ProviderAdapterTargetConfig, ProviderRegistry, ProviderRouteResolutionError,

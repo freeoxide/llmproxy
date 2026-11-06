@@ -32,6 +32,8 @@ fn app_config() -> core::AppConfig {
             admin_bind: None,
             admin_on_main_listener: false,
             endpoint_families: HashMap::new(),
+            upstream_timeouts: Default::default(),
+            bare_v1: Default::default(),
         },
         auth: Default::default(),
         storage: None,

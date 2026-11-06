@@ -61,7 +61,9 @@ impl RetentionPolicy {
 
 /// Run one retention pass, deleting rows past `policy`'s bounds; returns the
 /// number of rows deleted. Age pruning covers failure-only rows (no
-/// `received_at`) via `COALESCE(received_at, completed_at)`.
+/// `received_at`) via `COALESCE(received_at, completed_at)`. Attempt rows are
+/// pruned with their requests: by the same age cutoff, and by request id when
+/// the row cap evicts requests.
 pub fn run_retention_pass(
     conn: &mut Connection,
     policy: &RetentionPolicy,
@@ -78,6 +80,11 @@ pub fn run_retention_pass(
             rusqlite::params![cutoff],
         )?;
         deleted += u64::try_from(n).unwrap_or(u64::MAX);
+        let n = conn.execute(
+            "DELETE FROM attempts WHERE created_at < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        deleted += u64::try_from(n).unwrap_or(u64::MAX);
     }
     if let Some(max_rows) = policy.max_rows {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))?;
@@ -86,6 +93,15 @@ pub fn run_retention_pass(
             .saturating_sub(max_rows);
         if excess > 0 {
             let limit = i64::try_from(excess).unwrap_or(i64::MAX);
+            let n = conn.execute(
+                "DELETE FROM attempts WHERE request_id IN (
+                     SELECT request_id FROM requests
+                     ORDER BY COALESCE(received_at, completed_at) ASC
+                     LIMIT ?1
+                 )",
+                rusqlite::params![limit],
+            )?;
+            deleted += u64::try_from(n).unwrap_or(u64::MAX);
             let n = conn.execute(
                 "DELETE FROM requests WHERE request_id IN (
                      SELECT request_id FROM requests
@@ -128,7 +144,9 @@ CREATE TABLE IF NOT EXISTS requests (
     error_kind            TEXT,
     http_status           INTEGER,
     latency_ms            INTEGER,
-    body_hash             TEXT
+    body_hash             TEXT,
+    session_id            TEXT,
+    credential_id         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp
     ON requests (received_at);
@@ -136,6 +154,25 @@ CREATE INDEX IF NOT EXISTS idx_requests_provider_timestamp
     ON requests (provider, received_at);
 CREATE INDEX IF NOT EXISTS idx_requests_caller_timestamp
     ON requests (caller, received_at);
+CREATE TABLE IF NOT EXISTS attempts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id    TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    attempt_seq   INTEGER NOT NULL,
+    route         TEXT,
+    provider      TEXT NOT NULL,
+    model         TEXT,
+    credential_id TEXT,
+    outcome       TEXT NOT NULL,
+    error_kind    TEXT,
+    http_status   INTEGER,
+    message       TEXT,
+    latency_ms    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_request
+    ON attempts (request_id);
+CREATE INDEX IF NOT EXISTS idx_attempts_created
+    ON attempts (created_at);
 ";
 
 fn open_connection(path: &Path) -> Result<Connection, StorageError> {
@@ -186,7 +223,37 @@ fn write_event(conn: &Connection, event: &ProxyEvent) -> Result<(), StorageError
         ProxyEvent::RequestReceived(e) => insert_request_received(conn, e),
         ProxyEvent::ResponseCompleted(e) => upsert_response_completed(conn, e),
         ProxyEvent::ResponseFailed(e) => upsert_response_failed(conn, e),
+        ProxyEvent::AttemptCompleted(e) => insert_attempt(conn, e),
     }
+}
+
+fn insert_attempt(conn: &Connection, e: &crate::AttemptCompleted) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO attempts (
+                     request_id, created_at, attempt_seq, route, provider, model,
+                     credential_id, outcome, error_kind, http_status, message,
+                     latency_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            e.request_id,
+            unix_millis(e.timestamp),
+            i64::from(e.attempt),
+            e.route,
+            e.provider,
+            e.model,
+            e.credential_id,
+            match e.outcome {
+                crate::AttemptOutcome::Succeeded => "succeeded",
+                crate::AttemptOutcome::Failed => "failed",
+                crate::AttemptOutcome::Streaming => "streaming",
+            },
+            e.error_kind,
+            e.http_status.map(i64::from),
+            e.message,
+            i64::try_from(e.latency_ms).unwrap_or(i64::MAX),
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_request_received(
@@ -197,8 +264,8 @@ fn insert_request_received(
         "INSERT OR IGNORE INTO requests (
                      request_id, received_at, caller, provider, route_kind,
                      client_protocol, streaming, model_requested, model_upstream,
-                     body_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     body_hash, session_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             e.request_id,
             unix_millis(e.timestamp),
@@ -210,6 +277,7 @@ fn insert_request_received(
             e.model.requested,
             e.model.upstream,
             e.body_hash,
+            e.session_id,
         ],
     )?;
     Ok(())
@@ -225,9 +293,10 @@ fn upsert_response_completed(
                      model_upstream, input_tokens, output_tokens, reasoning_tokens,
                      cache_read_tokens, cache_creation_tokens, usage_provenance,
                      cost_input, cost_output, cost_cache_creation, cost_cache_read,
-                     cost_reasoning, cost_total, stop_reason, latency_ms
+                     cost_reasoning, cost_total, stop_reason, latency_ms,
+                     credential_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                           ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                  ON CONFLICT(request_id) DO UPDATE SET
                      completed_at = excluded.completed_at,
                      provider = excluded.provider,
@@ -246,7 +315,8 @@ fn upsert_response_completed(
                      cost_reasoning = excluded.cost_reasoning,
                      cost_total = excluded.cost_total,
                      stop_reason = excluded.stop_reason,
-                     latency_ms = excluded.latency_ms",
+                     latency_ms = excluded.latency_ms,
+                     credential_id = excluded.credential_id",
         rusqlite::params![
             e.request_id,
             unix_millis(e.timestamp),
@@ -267,6 +337,7 @@ fn upsert_response_completed(
             e.cost.as_ref().map(|c| c.total.to_string()),
             stop_reason_label(&e.stop_reason),
             i64::try_from(e.latency_ms).unwrap_or(i64::MAX),
+            e.credential_id,
         ],
     )?;
     Ok(())
@@ -662,6 +733,7 @@ mod tests {
             },
             streaming: true,
             body_hash: "sha256-digest-only".to_owned(),
+            session_id: None,
         })
     }
 
@@ -696,6 +768,7 @@ mod tests {
             }),
             stop_reason: StopReason::Unknown("weird-finish".to_owned()),
             latency_ms: 4321,
+            credential_id: None,
         })
     }
 
@@ -735,6 +808,138 @@ mod tests {
     fn text_column(conn: &Connection, sql: &str) -> Option<String> {
         conn.query_row(sql, [], |row| row.get::<_, Option<String>>(0))
             .expect("text query")
+    }
+
+    #[tokio::test]
+    async fn attempt_rows_persist_one_per_upstream_attempt_with_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(&db, unbounded()).expect("open ledger");
+        let bus = Arc::new(bus);
+        for attempt in [
+            crate::AttemptCompleted {
+                request_id: "req-pool".to_owned(),
+                timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                    .expect("valid unix timestamp"),
+                attempt: 0,
+                route: "team".to_owned(),
+                provider: "limited".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+                credential_id: Some("key-0".to_owned()),
+                outcome: crate::AttemptOutcome::Failed,
+                error_kind: Some("Upstream".to_owned()),
+                http_status: Some(429),
+                message: Some("rate limited".to_owned()),
+                latency_ms: 12,
+            },
+            crate::AttemptCompleted {
+                request_id: "req-pool".to_owned(),
+                timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                    .expect("valid unix timestamp"),
+                attempt: 1,
+                route: "team".to_owned(),
+                provider: "healthy".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+                credential_id: None,
+                outcome: crate::AttemptOutcome::Succeeded,
+                error_kind: None,
+                http_status: None,
+                message: None,
+                latency_ms: 40,
+            },
+        ] {
+            bus.emit(&ProxyEvent::AttemptCompleted(attempt));
+        }
+        let closer = Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close");
+
+        let conn = reader(&db);
+        let rows: Vec<(i64, String, String, Option<String>, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT attempt_seq, provider, outcome, credential_id, error_kind
+                     FROM attempts WHERE request_id = ?1 ORDER BY attempt_seq",
+                )
+                .expect("prepare attempt query");
+            let mapped = stmt
+                .query_map(["req-pool"], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .expect("query attempts");
+            let mut rows = Vec::new();
+            for row in mapped {
+                rows.push(row.expect("attempt row"));
+            }
+            rows
+        };
+        assert_eq!(rows.len(), 2, "one row per upstream attempt");
+        assert_eq!(
+            rows[0],
+            (
+                0,
+                "limited".to_owned(),
+                "failed".to_owned(),
+                Some("key-0".to_owned()),
+                Some("Upstream".to_owned())
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (1, "healthy".to_owned(), "succeeded".to_owned(), None, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_attempt_rows_with_their_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        {
+            let bus = SqliteEventBus::open(&db, unbounded()).expect("open ledger");
+            let bus = Arc::new(bus);
+            bus.emit(&received_event("req-old", "laptop"));
+            bus.emit(&ProxyEvent::AttemptCompleted(crate::AttemptCompleted {
+                request_id: "req-old".to_owned(),
+                timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                    .expect("valid unix timestamp"),
+                attempt: 0,
+                route: "team".to_owned(),
+                provider: "limited".to_owned(),
+                model: "m".to_owned(),
+                credential_id: None,
+                outcome: crate::AttemptOutcome::Failed,
+                error_kind: None,
+                http_status: Some(500),
+                message: None,
+                latency_ms: 5,
+            }));
+            let closer = Arc::clone(&bus);
+            tokio::task::spawn_blocking(move || closer.close())
+                .await
+                .expect("close");
+        }
+        let mut conn = reader(&db);
+        // The row predates the cutoff, so an age pass removes it with its
+        // attempt rows.
+        let policy = RetentionPolicy {
+            max_age: Some(Duration::from_secs(1)),
+            max_rows: None,
+            prune_every: Duration::from_secs(3600),
+        };
+        let deleted = run_retention_pass(&mut conn, &policy).expect("retention pass");
+        assert!(deleted >= 2, "the request and its attempt row are pruned");
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM attempts"),
+            0,
+            "no orphaned attempt rows survive their request"
+        );
     }
 
     #[tokio::test]

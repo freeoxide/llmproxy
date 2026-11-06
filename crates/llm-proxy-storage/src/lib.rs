@@ -32,6 +32,11 @@ pub enum ProxyEvent {
     ResponseCompleted(ResponseCompleted),
     /// A response failed before or during upstream dispatch.
     ResponseFailed(ResponseFailed),
+    /// One upstream attempt of a request (plan 04 step 1, conflict 8). A
+    /// request whose route retries or fails over produces one row per
+    /// attempt, linked by `request_id`; failed attempts can still cost
+    /// money, and cost lands on the request's completed/failed row.
+    AttemptCompleted(AttemptCompleted),
 }
 
 /// Event payload for a received request.
@@ -58,6 +63,11 @@ pub struct RequestReceived {
     /// SHA-256 of the raw client request body for dedup/correlation (not the
     /// body itself, which may contain secrets).
     pub body_hash: String,
+    /// Session id attributed to the request (plan 04 step 10, backlog 17):
+    /// the inbound session header (for example
+    /// `x-claude-code-session-id`) or the request metadata's `user_id`,
+    /// when either is present.
+    pub session_id: Option<String>,
 }
 
 /// Event payload for a completed response.
@@ -82,6 +92,10 @@ pub struct ResponseCompleted {
     pub stop_reason: StopReason,
     /// Request latency in milliseconds.
     pub latency_ms: u64,
+    /// Which credential from the provider's pool served the request (its
+    /// id, never the secret), when the provider has more than one key
+    /// (plan 04 step 5).
+    pub credential_id: Option<String>,
 }
 
 /// Event payload for a failed response; `model` and `provider` are optional
@@ -107,6 +121,54 @@ pub struct ResponseFailed {
     pub http_status: u16,
     /// Request latency in milliseconds.
     pub latency_ms: u64,
+}
+
+/// Event payload for one upstream attempt (plan 04 step 1, conflict 8):
+/// what was tried, against which member with which credential, and how it
+/// ended. Emitted for every attempt including the one that succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptCompleted {
+    /// Proxy-generated unique request identifier this attempt belongs to.
+    pub request_id: String,
+    /// When the attempt ended (RFC 3339).
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
+    /// Zero-based sequence number of this attempt within the request.
+    pub attempt: u32,
+    /// The route the client addressed: a provider name or a pool name.
+    pub route: String,
+    /// The member provider this attempt was sent to.
+    pub provider: String,
+    /// The upstream model this attempt encoded for.
+    pub model: String,
+    /// Which credential from the member's pool was used (its id, never the
+    /// secret).
+    pub credential_id: Option<String>,
+    /// `"succeeded"`, `"failed"` (the attempt errored and the ladder moved
+    /// on), or `"streaming"` (the attempt's stream was committed to the
+    /// client; its outcome lands on the request's terminal row).
+    pub outcome: AttemptOutcome,
+    /// Error kind string when the attempt failed.
+    pub error_kind: Option<String>,
+    /// Upstream HTTP status when the attempt failed with one.
+    pub http_status: Option<u16>,
+    /// Sanitized error message when the attempt failed.
+    pub message: Option<String>,
+    /// Attempt latency in milliseconds.
+    pub latency_ms: u64,
+}
+
+/// How one upstream attempt ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    /// The attempt produced the response the client gets.
+    Succeeded,
+    /// The attempt failed; the ladder retried or failed over (or gave up).
+    Failed,
+    /// The attempt's stream was committed to the client before completion;
+    /// the terminal outcome is recorded on the request's row.
+    Streaming,
 }
 
 /// In-process event sink.
@@ -184,6 +246,7 @@ mod tests {
             },
             streaming: false,
             body_hash: "abc123".to_owned(),
+            session_id: None,
         }
     }
 
@@ -215,6 +278,7 @@ mod tests {
             cost: None,
             stop_reason: StopReason::EndTurn,
             latency_ms: 123,
+            credential_id: None,
         });
         bus.emit(&req);
         bus.emit(&done);
@@ -247,6 +311,7 @@ mod tests {
             },
             streaming: false,
             body_hash: "abc123".to_owned(),
+            session_id: None,
         });
         let json = serde_json::to_string(&event).expect("serialize");
         assert!(json.contains(r#""kind":"request_received""#), "got: {json}");
@@ -347,6 +412,7 @@ mod tests {
             },
             streaming: false,
             body_hash: SENTINEL.to_owned(),
+            session_id: None,
         });
         let req_json = serde_json::to_string(&req).expect("serialize RequestReceived");
         assert_no_forbidden_secret_key(&req_json, FORBIDDEN_KEY_FRAGMENTS);
@@ -364,6 +430,7 @@ mod tests {
             cost: None,
             stop_reason: StopReason::EndTurn,
             latency_ms: 1,
+            credential_id: None,
         });
         let done_json = serde_json::to_string(&done).expect("serialize ResponseCompleted");
         assert_no_forbidden_secret_key(&done_json, FORBIDDEN_KEY_FRAGMENTS);

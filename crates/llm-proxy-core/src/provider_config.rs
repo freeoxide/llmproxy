@@ -180,6 +180,15 @@ pub struct ServerConfig {
     /// `"count_tokens"`); absent families use the server-wide defaults.
     #[serde(default)]
     pub endpoint_families: std::collections::HashMap<String, EndpointFamilyConfig>,
+    /// Phase-shaped upstream timeouts (backlog 8, BUG-14): connect,
+    /// first-byte, in-stream idle and an optional one-deadline-per-request
+    /// total, validated at config load.
+    #[serde(default)]
+    pub upstream_timeouts: UpstreamTimeoutsConfig,
+    /// Bare `/v1/*` routing (plan 04 step 11): off by default; when enabled
+    /// a model name resolves to a provider or pool.
+    #[serde(default)]
+    pub bare_v1: BareV1Config,
 }
 
 /// Per-endpoint-family settings (audit conflict 16): the body limit and
@@ -192,6 +201,242 @@ pub struct EndpointFamilyConfig {
     /// Maximum request duration this family applies.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
+}
+
+/// Phase-shaped upstream timeouts (backlog 8, BUG-14): one set of phases for
+/// every upstream request, replacing the fixed 60-second headers deadline.
+/// Cross-validated at config load ([`validate_upstream_timeouts`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamTimeoutsConfig {
+    /// TCP/TLS connect deadline per upstream attempt.
+    #[serde(default = "default_connect_timeout", with = "humantime_serde")]
+    pub connect: Duration,
+    /// Time-to-first-byte deadline: waiting for response headers on a
+    /// non-streaming request, or for the first stream event on a streaming
+    /// request. Does not cap the body.
+    #[serde(default = "default_first_byte_timeout", with = "humantime_serde")]
+    pub first_byte: Duration,
+    /// In-stream idle deadline: a stream silent for longer than this between
+    /// chunks is a dead upstream.
+    #[serde(default = "default_idle_timeout", with = "humantime_serde")]
+    pub idle: Duration,
+    /// One deadline across every attempt of one request (retry ladder
+    /// included). `None` (the default) leaves the ladder unbounded here; the
+    /// per-route `[provider.retry]` / `[pool.retry]` `total_timeout` may still
+    /// bound it.
+    #[serde(default, with = "humantime_serde::option")]
+    pub total: Option<Duration>,
+}
+
+const fn default_connect_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+const fn default_first_byte_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+const fn default_idle_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+impl Default for UpstreamTimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(10),
+            first_byte: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            total: None,
+        }
+    }
+}
+
+/// Validates one [`UpstreamTimeoutsConfig`]: every phase is positive, connect
+/// fits inside first-byte, and the total deadline (when set) covers
+/// first-byte. Called at config load and by builders.
+///
+/// # Errors
+///
+/// A [`ConfigValidationError::InvalidTimeouts`] naming the first broken rule.
+pub fn validate_upstream_timeouts(
+    timeouts: &UpstreamTimeoutsConfig,
+) -> Result<(), ConfigValidationError> {
+    let phases = [
+        ("connect", timeouts.connect),
+        ("first_byte", timeouts.first_byte),
+        ("idle", timeouts.idle),
+    ];
+    for &(name, value) in &phases {
+        if value.is_zero() {
+            return Err(ConfigValidationError::InvalidTimeouts {
+                message: format!("upstream timeout phase \"{name}\" must be positive"),
+            });
+        }
+    }
+    if timeouts.connect > timeouts.first_byte {
+        return Err(ConfigValidationError::InvalidTimeouts {
+            message: format!(
+                "upstream timeout \"connect\" ({:?}) must not exceed \"first_byte\" ({:?})",
+                timeouts.connect, timeouts.first_byte
+            ),
+        });
+    }
+    if let Some(total) = timeouts.total
+        && total < timeouts.first_byte
+    {
+        return Err(ConfigValidationError::InvalidTimeouts {
+            message: format!(
+                "upstream timeout \"total\" ({total:?}) must cover \"first_byte\" ({:?})",
+                timeouts.first_byte
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Bare `/v1/*` routing (plan 04 step 11): off by default. When enabled, a
+/// model name resolves to a provider or pool through `models`, falling back
+/// to `default_target`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BareV1Config {
+    /// Serve the bare `/v1/messages` and `/v1/chat/completions` routes.
+    /// Default `false`: those routes 404.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Model name to provider or pool name.
+    #[serde(default)]
+    pub models: HashMap<String, String>,
+    /// Target used when no `models` entry matches. `None` makes an unmapped
+    /// model a 404 naming the model.
+    #[serde(default)]
+    pub default_target: Option<String>,
+}
+
+/// The retry/failover ladder for one route (plan 04 steps 2-3, 6). Present
+/// only by opt-in on a provider (`[provider.retry]`) or a pool
+/// (`[pool.retry]`); absent means exactly one attempt and no failover, the
+/// pre-plan behaviour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryConfig {
+    /// Attempts against one member before moving to the next (pools) or
+    /// giving up (single provider). `1` disables same-member retries.
+    pub max_attempts: u32,
+    /// Base delay between attempts against the same member. An upstream
+    /// `Retry-After` longer than this wins, clamped to the remaining
+    /// deadline.
+    #[serde(with = "humantime_serde")]
+    pub backoff: Duration,
+    /// How long a member that failed transiently is skipped by later
+    /// requests. A 429 with real reset information overrides this until the
+    /// reported reset time.
+    #[serde(with = "humantime_serde")]
+    pub cooldown: Duration,
+    /// One deadline across every attempt of one request. `0s` disables it.
+    #[serde(with = "humantime_serde")]
+    pub total_timeout: Duration,
+    /// Streaming pre-commit hold budget (plan 04 step 6): how long the route
+    /// buffers waiting for the first output event before committing HTTP 200
+    /// (after which heartbeats cover silence and errors are in-band).
+    /// `0s` (the default) never commits without an event, keeping HTTP error
+    /// semantics for as long as nothing was sent.
+    #[serde(with = "humantime_serde")]
+    pub hold: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 2,
+            backoff: Duration::from_millis(250),
+            cooldown: Duration::from_secs(30),
+            total_timeout: Duration::ZERO,
+            hold: Duration::ZERO,
+        }
+    }
+}
+
+/// What a pool does when a sticky session's pinned member must be switched
+/// away from (plan 04 step 10, conflict 6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AffinityConflictPolicy {
+    /// Strip provider-bound request state (`provider_hints`) before
+    /// switching. The default: availability over fidelity.
+    #[default]
+    Strip,
+    /// Refuse the switch: the request fails rather than reaching a different
+    /// account with state it cannot honour.
+    Refuse,
+}
+
+/// Session affinity for a pool (plan 04 step 10): record session ids on usage
+/// rows always; pinning a session to its last successful member is opt-in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AffinityConfig {
+    /// Pin a session id to the member that last served it, so conversation
+    /// cache warmth survives across requests. Default `false`.
+    #[serde(default)]
+    pub sticky: bool,
+    /// What happens when the pinned member has to be switched away from.
+    #[serde(default)]
+    pub on_conflict: AffinityConflictPolicy,
+}
+
+impl Default for AffinityConfig {
+    fn default() -> Self {
+        Self {
+            sticky: false,
+            on_conflict: AffinityConflictPolicy::Strip,
+        }
+    }
+}
+
+/// Pool health settings (plan 04 step 9): passive cooldowns from 429 and
+/// rate-limit headers are always on; the synthetic probe is opt-in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolHealthConfig {
+    /// How often to probe cooled-down members with a synthetic one-token
+    /// request; a healthy answer clears the cooldown early. `None` (the
+    /// default) disables probing — cooldowns then simply expire.
+    #[serde(default, with = "humantime_serde::option")]
+    pub probe_interval: Option<Duration>,
+}
+
+/// A named pool of providers served at `/providers/{pool}/v1/...`
+/// (plan 04 step 4, conflict 1): fallback inside the pool, same URL shape as
+/// a single provider. A pool name may not collide with a provider name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolConfig {
+    /// Pool name; occupies the same URL namespace as provider names.
+    pub name: String,
+    /// Member provider names, in failover order. Duplicates and unknown
+    /// names are rejected at config validation.
+    pub members: Vec<String>,
+    /// Retry ladder applied to the pool and inherited as the per-member
+    /// attempt policy.
+    #[serde(default)]
+    pub retry: RetryConfig,
+    /// Session affinity policy for this pool.
+    #[serde(default)]
+    pub affinity: AffinityConfig,
+    /// Health tracking for this pool's members.
+    #[serde(default)]
+    pub health: PoolHealthConfig,
+}
+
+/// Wrapper for a single pool TOML file (a `[pool]` table instead of a
+/// `[provider]` one).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolFile {
+    /// The pool definition.
+    pub pool: PoolConfig,
 }
 
 /// Default body limit for one request: 32 MiB (as before the family split).
@@ -414,6 +659,12 @@ pub struct ProviderConfig {
     /// is a required field. This is intentional.
     #[serde(skip_serializing)]
     pub api_key: SecretString,
+    /// Additional upstream credentials (plan 04 step 5, backlog 31): when
+    /// present and non-empty, these plus `api_key` form the provider's
+    /// credential pool; the attempt loop rotates over them and cools a key
+    /// down on auth and rate-limit failures. Never serialized.
+    #[serde(default, skip_serializing)]
+    pub api_keys: Option<Vec<SecretString>>,
     /// Authentication header style.
     pub auth_style: AuthStyle,
     /// When true, ignore this provider's configured `api_key` and instead use
@@ -424,6 +675,11 @@ pub struct ProviderConfig {
     /// provider's static `api_key` is used.
     #[serde(default)]
     pub passthrough_auth: bool,
+    /// Opt-in retry ladder for this provider (plan 04 steps 2-3): absent
+    /// means exactly one attempt, the pre-plan behaviour, and no failover on
+    /// a direct `/providers/{provider}/...` route.
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
     /// Named adapter configurations (protocol + endpoint pairs).
     #[serde(default)]
     pub adapters: HashMap<String, ProviderAdapterConfig>,
@@ -1122,6 +1378,28 @@ pub enum ConfigValidationError {
         /// Invalid limit name.
         limit: &'static str,
     },
+    /// A phase-shaped timeout rule is broken (backlog 8, BUG-14).
+    #[error("invalid upstream timeouts: {message}")]
+    InvalidTimeouts {
+        /// What is wrong.
+        message: String,
+    },
+    /// A pool definition is invalid (plan 04 step 4).
+    #[error("pool \"{pool}\": {message}")]
+    InvalidPool {
+        /// Pool name.
+        pool: String,
+        /// What is wrong.
+        message: String,
+    },
+    /// A retry ladder on a provider or pool is invalid.
+    #[error("retry config for \"{route}\": {message}")]
+    InvalidRetry {
+        /// Provider or pool name.
+        route: String,
+        /// What is wrong.
+        message: String,
+    },
 }
 
 /// Validate a single [`ProviderConfig`].
@@ -1171,6 +1449,8 @@ pub enum ConfigValidationError {
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     passthrough_auth: false,
+///     api_keys: None,
+///     retry: None,
 ///     egress: None,
 ///     adapters: HashMap::from([(
 ///         "chat".to_owned(),
@@ -1206,6 +1486,8 @@ pub enum ConfigValidationError {
 ///     api_key: SecretString::from("secret"),
 ///     auth_style: AuthStyle::Bearer,
 ///     passthrough_auth: false,
+///     api_keys: None,
+///     retry: None,
 ///     egress: None,
 ///     adapters: HashMap::new(),
 ///     routes: ProviderRoutesConfig::default(),
@@ -1271,6 +1553,21 @@ fn validate_api_key(provider: &ProviderConfig, name: &str) -> Result<(), ConfigV
     if provider.api_key.expose_secret().trim().is_empty() {
         return Err(ConfigValidationError::EmptyApiKey {
             provider: name.to_owned(),
+        });
+    }
+    if let Some(keys) = &provider.api_keys
+        && keys.iter().any(|k| k.expose_secret().trim().is_empty())
+    {
+        return Err(ConfigValidationError::EmptyApiKey {
+            provider: name.to_owned(),
+        });
+    }
+    if let Some(retry) = &provider.retry
+        && retry.max_attempts == 0
+    {
+        return Err(ConfigValidationError::InvalidRetry {
+            route: name.to_owned(),
+            message: "retry.max_attempts must be at least 1".to_owned(),
         });
     }
     Ok(())
@@ -1719,7 +2016,104 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
         validate_storage_config(storage)?;
     }
     validate_admin_mount(&cfg)?;
+    validate_upstream_timeouts(&cfg.server.upstream_timeouts).map_err(|error| {
+        CoreError::ConfigValidation {
+            message: error.to_string(),
+            source: None,
+        }
+    })?;
+    validate_bare_v1(&cfg)?;
     Ok(cfg)
+}
+
+/// Bare `/v1/*` validation: every configured target must name a loadable
+/// provider or pool (checked against `known_routes`, the registry's provider
+/// and pool names), and the model map must not be empty while enabled without
+/// a default target (it could never resolve anything).
+fn validate_bare_v1(cfg: &AppConfig) -> Result<(), CoreError> {
+    let bare = &cfg.server.bare_v1;
+    if !bare.enabled {
+        return Ok(());
+    }
+    if bare.models.is_empty() && bare.default_target.is_none() {
+        return Err(CoreError::ConfigValidation {
+            message: "server.bare_v1 is enabled but has no model mappings and no \
+                      default_target; no request could resolve"
+                .to_owned(),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+/// Validates one pool definition in isolation: non-empty name and members,
+/// no duplicate members, a valid retry ladder. Membership and name collisions
+/// with providers are checked by [`validate_registry_pools`], which sees both
+/// sets.
+///
+/// # Errors
+///
+/// [`ConfigValidationError::InvalidPool`] naming the first broken rule.
+pub fn validate_pool_config(pool: &PoolConfig) -> Result<(), ConfigValidationError> {
+    validate_pool_config_against(pool, &[])
+}
+
+/// Validates a pool against the set of known provider names (which may be
+/// empty when only structural checks are wanted).
+pub(crate) fn validate_pool_config_against(
+    pool: &PoolConfig,
+    known_providers: &[String],
+) -> Result<(), ConfigValidationError> {
+    let invalid = |message: String| ConfigValidationError::InvalidPool {
+        pool: pool.name.clone(),
+        message,
+    };
+    if pool.name.trim().is_empty() {
+        return Err(ConfigValidationError::EmptyProviderName);
+    }
+    if !pool_name_is_slug(&pool.name) {
+        return Err(ConfigValidationError::InvalidProviderNameFormat {
+            provider: pool.name.clone(),
+        });
+    }
+    if pool.members.is_empty() {
+        return Err(invalid(
+            "pool has no members; add at least one provider name".to_owned(),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for member in &pool.members {
+        if member.trim().is_empty() {
+            return Err(invalid(
+                "member name is empty; members must name configured providers".to_owned(),
+            ));
+        }
+        if !seen.insert(member.as_str()) {
+            return Err(invalid(format!(
+                "member \"{member}\" is listed more than once"
+            )));
+        }
+        if !known_providers.is_empty() && !known_providers.iter().any(|p| p == member) {
+            return Err(invalid(format!(
+                "member \"{member}\" is not a configured provider"
+            )));
+        }
+    }
+    let retry = &pool.retry;
+    if retry.max_attempts == 0 {
+        return Err(invalid("retry.max_attempts must be at least 1".to_owned()));
+    }
+    Ok(())
+}
+
+/// A pool name is valid in the provider URL namespace under the same slug
+/// rule as provider names.
+fn pool_name_is_slug(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
 }
 
 fn validate_admin_mount(cfg: &AppConfig) -> Result<(), CoreError> {
@@ -2010,6 +2404,164 @@ chat_completions = "chat"
         .provider;
         provider.name = name.to_owned();
         provider
+    }
+
+    #[test]
+    fn upstream_timeouts_are_cross_validated() {
+        validate_upstream_timeouts(&UpstreamTimeoutsConfig::default())
+            .expect("defaults are internally consistent");
+
+        let connect_gt_first_byte = UpstreamTimeoutsConfig {
+            connect: Duration::from_secs(30),
+            first_byte: Duration::from_secs(5),
+            ..UpstreamTimeoutsConfig::default()
+        };
+        let err = validate_upstream_timeouts(&connect_gt_first_byte).expect_err("connect > first");
+        assert!(
+            err.to_string().contains("connect"),
+            "the error names the offending phase: {err}"
+        );
+
+        let total_below_first_byte = UpstreamTimeoutsConfig {
+            total: Some(Duration::from_secs(10)),
+            first_byte: Duration::from_secs(60),
+            ..UpstreamTimeoutsConfig::default()
+        };
+        let err = validate_upstream_timeouts(&total_below_first_byte).expect_err("total < first");
+        assert!(
+            err.to_string().contains("total"),
+            "the error names the total: {err}"
+        );
+
+        let zero_idle = UpstreamTimeoutsConfig {
+            idle: Duration::ZERO,
+            ..UpstreamTimeoutsConfig::default()
+        };
+        assert!(validate_upstream_timeouts(&zero_idle).is_err());
+    }
+
+    #[test]
+    fn upstream_timeouts_parse_from_toml_and_validate_at_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+
+[server.upstream_timeouts]
+connect = "5s"
+first_byte = "15s"
+idle = "30s"
+total = "120s"
+"#,
+        )
+        .expect("write config");
+
+        let cfg = load_app_config(&cfg_path).expect("config loads");
+        assert_eq!(cfg.server.upstream_timeouts.connect, Duration::from_secs(5));
+        assert_eq!(
+            cfg.server.upstream_timeouts.total,
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn invalid_upstream_timeouts_are_rejected_at_config_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+
+[server.upstream_timeouts]
+connect = "50s"
+first_byte = "5s"
+"#,
+        )
+        .expect("write config");
+
+        let err = load_app_config(&cfg_path).expect_err("cross-validation fires at load");
+        assert!(
+            err.to_string().contains("first_byte"),
+            "the load error names the broken phase rule: {err}"
+        );
+    }
+
+    #[test]
+    fn bare_v1_defaults_off_and_empty_enabled_config_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+
+[server.bare_v1]
+enabled = true
+"#,
+        )
+        .expect("write config");
+
+        let err = load_app_config(&cfg_path).expect_err("enabled bare_v1 needs a target");
+        assert!(
+            err.to_string().contains("bare_v1"),
+            "the load error names bare_v1: {err}"
+        );
+    }
+
+    #[test]
+    fn provider_retry_and_api_keys_parse_from_toml() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let provider_path = dir.path().join("p.toml");
+        std::fs::write(
+            &provider_path,
+            r#"[provider]
+name = "retried"
+api_key = "k1"
+api_keys = ["k2", "k3"]
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+
+[provider.retry]
+max_attempts = 3
+backoff = "100ms"
+cooldown = "45s"
+total_timeout = "30s"
+hold = "1s"
+"#,
+        )
+        .expect("write provider");
+
+        let provider = load_provider_config(&provider_path, None).expect("provider parses");
+        let retry = provider.retry.expect("retry present");
+        assert_eq!(retry.max_attempts, 3);
+        assert_eq!(retry.backoff, Duration::from_millis(100));
+        assert_eq!(retry.total_timeout, Duration::from_secs(30));
+        assert_eq!(retry.hold, Duration::from_secs(1));
+        assert_eq!(provider.api_keys.expect("key pool present").len(), 2);
     }
 
     use super::*;
@@ -2927,6 +3479,8 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -2957,6 +3511,8 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -2987,6 +3543,8 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -3017,6 +3575,8 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -3038,6 +3598,8 @@ endpoint = "https://example.com/v1"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -3097,6 +3659,8 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -3124,6 +3688,8 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -3145,6 +3711,8 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -3177,6 +3745,8 @@ input = 0.0000025
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -3219,6 +3789,8 @@ input = 0.0000025
             api_key: SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: true,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -3240,6 +3812,8 @@ input = 0.0000025
             api_key: SecretString::from(""),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),

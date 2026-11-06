@@ -27,12 +27,16 @@ pub enum ProviderError {
 
     /// The upstream API returned an error status code; `body` is truncated and
     /// stripped of API-key patterns so `Display` output never leaks key material.
+    /// `headers` carries the error response's headers (lowercased names) so
+    /// callers can honour `Retry-After` and rate-limit reset information.
     #[error("API error {status}: {body}")]
     Api {
         /// HTTP status code.
         status: u16,
         /// Response body text (truncated and sanitized).
         body: String,
+        /// Error-response headers, names lowercased; empty when unknown.
+        headers: Vec<(String, String)>,
     },
 
     /// Invalid UTF-8 encountered in streamed bytes.
@@ -114,6 +118,22 @@ impl ProviderError {
         Self::Api {
             status,
             body: sanitize_api_error_body(body_text),
+            headers: Vec::new(),
+        }
+    }
+
+    /// Construct a [`ProviderError::Api`] with automatic body sanitization,
+    /// preserving the error response's headers (names should be lowercased by
+    /// the caller) so retry and rate-limit policy can honour them.
+    pub fn api_with_headers(
+        status: u16,
+        body_text: String,
+        headers: Vec<(String, String)>,
+    ) -> Self {
+        Self::Api {
+            status,
+            body: sanitize_api_error_body(body_text),
+            headers,
         }
     }
 

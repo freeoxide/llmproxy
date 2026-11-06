@@ -169,6 +169,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -209,6 +211,8 @@ mod tests {
                 admin_bind: None,
                 admin_on_main_listener: false,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -1078,14 +1082,16 @@ mod tests {
 
         let body = make_messages_body("gpt-4o", true);
         let resp = app.oneshot(messages_request(&body)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        // Plan 04: an error frame before any output event never commits —
+        // the caller gets an HTTP error status instead of a 200 stream.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .unwrap();
         let text = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(
-            text.contains("upstream overloaded"),
-            "client must see the error payload: {text}"
+            !text.contains("upstream overloaded"),
+            "the upstream's own error schema must not reach the client: {text}"
         );
 
         let events = bus.snapshot();
@@ -1093,13 +1099,13 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
-            "an in-band error frame must not be recorded as success: {events:?}"
+            "a leading error frame must not be recorded as success: {events:?}"
         );
         assert!(
             !events
                 .iter()
                 .any(|e| matches!(e, ProxyEvent::ResponseCompleted(_))),
-            "an in-band error frame must not record a success row: {events:?}"
+            "a leading error frame must not record a success row: {events:?}"
         );
     }
 
@@ -1251,6 +1257,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -1297,6 +1305,8 @@ mod tests {
                 admin_bind: None,
                 admin_on_main_listener: false,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -1720,14 +1730,18 @@ mod tests {
         let events = bus.snapshot();
         assert_eq!(
             events.len(),
-            2,
-            "expected RequestReceived + ResponseCompleted"
+            3,
+            "expected RequestReceived + AttemptCompleted + ResponseCompleted"
         );
         assert!(
             matches!(events[0], ProxyEvent::RequestReceived(_)),
             "first event must be RequestReceived"
         );
-        match &events[1] {
+        assert!(
+            matches!(events[1], ProxyEvent::AttemptCompleted(_)),
+            "second event must be the upstream attempt row"
+        );
+        match &events[2] {
             ProxyEvent::ResponseCompleted(rc) => {
                 assert_eq!(rc.provider, "mock-provider");
                 assert_eq!(rc.upstream_message_id.as_deref(), Some("msg_mock123"));
@@ -2641,6 +2655,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -2683,6 +2699,8 @@ mod tests {
                     admin_bind: None,
                     admin_on_main_listener: false,
                     endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -2748,6 +2766,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -2790,6 +2810,8 @@ mod tests {
                     admin_bind: None,
                     admin_on_main_listener: false,
                     endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -3057,6 +3079,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -3099,6 +3123,8 @@ mod tests {
                     admin_bind: None,
                     admin_on_main_listener: false,
                     endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -3288,6 +3314,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -3330,6 +3358,8 @@ mod tests {
                 admin_bind: None,
                 admin_on_main_listener: false,
                 endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -3391,7 +3421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_openai_chat_leading_error_returns_200_in_band_sse_error() {
+    async fn stream_openai_chat_leading_error_returns_an_http_error_before_commit() {
         let mock_url = spawn_mock_anthropic_leading_error_stream().await;
         let state = state_with_openai_chat_client_anthropic_upstream(&mock_url);
         let app = build_router(state);
@@ -3402,10 +3432,13 @@ mod tests {
             .await
             .unwrap();
 
+        // Plan 04 (backlog 2): a 200 whose first frame is an error never
+        // commits — the failure happened before any output event, so the
+        // caller gets an HTTP error status instead of a 200 stream.
         assert_eq!(
             resp.status(),
-            StatusCode::OK,
-            "leading stream error must be delivered in-band at HTTP 200, not a 502"
+            StatusCode::BAD_GATEWAY,
+            "a leading error frame is a pre-commit failure"
         );
 
         let ct = resp
@@ -3415,8 +3448,8 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(
-            ct.contains("text/event-stream"),
-            "expected SSE content-type for in-band error, got: {ct}"
+            ct.contains("application/json"),
+            "expected a JSON error body, got: {ct}"
         );
 
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -3425,23 +3458,13 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
         assert!(
-            text.contains("\"error\"") && text.contains("\"type\""),
-            "in-band SSE error must carry an OpenAI error object; got: {text}"
+            text.contains("\"error\""),
+            "the error body must carry an OpenAI error object; got: {text}"
         );
         assert!(
-            text.contains("server_error"),
-            "an upstream/overloaded error must render as server_error; got: {text}"
+            !text.contains("Upstream overloaded"),
+            "the upstream's own error schema must not reach the client: {text}"
         );
-        assert!(
-            text.contains("Upstream overloaded"),
-            "the sanitized error message must be surfaced in-band; got: {text}"
-        );
-
-        assert!(
-            text.contains("[DONE]"),
-            "the OpenAI [DONE] terminator must follow the in-band error; got: {text}"
-        );
-
         assert!(
             !text.contains("empty stream"),
             "must not surface the misleading empty-stream 502 body; got: {text}"

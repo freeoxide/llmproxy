@@ -35,6 +35,20 @@ pub(super) enum RouteError {
     },
     #[error("upstream timeout: {0}")]
     UpstreamTimeout(String),
+    /// The engine's retry/failover ladder ran out (plan 04 step 12): the
+    /// proxy already retried, so the response also carries
+    /// `x-should-retry: false` and a computed `Retry-After`.
+    #[error("retries exhausted")]
+    RetryExhausted {
+        /// The status of the final underlying error.
+        status: StatusCode,
+        /// The computed wait, in seconds (always present: the ladder derives
+        /// one from the cooldown when the upstream advertised nothing).
+        retry_after_secs: u64,
+    },
+    /// The route's affinity policy refused a failover (plan 04 step 10).
+    #[error("session affinity refused the failover")]
+    AffinityRefused,
     #[error("provider decode error: {0}")]
     ProviderDecode(String),
     #[error("internal error: {0}")]
@@ -81,10 +95,24 @@ struct OpenAiErrorDetail {
     code: serde_json::Value,
 }
 pub(super) fn route_error_response(protocol: ClientProtocol, error: &RouteError) -> Response<Body> {
-    match protocol {
+    let mut response = match protocol {
         ClientProtocol::Anthropic => anthropic_error_response(error),
         ClientProtocol::OpenAiChat => openai_error_response(error),
+    };
+    if let RouteError::RetryExhausted {
+        retry_after_secs, ..
+    } = error
+    {
+        // Plan 04 step 12 (backlog 38): the proxy exhausted its own ladder,
+        // so the client must not stack another retry loop on top.
+        response
+            .headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("false"));
+        if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
     }
+    response
 }
 pub(crate) const INTERNAL_ERROR_CLIENT_MESSAGE: &str = "internal server error";
 pub(crate) const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decode error";
@@ -144,6 +172,7 @@ impl From<llm_proxy_engine::EngineError> for RouteError {
                 status,
                 body,
                 auth_owner,
+                ..
             } => {
                 let owner = match auth_owner {
                     llm_proxy_engine::AuthOwner::Client => AuthOwner::Client,
@@ -157,6 +186,13 @@ impl From<llm_proxy_engine::EngineError> for RouteError {
                 }
             }
             E::UpstreamTimeout(m) => Self::UpstreamTimeout(m),
+            E::RetryExhausted {
+                last, retry_after, ..
+            } => Self::RetryExhausted {
+                status: StatusCode::from_u16(last.status_code()).unwrap_or(StatusCode::BAD_GATEWAY),
+                retry_after_secs: retry_after.map(|wait| wait.as_secs().max(1)).unwrap_or(1),
+            },
+            E::AffinityRefused { .. } => Self::AffinityRefused,
             E::RateLimited(m) => Self::InvalidRequest(m),
             E::Internal(m) => Self::Internal(m),
             other => Self::Internal(other.to_string()),
@@ -173,6 +209,8 @@ pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
         RouteError::InvalidProviderName(_) => "InvalidProviderName",
         RouteError::Upstream { .. } => "Upstream",
         RouteError::UpstreamTimeout(_) => "UpstreamTimeout",
+        RouteError::RetryExhausted { .. } => "RetryExhausted",
+        RouteError::AffinityRefused => "AffinityRefused",
         RouteError::ProviderDecode(_) => "ProviderDecode",
         RouteError::Internal(_) => "Internal",
         RouteError::RateLimited => "RateLimited",
@@ -184,6 +222,10 @@ pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
         RouteError::Unauthorized => "Unauthorized",
     }
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "one row per RouteError variant: the status/type/message table reads as a unit"
+)]
 pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static str, String) {
     match error {
         RouteError::InvalidRequest(msg) => (
@@ -228,6 +270,17 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             StatusCode::GATEWAY_TIMEOUT,
             "api_error",
             "upstream request timed out".to_owned(),
+        ),
+        RouteError::RetryExhausted { status, .. } => (
+            *status,
+            "api_error",
+            "upstream unavailable after retries; the proxy has already retried this request"
+                .to_owned(),
+        ),
+        RouteError::AffinityRefused => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "session is pinned to an upstream that is unavailable".to_owned(),
         ),
         RouteError::ProviderDecode(_msg) => (
             StatusCode::BAD_GATEWAY,

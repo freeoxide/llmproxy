@@ -1,6 +1,6 @@
 # 04. Routing and failover
 
-- **Status:** Not started
+- **Status:** Completed (2026-11-05)
 - **Depends on:** 03
 - **Audit rows:** None
 - **Code-audit bugs:** BUG-14

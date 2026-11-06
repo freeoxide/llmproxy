@@ -14,35 +14,82 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use llm_proxy_core::{AppConfig, ProviderRegistry, ProviderRouteKind};
+use llm_proxy_core::{AffinityConfig, AppConfig, ProviderRegistry, ProviderRouteKind, RetryConfig};
 use llm_proxy_protocol::core::{CoreEvent, CoreRequest, CoreResponse};
 use secrecy::SecretString;
 
 use crate::catalog::ModelCatalogService;
-use crate::error::EngineError;
 
-/// Resolves a route to a provider target (pipeline slot 3). The default
-/// implementation is the TOML/config-loaded [`ProviderRegistry`] plus catalog
-/// enforcement.
+/// The ladder for a route that did not opt into retries: one attempt, no
+/// backoff, no hold.
+fn single_attempt() -> RetryConfig {
+    RetryConfig {
+        max_attempts: 1,
+        backoff: std::time::Duration::ZERO,
+        cooldown: std::time::Duration::from_secs(30),
+        total_timeout: std::time::Duration::ZERO,
+        hold: std::time::Duration::ZERO,
+    }
+}
+use crate::error::EngineError;
+use crate::health::AffinityTable;
+
+/// Resolves a route to a plan of candidate targets (pipeline slot 3). The
+/// default implementation is the TOML/config-loaded [`ProviderRegistry`]
+/// plus catalog enforcement, and it understands pools: a pool route resolves
+/// to its members in failover order with the pool's ladder policy.
 #[async_trait]
 pub trait Router: Debug + Send + Sync {
-    /// Resolve `provider` + route kind + requested model to the target the
-    /// attempt loop encodes against.
-    async fn resolve(&self, query: &RouteQuery<'_>) -> Result<ResolvedTarget, EngineError>;
+    /// Resolve `provider` + route kind + requested model to the candidate
+    /// targets the attempt loop tries in order, plus the ladder policy that
+    /// governs them.
+    async fn resolve(&self, query: &RouteQuery<'_>) -> Result<RoutePlan, EngineError>;
 }
 
 /// Everything the router is asked per request.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteQuery<'a> {
-    /// The provider named in the URL (or pool, once pools exist).
+    /// The provider or pool named in the URL.
     pub provider: &'a str,
     /// The endpoint family the client called.
     pub route_kind: ProviderRouteKind,
     /// The model name the client asked for.
     pub requested_model: &'a str,
+    /// The session id attributed to this request (plan 04 step 10), when
+    /// one is known: the sticky-affinity input. `None` disables pinning for
+    /// this request.
+    pub session_id: Option<&'a str>,
 }
 
-/// The routing decision: which adapter config serves this request.
+/// The routing decision: the ordered candidate targets plus the ladder
+/// policy that applies to them.
+#[derive(Clone)]
+pub struct RoutePlan {
+    /// The route the client addressed: a provider name or a pool name.
+    pub route: String,
+    /// Candidate targets in failover order. A direct provider route has
+    /// exactly one; a pool has one per member.
+    pub candidates: Vec<ResolvedTarget>,
+    /// The retry/failover ladder for this route: attempts per member, one
+    /// deadline across all attempts, and the streaming hold budget.
+    pub retry: RetryConfig,
+    /// Session affinity policy for this route (pools only).
+    pub affinity: AffinityConfig,
+}
+
+impl Debug for RoutePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutePlan")
+            .field("route", &self.route)
+            .field("candidates", &self.candidates.len())
+            .field("retry", &self.retry)
+            .field("affinity", &self.affinity)
+            .finish()
+    }
+}
+
+/// The routing decision for one candidate: which adapter config serves this
+/// member.
 #[derive(Clone)]
 pub struct ResolvedTarget {
     /// The provider config's resolved adapter target (endpoint, protocol,
@@ -64,29 +111,28 @@ impl Debug for ResolvedTarget {
 }
 
 /// The default [`Router`]: the loaded [`ProviderRegistry`], with catalog
-/// enforcement for providers that opt in.
+/// enforcement for providers that opt in, pool expansion for pool routes,
+/// and (when constructed with one) sticky-affinity reordering of pool
+/// candidates.
 #[derive(Debug)]
 pub struct RegistryRouter {
     registry: Arc<ProviderRegistry>,
     catalogs: Arc<ModelCatalogService>,
+    affinity: Option<Arc<AffinityTable>>,
 }
 
 impl RegistryRouter {
-    /// Wrap a registry and the catalog service.
-    #[must_use]
-    pub fn new(registry: Arc<ProviderRegistry>, catalogs: Arc<ModelCatalogService>) -> Self {
-        Self { registry, catalogs }
-    }
-}
-
-#[async_trait]
-impl Router for RegistryRouter {
-    async fn resolve(&self, query: &RouteQuery<'_>) -> Result<ResolvedTarget, EngineError> {
+    /// Resolves one provider through the registry with catalog enforcement.
+    async fn resolve_one(
+        &self,
+        query: &RouteQuery<'_>,
+        provider: &str,
+    ) -> Result<ResolvedTarget, EngineError> {
         let target = self
             .registry
-            .resolve_provider_route(query.provider, query.route_kind, query.requested_model)
+            .resolve_provider_route(provider, query.route_kind, query.requested_model)
             .map_err(EngineError::from_route_error)?;
-        if let Some(provider) = self.registry.get(query.provider)
+        if let Some(provider) = self.registry.get(provider)
             && provider
                 .catalog
                 .as_ref()
@@ -102,6 +148,72 @@ impl Router for RegistryRouter {
             }
         }
         Ok(ResolvedTarget { target })
+    }
+
+    /// Wrap a registry and the catalog service.
+    #[must_use]
+    pub fn new(registry: Arc<ProviderRegistry>, catalogs: Arc<ModelCatalogService>) -> Self {
+        Self {
+            registry,
+            catalogs,
+            affinity: None,
+        }
+    }
+
+    /// Give the router the shared affinity table, so a session pinned to a
+    /// pool member is tried first while that member is healthy.
+    #[must_use]
+    pub fn with_affinity(mut self, affinity: Arc<AffinityTable>) -> Self {
+        self.affinity = Some(affinity);
+        self
+    }
+}
+
+#[async_trait]
+impl Router for RegistryRouter {
+    async fn resolve(&self, query: &RouteQuery<'_>) -> Result<RoutePlan, EngineError> {
+        // Pool routes: resolve every member, apply the pool's ladder, and
+        // reorder for sticky affinity.
+        if let Some(pool) = self.registry.pool(query.provider) {
+            // Resolve each member (a member that cannot serve the route kind
+            // is a config-time fact, so it fails the request rather than
+            // being silently skipped — the operator asked for it as fallback
+            // capacity).
+            let mut candidates = Vec::with_capacity(pool.members.len());
+            for member in &pool.members {
+                candidates.push(self.resolve_one(query, member).await?);
+            }
+            let mut plan = RoutePlan {
+                route: pool.name.clone(),
+                candidates,
+                retry: pool.retry.clone(),
+                affinity: pool.affinity.clone(),
+            };
+            if pool.affinity.sticky
+                && let (Some(table), Some(session)) = (&self.affinity, query.session_id)
+                && let Some(pinned) = table.pinned_provider(session)
+            {
+                plan.candidates
+                    .sort_by_key(|candidate| u8::from(candidate.target.provider_name != pinned));
+            }
+            return Ok(plan);
+        }
+
+        // Direct provider route: exactly one candidate, the provider's own
+        // opt-in ladder, and no failover beyond it. Without `[provider.retry]`
+        // the ladder is exactly one attempt — the pre-plan behaviour.
+        let resolved = self.resolve_one(query, query.provider).await?;
+        let retry = self
+            .registry
+            .get(query.provider)
+            .and_then(|p| p.retry.clone())
+            .unwrap_or_else(single_attempt);
+        Ok(RoutePlan {
+            route: query.provider.to_owned(),
+            candidates: vec![resolved],
+            retry,
+            affinity: AffinityConfig::default(),
+        })
     }
 }
 
@@ -253,44 +365,163 @@ pub enum GuardDecision {
 
 /// Supplies the upstream credential for an attempt (slot 9's credential
 /// pick). The default is the static key from provider config, with
-/// client-token passthrough when the provider opts in.
+/// client-token passthrough when the provider opts in; providers configured
+/// with more than one key rotate across the pool with failure feedback
+/// (plan 04 step 5, backlog 31).
 #[async_trait]
 pub trait CredentialSource: Debug + Send + Sync {
-    /// Pick the credential for `provider`.
+    /// Pick the credential for one attempt.
     ///
-    /// `configured` is the static key from provider config; `inbound` is the
-    /// client's own token, present only when the caller sent one. A rotation
-    /// implementation ignores both or uses them as seeds.
-    async fn credential(
+    /// `query.keys` is the member's resolved key pool (`api_keys` plus the
+    /// base `api_key`, or just the base key); `query.avoid` names the
+    /// credential that just failed, so a rotating implementation can move
+    /// on even statelessly. Returns the secret plus the id recorded on
+    /// ledger rows (never the secret itself).
+    async fn pick(&self, query: &CredentialQuery<'_>) -> Result<CredentialPick, EngineError> {
+        if query.passthrough {
+            return Ok(CredentialPick {
+                secret: query.inbound.cloned().ok_or(EngineError::Unauthorized)?,
+                credential_id: None,
+            });
+        }
+        let secret = query.keys.first().cloned().ok_or(EngineError::Internal(
+            "no upstream credential configured".to_owned(),
+        ))?;
+        Ok(CredentialPick {
+            secret,
+            credential_id: None,
+        })
+    }
+
+    /// Feedback after the attempt ran (plan 04 step 5): which credential was
+    /// used and how it ended. Default: ignore.
+    fn feedback(
         &self,
-        provider: &str,
-        configured: &SecretString,
-        passthrough: bool,
-        inbound: Option<&SecretString>,
-    ) -> Result<SecretString, EngineError>;
+        _provider: &str,
+        _credential_id: Option<&str>,
+        _outcome: CredentialFeedback,
+    ) {
+    }
+}
+
+/// What a credential pick hands back.
+#[derive(Debug, Clone)]
+pub struct CredentialPick {
+    /// The secret to send upstream.
+    pub secret: SecretString,
+    /// The id recorded on usage rows identifying which pool key was used
+    /// (for example `key-2`); `None` when the member has a single key or
+    /// passthrough auth supplied it.
+    pub credential_id: Option<String>,
+}
+
+/// What the attempt loop knows when picking a credential.
+#[derive(Debug)]
+pub struct CredentialQuery<'a> {
+    /// The member provider the attempt targets.
+    pub provider: &'a str,
+    /// The member's resolved credential pool.
+    pub keys: &'a [SecretString],
+    /// Whether the member forwards the client's own token.
+    pub passthrough: bool,
+    /// The client's token when one arrived.
+    pub inbound: Option<&'a SecretString>,
+    /// The id of the credential that failed the previous attempt against
+    /// this member, if that attempt used one.
+    pub avoid: Option<&'a str>,
+}
+
+/// How an attempt that used a credential ended, for
+/// [`CredentialSource::feedback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialFeedback {
+    /// The attempt succeeded.
+    Succeeded,
+    /// The credential was rejected or throttled (401/403/429): a pool should
+    /// let this key cool down.
+    Rejected,
+    /// The member failed transiently (5xx/timeout): the key is probably
+    /// fine, but the member cools down.
+    TransientFailure,
 }
 
 /// The default [`CredentialSource`]: the configured static key, or the
 /// client's token on `passthrough_auth` providers (which requires one).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ConfigCredentialSource;
+/// With a multi-key pool it rotates round-robin and avoids the key that just
+/// failed; cross-request key cooldowns live in the engine's
+/// [`crate::health::CooldownStore`], which the attempt loop updates from
+/// the same feedback.
+#[derive(Debug)]
+pub struct ConfigCredentialSource {
+    last_pick: Mutex<HashMap<String, usize>>,
+}
+
+use std::sync::Mutex;
+
+impl Default for ConfigCredentialSource {
+    fn default() -> Self {
+        Self {
+            last_pick: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ConfigCredentialSource {
+    /// A fresh source with no rotation memory.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 #[async_trait]
 impl CredentialSource for ConfigCredentialSource {
-    async fn credential(
-        &self,
-        provider: &str,
-        configured: &SecretString,
-        passthrough: bool,
-        inbound: Option<&SecretString>,
-    ) -> Result<SecretString, EngineError> {
-        let _ = provider;
-        if passthrough {
-            inbound.cloned().ok_or(EngineError::Unauthorized)
-        } else {
-            Ok(configured.clone())
+    async fn pick(&self, query: &CredentialQuery<'_>) -> Result<CredentialPick, EngineError> {
+        if query.passthrough {
+            return Ok(CredentialPick {
+                secret: query.inbound.cloned().ok_or(EngineError::Unauthorized)?,
+                credential_id: None,
+            });
         }
+        let Some(first) = query.keys.first() else {
+            return Err(EngineError::Internal(
+                "no upstream credential configured".to_owned(),
+            ));
+        };
+        if query.keys.len() == 1 {
+            // Single-key member: the base key, no id to record.
+            return Ok(CredentialPick {
+                secret: first.clone(),
+                credential_id: None,
+            });
+        }
+        // Multi-key pool (the base key plus extras): rotate round-robin,
+        // skipping the key that just failed when another exists.
+        let total = query.keys.len();
+        let mut guard = self.last_pick.lock().unwrap_or_else(|e| e.into_inner());
+        let last = guard.get(query.provider).copied().unwrap_or(total - 1);
+        let mut next = (last + 1) % total;
+        if let Some(avoid) = query.avoid
+            && let Some(avoid_idx) = parse_key_index(avoid)
+            && avoid_idx == next
+            && total > 1
+        {
+            next = (next + 1) % total;
+        }
+        guard.insert(query.provider.to_owned(), next);
+        let secret = query.keys.get(next).cloned().ok_or(EngineError::Internal(
+            "credential pool index out of range".to_owned(),
+        ))?;
+        Ok(CredentialPick {
+            secret,
+            credential_id: Some(format!("key-{next}")),
+        })
     }
+}
+
+/// Pool credential ids are `key-<index>`; parse the index back out.
+fn parse_key_index(id: &str) -> Option<usize> {
+    id.strip_prefix("key-")?.parse().ok()
 }
 
 /// Where usage rows go (slot 13). The default forwards to the
