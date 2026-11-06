@@ -94,6 +94,7 @@ fn member(name: &str, endpoint: String) -> ProviderConfig {
         discovery: None,
         catalog: None,
         pricing: Default::default(),
+        concurrency: None,
     }
 }
 
@@ -131,6 +132,7 @@ fn state_with(
             endpoint_families: Default::default(),
             upstream_timeouts: Default::default(),
             bare_v1: bare,
+            preflight: Default::default(),
         },
         auth: Default::default(),
         storage: None,

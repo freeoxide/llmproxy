@@ -189,6 +189,9 @@ pub struct ServerConfig {
     /// a model name resolves to a provider or pool.
     #[serde(default)]
     pub bare_v1: BareV1Config,
+    /// Context-window preflight (plan 05 step 8): warn by default.
+    #[serde(default)]
+    pub preflight: PreflightConfig,
 }
 
 /// Per-endpoint-family settings (audit conflict 16): the body limit and
@@ -520,20 +523,202 @@ pub struct AuthConfig {
     /// Authentication mode. Defaults to [`AuthMode::None`].
     #[serde(default)]
     pub mode: AuthMode,
-    /// Key id to hashed client secret, under `[auth.clients]`.
+    /// Key id to key spec, under `[auth.clients]`.
     ///
-    /// Each value is a PHC-format password-hashing string (argon2id), never a
-    /// plaintext secret. Wrapped in [`SecretString`] so the value is redacted
-    /// in `Debug` output. `skip_serializing` keeps the hashes out of every
-    /// `Serialize` path, so serializing then deserializing a config fails on
-    /// this field — by design.
+    /// A spec is either a bare PHC-format password-hashing string (argon2id)
+    /// or a table carrying the verifier plus this key's admission policy
+    /// (allowlists, rate windows, spend budget — plan 05 steps 3-5). The
+    /// verifier is never a plaintext secret and is wrapped in
+    /// [`SecretString`] so it is redacted in `Debug` output.
+    /// `skip_serializing` keeps the hashes out of every `Serialize` path, so
+    /// serializing then deserializing a config fails on this field — by
+    /// design.
     #[serde(default, skip_serializing)]
-    pub clients: HashMap<String, SecretString>,
+    pub clients: HashMap<String, ClientKeySpec>,
     /// Admin API authentication (`[auth.admin]` section). When present, the
     /// read-only `/usage` query surface is enabled and every `/usage` route
     /// on every mount requires its bearer token.
     #[serde(default)]
     pub admin: Option<AdminAuthConfig>,
+}
+
+/// One client key: its verifier, optionally plus its admission policy
+/// (`[auth.clients.<id>]` as a table instead of a bare string).
+///
+/// ```toml
+/// # bare: no policy, the key reaches everything
+/// laptop = "$argon2id$v=19$m=19456,t=2,p=1$..."
+///
+/// # with policy
+/// [auth.clients.laptop]
+/// verifier = "$argon2id$v=19$m=19456,t=2,p=1$..."
+/// allow_models = ["claude-*", "gpt-4o"]
+/// allow_providers = ["anthropic-pool", "openai"]
+/// [auth.clients.laptop.limits]
+/// rpm = 60
+/// tpm = 200_000
+/// rpd = 5_000
+/// [auth.clients.laptop.budget]
+/// usd_per_day = "10.00"
+/// ```
+/// `Serialize` is deliberately not implemented: verifiers must not be
+/// serializable, and the `[auth.clients]` map is `skip_serializing` on
+/// [`AuthConfig`] anyway.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ClientKeySpec {
+    /// A bare PHC verifier string: no policy fields.
+    Verifier(
+        /// The argon2id PHC string.
+        SecretString,
+    ),
+    /// A verifier table with policy.
+    Policy {
+        /// The argon2id PHC string.
+        verifier: SecretString,
+        /// Model globs this key may request (`["*"]` or empty allows all).
+        /// An empty or missing model in the request fails closed (backlog
+        /// 18): a restricted key may not run unattributable work.
+        #[serde(default)]
+        allow_models: Vec<String>,
+        /// Provider (or pool) name globs this key may address. Empty allows
+        /// all.
+        #[serde(default)]
+        allow_providers: Vec<String>,
+        /// Rate windows for this key (plan 05 step 5).
+        #[serde(default)]
+        limits: Option<KeyWindowLimits>,
+        /// Spend budget for this key (plan 05 step 4).
+        #[serde(default)]
+        budget: Option<KeyBudgetConfig>,
+    },
+}
+
+impl ClientKeySpec {
+    /// The verifier this key authenticates with.
+    #[must_use]
+    pub fn verifier(&self) -> &SecretString {
+        match self {
+            Self::Verifier(phc) => phc,
+            Self::Policy { verifier, .. } => verifier,
+        }
+    }
+}
+
+/// Per-key rate windows (plan 05 step 5, backlog 6). All optional; an absent
+/// window is unlimited.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyWindowLimits {
+    /// Requests per rolling 60-second window.
+    #[serde(default)]
+    pub rpm: Option<u32>,
+    /// Tokens (input estimate at reserve, actual usage at settle) per
+    /// rolling 60-second window.
+    #[serde(default)]
+    pub tpm: Option<u64>,
+    /// Requests per UTC day.
+    #[serde(default)]
+    pub rpd: Option<u64>,
+}
+
+/// How a key's budget treats a request whose cost cannot be estimated (no
+/// pricing configured for the model). Failing closed is the default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum UnestimatableCostPolicy {
+    /// Refuse the request (fail closed): the key cannot spend what cannot be
+    /// bounded.
+    #[default]
+    Reject,
+    /// Reserve this fixed USD amount in place of an estimate.
+    ReserveUsd {
+        /// The fixed per-request reservation.
+        usd: rust_decimal::Decimal,
+    },
+}
+
+/// Per-key spend budget (plan 05 step 4): a USD cap per UTC day, enforced
+/// reserve-then-settle so concurrent requests cannot overspend it by more
+/// than the reserved amount.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyBudgetConfig {
+    /// Maximum USD spend per UTC day, as a quoted decimal string.
+    pub usd_per_day: rust_decimal::Decimal,
+    /// What to do when a request's cost cannot be estimated (the model has
+    /// no pricing entry): refuse it (default) or reserve a fixed amount.
+    #[serde(default)]
+    pub unestimatable: UnestimatableCostPolicy,
+    /// Output tokens assumed when the request sets no `max_tokens`, for
+    /// estimating the reservation. Default 4096.
+    #[serde(default = "default_assumed_max_output_tokens")]
+    pub assumed_max_output_tokens: u64,
+}
+
+const fn default_assumed_max_output_tokens() -> u64 {
+    4096
+}
+
+/// Per-provider in-flight concurrency caps (plan 05 step 7, backlog 30).
+/// Saturated caps answer 503 with a short `Retry-After`, never 429.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConcurrencyConfig {
+    /// Maximum in-flight requests against this provider (route name). A
+    /// pool's cap counts the whole pool; per-member caps apply when that
+    /// member is addressed directly. `None` = uncapped.
+    #[serde(default)]
+    pub total: Option<u32>,
+    /// Tighter per-model caps (upstream model ids), overriding `total`
+    /// when lower.
+    #[serde(default)]
+    pub models: HashMap<ModelId, u32>,
+}
+
+/// Context-window preflight (plan 05 step 8, backlog 4, conflict 15).
+/// Warn by default: non-OpenAI estimates use chars/4 and counting ignores
+/// tools, tool results and images, so a hard reject needs a margin or a
+/// provider token count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreflightConfig {
+    /// Whether preflight warns, rejects, or stays off. Default
+    /// [`PreflightMode::Warn`].
+    #[serde(default)]
+    pub mode: PreflightMode,
+    /// Safety margin in tokens: enforce mode rejects only when the
+    /// estimated input exceeds the context window by at least this much, so
+    /// estimate error cannot produce a false rejection. Default 512.
+    #[serde(default = "default_preflight_margin_tokens")]
+    pub margin_tokens: u32,
+}
+
+const fn default_preflight_margin_tokens() -> u32 {
+    512
+}
+
+impl Default for PreflightConfig {
+    fn default() -> Self {
+        Self {
+            mode: PreflightMode::default(),
+            margin_tokens: default_preflight_margin_tokens(),
+        }
+    }
+}
+
+/// Preflight mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightMode {
+    /// No preflight at all.
+    Off,
+    /// Log a warning when the estimate does not fit; admit the request.
+    #[default]
+    Warn,
+    /// Warn as above, and reject (400) only when the estimated input
+    /// exceeds the window by at least `margin_tokens`.
+    Enforce,
 }
 
 /// Admin API configuration (`[auth.admin]` section of `config.toml`).
@@ -700,6 +885,9 @@ pub struct ProviderConfig {
     /// the key is the upstream model id. Defaults to empty (no cost accounting).
     #[serde(default)]
     pub pricing: HashMap<ModelId, ModelPricing>,
+    /// In-flight concurrency caps (plan 05 step 7). Absent = uncapped.
+    #[serde(default)]
+    pub concurrency: Option<ProviderConcurrencyConfig>,
     /// Upstream egress (network exit) configuration. When present, this
     /// provider's upstream requests are sent through the configured forward
     /// proxy instead of a direct connection; absent means direct egress.
@@ -1209,6 +1397,14 @@ pub enum ConfigValidationError {
         /// Provider name.
         provider: String,
     },
+    /// A concurrency cap is invalid (zero would refuse every request).
+    #[error("provider \"{provider}\": concurrency cap is invalid: {message}")]
+    InvalidConcurrency {
+        /// Provider whose cap is invalid.
+        provider: String,
+        /// What is wrong.
+        message: String,
+    },
     /// A pricing entry is invalid (empty model id or negative price).
     #[error("provider \"{provider}\": pricing for model \"{model}\" is invalid: {message}")]
     InvalidPricing {
@@ -1467,6 +1663,7 @@ pub enum ConfigValidationError {
 ///     discovery: None,
 ///     catalog: None,
 ///     pricing: Default::default(),
+///     concurrency: None,
 /// };
 /// assert!(validate_provider_config(&provider, None).is_ok());
 /// ```
@@ -1495,6 +1692,7 @@ pub enum ConfigValidationError {
 ///     discovery: None,
 ///     catalog: None,
 ///     pricing: Default::default(),
+///     concurrency: None,
 /// };
 /// assert_eq!(
 ///     validate_provider_config(&provider, None),
@@ -1510,6 +1708,7 @@ pub fn validate_provider_config(
     validate_name(name)?;
     validate_api_key(provider, name)?;
     validate_pricing(provider, name)?;
+    validate_concurrency(provider, name)?;
     validate_adapters(provider, name, known_protocols)?;
     validate_discovery(provider, name)?;
     validate_egress(provider, name)?;
@@ -1567,6 +1766,33 @@ fn validate_api_key(provider: &ProviderConfig, name: &str) -> Result<(), ConfigV
             route: name.to_owned(),
             message: "retry.max_attempts must be at least 1".to_owned(),
         });
+    }
+    Ok(())
+}
+
+fn validate_concurrency(
+    provider: &ProviderConfig,
+    name: &str,
+) -> Result<(), ConfigValidationError> {
+    let Some(concurrency) = &provider.concurrency else {
+        return Ok(());
+    };
+    if concurrency.total == Some(0) {
+        return Err(ConfigValidationError::InvalidConcurrency {
+            provider: name.to_owned(),
+            message: "total must be at least 1, not 0 (0 would refuse every request)".to_owned(),
+        });
+    }
+    for (model_id, cap) in &concurrency.models {
+        if *cap == 0 {
+            return Err(ConfigValidationError::InvalidConcurrency {
+                provider: name.to_owned(),
+                message: format!(
+                    "model cap for \"{}\" must be at least 1, not 0 (0 would refuse every request)",
+                    model_id.as_str()
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -2366,7 +2592,7 @@ mod tests {
             mode: AuthMode::ClientKeys,
             clients: HashMap::from([(
                 "laptop".to_owned(),
-                secrecy::SecretString::from("argon2id$hash"),
+                ClientKeySpec::Verifier(secrecy::SecretString::from("argon2id$hash")),
             )]),
             admin: None,
         };
@@ -2406,7 +2632,7 @@ mod tests {
             mode: AuthMode::ClientKeys,
             clients: HashMap::from([(
                 "laptop".to_owned(),
-                secrecy::SecretString::from("argon2id$hash"),
+                ClientKeySpec::Verifier(secrecy::SecretString::from("argon2id$hash")),
             )]),
             admin: None,
         };
@@ -2414,6 +2640,136 @@ mod tests {
 
         validate_passthrough_auth_combination(&auth, &[provider])
             .expect("provider api keys with client keys are fine");
+    }
+
+    #[test]
+    fn client_key_specs_parse_as_bare_verifier_or_policy_table() {
+        let raw = r#"
+mode = "client-keys"
+
+[clients]
+bare = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
+
+[clients.scoped]
+verifier = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
+allow_models = ["claude-*"]
+allow_providers = ["anthropic"]
+
+[clients.scoped.limits]
+rpm = 60
+tpm = 200000
+
+[clients.scoped.budget]
+usd_per_day = "10.50"
+unestimatable = { reserve_usd = { usd = "0.25" } }
+"#;
+        let auth: AuthConfig = toml::from_str(raw).expect("auth parses");
+        let bare = auth.clients.get("bare").expect("bare key");
+        assert!(matches!(bare, ClientKeySpec::Verifier(_)));
+        assert!(bare.verifier().expose_secret().starts_with("$argon2id$"));
+
+        let ClientKeySpec::Policy {
+            verifier,
+            allow_models,
+            allow_providers,
+            limits,
+            budget,
+        } = auth.clients.get("scoped").expect("scoped key")
+        else {
+            panic!("scoped key must parse as a policy table");
+        };
+        assert!(verifier.expose_secret().starts_with("$argon2id$"));
+        assert_eq!(allow_models, &["claude-*".to_owned()]);
+        assert_eq!(allow_providers, &["anthropic".to_owned()]);
+        let limits = limits.as_ref().expect("limits");
+        assert_eq!(
+            (limits.rpm, limits.tpm, limits.rpd),
+            (Some(60), Some(200_000), None)
+        );
+        let budget = budget.as_ref().expect("budget");
+        assert_eq!(budget.usd_per_day.to_string(), "10.50");
+        assert_eq!(
+            budget.unestimatable,
+            UnestimatableCostPolicy::ReserveUsd {
+                usd: "0.25".parse().expect("decimal")
+            }
+        );
+        assert_eq!(budget.assumed_max_output_tokens, 4096);
+    }
+
+    #[test]
+    fn client_key_budget_defaults_to_rejecting_unestimatable_cost() {
+        let raw = r#"
+[clients.scoped]
+verifier = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
+[clients.scoped.budget]
+usd_per_day = "1"
+"#;
+        let auth: AuthConfig = toml::from_str(raw).expect("auth parses");
+        let ClientKeySpec::Policy { budget, .. } = auth.clients.get("scoped").expect("key") else {
+            panic!("policy table expected");
+        };
+        assert_eq!(
+            budget.as_ref().expect("budget").unestimatable,
+            UnestimatableCostPolicy::Reject,
+            "a key with a budget must fail closed on unpriced models unless told otherwise"
+        );
+    }
+
+    #[test]
+    fn concurrency_caps_of_zero_are_rejected_at_validation() {
+        let mut provider = make_minimal_provider("capped");
+        provider.concurrency = Some(ProviderConcurrencyConfig {
+            total: Some(0),
+            models: HashMap::new(),
+        });
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::InvalidConcurrency { .. })
+        ));
+
+        provider.concurrency = Some(ProviderConcurrencyConfig {
+            total: Some(4),
+            models: HashMap::from([(ModelId::new("gpt-4o"), 0)]),
+        });
+        assert!(matches!(
+            validate_provider_config(&provider, None),
+            Err(ConfigValidationError::InvalidConcurrency { .. })
+        ));
+
+        provider.concurrency = Some(ProviderConcurrencyConfig {
+            total: Some(4),
+            models: HashMap::from([(ModelId::new("gpt-4o"), 2)]),
+        });
+        validate_provider_config(&provider, None).expect("positive caps are valid");
+    }
+
+    #[test]
+    fn preflight_defaults_to_warn_with_a_margin() {
+        let raw = r#"
+bind = "127.0.0.1:3456"
+request_timeout = "30s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#;
+        let server: ServerConfig = toml::from_str(raw).expect("server parses");
+        assert_eq!(server.preflight.mode, PreflightMode::Warn);
+        assert!(server.preflight.margin_tokens > 0);
+
+        let raw = r#"
+bind = "127.0.0.1:3456"
+request_timeout = "30s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+[preflight]
+mode = "enforce"
+margin_tokens = 1024
+"#;
+        let server: ServerConfig = toml::from_str(raw).expect("server parses");
+        assert_eq!(server.preflight.mode, PreflightMode::Enforce);
+        assert_eq!(server.preflight.margin_tokens, 1024);
     }
 
     fn make_minimal_provider(name: &str) -> ProviderConfig {
@@ -3577,6 +3933,7 @@ endpoint = "https://example.com/v1"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3609,6 +3966,7 @@ endpoint = "https://example.com/v1"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3641,6 +3999,7 @@ endpoint = "https://example.com/v1"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3664,6 +4023,7 @@ endpoint = "https://example.com/v1"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3687,6 +4047,7 @@ endpoint = "https://example.com/v1"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         validate_provider_config(&provider, None).unwrap();
     }
@@ -3754,6 +4115,7 @@ input = 0.0000025
                     ..ModelPricing::default()
                 },
             )]),
+            concurrency: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3777,6 +4139,7 @@ input = 0.0000025
             discovery: None,
             catalog: None,
             pricing: HashMap::from([(ModelId::new(""), ModelPricing::default())]),
+            concurrency: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3806,6 +4169,7 @@ input = 0.0000025
                     ..ModelPricing::default()
                 },
             )]),
+            concurrency: None,
         };
         match validate_provider_config(&provider, None) {
             Err(ConfigValidationError::InvalidPricing { message, .. }) => {
@@ -3841,6 +4205,7 @@ input = 0.0000025
                     ..ModelPricing::default()
                 },
             )]),
+            concurrency: None,
         };
         validate_provider_config(&provider, None).unwrap();
     }
@@ -3878,6 +4243,7 @@ input = 0.0000025
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         assert!(
             validate_provider_config(&provider, None).is_ok(),
@@ -3901,6 +4267,7 @@ input = 0.0000025
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3927,6 +4294,7 @@ input = 0.0000025
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         match validate_provider_config(&provider, None) {
             Err(ConfigValidationError::UnresolvedEnvVar { provider, var }) => {

@@ -41,6 +41,7 @@ mod tests {
                 endpoint_families: families,
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,

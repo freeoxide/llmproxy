@@ -191,6 +191,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing,
+            concurrency: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -213,6 +214,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -1285,6 +1287,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: HashMap::new(),
+            concurrency: None,
         };
         provider.name = "mock-provider".to_owned();
         let registry =
@@ -1307,6 +1310,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -1893,7 +1897,10 @@ mod tests {
             .expect("hash token")
             .to_string();
         let mut clients = HashMap::new();
-        clients.insert(key_id.to_owned(), secrecy::SecretString::from(phc));
+        clients.insert(
+            key_id.to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc)),
+        );
         llm_proxy_server::ClientAuth::from_config(&llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
@@ -2680,6 +2687,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -2701,6 +2709,7 @@ mod tests {
                     endpoint_families: Default::default(),
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
+                    preflight: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -2791,6 +2800,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -2812,6 +2822,7 @@ mod tests {
                     endpoint_families: Default::default(),
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
+                    preflight: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -3104,6 +3115,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         AppState::new(
@@ -3125,6 +3137,7 @@ mod tests {
                     endpoint_families: Default::default(),
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
+                    preflight: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -3339,6 +3352,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -3360,6 +3374,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,

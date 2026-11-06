@@ -175,6 +175,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -197,6 +198,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -384,6 +386,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -434,6 +437,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let app_config = AppConfig {
@@ -454,6 +458,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -1816,6 +1821,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let mut adapters_b = HashMap::new();
@@ -1846,6 +1852,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).unwrap();
@@ -1868,6 +1875,7 @@ mod tests {
                     endpoint_families: Default::default(),
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
+                    preflight: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,

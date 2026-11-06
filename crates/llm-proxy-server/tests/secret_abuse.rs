@@ -72,7 +72,7 @@ mod tests {
             let phc = cheap_phc(token, salt.as_bytes());
             clients.insert(
                 (*key_id).to_owned(),
-                secrecy::SecretString::from(phc.clone()),
+                llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc.clone())),
             );
             phcs.push(phc);
         }
@@ -127,6 +127,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: HashMap::new(),
+            concurrency: None,
         };
 
         AppState::new(
@@ -148,6 +149,7 @@ mod tests {
                     endpoint_families: Default::default(),
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
+                    preflight: Default::default(),
                 },
                 auth: llm_proxy_core::AuthConfig {
                     mode: AuthMode::None,

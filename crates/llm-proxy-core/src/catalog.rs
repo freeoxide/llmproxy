@@ -157,6 +157,14 @@ pub fn model_allowed(model: &str, allow: &[String], deny: &[String]) -> bool {
 
 static GLOB_CACHE: std::sync::Mutex<Vec<(String, Regex)>> = std::sync::Mutex::new(Vec::new());
 
+/// Whether `value` matches the glob `pattern`: `*` spans anything, `?` one
+/// character, everything else is literal. The pattern set compiled here is
+/// bounded by configuration (catalog filters, per-key allowlists).
+#[must_use]
+pub fn glob_match(pattern: &str, value: &str) -> bool {
+    glob_matches(pattern, value)
+}
+
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let mut cache = GLOB_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, regex)) = cache.iter().find(|(p, _)| p == pattern) {

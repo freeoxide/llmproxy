@@ -284,6 +284,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: HashMap::new(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
@@ -305,6 +306,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -921,6 +923,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: HashMap::new(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let app_config = AppConfig {
@@ -941,6 +944,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,

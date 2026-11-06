@@ -705,6 +705,7 @@ enabled = true
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,

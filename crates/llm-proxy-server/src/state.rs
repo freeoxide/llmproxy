@@ -295,6 +295,7 @@ mod tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: Default::default(),
             storage: None,
@@ -358,6 +359,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -481,6 +483,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -520,6 +523,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -608,6 +612,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let bad = ProviderConfig {
@@ -637,6 +642,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![good, bad]).expect("registry");
@@ -711,7 +717,9 @@ mod tests {
         cfg.auth.mode = llm_proxy_core::AuthMode::ClientKeys;
         cfg.auth.clients.insert(
             "laptop".to_owned(),
-            secrecy::SecretString::from("not-a-phc-string"),
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(
+                "not-a-phc-string",
+            )),
         );
         let state = AppState::new(
             cfg,
@@ -745,9 +753,10 @@ mod tests {
 
         let mut cfg = make_app_config();
         cfg.auth.mode = llm_proxy_core::AuthMode::ClientKeys;
-        cfg.auth
-            .clients
-            .insert("laptop".to_owned(), secrecy::SecretString::from(phc));
+        cfg.auth.clients.insert(
+            "laptop".to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc)),
+        );
         let client_auth =
             crate::middleware::ClientAuth::from_config(&cfg.auth).expect("valid verifier");
         let state = AppState::new(

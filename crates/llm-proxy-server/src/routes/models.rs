@@ -283,6 +283,7 @@ mod tests {
                 ],
             }),
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let registry =
@@ -306,6 +307,7 @@ mod tests {
                     endpoint_families: Default::default(),
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
+                    preflight: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
@@ -336,6 +338,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         };
 
         let registry =
@@ -359,6 +362,7 @@ mod tests {
                     endpoint_families: Default::default(),
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
+                    preflight: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,

@@ -531,6 +531,7 @@ mod tests {
                 models: Vec::new(),
             }),
             pricing: Default::default(),
+            concurrency: None,
         }
     }
 
@@ -668,6 +669,7 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         }
     }
 
@@ -1001,6 +1003,7 @@ mod tests {
                 models,
             }),
             pricing: Default::default(),
+            concurrency: None,
         }
     }
 

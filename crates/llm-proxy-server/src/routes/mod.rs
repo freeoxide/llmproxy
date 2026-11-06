@@ -417,7 +417,10 @@ mod auth_gate_tests {
             .to_string();
 
         let mut clients = std::collections::HashMap::new();
-        clients.insert("laptop".to_owned(), secrecy::SecretString::from(phc));
+        clients.insert(
+            "laptop".to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc)),
+        );
         let app_config = llm_proxy_core::AppConfig {
             server: llm_proxy_core::ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
@@ -436,6 +439,7 @@ mod auth_gate_tests {
                 endpoint_families: Default::default(),
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
+                preflight: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::ClientKeys,

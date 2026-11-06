@@ -436,10 +436,11 @@ impl ClientAuth {
             AuthMode::None | AuthMode::ClientKeys => {}
         }
         let mut verifiers = Vec::with_capacity(config.clients.len());
-        for (key_id, phc) in &config.clients {
+        for (key_id, spec) in &config.clients {
             if key_id.is_empty() || key_id == ANONYMOUS_CALLER {
                 return Err(ClientAuthError::InvalidKeyId(key_id.clone()));
             }
+            let phc = spec.verifier();
             if let Err(source) = argon2::password_hash::phc::PasswordHash::new(phc.expose_secret())
             {
                 return Err(ClientAuthError::InvalidVerifier {
@@ -734,7 +735,10 @@ mod tests {
 
     fn auth_config_with(phc: &str) -> llm_proxy_core::AuthConfig {
         let mut clients = HashMap::new();
-        clients.insert("laptop".to_owned(), SecretString::from(phc.to_owned()));
+        clients.insert(
+            "laptop".to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(phc.to_owned())),
+        );
         llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
@@ -748,7 +752,10 @@ mod tests {
             let mut clients = HashMap::new();
             clients.insert(
                 "laptop".to_owned(),
-                SecretString::from(cheap_phc("secret", b"0123456789abcdef")),
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                    "secret",
+                    b"0123456789abcdef",
+                ))),
             );
             llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,
@@ -777,9 +784,10 @@ mod tests {
         for bad_id in ["", "anonymous"] {
             let mut config = auth_config_with(&cheap_phc("secret", b"0123456789abcdef"));
             config.clients.remove("laptop");
-            config
-                .clients
-                .insert(bad_id.to_owned(), SecretString::from("x".to_owned()));
+            config.clients.insert(
+                bad_id.to_owned(),
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from("x".to_owned())),
+            );
             assert!(
                 matches!(
                     ClientAuth::from_config(&config),
@@ -822,7 +830,10 @@ mod tests {
         for (id, token) in [("alpha", "one"), ("beta", "two"), ("gamma", "three")] {
             clients.insert(
                 id.to_owned(),
-                SecretString::from(cheap_phc(token, b"0123456789abcdef")),
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                    token,
+                    b"0123456789abcdef",
+                ))),
             );
         }
         let config = llm_proxy_core::AuthConfig {
@@ -841,15 +852,18 @@ mod tests {
         let mut clients = HashMap::new();
         clients.insert(
             "laptop".to_owned(),
-            SecretString::from(cheap_phc("the-real-secret", b"0123456789abcdef")),
+            llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                "the-real-secret",
+                b"0123456789abcdef",
+            ))),
         );
         for index in 0..count.saturating_sub(1) {
             clients.insert(
                 format!("key-{index:03}"),
-                SecretString::from(cheap_phc(
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
                     format!("secret-{index}").as_str(),
                     b"0123456789abcdef",
-                )),
+                ))),
             );
         }
         let config = llm_proxy_core::AuthConfig {

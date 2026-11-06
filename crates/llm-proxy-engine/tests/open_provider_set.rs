@@ -293,6 +293,7 @@ fn echo_provider(endpoint: String) -> ProviderConfig {
         discovery: None,
         catalog: None,
         pricing: Default::default(),
+        concurrency: None,
     }
 }
 
@@ -315,6 +316,7 @@ fn config() -> AppConfig {
             endpoint_families: Default::default(),
             upstream_timeouts: Default::default(),
             bare_v1: Default::default(),
+            preflight: Default::default(),
         },
         auth: Default::default(),
         storage: None,

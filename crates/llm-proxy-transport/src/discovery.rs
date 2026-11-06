@@ -400,6 +400,7 @@ mod tests {
             }),
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         }
     }
 
@@ -640,6 +641,7 @@ mod tests {
             }),
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
         }
     }
 

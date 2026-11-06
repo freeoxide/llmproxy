@@ -24,21 +24,22 @@ pub mod token;
 pub mod test_support;
 
 pub use catalog::{
-    CatalogFile, CatalogFileMetadata, merge_catalog, model_allowed, parse_catalog_file,
+    CatalogFile, CatalogFileMetadata, glob_match, merge_catalog, model_allowed, parse_catalog_file,
 };
 pub use error::CoreError;
 pub use metrics::{Metrics, Snapshot};
 pub use provider_config::{
     ANONYMOUS_CALLER, AdminAuthConfig, AdminMountPosture, AffinityConfig, AffinityConflictPolicy,
-    AppConfig, AuthConfig, AuthMode, AuthStyle, BareV1Config, ConfigValidationError,
-    DEFAULT_MAX_BODY_BYTES, EndpointFamilyConfig, LogFormat, ModelId, ModelPricing, PoolConfig,
-    PoolFile, ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode, ProviderConfig,
-    ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderEgressConfig, ProviderFile,
-    ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig, StaticModelCatalogEntry,
-    StorageConfig, UpstreamTimeoutsConfig, bare_v1_target_problems, family_max_body_bytes,
-    family_request_timeout, load_app_config, load_provider_config,
-    validate_passthrough_auth_combination, validate_pool_config, validate_provider_config,
-    validate_upstream_timeouts,
+    AppConfig, AuthConfig, AuthMode, AuthStyle, BareV1Config, ClientKeySpec, ConfigValidationError,
+    DEFAULT_MAX_BODY_BYTES, EndpointFamilyConfig, KeyBudgetConfig, KeyWindowLimits, LogFormat,
+    ModelId, ModelPricing, PoolConfig, PoolFile, PreflightConfig, PreflightMode,
+    ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode, ProviderConcurrencyConfig,
+    ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderEgressConfig,
+    ProviderFile, ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig,
+    StaticModelCatalogEntry, StorageConfig, UnestimatableCostPolicy, UpstreamTimeoutsConfig,
+    bare_v1_target_problems, family_max_body_bytes, family_request_timeout, load_app_config,
+    load_provider_config, validate_passthrough_auth_combination, validate_pool_config,
+    validate_provider_config, validate_upstream_timeouts,
 };
 pub use provider_registry::{
     ProviderAdapterTargetConfig, ProviderRegistry, ProviderRouteResolutionError,
