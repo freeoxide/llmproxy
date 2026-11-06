@@ -260,7 +260,7 @@ async fn an_exhausted_pool_carries_the_retry_terminality_signals() {
 }
 
 #[tokio::test]
-async fn a_direct_provider_route_keeps_its_429_without_retry_headers() {
+async fn a_direct_provider_route_429_follows_the_policy_table() {
     let solo = spawn_json_upstream(
         StatusCode::TOO_MANY_REQUESTS,
         r#"{"error":"slow"}"#,
@@ -284,9 +284,25 @@ async fn a_direct_provider_route_keeps_its_429_without_retry_headers() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(
-        response.headers().get("x-should-retry").is_none(),
-        "a bare provider route behaves exactly as before plan 04"
+    // One policy table (plan 05 step 1): a 429 the proxy did not retry
+    // itself is a genuine upstream throttle the client may retry after the
+    // advised wait — true, unlike an exhausted ladder — and the upstream's
+    // Retry-After survives the mapping.
+    assert_eq!(
+        response
+            .headers()
+            .get("x-should-retry")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "a 429 on a route with no ladder is retryable by the client"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("3"),
+        "the upstream-advised wait reaches the client"
     );
 }
 

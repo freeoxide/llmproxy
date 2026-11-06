@@ -197,6 +197,7 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
                 status: status_code,
                 body,
                 auth_owner: AuthOwner::Operator,
+                retry_after_secs: None,
             }
         }
         ProviderError::Http { timeout: true, .. } => {
@@ -212,6 +213,7 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
                 status: StatusCode::BAD_GATEWAY,
                 body: sanitized,
                 auth_owner: AuthOwner::Operator,
+                retry_after_secs: None,
             }
         }
         ProviderError::Serialize(_)

@@ -66,7 +66,10 @@ pub(crate) fn prepare_request(
     };
     if !direct_loopback && !state.rate_limiter.is_allowed(&rate_limit_key) {
         state.metrics.record_rate_limited();
-        return Err(RouteError::RateLimited);
+        return Err(RouteError::RateLimited {
+            message: "rate limit exceeded".to_owned(),
+            retry_after_secs: Some(1),
+        });
     }
 
     if state.request_dedup.is_duplicate_with_path(path, body) {
@@ -164,6 +167,7 @@ pub(crate) fn emit_response_failed(
         status: upstream_status,
         body,
         auth_owner,
+        retry_after_secs: _,
     } = error
     {
         warn!(

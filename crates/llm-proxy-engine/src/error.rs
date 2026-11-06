@@ -7,6 +7,7 @@ use llm_proxy_adapters::ProviderError;
 use llm_proxy_core::ProviderRouteResolutionError;
 
 use crate::classification::rate_limit_reset;
+use crate::error_policy::{policy_for, should_retry as policy_should_retry};
 
 /// Who owns the credential an upstream auth failure implicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,9 +38,39 @@ pub enum EngineError {
     /// Passthrough auth requires a client credential and none arrived.
     #[error("unauthorized")]
     Unauthorized,
-    /// Admission (budget/limits reservation) refused the request.
+    /// A rate window (RPM, TPM or RPD) refused the request: 429 with the
+    /// window reset, when known (plan 05 step 5).
+    #[error("rate limit exceeded: {message}")]
+    RateLimited {
+        /// Which window refused, in the admission step's words.
+        message: String,
+        /// The window reset, when the admission step knows it.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The caller's spend budget refused the request: 402 (plan 05 step 4).
+    /// Also covers the "cost cannot be estimated and the key's policy
+    /// rejects unestimatable requests" refusal.
+    #[error("budget exhausted: {message}")]
+    BudgetExhausted {
+        /// Which budget refused, in the admission step's words.
+        message: String,
+        /// The budget window reset, when the admission step knows it.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// A concurrency cap is saturated (plan 05 step 7): 503, never 429 —
+    /// capacity shedding misread as rate limiting arms hour-long client
+    /// backoff ladders.
+    #[error("at capacity: {message}")]
+    Overloaded {
+        /// Which cap saturated, in the admission step's words.
+        message: String,
+        /// A short wait after which a slot may be free.
+        retry_after: Option<std::time::Duration>,
+    },
+    /// The caller's key may not reach this provider or model (plan 05 step
+    /// 3, backlog 18): 403.
     #[error("{0}")]
-    RateLimited(String),
+    Forbidden(String),
     /// The client request is not representable (bad body or cross-format
     /// field rejection naming the fields).
     #[error("{0}")]
@@ -116,7 +147,10 @@ impl EngineError {
             Self::UnsupportedRoute(_) => "UnsupportedRoute",
             Self::ModelNotAllowed(_) => "ModelNotAllowed",
             Self::Unauthorized => "Unauthorized",
-            Self::RateLimited(_) => "RateLimited",
+            Self::RateLimited { .. } => "RateLimited",
+            Self::BudgetExhausted { .. } => "BudgetExhausted",
+            Self::Overloaded { .. } => "Overloaded",
+            Self::Forbidden(_) => "Forbidden",
             Self::InvalidRequest(_) => "InvalidRequest",
             Self::ProviderDecode(_) => "ProviderDecode",
             Self::Upstream { .. } => "Upstream",
@@ -139,7 +173,10 @@ impl EngineError {
             Self::UnsupportedRoute(_) => 404,
             Self::ModelNotAllowed(_) => 400,
             Self::Unauthorized => 401,
-            Self::RateLimited(_) => 429,
+            Self::RateLimited { .. } => 429,
+            Self::BudgetExhausted { .. } => 402,
+            Self::Overloaded { .. } => 503,
+            Self::Forbidden(_) => 403,
             Self::InvalidRequest(_) => 400,
             Self::ProviderDecode(_) => 502,
             Self::UpstreamTimeout(_) => 504,
@@ -154,18 +191,30 @@ impl EngineError {
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::Upstream { retry_after, .. } => *retry_after,
-            Self::RetryExhausted { retry_after, .. } => *retry_after,
+            Self::Upstream { retry_after, .. }
+            | Self::RateLimited { retry_after, .. }
+            | Self::BudgetExhausted { retry_after, .. }
+            | Self::Overloaded { retry_after, .. }
+            | Self::RetryExhausted { retry_after, .. } => *retry_after,
             _ => None,
         }
     }
 
-    /// Whether the proxy wants the client to retry this request itself.
-    /// `false` exactly when the ladder already exhausted its own retries
-    /// (backlog 38): the server renders this as `x-should-retry`.
+    /// Whether the proxy wants the client to retry this request itself:
+    /// the one policy table's row for this status, except that an exhausted
+    /// ladder always says `false` (the proxy already retried; backlog 38).
+    /// The server renders this as `x-should-retry`.
     #[must_use]
     pub fn should_retry(&self) -> bool {
-        !matches!(self, Self::RetryExhausted { .. })
+        policy_should_retry(self)
+    }
+
+    /// The policy row governing this error's status, or `None` when the
+    /// status is not one the proxy produces (a programming error; tests on
+    /// both sides of the engine/server boundary enforce coverage).
+    #[must_use]
+    pub fn status_policy(&self) -> Option<&'static crate::error_policy::StatusCodePolicy> {
+        policy_for(self.status_code())
     }
 
     /// Sanitized client-facing message.

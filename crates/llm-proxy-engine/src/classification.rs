@@ -70,7 +70,10 @@ pub fn classify(error: &EngineError) -> ErrorClass {
         | EngineError::UnsupportedRoute(_)
         | EngineError::ModelNotAllowed(_)
         | EngineError::Unauthorized
-        | EngineError::RateLimited(_)
+        | EngineError::RateLimited { .. }
+        | EngineError::BudgetExhausted { .. }
+        | EngineError::Overloaded { .. }
+        | EngineError::Forbidden(_)
         | EngineError::InvalidRequest(_) => ErrorClass::Terminal,
         EngineError::RetryExhausted { .. } | EngineError::AffinityRefused { .. } => {
             ErrorClass::Terminal

@@ -33,6 +33,7 @@
 pub mod catalog;
 pub mod classification;
 pub mod error;
+pub mod error_policy;
 pub mod headers;
 pub mod health;
 pub mod lifecycle;
@@ -53,6 +54,7 @@ pub use classification::{ErrorClass, classify, parse_duration_suffix, parse_retr
 pub use error::{
     AuthOwner, EngineError, map_provider_error, map_upstream_status, sanitize_upstream_error_body,
 };
+pub use error_policy::{STATUS_POLICY, StatusCodePolicy, policy_for};
 pub use headers::select_forwarded_headers;
 pub use health::{AffinityTable, CooldownStore};
 pub use traits::{
