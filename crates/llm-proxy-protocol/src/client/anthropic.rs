@@ -147,29 +147,66 @@ fn decode_message(msg: &Message) -> Result<CoreMessage, ProtocolError> {
         }
     };
 
-    let blocks = msg
-        .content_blocks()
-        .map_err(|error| malformed_block("message content", &error))?;
-    let mut content = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        content.push(decode_content_block(block)?);
-    }
+    let content = match msg.content.as_array() {
+        Some(items) => items
+            .iter()
+            .map(|item| decode_wire_block(item, "message content"))
+            .collect::<Result<Vec<_>, _>>()?,
+        // A string (one text block), null (no blocks) or an invalid shape.
+        None => msg
+            .content_blocks()
+            .map_err(|error| malformed_block("message content", &error))?
+            .into_iter()
+            .map(decode_content_block)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     Ok(CoreMessage { role, content })
+}
+
+/// Block types the decoder models in the core. Every other type is carried
+/// verbatim as [`CoreContent::Opaque`] so same-format passthrough can forward
+/// it: Anthropic requires replayed server-tool blocks back unmodified.
+const MODELED_BLOCK_TYPES: &[&str] = &[
+    "text",
+    "image",
+    "document",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "redacted_thinking",
+];
+
+/// Decodes one wire block. Unmodeled types bypass the typed [`ContentBlock`]
+/// decode, so fields the proxy has no model for can never fail the request.
+fn decode_wire_block(
+    item: &serde_json::Value,
+    context: &str,
+) -> Result<CoreContent, ProtocolError> {
+    let unmodeled = item
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|block_type| !MODELED_BLOCK_TYPES.contains(&block_type));
+    if unmodeled {
+        return Ok(CoreContent::Opaque {
+            block: item.clone(),
+        });
+    }
+    let block = serde_json::from_value::<ContentBlock>(item.clone())
+        .map_err(|error| malformed_block(context, &error))?;
+    decode_content_block(block)
 }
 
 fn decode_tool_result_blocks(arr: &[serde_json::Value]) -> Result<Vec<CoreContent>, ProtocolError> {
     let mut blocks = Vec::with_capacity(arr.len());
     for item in arr {
-        let cb = serde_json::from_value::<ContentBlock>(item.clone())
-            .map_err(|error| malformed_block("tool_result content", &error))?;
-        match decode_content_block(cb) {
+        match decode_wire_block(item, "tool_result content") {
             Ok(core) => blocks.push(core),
             Err(ProtocolError::Decode(msg)) => {
                 let truncated = crate::util::truncate_str_safe(&msg, 64);
                 tracing::warn!(
                     decode_error = truncated,
-                    "skipping unknown block inside tool_result content array"
+                    "skipping undecodable block inside tool_result content array"
                 );
             }
             Err(other) => return Err(other),
@@ -246,12 +283,12 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                     "Anthropic client: cache_control on image block is not supported; dropping"
                 );
             }
-            let source = block
-                .source
-                .map(|s| serde_json::to_value(&s).unwrap_or(serde_json::Value::Null))
-                .unwrap_or(serde_json::Value::Null);
+            let source = block.source.unwrap_or(serde_json::Value::Null);
             Ok(CoreContent::Image { source })
         }
+        "document" => Ok(CoreContent::Document {
+            source: block.source.unwrap_or(serde_json::Value::Null),
+        }),
         "tool_use" => {
             let id = block.id.unwrap_or_default();
             if id.is_empty() {
@@ -365,11 +402,6 @@ pub fn encode_response(resp: CoreResponse) -> Result<MessageResponse, ProtocolEr
     })
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one match arm per CoreContent variant: the Anthropic client block \
-             mapping is a single translation table"
-)]
 fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolError> {
     match content {
         CoreContent::Text { text, cache } => {
@@ -381,20 +413,7 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             block.cache_control = cc;
             Ok(block)
         }
-        CoreContent::Image { source } => {
-            let img_source = serde_json::from_value(source).unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "Image source deserialization failed; producing empty ImageSource fallback"
-                );
-                anthropic::ImageSource {
-                    r#type: String::new(),
-                    media_type: String::new(),
-                    data: String::new(),
-                }
-            });
-            Ok(ContentBlock::new_image(img_source))
-        }
+        CoreContent::Image { source } => Ok(ContentBlock::new_image(source)),
         CoreContent::ToolUse {
             id,
             name,
@@ -475,6 +494,12 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             );
             Err(ProtocolError::Encode(
                 "Anthropic Messages does not support Refusal blocks".into(),
+            ))
+        }
+        CoreContent::Opaque { .. } => {
+            tracing::warn!("opaque client block has no Anthropic response encoding; omitting");
+            Err(ProtocolError::EncodeSkippable(
+                "opaque client blocks have no Anthropic response encoding".into(),
             ))
         }
     }
@@ -1139,6 +1164,63 @@ mod tests {
                 assert_eq!(source["type"], "base64");
             }
             _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn every_documented_image_source_decodes_with_the_source_intact() {
+        let sources = [
+            serde_json::json!({ "type": "base64", "media_type": "image/png", "data": "iVBOR..." }),
+            serde_json::json!({ "type": "url", "url": "https://example.com/cat.jpg" }),
+            serde_json::json!({ "type": "file", "file_id": "file_fixture_01" }),
+        ];
+        for source in sources {
+            let mut req = make_anthropic_request();
+            req.messages.push(Message {
+                role: "user".into(),
+                content: serde_json::json!([{ "type": "image", "source": source }]),
+            });
+            let core = decode_request(req)
+                .unwrap_or_else(|e| panic!("image source {source} must decode: {e}"));
+            match &core.messages[1].content[..] {
+                [CoreContent::Image { source: decoded }] => assert_eq!(decoded, &source),
+                other => panic!("expected one Image for {source}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn document_blocks_decode_to_core_documents_in_order() {
+        let url_source =
+            serde_json::json!({ "type": "url", "url": "https://example.com/report.pdf" });
+        let base64_source = serde_json::json!({
+            "type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjcK"
+        });
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                { "type": "document", "source": url_source },
+                {
+                    "type": "document",
+                    "source": base64_source,
+                    "cache_control": { "type": "ephemeral" }
+                },
+                { "type": "text", "text": "Summarize both." }
+            ]),
+        });
+        let core = decode_request(req).expect("document blocks must decode");
+        match &core.messages[1].content[..] {
+            [
+                CoreContent::Document { source: first },
+                CoreContent::Document { source: second },
+                CoreContent::Text { text, .. },
+            ] => {
+                assert_eq!(first, &url_source);
+                assert_eq!(second, &base64_source);
+                assert_eq!(text, "Summarize both.");
+            }
+            other => panic!("expected two Documents then Text, got {other:?}"),
         }
     }
 
@@ -1966,6 +2048,17 @@ mod tests {
     }
 
     #[test]
+    fn encode_image_forwards_a_url_source_verbatim() {
+        let source = serde_json::json!({"type": "url", "url": "https://example.com/cat.jpg"});
+        let block = encode_content_block(CoreContent::Image {
+            source: source.clone(),
+        })
+        .unwrap();
+        let wire = serde_json::to_value(&block).unwrap();
+        assert_eq!(wire, serde_json::json!({"type": "image", "source": source}));
+    }
+
+    #[test]
     fn encode_refusal_returns_encode_error() {
         let content = CoreContent::Refusal {
             text: "I cannot help with that".into(),
@@ -2085,17 +2178,71 @@ mod tests {
     }
 
     #[test]
-    fn unknown_block_type_returns_decode_error() {
+    fn unmodeled_block_types_are_carried_verbatim_as_opaque() {
+        // `data` is a string on the typed block: an unmodeled block's own field
+        // shapes must never reach the typed decode, at top level or nested.
+        let unmodeled =
+            serde_json::json!({ "type": "future_unknown_block", "data": { "nested": true } });
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                unmodeled,
+                { "type": "tool_result", "tool_use_id": "tu_1", "content": [unmodeled] }
+            ]),
+        });
+        let core = decode_request(req).expect("unmodeled blocks must not fail the decode");
+        match &core.messages[1].content[..] {
+            [
+                CoreContent::Opaque { block },
+                CoreContent::ToolResult { content, .. },
+            ] => {
+                assert_eq!(block, &unmodeled);
+                assert_eq!(content, &vec![CoreContent::Opaque { block: unmodeled }]);
+            }
+            other => panic!("expected Opaque then ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_search_replay_blocks_decode_as_opaque_blocks_in_order() {
+        let server_tool_use = serde_json::json!({
+            "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+            "input": { "query": "claude shannon birth date" }
+        });
+        let search_result = serde_json::json!({
+            "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+            "content": [{
+                "type": "web_search_result", "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                "title": "Claude Shannon - Wikipedia", "encrypted_content": "EqgfCioIARgB",
+                "page_age": "April 30, 2025"
+            }]
+        });
         let mut req = make_anthropic_request();
         req.messages.push(Message {
             role: "assistant".into(),
             content: serde_json::json!([
-                { "type": "future_unknown_block", "data": "some-data" }
+                { "type": "text", "text": "Searching." },
+                server_tool_use,
+                search_result,
+                { "type": "text", "text": "Born April 30, 1916." }
             ]),
         });
-        let result = decode_request(req);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ProtocolError::Decode(_)));
+        let core = decode_request(req).expect("server-tool replay blocks must decode");
+        match &core.messages[1].content[..] {
+            [
+                CoreContent::Text { text: before, .. },
+                CoreContent::Opaque { block: tool_use },
+                CoreContent::Opaque { block: tool_result },
+                CoreContent::Text { text: after, .. },
+            ] => {
+                assert_eq!(before, "Searching.");
+                assert_eq!(tool_use, &server_tool_use);
+                assert_eq!(tool_result, &search_result);
+                assert_eq!(after, "Born April 30, 1916.");
+            }
+            other => panic!("expected Text, two Opaque blocks, Text; got {other:?}"),
+        }
     }
 
     #[test]

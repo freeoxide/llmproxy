@@ -8,11 +8,14 @@
 //! normalized core encoding, and every client field the core does not model is
 //! looked up in one table per format pair: **carried** verbatim, **mapped** by
 //! adapter code, or **rejected** with an error naming it (a per-route `lossy`
-//! opt-in turns a rejection into a drop with a logged warning).
+//! opt-in turns a rejection into a drop with a logged warning). Server tools
+//! and message blocks the cross-format encoders cannot carry are rejected the
+//! same way.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use llm_proxy_protocol::core::{CoreContent, CoreRequest};
 use serde_json::Value;
 
 use crate::ProtocolName;
@@ -320,6 +323,78 @@ fn check_cross_format_tools(
     Err(ProviderError::InvalidRequest(format!(
         "server tool(s) [{}] have no {provider} equivalent; remove them or enable the route's lossy mode",
         server_tools.join(", "),
+    )))
+}
+
+/// Whether the cross-format image mappings (OpenAI `image_url` parts, Gemini
+/// `inlineData`/`fileData`) can read a neutral image source: `base64` with
+/// `media_type` and `data`, or `url` with `url`.
+fn image_source_is_mappable(source: &Value) -> bool {
+    let Some(source) = source.as_object() else {
+        return false;
+    };
+    let has_string = |key: &str| source.get(key).is_some_and(Value::is_string);
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => has_string("media_type") && has_string("data"),
+        Some("url") => has_string("url"),
+        _ => false,
+    }
+}
+
+/// Labels a message block the cross-format encoders cannot carry, or `None`
+/// when they can.
+fn uncarried_block_label(content: &CoreContent) -> Option<String> {
+    let wire_type = |value: &Value| {
+        let found = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        llm_proxy_protocol::util::truncate_str_safe(found, 64).to_owned()
+    };
+    match content {
+        CoreContent::Opaque { block } => Some(format!("type={}", wire_type(block))),
+        CoreContent::Document { .. } => Some("type=document".to_owned()),
+        CoreContent::Image { source } if !image_source_is_mappable(source) => {
+            Some(format!("type=image source.type={}", wire_type(source)))
+        }
+        _ => None,
+    }
+}
+
+/// Message blocks the cross-format encoders cannot carry: opaque blocks (a
+/// client block the core does not model, e.g. a replayed Anthropic
+/// `server_tool_use`), documents (no built-in provider encodes them) and
+/// images without a readable `base64`/`url` source (e.g. a Files API `file`
+/// source). Same-format passthrough forwards the raw client body instead;
+/// every cross-format encode calls this so these blocks are rejected by name
+/// rather than dropped by the encoder (dropped with a warning under `lossy`).
+pub fn check_cross_format_content(
+    core: &CoreRequest,
+    provider: &ProtocolName,
+    lossy: bool,
+) -> Result<(), ProviderError> {
+    let mut uncarried: Vec<String> = Vec::new();
+    for (m, message) in core.messages.iter().enumerate() {
+        for (b, content) in message.content.iter().enumerate() {
+            if let Some(label) = uncarried_block_label(content) {
+                uncarried.push(format!("messages[{m}].content[{b}] {label}"));
+            }
+        }
+    }
+    if uncarried.is_empty() {
+        return Ok(());
+    }
+    if lossy {
+        tracing::warn!(
+            blocks = ?uncarried,
+            provider = %provider,
+            "lossy route: dropping content blocks with no provider equivalent"
+        );
+        return Ok(());
+    }
+    Err(ProviderError::InvalidRequest(format!(
+        "content block(s) [{}] have no {provider} equivalent; remove them or enable the route's lossy mode",
+        uncarried.join(", "),
     )))
 }
 
@@ -648,6 +723,87 @@ mod tests {
         )
         .unwrap();
         assert!(!anthropic_body_has_server_tools(&client.body));
+    }
+
+    fn media_core_request() -> CoreRequest {
+        use llm_proxy_protocol::core::{CoreMessage, CoreRole, ModelRef, SamplingOptions};
+        CoreRequest {
+            model: ModelRef {
+                requested: "m".into(),
+                upstream: None,
+            },
+            system: vec![],
+            messages: vec![CoreMessage {
+                role: CoreRole::User,
+                content: vec![
+                    CoreContent::Image {
+                        source: json!({"type": "base64", "media_type": "image/png", "data": "iVBOR"}),
+                    },
+                    CoreContent::Image {
+                        source: json!({"type": "url", "url": "https://example.com/cat.jpg"}),
+                    },
+                    CoreContent::Image {
+                        source: json!({"type": "file", "file_id": "file_fixture_01"}),
+                    },
+                    CoreContent::Document {
+                        source: json!({"type": "url", "url": "https://example.com/report.pdf"}),
+                    },
+                    CoreContent::Opaque {
+                        block: json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}),
+                    },
+                    CoreContent::Text {
+                        text: "compare".into(),
+                        cache: None,
+                    },
+                ],
+            }],
+            tools: vec![],
+            tool_choice: None,
+            sampling: SamplingOptions::default(),
+            stream: false,
+            metadata: Default::default(),
+            provider_hints: Default::default(),
+        }
+    }
+
+    #[test]
+    fn content_the_cross_format_encoders_cannot_carry_is_rejected_by_name() {
+        let core = media_core_request();
+        for provider in [
+            protocols::OPENAI_CHAT_COMPLETIONS,
+            protocols::OPENAI_RESPONSES,
+            protocols::GEMINI_GENERATE_CONTENT,
+        ] {
+            let err = check_cross_format_content(&core, &ProtocolName::new(provider), false)
+                .expect_err("opaque, document and file-sourced image blocks cannot cross formats");
+            let msg = err.to_string();
+            for named in [
+                "messages[0].content[2] type=image source.type=file",
+                "messages[0].content[3] type=document",
+                "messages[0].content[4] type=server_tool_use",
+            ] {
+                assert!(
+                    msg.contains(named),
+                    "error must name {named} for {provider}: {msg}"
+                );
+            }
+            for carried in ["content[0]", "content[1]", "content[5]"] {
+                assert!(
+                    !msg.contains(carried),
+                    "base64/url images and text cross formats, {carried} must not be named: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn content_the_cross_format_encoders_cannot_carry_passes_on_lossy_routes() {
+        check_cross_format_content(
+            &media_core_request(),
+            &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+            true,
+        )
+        .expect("lossy drops uncarried blocks instead of rejecting");
     }
 
     #[test]

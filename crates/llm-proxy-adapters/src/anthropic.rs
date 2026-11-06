@@ -650,6 +650,11 @@ fn encode_normalized_request(
         &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
         target.lossy,
     )?;
+    super::client_wire::check_cross_format_content(
+        core,
+        &ProtocolName::new(protocols::ANTHROPIC_MESSAGES),
+        target.lossy,
+    )?;
 
     let system = encode_system(&core.system);
     let messages = encode_messages(&core.messages);

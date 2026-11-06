@@ -1,0 +1,47 @@
+{
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image",
+          "source": {
+            "type": "url",
+            "url": "https://platform.claude.com/docs/images/vision-example.jpg"
+          }
+        },
+        {
+          "type": "image",
+          "source": {
+            "type": "file",
+            "file_id": "file_fixture_image_01"
+          }
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "url",
+            "url": "https://example.com/annual-report.pdf"
+          }
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            "data": "JVBERi0xLjcK"
+          },
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        },
+        {
+          "type": "text",
+          "text": "Compare the photo with the findings in both documents."
+        }
+      ]
+    }
+  ]
+}

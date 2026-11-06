@@ -518,6 +518,11 @@ fn encode_normalized_request(
         &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
         target.lossy,
     )?;
+    super::client_wire::check_cross_format_content(
+        core,
+        &ProtocolName::new(protocols::OPENAI_CHAT_COMPLETIONS),
+        target.lossy,
+    )?;
     let mut messages = Vec::new();
 
     for sys_content in &core.system {

@@ -205,6 +205,14 @@ pub enum CoreContent {
         /// Human-readable refusal text.
         text: String,
     },
+    /// A client block the core does not model (an Anthropic `server_tool_use`
+    /// or `web_search_tool_result` replay, an MCP block, ...), carried as its
+    /// raw wire JSON. Only same-format passthrough can forward it; cross-format
+    /// it is rejected by name.
+    Opaque {
+        /// The raw wire block; `Debug` shows only its `type`.
+        block: serde_json::Value,
+    },
 }
 
 impl fmt::Debug for CoreContent {
@@ -267,6 +275,17 @@ impl fmt::Debug for CoreContent {
             CoreContent::Refusal { text } => {
                 f.debug_struct("Refusal").field("text", &text).finish()
             }
+            CoreContent::Opaque { block } => f
+                .debug_struct("Opaque")
+                .field(
+                    "type",
+                    &block
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|t| crate::util::truncate_str_safe(t, 64)),
+                )
+                .field("block", &OpaqueJsonRef(block))
+                .finish(),
         }
     }
 }
@@ -1791,6 +1810,12 @@ mod tests {
             CoreContent::Refusal {
                 text: "I cannot".into(),
             },
+            CoreContent::Opaque {
+                block: serde_json::json!({
+                    "type": "server_tool_use", "id": "srvtoolu_1",
+                    "name": "web_search", "input": {"query": "q"}
+                }),
+            },
         ];
         for content in &contents {
             let json = serde_json::to_string(content).unwrap();
@@ -2241,6 +2266,26 @@ mod tests {
         let debug = format!("{content:?}");
         assert!(!debug.contains("secret-url"), "Debug should redact source");
         assert!(debug.contains("Object"), "Debug should show type");
+    }
+
+    #[test]
+    fn opaque_block_debug_names_the_type_and_redacts_the_payload() {
+        let content = CoreContent::Opaque {
+            block: serde_json::json!({
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": [{"type": "web_search_result", "encrypted_content": "secret-blob"}]
+            }),
+        };
+        let debug = format!("{content:?}");
+        assert!(
+            debug.contains("web_search_tool_result"),
+            "Debug should name the block type: {debug}"
+        );
+        assert!(
+            !debug.contains("secret-blob") && !debug.contains("srvtoolu_1"),
+            "Debug should redact the block payload: {debug}"
+        );
     }
 
     #[test]

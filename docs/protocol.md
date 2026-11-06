@@ -88,11 +88,16 @@ ToolResult
 Thinking
 RedactedThinking
 Refusal
+Opaque
 ```
 
 Media source values and provider hints may remain opaque when their stable
 meaning is not portable. They must be redacted in diagnostics and interpreted
 only by adapters that understand them.
+
+`Opaque` carries a client block the core does not model (such as a replayed
+Anthropic `server_tool_use`) as its raw wire JSON. Only same-format passthrough
+can forward it; a cross-format request carrying one is rejected by name.
 
 ## Normalized response
 

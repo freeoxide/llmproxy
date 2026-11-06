@@ -435,6 +435,176 @@ mod tests {
         );
     }
 
+    fn post_messages(body: &Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/fixture-provider/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("body")
+    }
+
+    #[tokio::test]
+    async fn anthropic_media_blocks_reach_a_same_format_upstream_unchanged() {
+        let upstream = spawn_fake_upstream(true, false).await;
+        let state = state_with_provider(&upstream, "anthropic_messages", "messages", false);
+        let app = build_router(state);
+
+        let body = fixture("anthropic-sdk/media-request.json");
+        let resp = app
+            .oneshot(post_messages(&body))
+            .await
+            .expect("request served");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "url/file image sources and document blocks must not fail the typed decode"
+        );
+
+        let (_, upstream_body) = captured(&upstream).await;
+        let mut expected = body.clone();
+        expected["model"] = Value::String("claude-sonnet-4-5-20250929".to_owned());
+        assert_eq!(upstream_body, expected);
+    }
+
+    #[tokio::test]
+    async fn web_search_replay_reaches_a_same_format_upstream_unchanged() {
+        // Turn two of a server-tool conversation: Anthropic requires the
+        // server_tool_use / web_search_tool_result blocks (with their
+        // encrypted_content and the citations' encrypted_index) back verbatim.
+        let upstream = spawn_fake_upstream(true, false).await;
+        let state = state_with_provider(&upstream, "anthropic_messages", "messages", false);
+        let app = build_router(state);
+
+        let body = fixture("anthropic-sdk/web-search-replay-request.json");
+        let resp = app
+            .oneshot(post_messages(&body))
+            .await
+            .expect("request served");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "replayed server-tool blocks must not fail the typed decode"
+        );
+
+        let (_, upstream_body) = captured(&upstream).await;
+        let mut expected = body.clone();
+        expected["model"] = Value::String("claude-sonnet-4-5-20250929".to_owned());
+        assert_eq!(upstream_body, expected);
+    }
+
+    #[tokio::test]
+    async fn cross_format_server_tool_replay_blocks_are_rejected_by_name_never_stripped() {
+        // The replay against an OpenAI Chat upstream. The declared server tool
+        // is removed so the tools check cannot answer first: the replayed
+        // blocks alone must fail naming them, and lossy must drop them whole.
+        let mut body = fixture("anthropic-sdk/web-search-replay-request.json");
+        body.as_object_mut()
+            .expect("fixture is an object")
+            .remove("tools");
+
+        let upstream = spawn_fake_upstream(false, false).await;
+        let state = state_with_provider(&upstream, "openai_chat_completions", "messages", false);
+        let resp = build_router(state)
+            .oneshot(post_messages(&body))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("error json");
+        let full = resp_json.to_string();
+        for named in [
+            "messages[1].content[1] type=server_tool_use",
+            "messages[1].content[2] type=web_search_tool_result",
+        ] {
+            assert!(
+                full.contains(named),
+                "the rejection must name {named}: {resp_json}"
+            );
+        }
+        assert!(
+            upstream.capture.lock().await.is_none(),
+            "a rejected request must not reach the upstream"
+        );
+
+        let upstream = spawn_fake_upstream(false, false).await;
+        let state = state_with_provider(&upstream, "openai_chat_completions", "messages", true);
+        let resp = build_router(state)
+            .oneshot(post_messages(&body))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, upstream_body) = captured(&upstream).await;
+        let forwarded = upstream_body.to_string();
+        for leaked in ["srvtoolu_fixture_01", "encrypted_content"] {
+            assert!(
+                !forwarded.contains(leaked),
+                "opaque blocks must never cross formats, saw {leaked}: {upstream_body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_format_media_blocks_are_rejected_by_name_and_lossy_maps_the_rest() {
+        // The same media request against an OpenAI Chat upstream: the document
+        // blocks and the file-sourced image have no Chat mapping and must fail
+        // naming them; the lossy opt-in drops them and maps the url image.
+        let body = fixture("anthropic-sdk/media-request.json");
+
+        let upstream = spawn_fake_upstream(false, false).await;
+        let state = state_with_provider(&upstream, "openai_chat_completions", "messages", false);
+        let resp = build_router(state)
+            .oneshot(post_messages(&body))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body"),
+        )
+        .expect("error json");
+        let full = resp_json.to_string();
+        for named in [
+            "messages[0].content[1] type=image source.type=file",
+            "messages[0].content[2] type=document",
+            "messages[0].content[3] type=document",
+        ] {
+            assert!(
+                full.contains(named),
+                "the rejection must name {named}: {resp_json}"
+            );
+        }
+        assert!(
+            upstream.capture.lock().await.is_none(),
+            "a rejected request must not reach the upstream"
+        );
+
+        let upstream = spawn_fake_upstream(false, false).await;
+        let state = state_with_provider(&upstream, "openai_chat_completions", "messages", true);
+        let resp = build_router(state)
+            .oneshot(post_messages(&body))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, upstream_body) = captured(&upstream).await;
+        assert_eq!(
+            upstream_body["messages"][0]["content"],
+            serde_json::json!([
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://platform.claude.com/docs/images/vision-example.jpg"}
+                },
+                {"type": "text", "text": "Compare the photo with the findings in both documents."}
+            ]),
+            "lossy keeps only the mappable url image and the text: {upstream_body}"
+        );
+    }
+
     #[tokio::test]
     async fn openai_sdk_fields_all_reach_the_upstream() {
         let upstream = spawn_fake_upstream(false, false).await;
@@ -464,10 +634,9 @@ mod tests {
         let (_, upstream_body) = captured(&upstream).await;
         // Same-format passthrough: byte-identical apart from reasoning
         // translation (the fixture's explicit reasoning_effort survives as-is).
-        let mut expected = body.clone();
         // No model alias configured for gpt-4o on this provider, so the model
         // field is unchanged; thinking is absent in the fixture.
-        let _ = &mut expected;
+        let expected = body.clone();
         assert_eq!(upstream_body, expected);
         // The eleven fields the audit found dropped (row 8) all survive.
         for field in [

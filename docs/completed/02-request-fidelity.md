@@ -72,7 +72,11 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   surgical edits: the model alias, reasoning translation, usage-on-streams
   (`stream_options.include_usage`) and stripping foreign block fields.
   `deny_unknown_fields` is gone from `MessageRequest`, `Tool` and
-  `SystemContentBlock`; unknown fields decode and survive. Non-streaming
+  `SystemContentBlock`; unknown fields decode and survive. Image and document
+  `source` objects decode as opaque JSON, so `url`/`file` sources and
+  `document` blocks pass through too, and block types the core does not model
+  (replayed `server_tool_use`/`web_search_tool_result`, MCP blocks) decode as
+  `Opaque` blocks and reach the upstream verbatim. Non-streaming
   same-format responses are returned verbatim — usage and the stop reason are
   read for the ledger without rewriting the body.
 - **Cross-format field policy (step 3).** One disposition table per provider
@@ -84,7 +88,8 @@ tested OpenAI fields with a 200 and rejects common Anthropic fields with a 400.
   Anthropic shapes), or **rejected with a 400 naming every field**. The
   per-adapter `lossy` TOML flag turns rejections into drops with logged
   warnings. Server tools are rejected by name cross-format (dropped under
-  lossy), never mis-encoded as functions.
+  lossy), never mis-encoded as functions. `Opaque` blocks, document blocks and
+  images without a `base64`/`url` source are handled the same way.
 - **Missing fields (step 4).** `stop_sequences`/`top_k` decode into core
   sampling and re-encode on Anthropic and Gemini (`topK`); `image_url` parts
   decode into a neutral image source that maps onto Anthropic `base64`/`url`

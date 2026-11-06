@@ -506,6 +506,11 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
             CoreContent::Refusal { text } => {
                 refusal_text = Some(text);
             }
+            CoreContent::Opaque { .. } => {
+                tracing::warn!(
+                    "OpenAI Chat Completions has no encoding for opaque client blocks; dropping"
+                );
+            }
         }
     }
 

@@ -369,6 +369,11 @@ impl GeminiAdapter {
             &ProtocolName::new(protocols::GEMINI_GENERATE_CONTENT),
             target.lossy,
         )?;
+        super::client_wire::check_cross_format_content(
+            core,
+            &ProtocolName::new(protocols::GEMINI_GENERATE_CONTENT),
+            target.lossy,
+        )?;
         if !carried.is_empty() {
             tracing::warn!(
                 keys = ?carried.keys().collect::<Vec<_>>(),

@@ -472,6 +472,11 @@ impl ResponsesAdapter {
             &ProtocolName::new(protocols::OPENAI_RESPONSES),
             target.lossy,
         )?;
+        super::client_wire::check_cross_format_content(
+            core,
+            &ProtocolName::new(protocols::OPENAI_RESPONSES),
+            target.lossy,
+        )?;
         let mut input = Vec::new();
 
         if !core.system.is_empty() {

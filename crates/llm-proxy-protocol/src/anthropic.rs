@@ -197,7 +197,8 @@ impl Message {
 
 /// A block of content within a message; `r#type` selects the populated
 /// fields (`"text"`, `"tool_use"`, `"tool_result"`, `"thinking"`,
-/// `"redacted_thinking"`, `"image"`). Unknown types must be tolerated.
+/// `"redacted_thinking"`, `"image"`, `"document"`). Unknown types must be
+/// tolerated.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct ContentBlock {
@@ -235,9 +236,11 @@ pub struct ContentBlock {
     /// Signature for the thinking block (extended thinking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    /// Image source (for `"image"` blocks).
+    /// Media source of `"image"` and `"document"` blocks, kept as opaque JSON
+    /// so every documented shape (`base64`, `url`, `file`, ...) decodes;
+    /// adapters interpret only the shapes they understand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<ImageSource>,
+    pub source: Option<serde_json::Value>,
     /// Cache control directive (for `"text"` blocks, but potentially others).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
@@ -337,7 +340,7 @@ impl ContentBlock {
 
     /// Create an image content block.
     #[must_use]
-    pub fn new_image(source: ImageSource) -> Self {
+    pub fn new_image(source: serde_json::Value) -> Self {
         ContentBlock {
             r#type: "image".to_owned(),
             text: None,
@@ -455,7 +458,7 @@ where
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        source: Option<ImageSource>,
+        source: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -558,30 +561,13 @@ impl Serialize for ContentBlock {
                 map.serialize_entry("type", &self.r#type)?;
                 map.serialize_entry(
                     "source",
-                    self.source.as_ref().unwrap_or(&ImageSource {
-                        r#type: String::new(),
-                        media_type: String::new(),
-                        data: String::new(),
-                    }),
+                    self.source.as_ref().unwrap_or(&serde_json::Value::Null),
                 )?;
                 map.end()
             }
             _ => serialize_unknown_block(self, serializer),
         }
     }
-}
-
-/// An image source embedded in a content block.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageSource {
-    /// Source type, typically `"base64"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
-    /// MIME type of the image (e.g. `"image/png"`).
-    pub media_type: String,
-    /// Base64-encoded image data.
-    pub data: String,
 }
 
 /// A tool definition for function calling. Unknown fields (server-tool
