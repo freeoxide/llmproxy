@@ -156,8 +156,9 @@ async fn spawn_upstream() -> String {
         .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
-        let serve = axum::serve(listener, app);
-        let _ = serve.await;
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "swap-test upstream stopped");
+        }
     });
     format!("http://{addr}/v1/messages")
 }
