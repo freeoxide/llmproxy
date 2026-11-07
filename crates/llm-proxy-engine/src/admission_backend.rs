@@ -319,6 +319,10 @@ fn model_saturated(model: &str, member: &str, cap: u32) -> EngineError {
 
 #[async_trait]
 impl AdmissionBackend for MemoryAdmissionBackend {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the four rules are checked and committed under one lock; splitting them would scatter the atomic reservation"
+    )]
     async fn admit(&self, demand: &ReservationDemand<'_>) -> Result<LeaseId, EngineError> {
         let now = demand.now;
         let mut state = self.lock();
