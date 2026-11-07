@@ -16,6 +16,7 @@ default-members = [
     "crates/llm-proxy-store-redis",
     "crates/llm-proxy-store-postgres",
     "crates/llm-proxy-admin",
+    "crates/llm-proxy-guardrails",
 ]
 
 members = [
@@ -32,6 +33,7 @@ members = [
     "crates/llm-proxy-store-redis",
     "crates/llm-proxy-store-postgres",
     "crates/llm-proxy-admin",
+    "crates/llm-proxy-guardrails",
 ]
 
 [workspace.package]
@@ -57,6 +59,7 @@ llm-proxy-server = { path = "crates/llm-proxy-server", version = "0.1.0" }
 llm-proxy-store-redis = { path = "crates/llm-proxy-store-redis", version = "0.1.0" }
 llm-proxy-store-postgres = { path = "crates/llm-proxy-store-postgres", version = "0.1.0" }
 llm-proxy-admin = { path = "crates/llm-proxy-admin", version = "0.1.0", default-features = false }
+llm-proxy-guardrails = { path = "crates/llm-proxy-guardrails", version = "0.1.0" }
 
 # Async / runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }

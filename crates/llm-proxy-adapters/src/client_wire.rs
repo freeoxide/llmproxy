@@ -69,6 +69,11 @@ pub struct ClientWireRequest {
     pub body: Arc<Value>,
     /// Allowlisted inbound headers, applied to the upstream request.
     pub forwarded_headers: HashMap<String, String>,
+    /// Set when the engine rewrote the normalized request after decoding
+    /// (a masking guardrail, plan 09 step 4): the redacted core — not the
+    /// client's raw bytes — is the truth, so the same-format passthrough
+    /// shortcut is refused and the adapter re-encodes from the core.
+    pub force_core_encode: bool,
 }
 
 impl std::fmt::Debug for ClientWireRequest {
@@ -93,6 +98,7 @@ impl ClientWireRequest {
             format,
             body: Arc::new(body),
             forwarded_headers: HashMap::new(),
+            force_core_encode: false,
         }
     }
 
@@ -100,6 +106,9 @@ impl ClientWireRequest {
     /// same-format passthrough applies.
     #[must_use]
     pub fn same_format_as(&self, protocol: &ProtocolName) -> bool {
+        if self.force_core_encode {
+            return false;
+        }
         matches!(
             (self.format, protocol.as_str()),
             (

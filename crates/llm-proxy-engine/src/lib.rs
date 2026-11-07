@@ -90,6 +90,27 @@ static PROVIDER_NAME_REGEX: std::sync::LazyLock<regex::Regex> = std::sync::LazyL
     regex::Regex::new(r"^[a-z0-9_-]+$").expect("valid provider name regex")
 });
 
+/// Every text block of a core request, in order — the guard-rewrite
+/// comparison (plan 09 step 4).
+pub(crate) fn guard_texts(
+    request: &llm_proxy_protocol::core::CoreRequest,
+) -> impl Iterator<Item = String> + '_ {
+    use llm_proxy_protocol::core::CoreContent;
+    request
+        .system
+        .iter()
+        .chain(
+            request
+                .messages
+                .iter()
+                .flat_map(|message| message.content.iter()),
+        )
+        .filter_map(|content| match content {
+            CoreContent::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+}
+
 /// Validates a provider name from the URL path.
 ///
 /// # Errors

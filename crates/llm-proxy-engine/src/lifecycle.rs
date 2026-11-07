@@ -780,6 +780,8 @@ pub(crate) async fn execute(
 
     emit_request_received(&inner, &req, false);
 
+    let mut req = req;
+    apply_request_transforms(&inner, &mut req).await?;
     let outcome = run_once(&inner, &req).await;
     match outcome {
         Ok(response) => Ok(response),
@@ -796,6 +798,31 @@ pub(crate) async fn execute(
             Err(error)
         }
     }
+}
+
+/// Slot 7.5 for non-streaming and streaming alike: the guards' request
+/// rewrites (masking, plan 09 step 4), applied once before the ladder so
+/// every attempt encodes the same redacted core. With no guards
+/// configured this is a no-op.
+async fn apply_request_transforms(
+    inner: &Arc<EngineInner>,
+    req: &mut EngineRequest,
+) -> Result<(), EngineError> {
+    if inner.guards.is_empty() {
+        return Ok(());
+    }
+    let before: Vec<String> = crate::guard_texts(&req.core).collect();
+    for guard in &inner.guards {
+        guard.transform_request(&mut req.core).await?;
+    }
+    let after: Vec<String> = crate::guard_texts(&req.core).collect();
+    if before != after {
+        // A guard rewrote the request's words. The client's raw bytes are
+        // no longer the truth: the same-format passthrough shortcut must
+        // not carry the un-redacted text to the upstream.
+        req.inbound.wire.force_core_encode = true;
+    }
+    Ok(())
 }
 
 async fn resolve_plan(
@@ -1267,6 +1294,12 @@ async fn run_ladder_once(
                     cost,
                 });
             }
+            // Slot 11.5 (plan 09 step 4): the guards' response rewrites —
+            // the masked form is what the client receives, what the cache
+            // stores and what usage rows describe.
+            for guard in &inner.guards {
+                guard.transform_response(&mut core_resp).await?;
+            }
 
             let latency = req.start.elapsed();
             core_resp.cost = cost.clone();
@@ -1389,13 +1422,14 @@ type ByteStream = std::pin::Pin<
 /// internal error for a request it never ran.
 pub(crate) async fn execute_stream(
     inner: Arc<EngineInner>,
-    req: EngineRequest,
+    mut req: EngineRequest,
 ) -> Result<EngineStream, EngineError> {
     let start = req.start;
     crate::validate_provider_name(&req.provider_name)?;
     inner.metrics.record_request(true);
 
     emit_request_received(&inner, &req, true);
+    apply_request_transforms(&inner, &mut req).await?;
 
     let mut leader_losses_left = 1;
     loop {

@@ -372,15 +372,28 @@ pub struct NoCache;
 #[async_trait]
 impl Cache for NoCache {}
 
-/// A guardrail hook. Modes follow audit conflict 9: pre-call (before egress),
-/// post-call (non-streaming response), and per-event (streaming), with the
-/// verdict deciding rejection; buffering/redaction modes are a later plan.
+/// A guardrail hook (audit conflict 9). A guard inspects the normalized
+/// request before egress, the completed non-streaming response, and each
+/// streamed event — and may rewrite request texts and response content in
+/// place (redaction/masking, plan 09 step 4). A guard that cannot keep its
+/// placeholders consistent across stream chunks must reject streaming
+/// requests instead of masking them (see [`Guard::inspect_request`]).
 #[async_trait]
 pub trait Guard: Debug + Send + Sync {
-    /// Inspect the normalized request before egress.
+    /// Inspect the normalized request before egress. A masking guard
+    /// whose rule cannot hold across stream chunks rejects a request with
+    /// `stream: true` here rather than masking it unsafely.
     async fn inspect_request(&self, request: &CoreRequest) -> Result<GuardDecision, EngineError> {
         let _ = request;
         Ok(GuardDecision::Allow)
+    }
+
+    /// Rewrite the request in place before egress (after
+    /// [`Guard::inspect_request`] allowed it). The default changes
+    /// nothing.
+    async fn transform_request(&self, request: &mut CoreRequest) -> Result<(), EngineError> {
+        let _ = request;
+        Ok(())
     }
 
     /// Inspect a completed non-streaming response.
@@ -390,6 +403,14 @@ pub trait Guard: Debug + Send + Sync {
     ) -> Result<GuardDecision, EngineError> {
         let _ = response;
         Ok(GuardDecision::Allow)
+    }
+
+    /// Rewrite a completed non-streaming response in place (after
+    /// [`Guard::inspect_response`] allowed it): the redacted form is what
+    /// the client receives and what the cache stores.
+    async fn transform_response(&self, response: &mut CoreResponse) -> Result<(), EngineError> {
+        let _ = response;
+        Ok(())
     }
 
     /// Inspect each streamed core event as it is decoded.
