@@ -177,6 +177,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -442,6 +443,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let app_config = AppConfig {
@@ -1828,6 +1830,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         let mut adapters_b = HashMap::new();
@@ -1860,6 +1863,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).unwrap();

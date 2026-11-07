@@ -129,6 +129,7 @@ mod tests {
             pricing: HashMap::new(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         AppState::new(

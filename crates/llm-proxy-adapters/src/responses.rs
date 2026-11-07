@@ -613,7 +613,18 @@ impl ResponsesAdapter {
             };
         }
 
-        let body = serde_json::to_vec(&req)?;
+        // Phase 3 (plan 06 step 7): operator hygiene at the provider edge —
+        // volatile-byte stripping only (this wire format has no cache
+        // markers). The round-trip through `Value` happens only when the
+        // operator configured hygiene.
+        let body = match &target.prompt_cache {
+            None => serde_json::to_vec(&req)?,
+            Some(hygiene) => {
+                let mut value = serde_json::to_value(&req)?;
+                super::mutation::apply_prompt_hygiene(&mut value, hygiene, false);
+                serde_json::to_vec(&value)?
+            }
+        };
         let url = expand_url_template(&target.endpoint, target)?;
 
         Ok(build_proxy_request(body, target, core.stream, url, client))
@@ -757,6 +768,7 @@ mod tests {
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
             lossy: false,
             forward_inbound_headers: std::sync::Arc::new(Vec::new()),
+            prompt_cache: None,
         }
     }
 

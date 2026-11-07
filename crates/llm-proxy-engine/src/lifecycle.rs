@@ -298,6 +298,7 @@ async fn resolve_attempt(
         headers: Arc::clone(&configured.headers),
         lossy: configured.lossy,
         forward_inbound_headers: Arc::clone(&configured.forward_inbound_headers),
+        prompt_cache: configured.prompt_cache.clone(),
     };
     Ok(Attempt {
         target,

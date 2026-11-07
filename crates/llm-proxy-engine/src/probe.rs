@@ -139,6 +139,7 @@ async fn probe_member(inner: &Arc<EngineInner>, member: &str) -> Result<(), Engi
                 headers: Arc::clone(&target.headers),
                 lossy: target.lossy,
                 forward_inbound_headers: Arc::clone(&target.forward_inbound_headers),
+                prompt_cache: target.prompt_cache.clone(),
             },
             &wire,
         )

@@ -78,6 +78,7 @@ mod tests {
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
             lossy: false,
             forward_inbound_headers: std::sync::Arc::new(Vec::new()),
+            prompt_cache: None,
         }
     }
 

@@ -95,6 +95,11 @@ pub struct ProviderAdapterTargetConfig {
     pub forward_inbound_headers: Arc<Vec<String>>,
     /// Per-route `lossy` opt-in from the adapter config.
     pub lossy: bool,
+    /// Prompt-cache hygiene for this provider (plan 06 steps 6-7): the
+    /// provider-edge edits — volatile-byte removal and marker injection —
+    /// applied last, after every other mutation phase. `Arc`-shared
+    /// straight from provider config.
+    pub prompt_cache: Option<Arc<crate::provider_config::PromptCacheConfig>>,
 }
 
 impl std::fmt::Debug for ProviderAdapterTargetConfig {
@@ -111,6 +116,7 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
             .field("forward_inbound_headers", &self.forward_inbound_headers)
             .field("lossy", &self.lossy)
+            .field("prompt_cache", &self.prompt_cache)
             .finish()
     }
 }
@@ -507,6 +513,7 @@ impl ProviderRegistry {
                     }),
             ),
             lossy: adapter_cfg.lossy,
+            prompt_cache: provider.prompt_cache.clone().map(Arc::new),
         })
     }
 
@@ -610,6 +617,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let target = registry
@@ -662,6 +670,7 @@ mod tests {
             )]),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let p = registry
@@ -710,6 +719,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers([provider]).expect("registry");
 
@@ -828,6 +838,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let pool = PoolConfig {
             name: "clash".to_owned(),
@@ -937,6 +948,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
@@ -969,6 +981,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let provider_b = ProviderConfig {
             name: "dup".to_owned(),
@@ -1008,6 +1021,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         assert!(!registry.is_empty());
@@ -1040,6 +1054,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let models = registry.catalog_models("test").expect("provider exists");
@@ -1064,6 +1079,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let models = registry.catalog_models("test").expect("provider exists");
@@ -1100,6 +1116,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let target = registry
@@ -1127,6 +1144,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let provider_b = ProviderConfig {
             name: "b".to_owned(),
@@ -1174,6 +1192,7 @@ members = [{members}]
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let error = registry

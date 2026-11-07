@@ -466,6 +466,12 @@ impl AnthropicAdapter {
         } else {
             encode_normalized_request(core, target, client)?
         };
+        // Phase 3 (plan 06 step 7): operator hygiene at the provider edge —
+        // the last mutation phase before serialization.
+        let mut req = req;
+        if let Some(hygiene) = &target.prompt_cache {
+            super::mutation::apply_prompt_hygiene(&mut req, hygiene, hygiene.inject_markers);
+        }
         let body = serde_json::to_vec(&req)?;
         Ok(build_proxy_request(body, target, core.stream, url, client))
     }
@@ -1176,6 +1182,7 @@ mod tests {
             headers: std::sync::Arc::new(std::collections::HashMap::new()),
             lossy: false,
             forward_inbound_headers: std::sync::Arc::new(Vec::new()),
+            prompt_cache: None,
         }
     }
 

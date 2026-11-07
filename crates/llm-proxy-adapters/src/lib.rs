@@ -14,6 +14,7 @@ pub mod anthropic;
 pub mod client_wire;
 pub mod error;
 pub mod gemini;
+pub mod mutation;
 pub mod openai_chat;
 pub mod reasoning;
 pub mod request;
@@ -129,6 +130,10 @@ pub struct ProviderAdapterTarget {
     /// Inbound header names this provider allows to forward upstream;
     /// `Arc`-shared straight from provider config.
     pub forward_inbound_headers: Arc<Vec<String>>,
+    /// Prompt-cache hygiene (plan 06 steps 6-7): the opt-in provider-edge
+    /// edits — volatile-byte removal and marker injection — applied as the
+    /// last mutation phase before serialization.
+    pub prompt_cache: Option<Arc<llm_proxy_core::PromptCacheConfig>>,
 }
 
 impl fmt::Debug for ProviderAdapterTarget {

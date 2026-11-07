@@ -163,6 +163,7 @@ fn provider(
         )]),
         concurrency,
         pricing_sync: None,
+        prompt_cache: None,
     }
 }
 

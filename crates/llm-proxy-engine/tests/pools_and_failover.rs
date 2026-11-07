@@ -303,6 +303,7 @@ fn member(name: &str, endpoint: String, api_keys: Option<Vec<&str>>) -> Provider
         pricing: Default::default(),
         concurrency: None,
         pricing_sync: None,
+        prompt_cache: None,
     }
 }
 

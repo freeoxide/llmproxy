@@ -548,6 +548,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         }
     }
 
@@ -687,6 +688,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         }
     }
 
@@ -1022,6 +1024,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         }
     }
 

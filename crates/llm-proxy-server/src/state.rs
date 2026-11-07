@@ -381,6 +381,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -505,6 +506,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -546,6 +548,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let adapter_reg = ProviderAdapterRegistry::builtin();
@@ -636,6 +639,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         let bad = ProviderConfig {
@@ -667,6 +671,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![good, bad]).expect("registry");

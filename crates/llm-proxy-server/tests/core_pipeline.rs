@@ -213,6 +213,7 @@ mod tests {
             pricing,
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -1317,6 +1318,7 @@ mod tests {
             pricing: HashMap::new(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         provider.name = "mock-provider".to_owned();
         let registry =
@@ -2719,6 +2721,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -3180,6 +3183,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         AppState::new(
@@ -3419,6 +3423,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");

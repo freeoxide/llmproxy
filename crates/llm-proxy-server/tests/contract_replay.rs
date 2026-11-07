@@ -224,6 +224,7 @@ mod tests {
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         AppState::new(
@@ -831,6 +832,7 @@ mod tests {
             headers: Arc::new(HashMap::new()),
             lossy: false,
             forward_inbound_headers: std::sync::Arc::new(Vec::new()),
+            prompt_cache: None,
         };
         target.upstream_model = "gemini-2.5-pro".into();
 

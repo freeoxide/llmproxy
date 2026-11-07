@@ -978,6 +978,32 @@ pub struct ProviderConfig {
     /// proxy instead of a direct connection; absent means direct egress.
     #[serde(default)]
     pub egress: Option<ProviderEgressConfig>,
+    /// Prompt-cache hygiene (plan 06 steps 6-7, backlog 15): opt-in
+    /// request edits at the provider edge that protect the provider's own
+    /// prompt cache. Absent — the default — means no hygiene edits at all.
+    #[serde(default)]
+    pub prompt_cache: Option<PromptCacheConfig>,
+}
+
+/// Prompt-cache hygiene (`[provider.prompt_cache]`): the operator's opt-in
+/// to volatile-byte removal and cache-marker injection at the provider edge.
+/// Nothing here fingerprints or impersonates clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptCacheConfig {
+    /// RFC 6901 JSON pointers stripped from the encoded upstream request
+    /// before egress: volatile per-request bytes — client correlation
+    /// tokens such as `metadata.user_id` or `user` — that would bust the
+    /// provider's prompt cache. A pointer that does not resolve is a no-op.
+    #[serde(default)]
+    pub strip_volatile: Vec<String>,
+    /// Inject cache markers on the stable prefix so the provider caches it.
+    /// Anthropic Messages only: `cache_control` breakpoints within the
+    /// provider's four-breakpoint budget (the last tool, the last system
+    /// block, then the last content block of earlier messages — the newest
+    /// message is never marked). Markers the client already set are kept.
+    #[serde(default)]
+    pub inject_markers: bool,
 }
 
 /// Per-provider forward-proxy egress configuration (`[provider.egress]`).
@@ -1443,6 +1469,19 @@ impl Default for ProviderCatalogConfig {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConfigValidationError {
+    /// A prompt-cache strip entry is not an RFC 6901 JSON pointer
+    /// (plan 06 step 7): a malformed pointer would be a silent no-op at the
+    /// provider edge, so it is refused at load.
+    #[error(
+        "provider \"{provider}\": prompt_cache.strip_volatile entries must be RFC 6901 JSON \
+         pointers like \"/metadata/user_id\", got {pointer:?}"
+    )]
+    InvalidStripPointer {
+        /// Provider name.
+        provider: String,
+        /// The offending entry.
+        pointer: String,
+    },
     /// An adapter `endpoint` URL is empty.
     #[error("provider \"{provider}\": adapter \"{adapter}\" has an empty endpoint")]
     EmptyEndpoint {
@@ -1750,6 +1789,7 @@ pub enum ConfigValidationError {
 ///     pricing: Default::default(),
 ///     concurrency: None,
 ///     pricing_sync: None,
+///     prompt_cache: None,
 /// };
 /// assert!(validate_provider_config(&provider, None).is_ok());
 /// ```
@@ -1780,6 +1820,7 @@ pub enum ConfigValidationError {
 ///     pricing: Default::default(),
 ///     concurrency: None,
 ///     pricing_sync: None,
+///     prompt_cache: None,
 /// };
 /// assert_eq!(
 ///     validate_provider_config(&provider, None),
@@ -1800,6 +1841,7 @@ pub fn validate_provider_config(
     validate_adapters(provider, name, known_protocols)?;
     validate_discovery(provider, name)?;
     validate_egress(provider, name)?;
+    validate_prompt_cache(provider, name)?;
 
     let uses_gemini_model_template = provider.adapters.values().any(|adapter| {
         adapter.protocol == "gemini_generate_content" && adapter.endpoint.contains("{model}")
@@ -2208,6 +2250,31 @@ fn validate_egress(provider: &ProviderConfig, name: &str) -> Result<(), ConfigVa
             proxy: egress.proxy.clone(),
             reason: "no proxy host",
         });
+    }
+    Ok(())
+}
+
+/// Validates `[provider.prompt_cache]` (plan 06 step 7): every strip
+/// pointer must be an RFC 6901 pointer (`/metadata/user_id`), so a typo is
+/// a config error instead of a silent no-op at the provider edge.
+fn validate_prompt_cache(
+    provider: &ProviderConfig,
+    name: &str,
+) -> Result<(), ConfigValidationError> {
+    let Some(config) = &provider.prompt_cache else {
+        return Ok(());
+    };
+    for pointer in &config.strip_volatile {
+        let invalid = pointer.is_empty()
+            || !pointer.starts_with('/')
+            || pointer.ends_with('/')
+            || pointer.contains("//");
+        if invalid {
+            return Err(ConfigValidationError::InvalidStripPointer {
+                provider: name.to_owned(),
+                pointer: pointer.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -2910,6 +2977,30 @@ chat_completions = "chat"
         .provider;
         provider.name = name.to_owned();
         provider
+    }
+
+    #[test]
+    fn prompt_cache_strip_pointers_are_validated_at_load() {
+        let mut provider = make_minimal_provider("hygienic");
+        provider.prompt_cache = Some(PromptCacheConfig {
+            strip_volatile: vec!["/metadata/user_id".to_owned(), "/user".to_owned()],
+            inject_markers: true,
+        });
+        validate_provider_config(&provider, None).expect("well-formed pointers validate");
+
+        for malformed in ["metadata/user_id", "/metadata//user_id", "/metadata/", ""] {
+            let mut provider = make_minimal_provider("hygienic");
+            provider.prompt_cache = Some(PromptCacheConfig {
+                strip_volatile: vec![malformed.to_owned()],
+                inject_markers: false,
+            });
+            let error = validate_provider_config(&provider, None)
+                .expect_err("a malformed strip pointer must be refused at load");
+            assert!(
+                error.to_string().contains("RFC 6901"),
+                "the error must say what a pointer is: {error}"
+            );
+        }
     }
 
     #[test]
@@ -4055,6 +4146,7 @@ endpoint = "https://example.com/v1"
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4089,6 +4181,7 @@ endpoint = "https://example.com/v1"
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4123,6 +4216,7 @@ endpoint = "https://example.com/v1"
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4148,6 +4242,7 @@ endpoint = "https://example.com/v1"
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4173,6 +4268,7 @@ endpoint = "https://example.com/v1"
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         validate_provider_config(&provider, None).unwrap();
     }
@@ -4242,6 +4338,7 @@ input = 0.0000025
             )]),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4267,6 +4364,7 @@ input = 0.0000025
             pricing: HashMap::from([(ModelId::new(""), ModelPricing::default())]),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4298,6 +4396,7 @@ input = 0.0000025
             )]),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         match validate_provider_config(&provider, None) {
             Err(ConfigValidationError::InvalidPricing { message, .. }) => {
@@ -4335,6 +4434,7 @@ input = 0.0000025
             )]),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         validate_provider_config(&provider, None).unwrap();
     }
@@ -4374,6 +4474,7 @@ input = 0.0000025
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(
             validate_provider_config(&provider, None).is_ok(),
@@ -4399,6 +4500,7 @@ input = 0.0000025
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4427,6 +4529,7 @@ input = 0.0000025
             pricing: Default::default(),
             concurrency: None,
             pricing_sync: None,
+            prompt_cache: None,
         };
         match validate_provider_config(&provider, None) {
             Err(ConfigValidationError::UnresolvedEnvVar { provider, var }) => {
