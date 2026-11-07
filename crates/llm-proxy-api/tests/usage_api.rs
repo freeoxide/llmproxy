@@ -320,6 +320,51 @@ mod tests {
         }
     }
 
+    /// Backlog 37: every admin API response — successes and the 401 refusal
+    /// alike — must forbid intermediary caching. A CDN that caches an
+    /// authenticated response turns the token check into a one-time check.
+    #[tokio::test]
+    async fn every_admin_response_forbids_caching() {
+        let ledger = seed().await;
+        for path in ["/usage/summary", "/usage/requests", "/usage/keys"] {
+            for token in [Some(ADMIN_TOKEN), Some("wrong-token"), None] {
+                let app = app_for(&ledger.path);
+                let builder = Request::builder().uri(path);
+                let builder = match token {
+                    Some(token) => builder.header("authorization", format!("Bearer {token}")),
+                    None => builder,
+                };
+                let response = app
+                    .oneshot(builder.body(Body::empty()).expect("request builds"))
+                    .await
+                    .expect("oneshot");
+                let status = response.status();
+                let cache_control = response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                let pragma = response
+                    .headers()
+                    .get("pragma")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                assert!(
+                    status.is_success() || status == StatusCode::UNAUTHORIZED,
+                    "{path}: unexpected status {status}"
+                );
+                assert_eq!(
+                    cache_control, "no-store",
+                    "{path} ({status}) must carry Cache-Control: no-store, got {cache_control:?}"
+                );
+                assert_eq!(
+                    pragma, "no-cache",
+                    "{path} ({status}) must carry Pragma: no-cache, got {pragma:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn summary_groups_by_provider_with_exact_decimal_costs() {
         let ledger = seed().await;

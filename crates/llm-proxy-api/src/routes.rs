@@ -45,7 +45,8 @@ impl UsageApi {
     }
 
     /// The `/usage` router with state applied, ready to serve or merge; admin
-    /// middleware and `nosniff`/panic-catch/trace layers are already applied.
+    /// middleware and `nosniff`/`no-store`/panic-catch/trace layers are
+    /// already applied.
     #[must_use = "the Router must be used with a server or merged into one"]
     pub fn router(self) -> axum::Router {
         let state = self.state;
@@ -58,6 +59,19 @@ impl UsageApi {
             .layer(SetResponseHeaderLayer::if_not_present(
                 header::X_CONTENT_TYPE_OPTIONS,
                 HeaderValue::from_static("nosniff"),
+            ))
+            // Authenticated API responses must never be cached by an
+            // intermediary (backlog 37, after done-hub's CDN-cached-admin
+            // bypass): `overriding`, so a value set anywhere along the path
+            // cannot win. `Pragma` covers HTTP/1.0 shared caches that never
+            // learned `Cache-Control`.
+            .layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            ))
+            .layer(SetResponseHeaderLayer::overriding(
+                header::PRAGMA,
+                HeaderValue::from_static("no-cache"),
             ))
             .layer(CatchPanicLayer::new())
             .with_state(state)
