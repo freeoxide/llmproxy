@@ -118,10 +118,27 @@ unless real use says otherwise.
   (`pg_advisory_xact_lock`), verified by three consecutive concurrent
   clean runs. Both suites are `#[ignore]`d without their env vars; the
   default test run still uses the in-repo loopback fakes.
-- Verification gaps that remain, recorded in the plan's review, not
-  hidden: the MCP gateway and admin MCP tools were exercised against
-  in-repo fake MCP servers speaking the documented 2026-07-28 wire
-  shapes (no external MCP server or client was contacted), and the
-  non-chat families were verified against loopback fakes per family —
-  no live LLM provider was contacted, since this environment has no
-  upstream API keys.
+- Live MCP verification (both directions), against the official
+  reference implementations run locally: the reference "everything"
+  server (`@modelcontextprotocol/server-everything` 2.2.1, Streamable
+  HTTP) as the gateway's upstream (`LLM_PROXY_TEST_MCP_UPSTREAM`,
+  `tests/live_upstream.rs`: tools aggregated and namespaced, a real
+  echo tool called end to end, usage rows written), and the official
+  MCP Inspector CLI (`@modelcontextprotocol/inspector` 2.14.0) as a
+  real client against the gateway's own `POST /mcp`
+  (`LLM_PROXY_TEST_MCP_CLIENT`, `tests/live_client.rs`: the inspector
+  negotiates initialize, lists the gateway's namespaced tools and calls
+  one through to the reference server). Both live runs found real bugs
+  the in-repo fakes could not, both fixed with red-green regression
+  tests: the gateway's upstream requests were missing the revision's
+  per-request `_meta` envelope (the reference server rejects with
+  -32602), and both MCP endpoints answered `initialize` with
+  2026-07-28 regardless of the version the client negotiated — an
+  initialization-era client (like the Inspector) rejects such a server,
+  so the negotiated revision is now echoed, exactly as the reference
+  server does. The admin `/mcp` endpoint gained the same negotiation.
+- Verification gap that remains, recorded here rather than hidden: the
+  non-chat families were verified against loopback fakes per family
+  (model aliasing, provider credential, verbatim audio/file bytes,
+  usage rows, 404 on an unconfigured family) — no live LLM provider was
+  contacted, since this environment has no upstream API keys.

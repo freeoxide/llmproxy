@@ -75,11 +75,20 @@ pub(crate) async fn endpoint(
     };
 
     let response = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "llm-proxy-admin", "version": env!("CARGO_PKG_VERSION") },
-        })),
+        // Version negotiation for initialization-era clients (see the
+        // gateway crate for the interop finding): echo the revision the
+        // client asked for, defaulting to this endpoint's own.
+        "initialize" => {
+            let negotiated = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(MCP_PROTOCOL_VERSION);
+            Ok(json!({
+                "protocolVersion": negotiated,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "llm-proxy-admin", "version": env!("CARGO_PKG_VERSION") },
+            }))
+        }
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tools() })),
         "tools/call" => {

@@ -31,6 +31,13 @@ crates/llm-proxy-mcp               MCP gateway ([mcp], own tokens)
 A bare `cargo build` compiles none of them (they sit outside
 `default-members`); `cargo build --workspace` builds everything.
 
+Live integration suites for the replica stores and the MCP gateway ship
+`#[ignore]`d so the default test run needs no servers; set
+`LLM_PROXY_TEST_REDIS`, `LLM_PROXY_TEST_POSTGRES` or
+`LLM_PROXY_TEST_MCP_UPSTREAM` (plus `LLM_PROXY_TEST_MCP_CLIENT` to also
+drive the gateway from the official MCP Inspector CLI) and run the
+matching crate's tests with `-- --ignored`.
+
 ## Build
 
 ~~~

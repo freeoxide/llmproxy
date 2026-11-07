@@ -112,11 +112,23 @@ pub(crate) async fn gateway_endpoint(
 
     let params = message.get("params").cloned().unwrap_or(Value::Null);
     let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "llm-proxy-mcp", "version": env!("CARGO_PKG_VERSION") },
-        })),
+        // Version negotiation for initialization-era clients (found by
+        // running the official MCP Inspector against this endpoint): a
+        // client that initializes names the revision it speaks, and a
+        // server answering a different one is rejected as unsupported.
+        // Echo the requested revision when the client named one; the
+        // per-request framing this gateway speaks stays 2026-07-28.
+        "initialize" => {
+            let negotiated = params
+                .get("protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(MCP_PROTOCOL_VERSION);
+            Ok(json!({
+                "protocolVersion": negotiated,
+                "capabilities": { "tools": { "listChanged": false } },
+                "serverInfo": { "name": "llm-proxy-mcp", "version": env!("CARGO_PKG_VERSION") },
+            }))
+        }
         "ping" => Ok(json!({})),
         "tools/list" => list_tools(&gateway).await,
         "tools/call" => call_tool(&gateway, &token_id, &params).await,
@@ -263,6 +275,26 @@ async fn upstream_request(
     extra_headers.insert("content-type".to_owned(), "application/json".to_owned());
     extra_headers.insert("accept".to_owned(), "application/json".to_owned());
 
+    // The revision mirrors the header metadata into the request body:
+    // every request carries its protocol version, client info and client
+    // capabilities in `_meta.io.modelcontextprotocol/*`, and servers
+    // validate the envelope against the headers. Found by running the
+    // gateway against the official reference server, which rejects a
+    // header-only request with -32602 "missing _meta".
+    let mut params = params.clone();
+    if let Some(object) = params.as_object_mut() {
+        object.insert(
+            "_meta".to_owned(),
+            json!({
+                "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "llm-proxy-mcp",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }),
+        );
+    }
     let payload = json!({
         "jsonrpc": "2.0",
         "id": uuid::Uuid::new_v4().to_string(),

@@ -363,11 +363,29 @@ async fn protocol_framing_rules_hold() {
     .await;
     assert_eq!(notification.status(), StatusCode::ACCEPTED);
 
-    // initialize is answered for older-era clients.
+    // initialize is answered for older-era clients, echoing the revision
+    // they negotiate (a client that names 2025-11-25 and receives
+    // 2026-07-28 rejects the server — found against the official
+    // Inspector).
     let initialize = post(
         &fixture.app,
         Some("gateway-token"),
-        r#"{"jsonrpc":"2.0","id":3,"method":"initialize"}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"inspector-cli","version":"2.14.0"}}}"#,
+    )
+    .await;
+    assert_eq!(initialize.status(), StatusCode::OK);
+    let body = json_of(initialize).await;
+    assert_eq!(
+        body["result"]["protocolVersion"].as_str(),
+        Some("2025-11-25"),
+        "the negotiated revision is echoed, got {body}"
+    );
+
+    // Without a named revision the endpoint answers its own.
+    let initialize = post(
+        &fixture.app,
+        Some("gateway-token"),
+        r#"{"jsonrpc":"2.0","id":4,"method":"initialize"}"#,
     )
     .await;
     let body = json_of(initialize).await;
