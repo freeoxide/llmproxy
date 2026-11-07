@@ -66,6 +66,21 @@ pub enum Commands {
         #[arg(long, requires = "live")]
         require_success: bool,
     },
+    /// Sync model pricing from the models.dev catalogue.
+    PricingSync {
+        /// Path to config file (must be TOML).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Only sync this provider (its configured name, not the models.dev id).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Catalogue URL. Defaults to https://models.dev/api.json.
+        #[arg(long)]
+        url: Option<String>,
+        /// Show what would be written without touching any file.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Manage auto-start on login.
     Autostart {
         /// Autostart subcommand.

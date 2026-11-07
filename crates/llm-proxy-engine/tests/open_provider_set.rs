@@ -294,6 +294,7 @@ fn echo_provider(endpoint: String) -> ProviderConfig {
         catalog: None,
         pricing: Default::default(),
         concurrency: None,
+        pricing_sync: None,
     }
 }
 

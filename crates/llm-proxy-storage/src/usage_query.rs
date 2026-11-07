@@ -103,19 +103,6 @@ pub struct CostTotals {
     pub total: String,
 }
 
-impl CostTotals {
-    fn zeroed() -> Self {
-        Self {
-            input: "0".to_owned(),
-            output: "0".to_owned(),
-            cache_read: "0".to_owned(),
-            cache_creation: "0".to_owned(),
-            reasoning: "0".to_owned(),
-            total: "0".to_owned(),
-        }
-    }
-}
-
 /// One summary group: the grouped key plus its totals.
 #[derive(Debug, Serialize)]
 pub struct SummaryGroup {
@@ -130,9 +117,16 @@ pub struct SummaryGroup {
     /// Token totals.
     /// Token totals, when usage was reported.
     pub tokens: TokenCounts,
-    /// Cost totals.
-    /// Computed cost, when pricing was configured.
-    pub cost: CostTotals,
+    /// Cost totals over the priced rows. `None` when no row in the group
+    /// carries a computed cost: unpriced is a state, never a silent $0
+    /// (BUG-24, plan 05 step 9).
+    pub cost: Option<CostTotals>,
+    /// Completed rows with reported usage but no computed cost: usage that
+    /// happened on an unpriced model.
+    pub unpriced: i64,
+    /// Requests answered from the response cache (plan 05 step 6): they
+    /// cost nothing by design.
+    pub cache_hits: i64,
 }
 
 /// One request's ledger row (identifiers and totals only; no bodies).
@@ -175,6 +169,8 @@ pub struct RequestRow {
     pub latency_ms: Option<i64>,
     /// SHA-256 of the raw client body.
     pub body_hash: Option<String>,
+    /// Whether the response came from the response cache.
+    pub cache_hit: Option<bool>,
 }
 
 /// One page of request rows plus the cursor for the next page.
@@ -313,7 +309,10 @@ fn summary_sync(
          COALESCE(SUM(COALESCE(output_tokens, 0)), 0), \
          COALESCE(SUM(COALESCE(reasoning_tokens, 0)), 0), \
          COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0), \
-         COALESCE(SUM(COALESCE(cache_creation_tokens, 0)), 0) \
+         COALESCE(SUM(COALESCE(cache_creation_tokens, 0)), 0), \
+         COALESCE(SUM(CASE WHEN error_kind IS NULL AND input_tokens IS NOT NULL \
+                AND cost_total IS NULL THEN 1 ELSE 0 END), 0), \
+         COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 1 THEN 1 ELSE 0 END), 0) \
          FROM requests \
          WHERE COALESCE(received_at, completed_at) >= ?1 \
          GROUP BY {key} ORDER BY 2 DESC"
@@ -333,17 +332,21 @@ fn summary_sync(
                     cache_read: row.get(6)?,
                     cache_creation: row.get(7)?,
                 },
-                cost: CostTotals::zeroed(),
+                cost: None,
+                unpriced: row.get(8)?,
+                cache_hits: row.get(9)?,
             })
         })?;
         for row in rows {
             groups.push(row?);
         }
     }
+    // Only groups with at least one priced row get cost totals; a group of
+    // unpriced rows keeps `cost: None` instead of a fabricated $0.
     let costs = sum_costs_by_group(&conn, key, since_ms)?;
-    for group_row in &mut groups {
-        if let Some(total) = costs.get(&group_row.key) {
-            group_row.cost = cost_totals_from(*total);
+    for (group_key, total) in costs {
+        if let Some(group_row) = groups.iter_mut().find(|g| g.key == group_key) {
+            group_row.cost = Some(cost_totals_from(total));
         }
     }
     Ok(groups)
@@ -450,8 +453,9 @@ fn map_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RequestRow, i64
         http_status: row.get(24)?,
         latency_ms: row.get(25)?,
         body_hash: row.get(26)?,
+        cache_hit: row.get::<_, Option<i64>>(27)?.map(|flag| flag != 0),
     };
-    let ts: Option<i64> = row.get(27)?;
+    let ts: Option<i64> = row.get(28)?;
     Ok((row_out, ts.unwrap_or(i64::MIN)))
 }
 
@@ -491,7 +495,7 @@ fn requests_sync(path: &Path, filter: &RequestFilter) -> Result<RequestsPage, Us
          output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, \
          usage_provenance, cost_input, cost_output, cost_cache_creation, cost_cache_read, \
          cost_reasoning, cost_total, stop_reason, error_kind, http_status, latency_ms, \
-         body_hash, COALESCE(received_at, completed_at) AS ts \
+         body_hash, cache_hit, COALESCE(received_at, completed_at) AS ts \
          FROM requests {where_sql} \
          ORDER BY ts DESC, request_id DESC \
          LIMIT ?"

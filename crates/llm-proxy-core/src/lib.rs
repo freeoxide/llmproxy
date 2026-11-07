@@ -32,7 +32,7 @@ pub use provider_config::{
     ANONYMOUS_CALLER, AdminAuthConfig, AdminMountPosture, AffinityConfig, AffinityConflictPolicy,
     AppConfig, AuthConfig, AuthMode, AuthStyle, BareV1Config, ClientKeySpec, ConfigValidationError,
     DEFAULT_MAX_BODY_BYTES, EndpointFamilyConfig, KeyBudgetConfig, KeyWindowLimits, LogFormat,
-    ModelId, ModelPricing, PoolConfig, PoolFile, PreflightConfig, PreflightMode,
+    ModelId, ModelPricing, PoolConfig, PoolFile, PreflightConfig, PreflightMode, PricingSyncConfig,
     ProviderAdapterConfig, ProviderCatalogConfig, ProviderCatalogMode, ProviderConcurrencyConfig,
     ProviderConfig, ProviderDiscoveryConfig, ProviderDiscoveryKind, ProviderEgressConfig,
     ProviderFile, ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig,

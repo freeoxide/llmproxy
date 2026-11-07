@@ -128,6 +128,7 @@ mod tests {
             catalog: None,
             pricing: HashMap::new(),
             concurrency: None,
+            pricing_sync: None,
         };
 
         AppState::new(

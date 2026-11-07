@@ -46,6 +46,13 @@ messages = "anthropic"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
 #
+# Opt-in pricing sync from models.dev (llm-proxy pricing sync). The sync
+# replaces the whole [provider.pricing] table; hand-tuned entries do not
+# survive it, so providers with manual prices stay out.
+#
+# [provider.pricing_sync]
+# models_dev_id = "openai"
+
 # In-flight request caps. A saturated cap answers 503 with a short
 # Retry-After, never 429. Absent = uncapped.
 #

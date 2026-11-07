@@ -301,6 +301,7 @@ fn member(name: &str, endpoint: String, api_keys: Option<Vec<&str>>) -> Provider
         catalog: None,
         pricing: Default::default(),
         concurrency: None,
+        pricing_sync: None,
     }
 }
 

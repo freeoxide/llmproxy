@@ -285,6 +285,7 @@ mod tests {
             catalog: None,
             pricing: HashMap::new(),
             concurrency: None,
+            pricing_sync: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
@@ -924,6 +925,7 @@ mod tests {
             catalog: None,
             pricing: HashMap::new(),
             concurrency: None,
+            pricing_sync: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let app_config = AppConfig {

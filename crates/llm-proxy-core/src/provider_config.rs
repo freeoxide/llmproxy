@@ -660,6 +660,17 @@ const fn default_assumed_max_output_tokens() -> u64 {
     4096
 }
 
+/// Opt-in pricing sync from models.dev (plan 05 step 9, backlog 22).
+/// Declares which models.dev provider this proxy provider's pricing comes
+/// from; `llm-proxy pricing sync` writes `[provider.pricing]` from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PricingSyncConfig {
+    /// The provider id in the models.dev catalogue (for example
+    /// `"anthropic"`). The proxy provider's own name need not match it.
+    pub models_dev_id: String,
+}
+
 /// Per-provider in-flight concurrency caps (plan 05 step 7, backlog 30).
 /// Saturated caps answer 503 with a short `Retry-After`, never 429.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -888,6 +899,10 @@ pub struct ProviderConfig {
     /// In-flight concurrency caps (plan 05 step 7). Absent = uncapped.
     #[serde(default)]
     pub concurrency: Option<ProviderConcurrencyConfig>,
+    /// Opt-in pricing sync from models.dev (plan 05 step 9). Absent keeps
+    /// operator-typed pricing untouched.
+    #[serde(default)]
+    pub pricing_sync: Option<PricingSyncConfig>,
     /// Upstream egress (network exit) configuration. When present, this
     /// provider's upstream requests are sent through the configured forward
     /// proxy instead of a direct connection; absent means direct egress.
@@ -1664,6 +1679,7 @@ pub enum ConfigValidationError {
 ///     catalog: None,
 ///     pricing: Default::default(),
 ///     concurrency: None,
+///     pricing_sync: None,
 /// };
 /// assert!(validate_provider_config(&provider, None).is_ok());
 /// ```
@@ -1693,6 +1709,7 @@ pub enum ConfigValidationError {
 ///     catalog: None,
 ///     pricing: Default::default(),
 ///     concurrency: None,
+///     pricing_sync: None,
 /// };
 /// assert_eq!(
 ///     validate_provider_config(&provider, None),
@@ -1708,6 +1725,7 @@ pub fn validate_provider_config(
     validate_name(name)?;
     validate_api_key(provider, name)?;
     validate_pricing(provider, name)?;
+    validate_pricing_sync(provider, name)?;
     validate_concurrency(provider, name)?;
     validate_adapters(provider, name, known_protocols)?;
     validate_discovery(provider, name)?;
@@ -1765,6 +1783,21 @@ fn validate_api_key(provider: &ProviderConfig, name: &str) -> Result<(), ConfigV
         return Err(ConfigValidationError::InvalidRetry {
             route: name.to_owned(),
             message: "retry.max_attempts must be at least 1".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_pricing_sync(
+    provider: &ProviderConfig,
+    name: &str,
+) -> Result<(), ConfigValidationError> {
+    if let Some(sync) = &provider.pricing_sync
+        && sync.models_dev_id.trim().is_empty()
+    {
+        return Err(ConfigValidationError::InvalidConcurrency {
+            provider: name.to_owned(),
+            message: "pricing_sync.models_dev_id must not be empty".to_owned(),
         });
     }
     Ok(())
@@ -3934,6 +3967,7 @@ endpoint = "https://example.com/v1"
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -3967,6 +4001,7 @@ endpoint = "https://example.com/v1"
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4000,6 +4035,7 @@ endpoint = "https://example.com/v1"
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4024,6 +4060,7 @@ endpoint = "https://example.com/v1"
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4048,6 +4085,7 @@ endpoint = "https://example.com/v1"
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         validate_provider_config(&provider, None).unwrap();
     }
@@ -4116,6 +4154,7 @@ input = 0.0000025
                 },
             )]),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4140,6 +4179,7 @@ input = 0.0000025
             catalog: None,
             pricing: HashMap::from([(ModelId::new(""), ModelPricing::default())]),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4170,6 +4210,7 @@ input = 0.0000025
                 },
             )]),
             concurrency: None,
+            pricing_sync: None,
         };
         match validate_provider_config(&provider, None) {
             Err(ConfigValidationError::InvalidPricing { message, .. }) => {
@@ -4206,6 +4247,7 @@ input = 0.0000025
                 },
             )]),
             concurrency: None,
+            pricing_sync: None,
         };
         validate_provider_config(&provider, None).unwrap();
     }
@@ -4244,6 +4286,7 @@ input = 0.0000025
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(
             validate_provider_config(&provider, None).is_ok(),
@@ -4268,6 +4311,7 @@ input = 0.0000025
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         assert!(matches!(
             validate_provider_config(&provider, None),
@@ -4295,6 +4339,7 @@ input = 0.0000025
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         match validate_provider_config(&provider, None) {
             Err(ConfigValidationError::UnresolvedEnvVar { provider, var }) => {

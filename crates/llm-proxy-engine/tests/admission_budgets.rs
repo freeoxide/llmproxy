@@ -158,6 +158,7 @@ fn provider(
             },
         )]),
         concurrency,
+        pricing_sync: None,
     }
 }
 

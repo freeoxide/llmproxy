@@ -223,6 +223,7 @@ mod tests {
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         AppState::new(

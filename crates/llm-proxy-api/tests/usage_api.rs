@@ -86,6 +86,19 @@ mod tests {
         })
     }
 
+    fn completed_event_without_cost(
+        id: &str,
+        provider: &str,
+        model: &str,
+        ts: OffsetDateTime,
+    ) -> ProxyEvent {
+        let mut event = completed_event(id, provider, model, ts, "0");
+        if let ProxyEvent::ResponseCompleted(done) = &mut event {
+            done.cost = None;
+        }
+        event
+    }
+
     fn failed_event(id: &str, provider: Option<&str>, ts: OffsetDateTime) -> ProxyEvent {
         ProxyEvent::ResponseFailed(ResponseFailed {
             request_id: id.to_owned(),
@@ -133,6 +146,15 @@ mod tests {
             ),
             received_event("req-3", "phone", "prov-b", "claude-3", t0 + second * 2),
             failed_event("req-3", Some("prov-b"), t0 + second * 6),
+            // prov-free serves usage with no pricing entry: unpriced.
+            received_event(
+                "req-4",
+                "tablet",
+                "prov-free",
+                "free-model",
+                t0 + second / 2,
+            ),
+            completed_event_without_cost("req-4", "prov-free", "free-model", t0 + second / 2),
             failed_event("orphan-1", None, t0 + second * 3),
             received_event(
                 "old-1",
@@ -254,6 +276,20 @@ mod tests {
         let prov_b = find("prov-b");
         assert_eq!(prov_b["requests"], 1);
         assert_eq!(prov_b["errors"], 1);
+
+        // BUG-24: usage on an unpriced model is an explicit unpriced state,
+        // never a silent $0.
+        let prov_free = find("prov-free");
+        assert_eq!(prov_free["requests"], 1);
+        assert!(
+            prov_free["cost"].is_null(),
+            "a group of unpriced rows must report null cost, got {}",
+            prov_free["cost"]
+        );
+        assert_eq!(prov_free["unpriced"], 1);
+        assert_eq!(prov_free["cache_hits"], 0);
+        // Priced groups stay priced, with the same exact decimals as before.
+        assert_eq!(prov_a["unpriced"], 0);
 
         let null_group = groups
             .iter()
@@ -443,7 +479,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["req-3", "req-2", "req-1", "old-1"],
+            vec!["req-3", "req-2", "req-4", "req-1", "old-1"],
             "until is exclusive on the ledger time axis (orphan-1 at t0+3s is out)"
         );
 
@@ -557,7 +593,7 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            vec!["<null>", "phone", "laptop"],
+            vec!["<null>", "phone", "laptop", "tablet"],
             "caller ordering follows last-seen timestamps, null caller included"
         );
     }

@@ -284,6 +284,7 @@ mod tests {
             }),
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
 
         let registry =
@@ -339,6 +340,7 @@ mod tests {
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         };
 
         let registry =

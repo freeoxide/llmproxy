@@ -33,6 +33,12 @@ async fn main() -> Result<()> {
             write_catalog,
             require_success,
         } => cmd_models(config, provider, live, write_catalog, require_success).await,
+        Commands::PricingSync {
+            config,
+            provider,
+            url,
+            dry_run,
+        } => cmd_pricing_sync(config, provider, url, dry_run).await,
         Commands::Autostart { action } => match action {
             AutostartAction::Enable {
                 config,

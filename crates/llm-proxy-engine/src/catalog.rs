@@ -547,6 +547,7 @@ mod tests {
             }),
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         }
     }
 
@@ -685,6 +686,7 @@ mod tests {
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         }
     }
 
@@ -1019,6 +1021,7 @@ mod tests {
             }),
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         }
     }
 

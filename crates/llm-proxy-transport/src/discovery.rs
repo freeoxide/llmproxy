@@ -103,6 +103,16 @@ impl DiscoveryClient {
         )))
     }
 
+    /// GET `url` (no credentials attached) and parse the response as JSON,
+    /// bounded by `max_bytes`. Operator tooling uses this — the models.dev
+    /// pricing sync (plan 05 step 9).
+    pub async fn fetch_json(&self, url: &str, max_bytes: usize) -> Result<Value, ProviderError> {
+        let url = Url::parse(url).map_err(|error| {
+            ProviderError::InvalidConfig(format!("invalid catalogue URL: {error}"))
+        })?;
+        self.send_once(self.http.get(url), max_bytes).await
+    }
+
     async fn fetch_page(
         &self,
         provider: &ProviderConfig,
@@ -354,6 +364,32 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
+    #[tokio::test]
+    async fn fetch_json_gets_the_catalogue_without_credentials() {
+        let app = Router::new().route(
+            "/api.json",
+            get(|| async { Json(json!({"provider_x": {"models": {}}})) }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                tracing::trace!(%error, "test upstream stopped");
+            }
+        });
+        let client = DiscoveryClient::try_new().expect("client");
+        let value = client
+            .fetch_json(&format!("http://{addr}/api.json"), 1024 * 1024)
+            .await
+            .expect("fetch");
+        assert!(value.get("provider_x").is_some(), "got {value}");
+        let error = client
+            .fetch_json("not a url", 1024)
+            .await
+            .expect_err("invalid URL refused");
+        assert!(error.to_string().contains("invalid"), "got {error}");
+    }
+
     async fn echo_anthropic_version(headers: HeaderMap) -> Json<Value> {
         let version = headers
             .get(ANTHROPIC_VERSION_HEADER)
@@ -401,6 +437,7 @@ mod tests {
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         }
     }
 
@@ -642,6 +679,7 @@ mod tests {
             catalog: None,
             pricing: Default::default(),
             concurrency: None,
+            pricing_sync: None,
         }
     }
 
