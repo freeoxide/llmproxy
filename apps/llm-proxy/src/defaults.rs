@@ -16,6 +16,17 @@ hot_reload = false
 rate_limit_rpm = 100
 trust_forwarded_headers = false
 server_name = "llm-proxy"
+
+# Exact-match response cache and Idempotency-Key replay (plan 06): both off
+# by default — with every opt-in off the proxy stores no prompt or response.
+# See docs/data-class-policy.md.
+# [server.cache]
+# enabled = true
+# ttl = "10m"
+# max_entries = 1000
+# [server.idempotency]
+# enabled = true
+# ttl = "24h"
 "#;
 
 /// Default provider TOML for opencode-go.
@@ -62,6 +73,12 @@ messages = "anthropic"
 # cache_creation = "0.000003"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
+
+# Prompt-cache hygiene (plan 06): opt-in edits at the provider edge that
+# protect the provider's own prompt cache. Off by default.
+# [provider.prompt_cache]
+# strip_volatile = ["/metadata/user_id"]
+# inject_markers = true
 "#;
 
 /// Default provider TOML for opencode-zen.
@@ -116,4 +133,10 @@ messages = "anthropic"
 # cache_creation = "0.000003"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
+
+# Prompt-cache hygiene (plan 06): opt-in edits at the provider edge that
+# protect the provider's own prompt cache. Off by default.
+# [provider.prompt_cache]
+# strip_volatile = ["/metadata/user_id"]
+# inject_markers = true
 "#;

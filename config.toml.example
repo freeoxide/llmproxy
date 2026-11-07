@@ -41,6 +41,27 @@ server_name = "llm-proxy"
 mode = "warn"
 margin_tokens = 512
 
+# Exact-match response cache (plan 06). Off by default: with it off the
+# proxy stores no prompt or response. When enabled, complete non-streaming
+# responses are stored in memory, keyed per caller (one caller's cached
+# response is never returned to another), for `ttl`; a hit is answered
+# without an upstream call and is recorded as a cache hit (nothing
+# charged). See docs/data-class-policy.md for what each opt-in stores.
+# [server.cache]
+# enabled = true
+# ttl = "10m"
+# max_entries = 1000
+
+# Idempotency-Key replay (plan 06). Off by default: the header is ignored.
+# When enabled, a request carrying an "Idempotency-Key" header claims the
+# key before budget checks; a matching retry within `ttl` replays the
+# stored response (no second upstream call, nothing charged), and a
+# request arriving while the first is still in flight gets 409. Failures
+# are not stored, so a retry after a failure executes again.
+# [server.idempotency]
+# enabled = true
+# ttl = "24h"
+
 # Client authentication for proxy routes.
 #
 # mode = "none" (default): no client authentication. Only permitted while
