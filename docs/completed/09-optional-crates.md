@@ -105,8 +105,23 @@ unless real use says otherwise.
   forced through the chat core. JSON families get the one surgical edit
   (model aliasing, unknown fields preserved); audio and file bodies pass
   through verbatim with the client's content type.
-- Verification gaps recorded in the plan's review, not hidden: no live
-  Redis/Postgres/MCP servers exist in this environment, so the Redis and
-  MCP paths run against in-repo loopback fakes that speak their real
-  wire protocols, and the Postgres integration tests ship `#[ignore]d`
-  behind `LLM_PROXY_TEST_POSTGRES`.
+- Live-server verification: a Docker daemon was available, so both
+  replica stores ran against the real servers — Redis 7
+  (`LLM_PROXY_TEST_REDIS`, `tests/live_server.rs`: two instances enforce
+  one budget between them concurrently, a refund crosses replicas,
+  windows and cooldowns are shared, usage events reach the stream) and
+  Postgres 16 (`LLM_PROXY_TEST_POSTGRES`, `tests/replica_state.rs`: the
+  same done-when). The real Postgres immediately exposed a concurrency
+  bug the in-repo fakes could not — parallel `CREATE TABLE IF NOT
+  EXISTS` races in `pg_type` (SQLSTATE 23505) — fixed by serializing
+  schema creation behind a transaction-scoped advisory lock
+  (`pg_advisory_xact_lock`), verified by three consecutive concurrent
+  clean runs. Both suites are `#[ignore]`d without their env vars; the
+  default test run still uses the in-repo loopback fakes.
+- Verification gaps that remain, recorded in the plan's review, not
+  hidden: the MCP gateway and admin MCP tools were exercised against
+  in-repo fake MCP servers speaking the documented 2026-07-28 wire
+  shapes (no external MCP server or client was contacted), and the
+  non-chat families were verified against loopback fakes per family —
+  no live LLM provider was contacted, since this environment has no
+  upstream API keys.

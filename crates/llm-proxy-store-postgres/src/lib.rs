@@ -139,15 +139,33 @@ impl PostgresStore {
 
     /// Creates the replica tables and indexes if they do not exist.
     ///
+    /// Schema creation is serialized across every process sharing the
+    /// database with a transaction-scoped advisory lock: Postgres's
+    /// `CREATE TABLE IF NOT EXISTS` checks the catalog and inserts
+    /// non-atomically across transactions, so two replicas creating the
+    /// schema at the same time collide in `pg_type` (SQLSTATE 23505)
+    /// even though each statement alone is idempotent. The lock is
+    /// transaction-scoped, so it releases at commit even if a creator
+    /// dies mid-DDL. Found by running the store against a real Postgres;
+    /// `tests/replica_state.rs` reproduces it by connecting several
+    /// stores concurrently.
+    ///
     /// # Errors
     ///
     /// [`PostgresStoreError::Schema`] when the DDL fails.
     pub async fn ensure_schema(&self) -> Result<(), PostgresStoreError> {
-        let client = self.connection().await?;
-        client
-            .batch_execute(SCHEMA_SQL)
+        let mut client = self.connection().await?;
+        let tx = client
+            .transaction()
             .await
             .map_err(PostgresStoreError::Schema)?;
+        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK_KEY])
+            .await
+            .map_err(PostgresStoreError::Schema)?;
+        tx.batch_execute(SCHEMA_SQL)
+            .await
+            .map_err(PostgresStoreError::Schema)?;
+        tx.commit().await.map_err(PostgresStoreError::Schema)?;
         Ok(())
     }
 
@@ -232,6 +250,12 @@ fn until_next_day(now: OffsetDateTime) -> Duration {
 /// How long an unsettled lease holds its reservation before the purge
 /// drops it (a crashed replica's crash bound).
 const LEASE_TTL: Duration = Duration::from_secs(3600);
+
+/// The advisory-lock key serializing schema creation across every
+/// process sharing the database (see [`PostgresStore::ensure_schema`]).
+/// Arbitrary but fixed; collisions with unrelated applications are
+/// improbable and only cause brief waiting.
+const SCHEMA_LOCK_KEY: i64 = 910_109;
 
 fn store_error(error: &tokio_postgres::Error) -> EngineError {
     EngineError::Internal(format!("admission store: {error}"))
