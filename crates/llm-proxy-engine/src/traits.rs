@@ -218,7 +218,9 @@ impl Router for RegistryRouter {
 }
 
 /// One admission step: reserve budget up front, then settle or refund
-/// (audit conflict 2's resolution). The default admits everything.
+/// (audit conflict 2's resolution). The default admits everything;
+/// [`PolicyAdmission`](crate::admission::PolicyAdmission) enforces per-key
+/// allowlists, rate windows, spend budgets and concurrency caps.
 ///
 /// `reserve` is async (it may consult a backend budget store); `settle` is
 /// synchronous fire-and-forget accounting, mirroring the contract of
@@ -241,16 +243,29 @@ pub trait Admission: Debug + Send + Sync {
 }
 
 /// What is being admitted.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct AdmissionClaim<'a> {
     /// The caller identity (key id or `"anonymous"`).
     pub caller: &'a str,
-    /// Provider the request routes to.
+    /// The route the client addressed: a provider name or a pool name (what
+    /// per-key provider allowlists match).
     pub provider: &'a str,
-    /// Requested model.
+    /// The member provider the first attempt targets: the pricing and
+    /// concurrency-cap key. Equals `provider` on a direct route.
+    pub member: &'a str,
+    /// The upstream model the first attempt encodes for (the billing key).
     pub model: &'a str,
+    /// The model name the client asked for (what per-key model allowlists
+    /// match, alongside `model`).
+    pub requested_model: &'a str,
     /// SHA-256 of the raw client body (never the body itself).
     pub body_hash: &'a str,
+    /// The engine's input token estimate (plan 05 step 8's counter): BPE for
+    /// known OpenAI models, chars/4 otherwise; tools, tool results and
+    /// images are not counted.
+    pub estimated_input_tokens: u64,
+    /// The request's `max_tokens`, when it set one.
+    pub max_output_tokens: Option<u64>,
 }
 
 /// An admission reservation; implementations carry what they need to settle.
@@ -258,6 +273,9 @@ pub struct AdmissionClaim<'a> {
 pub struct AdmissionTicket {
     /// Reserved units, if the implementation accounts in tokens/credits.
     pub reserved: Option<u64>,
+    /// An implementation-defined handle to the reservation record, so
+    /// settlement can find what was reserved. `None` when nothing was.
+    pub lease: Option<u64>,
 }
 
 /// The outcome handed back at settlement.
@@ -267,6 +285,11 @@ pub struct AdmissionOutcome<'a> {
     pub succeeded: bool,
     /// Final usage, when the attempt produced one.
     pub usage: Option<&'a llm_proxy_protocol::core::Usage>,
+    /// The cost the engine computed from provider-reported usage and the
+    /// member's pricing, when both exist: what the provider bills, which is
+    /// what a budget charges (plan 05 step 6). `None` with usage present
+    /// means the model is unpriced.
+    pub cost: Option<&'a llm_proxy_protocol::core::Cost>,
 }
 
 /// The default [`Admission`]: everything is admitted, nothing is accounted.

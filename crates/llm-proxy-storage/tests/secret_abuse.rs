@@ -66,6 +66,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             latency_ms: 42,
             credential_id: None,
+            cache_hit: false,
         })
     }
 

@@ -96,6 +96,11 @@ pub struct ResponseCompleted {
     /// id, never the secret), when the provider has more than one key
     /// (plan 04 step 5).
     pub credential_id: Option<String>,
+    /// Whether the response was served from the response cache (plan 05
+    /// step 6): a hit never reserved and is never charged, and is recorded
+    /// as a hit with the cached usage kept for the record.
+    #[serde(default)]
+    pub cache_hit: bool,
 }
 
 /// Event payload for a failed response; `model` and `provider` are optional
@@ -279,6 +284,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             latency_ms: 123,
             credential_id: None,
+            cache_hit: false,
         });
         bus.emit(&req);
         bus.emit(&done);
@@ -431,6 +437,7 @@ mod tests {
             stop_reason: StopReason::EndTurn,
             latency_ms: 1,
             credential_id: None,
+            cache_hit: false,
         });
         let done_json = serde_json::to_string(&done).expect("serialize ResponseCompleted");
         assert_no_forbidden_secret_key(&done_json, FORBIDDEN_KEY_FRAGMENTS);

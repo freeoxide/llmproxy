@@ -30,6 +30,7 @@
 
 #![deny(missing_docs)]
 
+pub mod admission;
 pub mod catalog;
 pub mod classification;
 pub mod error;
@@ -37,6 +38,7 @@ pub mod error_policy;
 pub mod headers;
 pub mod health;
 pub mod lifecycle;
+pub mod preflight;
 pub mod probe;
 pub mod traits;
 pub mod types;
@@ -45,10 +47,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use llm_proxy_adapters::{ProviderAdapterRegistry, ProviderAdapterTarget};
-use llm_proxy_core::{AppConfig, Metrics, ProviderRegistry};
+use llm_proxy_core::{AppConfig, Counter, Metrics, ProviderRegistry};
 use llm_proxy_storage::EventBus;
 use llm_proxy_transport::ProxyClient;
 
+pub use admission::{KeyPolicy, PolicyAdmission};
 pub use catalog::{ModelCatalogService, write_catalog_atomic};
 pub use classification::{ErrorClass, classify, parse_duration_suffix, parse_retry_after};
 pub use error::{
@@ -120,6 +123,9 @@ pub(crate) struct EngineInner {
     pub(crate) health: Arc<CooldownStore>,
     /// Sticky-session pins (plan 04 step 10).
     pub(crate) affinity: Arc<AffinityTable>,
+    /// The token counter behind the input estimate admission and preflight
+    /// share (plan 05 steps 4 and 8).
+    pub(crate) counter: Counter,
 }
 
 impl std::fmt::Debug for EngineInner {
@@ -138,6 +144,7 @@ impl std::fmt::Debug for EngineInner {
             .field("metrics", &self.metrics)
             .field("health", &self.health)
             .field("affinity", &self.affinity)
+            .field("counter", &self.counter)
             .finish()
     }
 }
@@ -264,6 +271,7 @@ pub struct EngineBuilder {
     usage: Option<EventBusSink>,
     catalogs: Option<Arc<ModelCatalogService>>,
     metrics: Option<Arc<Metrics>>,
+    counter: Option<Counter>,
 }
 
 impl EngineBuilder {
@@ -310,6 +318,7 @@ impl EngineBuilder {
             usage: None,
             catalogs: None,
             metrics: None,
+            counter: None,
         }
     }
 
@@ -408,6 +417,14 @@ impl EngineBuilder {
         self
     }
 
+    /// Provide the token counter the input estimate uses (default: a fresh
+    /// [`Counter`]; sharing the server's keeps one BPE cache).
+    #[must_use]
+    pub fn counter(mut self, counter: Counter) -> Self {
+        self.counter = Some(counter);
+        self
+    }
+
     /// Assemble the engine.
     ///
     /// # Errors
@@ -453,6 +470,7 @@ impl EngineBuilder {
             metrics: self.metrics.unwrap_or_else(|| Arc::new(Metrics::new())),
             health,
             affinity,
+            counter: self.counter.unwrap_or_default(),
         };
         let inner = Arc::new(inner);
         crate::probe::spawn_pool_probes(&inner);

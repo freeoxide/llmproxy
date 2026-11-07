@@ -1,0 +1,528 @@
+//! Admission and budgets through the real engine, against a loopback fake
+//! upstream (plan 05 steps 3-7): the done-when properties — concurrent
+//! requests cannot overspend a budget by more than the reserved amount, a
+//! refund restores the budget, cache hits never reserve — plus the
+//! concurrency cap's 503 and the per-key allowlists end to end.
+
+#![cfg(test)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use axum::Router;
+use axum::http::{StatusCode, header};
+use axum::routing::post;
+use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
+use llm_proxy_core::{
+    AppConfig, AuthStyle, ClientKeySpec, KeyBudgetConfig, KeyWindowLimits, ProviderAdapterConfig,
+    ProviderConfig, ProviderRegistry, ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
+};
+use llm_proxy_engine::{
+    Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, Cache, CacheEntry, CacheKey,
+    ClientDialect, EngineBuilder, EngineError, EngineRequest, InboundRequest, KeyPolicy,
+    PolicyAdmission,
+};
+use llm_proxy_protocol::core::{
+    CoreContent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
+};
+use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus};
+
+async fn spawn_upstream(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("fake upstream addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "fake upstream stopped");
+        }
+    });
+    format!("http://{addr}/v1/messages")
+}
+
+fn upstream_always_ok() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":4}}"#,
+            )
+        }),
+    )
+}
+
+fn upstream_always_500() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"boom"}"#,
+            )
+        }),
+    )
+}
+
+/// An upstream that answers only after `release` is set, holding its
+/// in-flight slot open; once set it stays set, so later requests answer
+/// immediately.
+fn upstream_held(release: Arc<tokio::sync::watch::Receiver<bool>>) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move || {
+            let mut release = release.as_ref().clone();
+            async move {
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":4}}"#,
+                )
+            }
+        }),
+    )
+}
+
+fn test_config() -> AppConfig {
+    AppConfig {
+        server: ServerConfig {
+            bind: "127.0.0.1:0".parse().expect("bind addr"),
+            request_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(5),
+            log_level: "info".to_owned(),
+            hot_reload: false,
+            allowed_origins: None,
+            server_name: "admission-test".to_owned(),
+            rate_limit_rpm: 1000,
+            trust_forwarded_headers: false,
+            dedup_window: Duration::ZERO,
+            log_format: Default::default(),
+            admin_bind: None,
+            admin_on_main_listener: false,
+            endpoint_families: Default::default(),
+            upstream_timeouts: Default::default(),
+            bare_v1: Default::default(),
+            preflight: Default::default(),
+        },
+        auth: Default::default(),
+        storage: None,
+    }
+}
+
+fn provider(
+    endpoint: String,
+    concurrency: Option<llm_proxy_core::ProviderConcurrencyConfig>,
+) -> ProviderConfig {
+    let mut adapters = HashMap::new();
+    adapters.insert(
+        "messages".to_owned(),
+        ProviderAdapterConfig {
+            protocol: "anthropic_messages".to_owned(),
+            endpoint,
+            headers: Arc::new(HashMap::new()),
+            forward_inbound_headers: None,
+            lossy: false,
+        },
+    );
+    ProviderConfig {
+        name: "fake".to_owned(),
+        api_key: secrecy::SecretString::from("upstream-key"),
+        auth_style: AuthStyle::XApiKey,
+        passthrough_auth: false,
+        api_keys: None,
+        retry: None,
+        egress: None,
+        adapters,
+        routes: ProviderRoutesConfig {
+            messages: Some("messages".to_owned()),
+            chat_completions: None,
+        },
+        model_aliases: HashMap::new(),
+        discovery: None,
+        catalog: None,
+        pricing: HashMap::from([(
+            llm_proxy_core::ModelId::new("claude-sonnet-4-6"),
+            llm_proxy_core::ModelPricing {
+                input: "0.0001".parse().expect("decimal"),
+                output: "0.0001".parse().expect("decimal"),
+                ..llm_proxy_core::ModelPricing::default()
+            },
+        )]),
+        concurrency,
+    }
+}
+
+fn core_request(model: &str) -> CoreRequest {
+    CoreRequest {
+        model: ModelRef {
+            requested: model.to_owned(),
+            upstream: None,
+        },
+        messages: vec![CoreMessage {
+            role: CoreRole::User,
+            content: vec![CoreContent::Text {
+                text: "hello".to_owned(),
+                cache: None,
+            }],
+        }],
+        system: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: None,
+        sampling: SamplingOptions {
+            max_tokens: Some(5),
+            ..SamplingOptions::default()
+        },
+        stream: false,
+        metadata: Default::default(),
+        provider_hints: Default::default(),
+    }
+}
+
+fn engine_request(caller: &str, model: &str) -> EngineRequest {
+    EngineRequest::new(
+        "fake",
+        ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        core_request(model),
+        InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(
+                ClientWireFormat::AnthropicMessages,
+                serde_json::json!({}),
+            ),
+        },
+    )
+    .with_request_id(format!("req-{model}"))
+    .with_caller(caller.to_owned())
+    .with_body_hash("hash")
+}
+
+#[tokio::test]
+async fn a_failing_request_refunds_the_budget_and_successes_charge_real_usage() {
+    let ok = spawn_upstream(upstream_always_ok()).await;
+    let failing = spawn_upstream(upstream_always_500()).await;
+
+    // One shared admission across two engines (ok + failing upstream), one
+    // budgeted key: each success bills 10 in + 4 out = 0.0014 USD. Pricing
+    // comes from the registry the admission is built from.
+    let registry = ProviderRegistry::from_providers(vec![provider(ok, None)]).expect("registry");
+    let admission = Arc::new(PolicyAdmission::from_config(&fake_auth_config(), &registry));
+    let ok_engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("ok engine");
+    let failing_registry =
+        ProviderRegistry::from_providers(vec![provider(failing, None)]).expect("registry");
+    let failing_engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(failing_registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("failing engine");
+
+    // A failing request reserves and refunds: afterwards the budget is
+    // untouched, so both successes below still fit.
+    let error = failing_engine
+        .execute(engine_request("laptop", "claude-sonnet-4-6"))
+        .await
+        .expect_err("upstream 500");
+    assert_eq!(error.status_code(), 502, "got {error:?}");
+
+    ok_engine
+        .execute(engine_request("laptop", "claude-sonnet-4-6"))
+        .await
+        .expect("first success");
+    ok_engine
+        .execute(engine_request("laptop", "claude-sonnet-4-6"))
+        .await
+        .expect("second success");
+    // 0.0014 x 2 = 0.0028 spent; a third would need 0.0028 + estimate
+    // (~0.0014) > 0.0032.
+    let error = ok_engine
+        .execute(engine_request("laptop", "claude-sonnet-4-6"))
+        .await
+        .expect_err("budget refuses the third");
+    match &error {
+        EngineError::BudgetExhausted {
+            message,
+            retry_after,
+        } => {
+            assert!(message.contains("budget"), "got {message}");
+            assert!(retry_after.is_some(), "the daily reset is advised");
+        }
+        other => panic!("expected BudgetExhausted, got {other:?}"),
+    }
+    assert_eq!(error.status_code(), 402);
+}
+
+fn fake_auth_config() -> llm_proxy_core::AuthConfig {
+    llm_proxy_core::AuthConfig {
+        mode: llm_proxy_core::AuthMode::ClientKeys,
+        clients: HashMap::from([(
+            "laptop".to_owned(),
+            ClientKeySpec::Policy {
+                verifier: secrecy::SecretString::from("$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"),
+                allow_models: Vec::new(),
+                allow_providers: Vec::new(),
+                limits: Some(KeyWindowLimits {
+                    rpm: None,
+                    tpm: None,
+                    rpd: None,
+                }),
+                budget: Some(KeyBudgetConfig {
+                    usd_per_day: "0.0032".parse().expect("decimal"),
+                    unestimatable: llm_proxy_core::UnestimatableCostPolicy::Reject,
+                    assumed_max_output_tokens: 5,
+                }),
+            },
+        )]),
+        admin: None,
+    }
+}
+
+#[tokio::test]
+async fn concurrent_requests_cannot_overspend_the_budget_by_more_than_reserved() {
+    let ok = spawn_upstream(upstream_always_ok()).await;
+    let registry = ProviderRegistry::from_providers(vec![provider(ok, None)]).expect("registry");
+    let admission = Arc::new(PolicyAdmission::from_config(&fake_auth_config(), &registry));
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine");
+
+    // Fire five concurrent requests against a 0.0032 budget whose requests
+    // each reserve ~0.0014: at most two are admitted; the rest answer 402
+    // before any egress.
+    let mut handles = Vec::new();
+    for index in 0..5 {
+        let engine = engine.clone();
+        handles.push(tokio::spawn(async move {
+            engine
+                .execute(engine_request("laptop", "claude-sonnet-4-6"))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.status_code())
+                .map_err(|code| (index, code))
+        }));
+    }
+    let mut admitted = 0usize;
+    let mut refused_402 = 0usize;
+    for handle in handles {
+        match handle.await.expect("task") {
+            Ok(()) => admitted += 1,
+            Err((_, 402)) => refused_402 += 1,
+            Err((index, code)) => panic!("request {index} failed with {code}, expected 200 or 402"),
+        }
+    }
+    assert_eq!(admitted + refused_402, 5);
+    assert!(
+        (1..=2).contains(&admitted),
+        "admitted {admitted}; the budget bounds committed plus reserved spend"
+    );
+    assert!(refused_402 >= 3, "refused {refused_402}");
+}
+
+#[tokio::test]
+async fn a_saturated_concurrency_cap_answers_503_and_frees_on_completion() {
+    let release = Arc::new(tokio::sync::watch::Sender::new(false));
+    let release_rx = release.subscribe();
+    let endpoint = spawn_upstream(upstream_held(Arc::new(release_rx.clone()))).await;
+    let bus = Arc::new(RecordingBus::new());
+    let registry = ProviderRegistry::from_providers(vec![provider(
+        endpoint,
+        Some(llm_proxy_core::ProviderConcurrencyConfig {
+            total: Some(1),
+            models: HashMap::new(),
+        }),
+    )])
+    .expect("registry");
+    let admission = Arc::new(PolicyAdmission::from_config(
+        &llm_proxy_core::AuthConfig::default(),
+        &registry,
+    ));
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::clone(&bus) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine");
+
+    let first = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+                .await
+                .expect("the held request completes after release")
+        }
+    });
+    // Give the first request a moment to reserve; then the cap is full.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let error = engine
+        .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+        .await
+        .expect_err("cap of 1 is held");
+    match &error {
+        EngineError::Overloaded { retry_after, .. } => {
+            assert!(
+                retry_after.is_some_and(|wait| wait <= Duration::from_secs(5)),
+                "Retry-After must be short, got {retry_after:?}"
+            );
+        }
+        other => panic!("expected Overloaded, got {other:?}"),
+    }
+    assert_eq!(error.status_code(), 503);
+
+    release.send_replace(true);
+    first.await.expect("task joins");
+    engine
+        .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+        .await
+        .expect("the slot freed at settlement");
+}
+
+#[tokio::test]
+async fn per_key_allowlists_are_enforced_through_the_engine() {
+    let ok = spawn_upstream(upstream_always_ok()).await;
+    let registry = ProviderRegistry::from_providers(vec![provider(ok, None)]).expect("registry");
+    let mut keys = HashMap::new();
+    keys.insert(
+        "scoped".to_owned(),
+        KeyPolicy {
+            allow_models: vec!["claude-*".to_owned()],
+            allow_providers: vec!["fake".to_owned()],
+            ..KeyPolicy::default()
+        },
+    );
+    let admission = Arc::new(PolicyAdmission::new(keys, HashMap::new(), HashMap::new()));
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine");
+
+    engine
+        .execute(engine_request("scoped", "claude-sonnet-4-6"))
+        .await
+        .expect("matching model and provider");
+
+    let error = engine
+        .execute(engine_request("scoped", "gpt-4o"))
+        .await
+        .expect_err("model outside the allowlist");
+    assert!(matches!(error, EngineError::Forbidden(_)));
+    assert_eq!(error.status_code(), 403);
+
+    // Unlisted callers stay unrestricted.
+    engine
+        .execute(engine_request("someone-else", "gpt-4o"))
+        .await
+        .expect("keys without a policy are unrestricted");
+}
+
+/// An admission that counts reservations, for the cache-hit rule.
+#[derive(Debug, Default)]
+struct CountingAdmission {
+    reserves: AtomicUsize,
+    settles: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Admission for CountingAdmission {
+    async fn reserve(&self, _claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
+        self.reserves.fetch_add(1, Ordering::SeqCst);
+        Ok(AdmissionTicket::default())
+    }
+
+    fn settle(&self, _ticket: &AdmissionTicket, _outcome: &AdmissionOutcome<'_>) {
+        self.settles.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A cache that answers every lookup with one stored entry.
+#[derive(Debug)]
+struct AlwaysHitCache {
+    entry: CacheEntry,
+}
+
+#[async_trait::async_trait]
+impl Cache for AlwaysHitCache {
+    async fn lookup(&self, _key: &CacheKey<'_>) -> Result<Option<CacheEntry>, EngineError> {
+        Ok(Some(self.entry.clone()))
+    }
+}
+
+#[tokio::test]
+async fn cache_hits_never_reserve_and_are_recorded_as_hits() {
+    let ok = spawn_upstream(upstream_always_ok()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let registry = ProviderRegistry::from_providers(vec![provider(ok, None)]).expect("registry");
+
+    // Prime the cache entry from one real request's shape.
+    let entry = {
+        let engine = EngineBuilder::new(test_config())
+            .providers(Arc::new(
+                ProviderRegistry::from_providers(vec![provider(
+                    spawn_upstream(upstream_always_ok()).await,
+                    None,
+                )])
+                .expect("registry"),
+            ))
+            .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+            .build()
+            .expect("engine");
+        let response = engine
+            .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+            .await
+            .expect("prime");
+        CacheEntry {
+            response: response.core,
+            events: Vec::new(),
+        }
+    };
+
+    let admission = Arc::new(CountingAdmission::default());
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::clone(&bus) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .cache(Arc::new(AlwaysHitCache { entry }))
+        .build()
+        .expect("engine");
+
+    let response = engine
+        .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+        .await
+        .expect("served from the cache");
+    assert_eq!(response.core.usage.input_tokens, 10);
+    assert_eq!(
+        admission.reserves.load(Ordering::SeqCst),
+        0,
+        "a cache hit must not reserve: it charges nothing"
+    );
+    assert_eq!(admission.settles.load(Ordering::SeqCst), 0);
+    let hits = bus
+        .snapshot()
+        .iter()
+        .filter(|event| match event {
+            ProxyEvent::ResponseCompleted(done) => done.cache_hit,
+            _ => false,
+        })
+        .count();
+    assert_eq!(hits, 1, "the hit is recorded as a hit on its ledger row");
+}

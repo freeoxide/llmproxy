@@ -150,6 +150,21 @@ impl ModelCatalogService {
         Ok(model_id_present(&ids, upstream_model, protocol))
     }
 
+    /// The context window the merged catalog (static entries plus the
+    /// cached discovery) records for `upstream_model`, when it records one
+    /// (plan 05 step 8's preflight input). Never refreshes live.
+    pub async fn context_length(
+        &self,
+        provider: &ProviderConfig,
+        upstream_model: &str,
+    ) -> Option<u32> {
+        let entries = self.catalog(provider, false).await.ok()?;
+        entries
+            .iter()
+            .find(|entry| entry.id == upstream_model)
+            .and_then(|entry| entry.context_length)
+    }
+
     async fn id_index_for(
         &self,
         provider: &ProviderConfig,

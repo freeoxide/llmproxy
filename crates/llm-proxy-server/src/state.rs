@@ -227,7 +227,18 @@ impl AppState {
             )
             .metrics(Arc::clone(&self.metrics))
             .catalogs(Arc::clone(&self.model_catalogs))
-            .event_bus(Arc::clone(&self.event_bus));
+            .event_bus(Arc::clone(&self.event_bus))
+            .counter(self.token_counter.clone());
+            // The one admission step (plan 05): per-key policies from
+            // [auth.clients] and caps from [provider.concurrency]. With
+            // neither configured the engine keeps its allow-all default.
+            let admission = llm_proxy_engine::PolicyAdmission::from_config(
+                &self.app_config.auth,
+                &self.providers,
+            );
+            if !admission.is_noop() {
+                builder = builder.admission(Arc::new(admission));
+            }
             let egress = (*self.egress_clients).clone();
             for provider in self.providers.iter() {
                 if provider.egress.is_some() && !egress.contains_key(&provider.name) {

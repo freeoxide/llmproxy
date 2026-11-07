@@ -188,6 +188,7 @@ async fn count_tokens_inner(
             stop_reason: StopReason::EndTurn,
             latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
             credential_id: None,
+            cache_hit: false,
         }));
 
     let response = axum::Json(TokenCountResponse {

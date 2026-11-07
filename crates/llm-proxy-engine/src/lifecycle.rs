@@ -311,10 +311,80 @@ fn ledger_model(core_model: &ModelRef, upstream_model: &str) -> ModelRef {
     model
 }
 
-fn settle(inner: &EngineInner, ticket: &AdmissionTicket, succeeded: bool, usage: Option<&Usage>) {
-    inner
-        .admission
-        .settle(ticket, &AdmissionOutcome { succeeded, usage });
+fn settle(
+    inner: &EngineInner,
+    ticket: &AdmissionTicket,
+    succeeded: bool,
+    usage: Option<&Usage>,
+    cost: Option<&Cost>,
+) {
+    inner.admission.settle(
+        ticket,
+        &AdmissionOutcome {
+            succeeded,
+            usage,
+            cost,
+        },
+    );
+}
+
+/// The cost of provider-reported usage at the member's pricing, when both
+/// exist: what the provider bills, which is what budgets charge (plan 05
+/// step 6). Synthetic or unknown usage is never priced.
+fn billed_cost(usage: &Usage, pricing: Option<&ModelPricing>) -> Option<Cost> {
+    if usage.provenance != UsageProvenance::ProviderReported {
+        return None;
+    }
+    pricing.map(|p| compute_cost(usage, p))
+}
+
+/// Slots 6 and 8 for one request: the token estimate, the context-window
+/// preflight (plan 05 step 8) and the admission reservation against the
+/// plan's first candidate (plan 05 step 4). Cache hits never reach here, so
+/// they are neither preflighted nor charged.
+async fn admit(
+    inner: &Arc<EngineInner>,
+    req: &EngineRequest,
+    plan: &RoutePlan,
+) -> Result<AdmissionTicket, EngineError> {
+    let first = plan.candidates.first();
+    let member = first.map_or("", |candidate| candidate.target.provider_name.as_str());
+    let model = first.map_or("", |candidate| candidate.target.upstream_model.as_str());
+    let estimated_input_tokens = crate::preflight::estimate_input_tokens(&inner.counter, &req.core);
+    let max_output_tokens = req
+        .core
+        .sampling
+        .max_tokens
+        .and_then(|n| u64::try_from(n).ok());
+    let preflight_config = inner
+        .config
+        .load()
+        .map(|config| config.server.preflight)
+        .unwrap_or_default();
+    let context_length = match inner.providers.get(member) {
+        Some(provider) => inner.catalogs.context_length(provider, model).await,
+        None => None,
+    };
+    crate::preflight::preflight(
+        preflight_config,
+        crate::preflight::PreflightInput {
+            model,
+            estimated_input_tokens,
+            max_output_tokens,
+            context_length,
+        },
+    )?;
+    let claim = crate::traits::AdmissionClaim {
+        caller: &req.caller,
+        provider: &req.provider_name,
+        member,
+        model,
+        requested_model: &req.core.model.requested,
+        body_hash: &req.body_hash,
+        estimated_input_tokens,
+        max_output_tokens,
+    };
+    inner.admission.reserve(&claim).await
 }
 
 /// Strips provider-bound request state for a failover target (plan 04 step
@@ -740,6 +810,9 @@ async fn run_once(
         let upstream_message_id = cached.id.clone();
         let cost = cached.cost.clone();
         let model = ledger_model(&req.core.model, &first_model);
+        // A hit is recorded as a hit (plan 05 step 6): the row keeps the
+        // cached usage for the record, but the request never reserved and
+        // is never charged — it did not reach admission.
         inner
             .usage
             .record(&ProxyEvent::ResponseCompleted(ResponseCompleted {
@@ -753,6 +826,7 @@ async fn run_once(
                 stop_reason,
                 latency_ms: 0,
                 credential_id: None,
+                cache_hit: true,
             }));
         cached.model = model;
         return Ok(EngineResponse {
@@ -761,20 +835,14 @@ async fn run_once(
         });
     }
 
-    // Slot 6: one reservation for the whole ladder; settlement happens
-    // exactly once at the end.
-    let claim = crate::traits::AdmissionClaim {
-        caller: &req.caller,
-        provider: &req.provider_name,
-        model: &first_model,
-        body_hash: &req.body_hash,
-    };
-    let ticket = inner.admission.reserve(&claim).await?;
+    // Slots 6 and 8: preflight, then one reservation for the whole ladder;
+    // settlement happens exactly once at the end.
+    let ticket = admit(inner, req, &plan).await?;
 
     match run_ladder_once(inner, req, plan, &ticket, &cache_key).await {
         Ok(response) => Ok(response),
         Err(error) => {
-            settle(inner, &ticket, false, None);
+            settle(inner, &ticket, false, None, None);
             Err(error)
         }
     }
@@ -934,11 +1002,7 @@ async fn run_ladder_once(
                     &attempt.target.upstream_model,
                 )
                 .cloned();
-            let cost = if core_resp.usage.provenance == UsageProvenance::ProviderReported {
-                pricing.as_ref().map(|p| compute_cost(&core_resp.usage, p))
-            } else {
-                None
-            };
+            let cost = billed_cost(&core_resp.usage, pricing.as_ref());
             core_resp.cost = cost.clone();
 
             emit_attempt(
@@ -956,8 +1020,9 @@ async fn run_ladder_once(
                 },
             );
 
-            // Slot 13: settle, store, record.
-            settle(inner, ticket, true, Some(&core_resp.usage));
+            // Slot 13: settle (charging what the provider billed), store,
+            // record.
+            settle(inner, ticket, true, Some(&core_resp.usage), cost.as_ref());
             let entry = CacheEntry {
                 response: core_resp.clone(),
                 events: Vec::new(),
@@ -1000,6 +1065,7 @@ async fn run_ladder_once(
                     stop_reason: resp_stop_reason,
                     latency_ms: latency.as_millis().try_into().unwrap_or(u64::MAX),
                     credential_id,
+                    cache_hit: false,
                 }));
 
             // Same-format passthrough: the upstream response body reaches the
@@ -1079,19 +1145,21 @@ pub(crate) async fn execute_stream(
         }
     }
 
-    // Slot 6: one reservation for the whole ladder.
-    let first_model = plan
-        .candidates
-        .first()
-        .map(|candidate| candidate.target.upstream_model.clone())
-        .unwrap_or_default();
-    let claim = crate::traits::AdmissionClaim {
-        caller: &req.caller,
-        provider: &req.provider_name,
-        model: &first_model,
-        body_hash: &req.body_hash,
+    // Slots 6 and 8: preflight, then one reservation for the whole ladder.
+    let ticket = match admit(&inner, &req, &plan).await {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            emit_response_failed(
+                &inner,
+                &req.request_id,
+                Some(&req.provider_name),
+                Some(&req.core.model),
+                &error,
+                start,
+            );
+            return Err(error);
+        }
     };
-    let ticket = inner.admission.reserve(&claim).await?;
 
     let request_id = req.request_id.clone();
     let route_name = req.provider_name.clone();
@@ -1202,6 +1270,24 @@ impl StreamContext {
     fn ledger_model(&self) -> ModelRef {
         ledger_model(&self.core.model, &self.upstream_model)
     }
+
+    /// Settles this stream's reservation with whatever usage the provider
+    /// reported so far and its billed cost (plan 05 step 6): a stream that
+    /// ends early still charges the tokens it consumed; one that reported
+    /// nothing charges nothing.
+    fn settle(&self, inner: &EngineInner, succeeded: bool) {
+        let cost = self
+            .pending_usage
+            .as_ref()
+            .and_then(|usage| billed_cost(usage, self.pricing.as_ref()));
+        settle(
+            inner,
+            &self.ticket,
+            succeeded,
+            self.pending_usage.as_ref(),
+            cost.as_ref(),
+        );
+    }
 }
 
 /// Records one failed attempt inline (encode failures never reach
@@ -1271,11 +1357,7 @@ fn record_stream_success(inner: &EngineInner, ctx: &StreamContext) {
         .pending_usage
         .clone()
         .unwrap_or_else(Usage::synthetic_zero);
-    let cost = if usage.provenance == UsageProvenance::ProviderReported {
-        ctx.pricing.as_ref().map(|p| compute_cost(&usage, p))
-    } else {
-        None
-    };
+    let cost = billed_cost(&usage, ctx.pricing.as_ref());
     inner
         .usage
         .record(&ProxyEvent::ResponseCompleted(ResponseCompleted {
@@ -1294,6 +1376,7 @@ fn record_stream_success(inner: &EngineInner, ctx: &StreamContext) {
                 .try_into()
                 .unwrap_or(u64::MAX),
             credential_id: ctx.credential_id.clone(),
+            cache_hit: false,
         }));
 }
 
@@ -1356,7 +1439,7 @@ async fn emit_final_events(
         capture_lifecycle(ctx, &core_event);
         if tx.send(core_event).await.is_err() {
             record_client_cancelled(inner, ctx);
-            settle(inner, &ctx.ticket, false, ctx.pending_usage.as_ref());
+            ctx.settle(inner, false);
             return false;
         }
     }
@@ -1459,7 +1542,7 @@ fn build_core_event_stream(
                 // The row above is deduplicated with the caller's first-byte
                 // error path; the reservation is not — only the task settles
                 // it, and it never reached that point.
-                settle(&inner, &supervise_ticket, false, None);
+                settle(&inner, &supervise_ticket, false, None, None);
             }
         }
     });
@@ -1500,12 +1583,7 @@ async fn commit_and_stream(
     if let Some(error) = vet_prefix(inner, &head).await {
         inner.metrics.record_failure();
         signal_pre_stream_error(inner, stream, error);
-        settle(
-            inner,
-            &committed.ctx.ticket,
-            false,
-            committed.ctx.pending_usage.as_ref(),
-        );
+        committed.ctx.settle(inner, false);
         return;
     }
     for core_event in head.iter() {
@@ -1541,12 +1619,7 @@ async fn commit_and_stream(
         // write the row here.
         inner.metrics.record_client_cancel();
         record_client_cancelled(inner, &committed.ctx);
-        settle(
-            inner,
-            &committed.ctx.ticket,
-            false,
-            committed.ctx.pending_usage.as_ref(),
-        );
+        committed.ctx.settle(inner, false);
         return;
     }
     stream_committed(inner, &mut committed.ctx, tx, committed.stream, cancel).await;
@@ -1812,7 +1885,7 @@ fn stop_with(inner: &Arc<EngineInner>, stream: &mut StreamLadder, error: EngineE
     };
     inner.metrics.record_failure();
     signal_pre_stream_error(inner, stream, final_error);
-    settle(inner, &stream.ticket, false, None);
+    settle(inner, &stream.ticket, false, None, None);
 }
 
 /// Slot 11 for streams: the guards vet the buffered prefix; the first
@@ -1887,7 +1960,7 @@ async fn buffer_pre_commit(
                 if !signalled {
                     record_client_cancelled(inner, &ctx);
                 }
-                settle(inner, &ctx.ticket, false, ctx.pending_usage.as_ref());
+                ctx.settle(inner, false);
                 return PreCommit::Stop;
             }
             _ = hold_expired(hold_deadline), if pending.is_empty() => {
@@ -1980,7 +2053,7 @@ async fn pre_commit_failure(
             let final_error = error.clone();
             inner.metrics.record_failure();
             signal_pre_stream_error(inner, stream, final_error);
-            settle(inner, &stream.ticket, false, None);
+            settle(inner, &stream.ticket, false, None, None);
             false
         }
         ErrorClass::Transient { retry_after } => {
@@ -1989,7 +2062,7 @@ async fn pre_commit_failure(
                 let final_error = exhausted(inner, &ladder.plan, ladder.seq, error.clone());
                 inner.metrics.record_failure();
                 signal_pre_stream_error(inner, stream, final_error);
-                settle(inner, &stream.ticket, false, None);
+                settle(inner, &stream.ticket, false, None, None);
                 false
             } else {
                 if !is_last_member_attempt {
@@ -2025,7 +2098,7 @@ async fn stream_committed(
             _ = cancel_clone.cancelled() => {
                 inner.metrics.record_client_cancel();
                 record_client_cancelled(inner, ctx);
-                settle(inner, &ctx.ticket, false, ctx.pending_usage.as_ref());
+                ctx.settle(inner, false);
                 return;
             }
             chunk = stream.next() => {
@@ -2098,14 +2171,14 @@ async fn stream_committed(
                                     );
                                     if tx.send(core_event).await.is_err() {
                                         record_client_cancelled(inner, ctx);
-                                        settle(inner, &ctx.ticket, false, ctx.pending_usage.as_ref());
+                                        ctx.settle(inner, false);
                                         return;
                                     }
                                     continue;
                                 }
                                 if tx.send(core_event).await.is_err() {
                                     record_client_cancelled(inner, ctx);
-                                    settle(inner, &ctx.ticket, false, ctx.pending_usage.as_ref());
+                                    ctx.settle(inner, false);
                                     return;
                                 }
                             }
@@ -2184,7 +2257,7 @@ async fn stream_committed(
         );
         if tx.send(CoreEvent::Error { error }).await.is_err() {
             record_client_cancelled(inner, ctx);
-            settle(inner, &ctx.ticket, false, ctx.pending_usage.as_ref());
+            ctx.settle(inner, false);
             return;
         }
     }
@@ -2203,10 +2276,10 @@ async fn stream_committed(
         }
     }
     if stream_failed {
-        settle(inner, &ctx.ticket, false, ctx.pending_usage.as_ref());
+        ctx.settle(inner, false);
     } else {
         record_stream_success(inner, ctx);
-        settle(inner, &ctx.ticket, true, ctx.pending_usage.as_ref());
+        ctx.settle(inner, true);
     }
 }
 

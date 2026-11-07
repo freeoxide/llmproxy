@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS requests (
     latency_ms            INTEGER,
     body_hash             TEXT,
     session_id            TEXT,
-    credential_id         TEXT
+    credential_id         TEXT,
+    cache_hit             INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp
     ON requests (received_at);
@@ -179,8 +180,11 @@ CREATE INDEX IF NOT EXISTS idx_attempts_created
 /// Columns appended to `requests` after its first release, as `(name, type)`.
 /// `CREATE TABLE IF NOT EXISTS` leaves an existing table's columns alone, so
 /// a ledger created by an earlier build gets them from [`migrate_schema`].
-const REQUESTS_COLUMNS_ADDED: &[(&str, &str)] =
-    &[("session_id", "TEXT"), ("credential_id", "TEXT")];
+const REQUESTS_COLUMNS_ADDED: &[(&str, &str)] = &[
+    ("session_id", "TEXT"),
+    ("credential_id", "TEXT"),
+    ("cache_hit", "INTEGER"),
+];
 
 fn open_connection(path: &Path) -> Result<Connection, StorageError> {
     let open_err = |source: rusqlite::Error| StorageError::Open {
@@ -322,9 +326,9 @@ fn upsert_response_completed(
                      cache_read_tokens, cache_creation_tokens, usage_provenance,
                      cost_input, cost_output, cost_cache_creation, cost_cache_read,
                      cost_reasoning, cost_total, stop_reason, latency_ms,
-                     credential_id
+                     credential_id, cache_hit
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                  ON CONFLICT(request_id) DO UPDATE SET
                      completed_at = excluded.completed_at,
                      provider = excluded.provider,
@@ -344,7 +348,8 @@ fn upsert_response_completed(
                      cost_total = excluded.cost_total,
                      stop_reason = excluded.stop_reason,
                      latency_ms = excluded.latency_ms,
-                     credential_id = excluded.credential_id",
+                     credential_id = excluded.credential_id,
+                     cache_hit = excluded.cache_hit",
         rusqlite::params![
             e.request_id,
             unix_millis(e.timestamp),
@@ -366,6 +371,7 @@ fn upsert_response_completed(
             stop_reason_label(&e.stop_reason),
             i64::try_from(e.latency_ms).unwrap_or(i64::MAX),
             e.credential_id,
+            i64::from(e.cache_hit),
         ],
     )?;
     Ok(())
@@ -797,6 +803,7 @@ mod tests {
             stop_reason: StopReason::Unknown("weird-finish".to_owned()),
             latency_ms: 4321,
             credential_id: None,
+            cache_hit: false,
         })
     }
 
