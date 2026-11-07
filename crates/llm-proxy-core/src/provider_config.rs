@@ -31,6 +31,88 @@ pub struct AppConfig {
     /// the in-memory no-op event bus (nothing is persisted).
     #[serde(default)]
     pub storage: Option<StorageConfig>,
+    /// Replica-shared state (plan 09 step 1, audit conflict 13): when set,
+    /// limits, cooldowns, budgets and usage live in the shared store, so
+    /// replicas enforce one policy between them. Requires the matching
+    /// optional store crate to be compiled in (`store-redis` /
+    /// `store-postgres` features of the daemon); with the feature off the
+    /// section is refused at startup.
+    #[serde(default)]
+    pub replica: Option<ReplicaConfig>,
+    /// MCP gateway (plan 09 step 6, audit conflict 17): its own listener,
+    /// auth and session model, sharing the proxy's admission and
+    /// accounting. Requires the `mcp-gateway` feature of the daemon.
+    #[serde(default)]
+    pub mcp: Option<McpGatewayConfig>,
+}
+
+/// Which shared store holds the replica state (plan 09 step 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaBackend {
+    /// Redis (`[replica]` with `backend = "redis"`): the
+    /// `llm-proxy-store-redis` crate.
+    Redis,
+    /// Postgres (`[replica]` with `backend = "postgres"`): the
+    /// `llm-proxy-store-postgres` crate.
+    Postgres,
+}
+
+/// Replica-shared state settings (`[replica]` section, plan 09 step 1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaConfig {
+    /// Which shared store holds limits, cooldowns, budgets and usage.
+    pub backend: ReplicaBackend,
+    /// Connection string (`redis://host:port` or
+    /// `postgres://user:pass@host/db`). Never serialized back out.
+    #[serde(skip_serializing)]
+    pub url: secrecy::SecretString,
+    /// Key prefix (Redis) all replicas must agree on; distinct prefixes
+    /// are distinct deployments.
+    #[serde(default = "default_replica_prefix")]
+    pub prefix: String,
+}
+
+fn default_replica_prefix() -> String {
+    "llm-proxy".to_owned()
+}
+
+/// One upstream MCP server the gateway exposes (plan 09 step 6).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpUpstreamConfig {
+    /// The name tools are namespaced under (`name__tool`).
+    pub name: String,
+    /// The upstream's MCP endpoint URL (streamable HTTP).
+    pub url: String,
+    /// The upstream's bearer token. Never serialized back out.
+    #[serde(skip_serializing)]
+    pub token: Option<secrecy::SecretString>,
+}
+
+/// MCP gateway settings (`[mcp]` section, plan 09 step 6): the gateway has
+/// its own auth (a separate token list) and session model, and shares the
+/// proxy's admission and accounting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpGatewayConfig {
+    /// The dedicated listener the gateway binds (its auth model is not the
+    /// proxy's, so it never shares a listener with it).
+    pub bind: std::net::SocketAddr,
+    /// Bearer tokens MCP clients may present. Empty refuses everyone.
+    #[serde(default, skip_serializing)]
+    pub tokens: Vec<secrecy::SecretString>,
+    /// The upstream MCP servers whose tools the gateway exposes.
+    #[serde(default)]
+    pub upstreams: Vec<McpUpstreamConfig>,
+    /// How long an idle gateway session survives.
+    #[serde(default = "default_mcp_session_ttl", with = "humantime_serde")]
+    pub session_ttl: Duration,
+}
+
+fn default_mcp_session_ttl() -> Duration {
+    Duration::from_secs(1800)
 }
 
 /// Named security postures for where the admin `/usage` API is reachable.
@@ -225,6 +307,56 @@ pub struct ServerConfig {
     /// are always kept; this adds export paths, off by default.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// Semantic cache (plan 09 step 5, conflict 7): off by default. When
+    /// enabled, prompts are embedded and near-duplicate hits (per caller)
+    /// reuse the stored response, under the data-class policy in
+    /// `docs/data-class-policy.md`.
+    #[serde(default)]
+    pub semantic_cache: SemanticCacheConfig,
+}
+
+/// Semantic cache settings (`[server.semantic_cache]`, plan 09 step 5):
+/// opt-in, caller-scoped, threshold-gated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticCacheConfig {
+    /// Whether the semantic cache is on. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long a cached response may be served.
+    #[serde(default = "default_semantic_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+    /// Bound on stored entries (per caller).
+    #[serde(default = "default_semantic_max_entries")]
+    pub max_entries: usize,
+    /// Cosine-similarity threshold in (0.0, 1.0]: a stored prompt must be
+    /// at least this similar to be served. 1.0 behaves like an exact
+    /// cache.
+    #[serde(default = "default_semantic_threshold")]
+    pub threshold: f32,
+}
+
+impl Default for SemanticCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl: default_semantic_ttl(),
+            max_entries: default_semantic_max_entries(),
+            threshold: default_semantic_threshold(),
+        }
+    }
+}
+
+fn default_semantic_ttl() -> Duration {
+    Duration::from_secs(600)
+}
+
+fn default_semantic_max_entries() -> usize {
+    256
+}
+
+fn default_semantic_threshold() -> f32 {
+    0.95
 }
 
 /// Per-endpoint-family settings (audit conflict 16): the body limit and
@@ -5236,6 +5368,102 @@ server_name = "test"
         )
         .unwrap();
         (directory, path)
+    }
+
+    #[test]
+    fn replica_section_parses_and_defaults_to_none() {
+        let (_dir, path) = write_app_config(
+            r#"
+[replica]
+backend = "redis"
+url = "redis://127.0.0.1:6379"
+prefix = "fleet-a""#,
+        );
+        let config = load_app_config(&path).expect("valid config with [replica]");
+        let replica = config.replica.as_ref().expect("section parsed");
+        assert!(matches!(replica.backend, super::ReplicaBackend::Redis));
+        assert_eq!(replica.prefix, "fleet-a");
+        assert_eq!(
+            replica.url.expose_secret(),
+            "redis://127.0.0.1:6379",
+            "the URL round-trips and never serializes back out"
+        );
+        assert!(
+            serde_json::to_value(replica).is_ok(),
+            "redacted serialization stays total"
+        );
+
+        let (_dir, path) = write_app_config("");
+        let config = load_app_config(&path).expect("valid config");
+        assert!(
+            config.replica.is_none(),
+            "absent [replica] keeps single-node state"
+        );
+    }
+
+    #[test]
+    fn replica_prefix_defaults_and_postgres_backend_parses() {
+        let (_dir, path) = write_app_config(
+            r#"
+[replica]
+backend = "postgres"
+url = "postgres://user:pass@db.example.com/llm""#,
+        );
+        let config = load_app_config(&path).expect("valid config with [replica]");
+        let replica = config.replica.as_ref().expect("section parsed");
+        assert!(matches!(replica.backend, super::ReplicaBackend::Postgres));
+        assert_eq!(
+            replica.prefix, "llm-proxy",
+            "an unset prefix defaults instead of rejecting"
+        );
+    }
+
+    #[test]
+    fn mcp_section_parses_with_defaults() {
+        let (_dir, path) = write_app_config(
+            r#"
+[mcp]
+bind = "127.0.0.1:3913"
+[[mcp.upstreams]]
+name = "docs"
+url = "https://mcp.example.com/mcp""#,
+        );
+        let config = load_app_config(&path).expect("valid config with [mcp]");
+        let mcp = config.mcp.as_ref().expect("section parsed");
+        assert_eq!(
+            mcp.bind,
+            "127.0.0.1:3913".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(mcp.upstreams.len(), 1);
+        assert_eq!(mcp.upstreams[0].name, "docs");
+        assert!(
+            mcp.tokens.is_empty(),
+            "no tokens configured refuses everyone"
+        );
+        assert_eq!(mcp.session_ttl, Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn semantic_cache_is_off_by_default_and_parses_opt_in() {
+        let (_dir, path) = write_app_config("");
+        let config = load_app_config(&path).expect("valid config");
+        assert!(
+            !config.server.semantic_cache.enabled,
+            "the semantic cache is off unless opted in"
+        );
+
+        let (_dir, path) = write_app_config(
+            r#"
+[server.semantic_cache]
+enabled = true
+ttl = "5m"
+max_entries = 64
+threshold = 0.9"#,
+        );
+        let config = load_app_config(&path).expect("valid config with [server.semantic_cache]");
+        assert!(config.server.semantic_cache.enabled);
+        assert_eq!(config.server.semantic_cache.ttl, Duration::from_secs(300));
+        assert_eq!(config.server.semantic_cache.max_entries, 64);
     }
 
     #[test]

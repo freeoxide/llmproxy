@@ -242,9 +242,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         edit(&mut app_config);
 
@@ -1349,9 +1352,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         let bus = Arc::new(RecordingBus::new());
         let state = AppState::new(
@@ -2753,9 +2759,12 @@ mod tests {
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
                     preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -3218,9 +3227,12 @@ mod tests {
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
                     preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -3460,9 +3472,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         AppState::new(
             app_config,

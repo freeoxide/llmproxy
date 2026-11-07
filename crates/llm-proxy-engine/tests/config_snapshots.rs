@@ -50,9 +50,12 @@ fn config_with_preflight(mode: PreflightMode) -> AppConfig {
                 mode,
                 margin_tokens: 0,
             },
+            semantic_cache: Default::default(),
         },
         auth: Default::default(),
         storage: None,
+        replica: None,
+        mcp: None,
     }
 }
 

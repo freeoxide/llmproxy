@@ -138,9 +138,12 @@ fn state_with(
             upstream_timeouts: Default::default(),
             bare_v1: bare,
             preflight: Default::default(),
+            semantic_cache: Default::default(),
         },
         auth: Default::default(),
         storage: None,
+        replica: None,
+        mcp: None,
     };
     let registry = ProviderRegistry::from_parts(providers, pools).expect("registry with pool");
     AppState::new(

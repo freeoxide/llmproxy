@@ -344,12 +344,13 @@ server_name = "reload-test"
         .with_body_hash("hash")
     }
 
-    fn state_for(dir: &Path) -> llm_proxy_server::AppState {
+    async fn state_for(dir: &Path) -> llm_proxy_server::AppState {
         crate::state::load_toml_state(
             &dir.join("config.toml"),
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect("state builds")
     }
 
@@ -366,7 +367,7 @@ server_name = "reload-test"
         write_provider(dir.path(), "quick", &quick_endpoint, 2);
         let _config = write_config(dir.path(), "");
 
-        let state = state_for(dir.path());
+        let state = state_for(dir.path()).await;
         let engine = state.engine().expect("engine builds");
 
         // Fire a request at the slow provider; it will still be in flight
@@ -419,7 +420,7 @@ server_name = "reload-test"
         write_provider(dir.path(), "prov", &endpoint, 1);
         let _initial = write_config(dir.path(), "");
 
-        let state = state_for(dir.path());
+        let state = state_for(dir.path()).await;
         let engine_before = state.engine().expect("engine builds");
         let registry_before = state.providers();
 
@@ -478,7 +479,7 @@ server_name = "reload-test"
         write_provider(dir.path(), "good", &endpoint, 1);
         write_provider(dir.path(), "also-good", &endpoint, 2);
         let path = write_config(dir.path(), "");
-        let state = state_for(dir.path());
+        let state = state_for(dir.path()).await;
         let engine_before = state.engine().expect("engine builds");
 
         // Corrupt one provider file.
@@ -505,7 +506,7 @@ server_name = "reload-test"
         write_provider(dir.path(), "keep", &endpoint, 1);
         write_provider(dir.path(), "drop-me", &endpoint, 2);
         let path = write_config(dir.path(), "");
-        let state = state_for(dir.path());
+        let state = state_for(dir.path()).await;
         state.engine().expect("engine builds");
 
         std::fs::remove_file(dir.path().join("providers/drop-me.toml")).expect("remove");
@@ -535,7 +536,7 @@ server_name = "reload-test"
         write_provider(dir.path(), "prov", &endpoint, 1);
         let _startup_config = write_config(dir.path(), "");
 
-        let state = state_for(dir.path());
+        let state = state_for(dir.path()).await;
         let engine_before = state.engine().expect("engine builds");
 
         // Move the port in the file; nothing else changes.
@@ -589,6 +590,7 @@ server_name = "reload-test"
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             Some(3999),
         )
+        .await
         .expect("state builds with the CLI port");
         state.engine().expect("engine builds");
 
@@ -634,7 +636,7 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$bi0KNLfLnc1qQxSai7uQ
             p
         };
 
-        let state = state_for(dir.path());
+        let state = state_for(dir.path()).await;
         let engine_before = state.engine().expect("engine builds");
 
         // Rotate the verifier under the same key id, touching nothing else.
@@ -685,7 +687,7 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mj
         let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
         write_provider(dir.path(), "prov", &endpoint, 1);
         let path = write_config(dir.path(), "");
-        let state = state_for(dir.path());
+        let state = state_for(dir.path()).await;
         state.engine().expect("engine builds");
         let snapshot_before = state.config_source().load().expect("startup snapshot");
 

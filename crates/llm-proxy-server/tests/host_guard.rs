@@ -45,9 +45,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth,
             storage: None,
+            replica: None,
+            mcp: None,
         }
     }
 
@@ -385,9 +388,12 @@ mod loop_guard_tests {
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
                     preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: AuthConfig::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),

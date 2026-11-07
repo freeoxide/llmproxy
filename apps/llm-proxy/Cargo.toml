@@ -21,6 +21,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Replica-shared stores (plan 09 step 1): `[replica]` in config refuses to
+# start without the matching feature.
+store-redis = ["dep:llm-proxy-store-redis"]
+store-postgres = ["dep:llm-proxy-store-postgres"]
+
 [dependencies]
 llm-proxy-server = { workspace = true, features = ["admin"] }
 
@@ -36,6 +43,8 @@ llm-proxy-adapters = { workspace = true }
 llm-proxy-transport = { workspace = true }
 llm-proxy-engine = { workspace = true }
 llm-proxy-storage = { workspace = true, features = ["sqlite"] }
+llm-proxy-store-redis = { workspace = true, optional = true }
+llm-proxy-store-postgres = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }

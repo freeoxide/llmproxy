@@ -59,7 +59,8 @@ pub async fn cmd_serve(
 
     let adapter_registry = ProviderAdapterRegistry::builtin();
 
-    let state = crate::state::load_toml_state_from_config(app_config, &path, adapter_registry)?;
+    let state =
+        crate::state::load_toml_state_from_config(app_config, &path, adapter_registry).await?;
 
     let admin = bind_admin_listener(&state).await?;
 

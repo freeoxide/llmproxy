@@ -698,3 +698,20 @@ pub fn replica_admission(
         Arc::new(RedisAdmissionBackend::new(store)),
     )
 }
+
+/// The daemon's replica path: the same config surfaces
+/// [`PolicyAdmission::from_config`](llm_proxy_engine::PolicyAdmission::from_config)
+/// reads — per-key policies from `[auth.clients]`, pricing and concurrency
+/// caps from the provider registry — over the shared store.
+#[must_use]
+pub fn replica_admission_over_config(
+    auth: &llm_proxy_core::AuthConfig,
+    providers: &llm_proxy_core::ProviderRegistry,
+    store: RedisStore,
+) -> PolicyAdmission {
+    PolicyAdmission::over_config_backend(
+        auth,
+        providers,
+        Arc::new(RedisAdmissionBackend::new(store)),
+    )
+}

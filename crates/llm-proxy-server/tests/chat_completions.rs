@@ -205,9 +205,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
 
         AppState::new(
@@ -395,9 +398,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(
@@ -472,9 +478,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         AppState::new(
             app_config,
@@ -1897,9 +1906,12 @@ mod tests {
                     upstream_timeouts: Default::default(),
                     bare_v1: Default::default(),
                     preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),

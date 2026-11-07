@@ -76,6 +76,7 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,
@@ -88,6 +89,8 @@ mod tests {
                 max_rows: None,
                 prune_interval: Duration::from_secs(3600),
             }),
+            replica: None,
+            mcp: None,
         }
     }
 

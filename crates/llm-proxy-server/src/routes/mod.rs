@@ -506,6 +506,7 @@ mod auth_gate_tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::ClientKeys,
@@ -513,6 +514,8 @@ mod auth_gate_tests {
                 admin: None,
             },
             storage: None,
+            replica: None,
+            mcp: None,
         };
 
         let state = crate::state::AppState::new(

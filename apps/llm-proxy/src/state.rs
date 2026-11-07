@@ -20,7 +20,7 @@ use crate::paths::providers_dir_for;
 /// loads the config itself (before tracing init, BUG-25) and calls
 /// [`load_toml_state_from_config`].
 #[cfg(test)]
-pub(crate) fn load_toml_state(
+pub(crate) async fn load_toml_state(
     path: &Path,
     adapter_registry: ProviderAdapterRegistry,
     port_override: Option<u16>,
@@ -34,13 +34,13 @@ pub(crate) fn load_toml_state(
         app_config.server.bind = bind;
     }
 
-    load_toml_state_from_config(app_config, path, adapter_registry)
+    load_toml_state_from_config(app_config, path, adapter_registry).await
 }
 
 /// Build the serving state from an already-loaded config: the path the serve
 /// command takes, so it can initialize the tracing subscriber from the
 /// config's `server.log_format` before anything logs through it (BUG-25).
-pub fn load_toml_state_from_config(
+pub async fn load_toml_state_from_config(
     app_config: AppConfig,
     path: &Path,
     adapter_registry: ProviderAdapterRegistry,
@@ -75,9 +75,9 @@ pub fn load_toml_state_from_config(
 
     warn_admin_posture(&app_config);
 
-    Ok(AppState::new_with_catalog_dir(
-        app_config,
-        registry,
+    let base = AppState::new_with_catalog_dir(
+        app_config.clone(),
+        registry.clone(),
         adapter_registry,
         proxy_client,
         build_info(),
@@ -85,7 +85,8 @@ pub fn load_toml_state_from_config(
     )
     .with_client_auth(std::sync::Arc::new(client_auth))
     .with_egress_clients(egress_clients)
-    .with_event_bus(event_bus))
+    .with_event_bus(event_bus);
+    crate::replica::apply_replica(&app_config, &registry, base).await
 }
 
 /// Loads the provider and pool registry from the directory beside
@@ -537,6 +538,7 @@ path = \"{}\"
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect("state with [storage]");
 
         let debug = format!("{state:?}");
@@ -585,6 +587,7 @@ path = \"{}\"
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect("state without [storage]");
 
         let debug = format!("{state:?}");
@@ -652,6 +655,7 @@ chat_completions = "chat"
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect("state builds with an egress provider");
 
         let debug = format!("{state:?}");
@@ -688,6 +692,7 @@ chat_completions = "chat"
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect_err("unusable egress proxy must be a startup error");
 
         let message = format!("{err:#}");
@@ -736,6 +741,7 @@ enabled = true
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect_err("a bare /v1 model mapping to an unknown target must fail startup");
 
         let message = format!("{err:#}");
@@ -756,6 +762,7 @@ enabled = true
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect("a bare /v1 target naming a configured provider builds the state");
     }
 
@@ -785,6 +792,7 @@ enabled = true
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,
@@ -799,6 +807,8 @@ enabled = true
                 max_rows: None,
                 prune_interval: std::time::Duration::from_secs(3600),
             }),
+            replica: None,
+            mcp: None,
         }
     }
 
@@ -889,8 +899,8 @@ server_name = "t"
         path
     }
 
-    #[test]
-    fn startup_refuses_an_upstream_on_the_own_listener() {
+    #[tokio::test]
+    async fn startup_refuses_an_upstream_on_the_own_listener() {
         let dir = tempfile::tempdir().unwrap();
         // The main listener binds 127.0.0.1:3456; an upstream on the same
         // loopback port (spelled by name, so DNS resolution is exercised)
@@ -901,6 +911,7 @@ server_name = "t"
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect_err("startup must refuse a self-referential upstream");
         let message = format!("{err:#}");
         assert!(
@@ -909,8 +920,8 @@ server_name = "t"
         );
     }
 
-    #[test]
-    fn startup_accepts_an_upstream_on_another_port() {
+    #[tokio::test]
+    async fn startup_accepts_an_upstream_on_another_port() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), "http://127.0.0.1:4567/v1/chat/completions");
         load_toml_state(
@@ -918,6 +929,47 @@ server_name = "t"
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
+        .await
         .expect("an upstream on another port is not a loop");
+    }
+
+    #[tokio::test]
+    async fn replica_config_without_the_feature_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3457"
+request_timeout = "300s"
+log_level = "info"
+server_name = "replica-refusal"
+
+[replica]
+backend = "redis"
+url = "redis://127.0.0.1:6379"
+"#,
+        )
+        .unwrap();
+        let result = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await;
+        // With the store-redis feature this build actually connects (and
+        // fails on the absent server); without it, the refusal must name
+        // the feature rather than silently running single-node.
+        match result {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("replica") || message.contains("connecting"),
+                    "the failure must name the replica wiring, got: {message}"
+                );
+            }
+            Ok(_) => panic!("[replica] must never start single-node silently"),
+        }
     }
 }

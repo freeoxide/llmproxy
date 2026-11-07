@@ -47,6 +47,13 @@ pub struct AppState {
     /// 07 step 10): swapping the whole immutable snapshot is the one update
     /// path; nothing merges into a live one.
     pub(crate) config_source: Arc<llm_proxy_engine::SwappingConfigSource>,
+    /// A replica-shared admission step (plan 09 step 1), injected by the
+    /// daemon when `[replica]` is configured: it replaces the in-process
+    /// one wholesale — the rules are the same, the counters are shared.
+    pub(crate) admission_override: Option<Arc<dyn llm_proxy_engine::Admission>>,
+    /// Replica-shared cooldowns (plan 09 step 1): one replica's cooldown is
+    /// every replica's.
+    pub(crate) cooldowns_override: Option<Arc<dyn llm_proxy_engine::Cooldowns>>,
     /// Shared by every clone of this state: axum hands each request its own
     /// `AppState` clone, and the engine carries process-wide state (response
     /// cache, single-flight, idempotency, cooldowns), so a per-clone cell
@@ -179,6 +186,8 @@ impl AppState {
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
             client_auth,
             config_source,
+            admission_override: None,
+            cooldowns_override: None,
             engine: Arc::new(EngineSlot::default()),
         }
     }
@@ -207,6 +216,23 @@ impl AppState {
     #[must_use]
     pub fn with_event_bus(mut self, event_bus: Arc<dyn EventBus>) -> Self {
         self.event_bus = event_bus;
+        self
+    }
+
+    /// Replace the admission step with a replica-shared one (plan 09 step
+    /// 1): the daemon injects this when `[replica]` is configured, so the
+    /// same rules run over shared counters instead of this process's.
+    #[must_use]
+    pub fn with_admission(mut self, admission: Arc<dyn llm_proxy_engine::Admission>) -> Self {
+        self.admission_override = Some(admission);
+        self
+    }
+
+    /// Replace the cooldown view with a replica-shared one (plan 09 step
+    /// 1).
+    #[must_use]
+    pub fn with_cooldowns(mut self, cooldowns: Arc<dyn llm_proxy_engine::Cooldowns>) -> Self {
+        self.cooldowns_override = Some(cooldowns);
         self
     }
 
@@ -325,10 +351,19 @@ impl AppState {
         // The one admission step (plan 05): per-key policies from
         // [auth.clients] and caps from [provider.concurrency] — read off the
         // registry this engine routes through. With neither configured the
-        // engine keeps its allow-all default.
-        let admission = llm_proxy_engine::PolicyAdmission::from_config(&config.auth, providers);
-        if !admission.is_noop() {
-            builder = builder.admission(Arc::new(admission));
+        // engine keeps its allow-all default. A replica-shared override
+        // (plan 09 step 1) replaces it wholesale: same rules, shared
+        // counters.
+        if let Some(admission) = self.admission_override.clone() {
+            builder = builder.admission(admission);
+        } else {
+            let admission = llm_proxy_engine::PolicyAdmission::from_config(&config.auth, providers);
+            if !admission.is_noop() {
+                builder = builder.admission(Arc::new(admission));
+            }
+        }
+        if let Some(cooldowns) = self.cooldowns_override.clone() {
+            builder = builder.cooldowns(cooldowns);
         }
         // The opt-in response cache (plan 06): off by default, so with
         // no [server.cache] the engine keeps its store-nothing default.
@@ -410,9 +445,12 @@ mod tests {
                 upstream_timeouts: Default::default(),
                 bare_v1: Default::default(),
                 preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         }
     }
 

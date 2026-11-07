@@ -2477,6 +2477,8 @@ dependencies = [
  "llm-proxy-protocol",
  "llm-proxy-server",
  "llm-proxy-storage",
+ "llm-proxy-store-postgres",
+ "llm-proxy-store-redis",
  "llm-proxy-transport",
  "opentelemetry",
  "opentelemetry-otlp",

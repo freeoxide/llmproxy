@@ -208,6 +208,63 @@ impl PolicyAdmission {
         Self::over_backend(keys, pricing, caps, Arc::new(MemoryAdmissionBackend::new()))
     }
 
+    /// Builds from the same config surfaces [`PolicyAdmission::from_config`]
+    /// reads, over an [`AdmissionBackend`] — what a replica deployment
+    /// (plan 09 step 1) builds: identical rules, shared counters.
+    #[must_use]
+    pub fn over_config_backend(
+        auth: &AuthConfig,
+        providers: &ProviderRegistry,
+        backend: Arc<dyn AdmissionBackend>,
+    ) -> Self {
+        let keys = auth
+            .clients
+            .iter()
+            .filter_map(|(id, spec)| match spec {
+                ClientKeySpec::Verifier(_) => None,
+                ClientKeySpec::Policy {
+                    allow_models,
+                    allow_providers,
+                    limits,
+                    budget,
+                    ..
+                } => Some((
+                    id.clone(),
+                    KeyPolicy {
+                        allow_models: allow_models.clone(),
+                        allow_providers: allow_providers.clone(),
+                        limits: limits.clone().unwrap_or_default(),
+                        budget: budget.clone(),
+                    },
+                )),
+            })
+            .collect();
+        let mut pricing = HashMap::new();
+        let mut caps: HashMap<String, (Option<u32>, HashMap<String, u32>)> = HashMap::new();
+        for provider in providers.iter() {
+            for (model, price) in &provider.pricing {
+                pricing.insert(
+                    (provider.name.clone(), model.as_str().to_owned()),
+                    price.clone(),
+                );
+            }
+            if let Some(concurrency) = &provider.concurrency {
+                caps.insert(
+                    provider.name.clone(),
+                    (
+                        concurrency.total,
+                        concurrency
+                            .models
+                            .iter()
+                            .map(|(model, cap)| (model.as_str().to_owned(), *cap))
+                            .collect(),
+                    ),
+                );
+            }
+        }
+        Self::over_backend(keys, pricing, caps, backend)
+    }
+
     /// Builds with the counters held by an [`AdmissionBackend`] — the
     /// replica path (plan 09 step 1): a shared backend makes two instances
     /// enforce one budget between them. The rules stay here.

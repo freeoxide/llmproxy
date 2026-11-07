@@ -36,9 +36,12 @@ fn app_config() -> core::AppConfig {
             upstream_timeouts: Default::default(),
             bare_v1: Default::default(),
             preflight: Default::default(),
+            semantic_cache: Default::default(),
         },
         auth: Default::default(),
         storage: None,
+        replica: None,
+        mcp: None,
     }
 }
 
