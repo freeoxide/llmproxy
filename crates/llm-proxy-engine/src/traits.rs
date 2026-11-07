@@ -294,7 +294,10 @@ pub struct AdmissionTicket {
     pub reserved: Option<u64>,
     /// An implementation-defined handle to the reservation record, so
     /// settlement can find what was reserved. `None` when nothing was.
-    pub lease: Option<u64>,
+    pub lease: Option<crate::admission_backend::LeaseId>,
+    /// The caller the reservation was made for, so settlement diagnostics
+    /// can name it without the backend knowing the policy tables.
+    pub caller: Option<String>,
 }
 
 /// The outcome handed back at settlement.

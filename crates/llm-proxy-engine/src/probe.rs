@@ -52,7 +52,8 @@ async fn probe_members(inner: &Arc<EngineInner>, pool_name: &str, members: &[Str
     for member in members {
         if inner
             .health
-            .provider_available(member, std::time::Instant::now())
+            .provider_available(member, time::OffsetDateTime::now_utc())
+            .await
         {
             // Healthy members are never probed: probes cost a request.
             continue;
@@ -64,7 +65,7 @@ async fn probe_members(inner: &Arc<EngineInner>, pool_name: &str, members: &[Str
                     member = %member,
                     "health probe succeeded; clearing cooldown"
                 );
-                inner.health.clear_provider(member);
+                inner.health.clear_provider(member).await;
             }
             Err(error) => {
                 tracing::debug!(
@@ -106,7 +107,8 @@ async fn probe_member(inner: &Arc<EngineInner>, member: &str) -> Result<(), Engi
     let keys = probe_credential_pool(inner, member);
     let cooling = inner
         .health
-        .cooling_credentials(member, std::time::Instant::now());
+        .cooling_credentials(member, time::OffsetDateTime::now_utc())
+        .await;
     let credential = inner
         .credentials
         .pick(&crate::traits::CredentialQuery {
@@ -202,7 +204,7 @@ fn probe_request(model: &str, upstream_model: &str) -> CoreRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::health::CooldownStore;
+    use crate::health::{CooldownStore, Cooldowns};
     use std::time::Duration;
 
     #[test]
@@ -213,16 +215,18 @@ mod tests {
         assert_eq!(request.model.upstream.as_deref(), Some("m-upstream"));
     }
 
-    #[test]
-    fn clearing_a_cooldown_makes_the_member_available_again() {
+    #[tokio::test]
+    async fn clearing_a_cooldown_makes_the_member_available_again() {
         let store = CooldownStore::new();
-        let now = std::time::Instant::now();
-        store.cooldown_provider("member", now + Duration::from_secs(600));
-        assert!(!store.provider_available("member", now));
+        let now = time::OffsetDateTime::now_utc();
+        store
+            .cooldown_provider("member", now + Duration::from_secs(600))
+            .await;
+        assert!(!store.provider_available("member", now).await);
         // What a successful probe does:
-        store.clear_provider("member");
+        store.clear_provider("member").await;
         assert!(
-            store.provider_available("member", now),
+            store.provider_available("member", now).await,
             "a probe success restores capacity immediately"
         );
     }

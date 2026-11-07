@@ -38,14 +38,16 @@
 //!   cap checked against) the member about to serve, so a capped member
 //!   is capped however the request reaches it.
 //!
-//! Every check and every mutation happens under one lock, so a reservation
-//! is atomic across all four rules. Keys without a policy entry and the
-//! anonymous caller are unrestricted; a provider without
-//! `[provider.concurrency]` is uncapped.
+//! Since plan 09 the counters live behind one
+//! [`AdmissionBackend`](crate::admission_backend::AdmissionBackend): the
+//! in-process [`MemoryAdmissionBackend`](crate::admission_backend::MemoryAdmissionBackend)
+//! by default, or a shared store from the optional
+//! `llm-proxy-store-redis` / `llm-proxy-store-postgres` crates, so replicas
+//! enforce one budget between them. This type holds only the rules; every
+//! check-and-commit stays atomic inside the backend.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use llm_proxy_core::{
@@ -54,30 +56,13 @@ use llm_proxy_core::{
 };
 use llm_proxy_protocol::core::Usage;
 use rust_decimal::Decimal;
-use time::{Date, OffsetDateTime};
+use time::OffsetDateTime;
 
+use crate::admission_backend::{
+    AdmissionBackend, MemoryAdmissionBackend, MicroUsd, ReservationDemand, Settlement, to_micro_usd,
+};
 use crate::error::EngineError;
 use crate::traits::{Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket};
-
-/// The wait advised when a concurrency cap is saturated: short, because a
-/// slot frees as soon as any in-flight request settles.
-const SATURATED_RETRY_AFTER: Duration = Duration::from_secs(1);
-
-/// The refusal a saturated member cap answers with (step 7).
-fn member_saturated(member: &str, cap: u32) -> EngineError {
-    EngineError::Overloaded {
-        message: format!("provider \"{member}\" is at its in-flight cap of {cap}"),
-        retry_after: Some(SATURATED_RETRY_AFTER),
-    }
-}
-
-/// The refusal a saturated per-model cap answers with (step 7).
-fn model_saturated(model: &str, member: &str, cap: u32) -> EngineError {
-    EngineError::Overloaded {
-        message: format!("model \"{model}\" on \"{member}\" is at its in-flight cap of {cap}"),
-        retry_after: Some(SATURATED_RETRY_AFTER),
-    }
-}
 
 /// One key's admission policy, as configured.
 #[derive(Debug, Clone, Default)]
@@ -110,102 +95,41 @@ struct MemberCaps {
 
 type Clock = Box<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
-/// Per-minute counters for one key.
-#[derive(Debug, Default)]
-struct MinuteWindow {
-    /// Unix minute this window counts.
-    minute: i64,
-    requests: u64,
-    /// Settled token totals.
-    tokens: u64,
-    /// In-flight token reservations.
-    reserved_tokens: u64,
+fn total_tokens(usage: &Usage) -> u64 {
+    let parts = [
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_creation_input_tokens.unwrap_or(0),
+        usage.cache_read_input_tokens.unwrap_or(0),
+        usage.reasoning_tokens.unwrap_or(0),
+    ];
+    parts
+        .into_iter()
+        .map(|count| u64::try_from(count).unwrap_or(0))
+        .sum()
 }
 
-/// Per-day counters for one key.
-#[derive(Debug)]
-struct DayWindow {
-    day: Date,
-    requests: u64,
-    /// Settled spend.
-    spent: Decimal,
-    /// In-flight spend reservations.
-    reserved: Decimal,
-}
-
-#[derive(Debug)]
-struct KeyState {
-    minute: MinuteWindow,
-    day: DayWindow,
-}
-
-impl KeyState {
-    fn fresh(now: OffsetDateTime) -> Self {
-        Self {
-            minute: MinuteWindow {
-                minute: unix_minute(now),
-                ..MinuteWindow::default()
-            },
-            day: DayWindow {
-                day: now.date(),
-                requests: 0,
-                spent: Decimal::ZERO,
-                reserved: Decimal::ZERO,
-            },
-        }
+/// Whether `value` (or `alternate`) matches any glob; an empty list allows
+/// everything, and a restricted list with nothing to match fails closed.
+fn allowed_by(globs: &[String], value: &str, alternate: &str) -> bool {
+    if globs.is_empty() {
+        return true;
     }
-
-    /// Rolls the windows forward when the clock crossed a boundary.
-    fn roll(&mut self, now: OffsetDateTime) {
-        let minute = unix_minute(now);
-        if self.minute.minute != minute {
-            self.minute = MinuteWindow {
-                minute,
-                ..MinuteWindow::default()
-            };
-        }
-        if self.day.day != now.date() {
-            self.day = DayWindow {
-                day: now.date(),
-                requests: 0,
-                spent: Decimal::ZERO,
-                reserved: Decimal::ZERO,
-            };
-        }
-    }
-}
-
-/// What one reservation holds, so settlement can release exactly it.
-#[derive(Debug)]
-struct Lease {
-    caller: String,
-    member: String,
-    model: String,
-    minute: i64,
-    day: Date,
-    reserved_tokens: u64,
-    reserved_usd: Decimal,
-    holds_member_slot: bool,
-    holds_model_slot: bool,
-}
-
-#[derive(Debug, Default)]
-struct State {
-    keys: HashMap<String, KeyState>,
-    leases: HashMap<u64, Lease>,
-    next_lease: u64,
-    inflight_members: HashMap<String, u32>,
-    inflight_models: HashMap<(String, String), u32>,
+    [value, alternate]
+        .into_iter()
+        .filter(|candidate| !candidate.is_empty())
+        .any(|candidate| globs.iter().any(|glob| glob_match(glob, candidate)))
 }
 
 /// The configured [`Admission`]: allowlists, windows, budgets and
-/// concurrency caps from `[auth.clients]` and `[provider.concurrency]`.
+/// concurrency caps from `[auth.clients]` and `[provider.concurrency]`,
+/// with the counters held by an [`AdmissionBackend`].
 pub struct PolicyAdmission {
     keys: HashMap<String, KeyPolicy>,
     pricing: HashMap<(String, String), ModelPricing>,
     caps: HashMap<String, MemberCaps>,
     clock: Clock,
-    state: Mutex<State>,
+    backend: Arc<dyn AdmissionBackend>,
 }
 
 impl std::fmt::Debug for PolicyAdmission {
@@ -214,13 +138,15 @@ impl std::fmt::Debug for PolicyAdmission {
             .field("keys", &self.keys.keys().collect::<Vec<_>>())
             .field("priced_models", &self.pricing.len())
             .field("capped_members", &self.caps.keys().collect::<Vec<_>>())
+            .field("backend", &self.backend)
             .finish_non_exhaustive()
     }
 }
 
 impl PolicyAdmission {
     /// Builds the admission step from the auth section (per-key policies)
-    /// and the provider registry (pricing for estimates, concurrency caps).
+    /// and the provider registry (pricing for estimates, concurrency caps),
+    /// keeping its counters in this process.
     #[must_use]
     pub fn from_config(auth: &AuthConfig, providers: &ProviderRegistry) -> Self {
         let keys = auth
@@ -279,6 +205,19 @@ impl PolicyAdmission {
         pricing: HashMap<(String, String), ModelPricing>,
         caps: HashMap<String, (Option<u32>, HashMap<String, u32>)>,
     ) -> Self {
+        Self::over_backend(keys, pricing, caps, Arc::new(MemoryAdmissionBackend::new()))
+    }
+
+    /// Builds with the counters held by an [`AdmissionBackend`] — the
+    /// replica path (plan 09 step 1): a shared backend makes two instances
+    /// enforce one budget between them. The rules stay here.
+    #[must_use]
+    pub fn over_backend(
+        keys: HashMap<String, KeyPolicy>,
+        pricing: HashMap<(String, String), ModelPricing>,
+        caps: HashMap<String, (Option<u32>, HashMap<String, u32>)>,
+        backend: Arc<dyn AdmissionBackend>,
+    ) -> Self {
         Self {
             keys,
             pricing,
@@ -287,8 +226,15 @@ impl PolicyAdmission {
                 .map(|(member, (total, models))| (member, MemberCaps { total, models }))
                 .collect(),
             clock: Box::new(OffsetDateTime::now_utc),
-            state: Mutex::new(State::default()),
+            backend,
         }
+    }
+
+    /// The backend holding this admission's counters (the shared store a
+    /// replica deployment was built with).
+    #[must_use]
+    pub fn backend(&self) -> &Arc<dyn AdmissionBackend> {
+        &self.backend
     }
 
     /// Replace the clock the windows read (tests drive it by hand).
@@ -312,20 +258,13 @@ impl PolicyAdmission {
             && self.caps.is_empty()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("admission state poisoned; recovering");
-            poisoned.into_inner()
-        })
-    }
-
     /// The reservation a budgeted key needs for this claim, or the refusal
     /// its unestimatable policy dictates.
     fn estimate_usd(
         &self,
         claim: &AdmissionClaim<'_>,
         budget: &KeyBudgetConfig,
-    ) -> Result<Decimal, EngineError> {
+    ) -> Result<MicroUsd, EngineError> {
         let Some(price) = self
             .pricing
             .get(&(claim.member.to_owned(), claim.model.to_owned()))
@@ -338,7 +277,7 @@ impl PolicyAdmission {
                     ),
                     retry_after: None,
                 }),
-                UnestimatableCostPolicy::ReserveUsd { usd } => Ok(*usd),
+                UnestimatableCostPolicy::ReserveUsd { usd } => Ok(to_micro_usd(*usd)),
             };
         };
         let output = claim
@@ -350,59 +289,22 @@ impl PolicyAdmission {
         let output_cost = Decimal::from(output)
             .checked_mul(price.output)
             .unwrap_or(Decimal::MAX);
-        Ok(input_cost.checked_add(output_cost).unwrap_or(Decimal::MAX))
+        Ok(to_micro_usd(
+            input_cost.checked_add(output_cost).unwrap_or(Decimal::MAX),
+        ))
     }
-}
 
-fn unix_minute(now: OffsetDateTime) -> i64 {
-    now.unix_timestamp().div_euclid(60)
-}
-
-/// Seconds until the next calendar minute starts.
-fn until_next_minute(now: OffsetDateTime) -> Duration {
-    let elapsed = now.unix_timestamp().rem_euclid(60);
-    Duration::from_secs((60 - elapsed).clamp(1, 60).unsigned_abs())
-}
-
-/// Seconds until the next UTC day starts.
-fn until_next_day(now: OffsetDateTime) -> Duration {
-    let (hours, minutes, seconds) = now.time().as_hms();
-    let elapsed = i64::from(hours) * 3600 + i64::from(minutes) * 60 + i64::from(seconds);
-    Duration::from_secs((86_400 - elapsed).clamp(1, 86_400).unsigned_abs())
-}
-
-fn total_tokens(usage: &Usage) -> u64 {
-    let parts = [
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_creation_input_tokens.unwrap_or(0),
-        usage.cache_read_input_tokens.unwrap_or(0),
-        usage.reasoning_tokens.unwrap_or(0),
-    ];
-    parts
-        .into_iter()
-        .map(|count| u64::try_from(count).unwrap_or(0))
-        .sum()
-}
-
-/// Whether `value` (or `alternate`) matches any glob; an empty list allows
-/// everything, and a restricted list with nothing to match fails closed.
-fn allowed_by(globs: &[String], value: &str, alternate: &str) -> bool {
-    if globs.is_empty() {
-        return true;
+    fn caps_for(&self, member: &str, model: &str) -> (Option<u32>, Option<u32>) {
+        let caps = self.caps.get(member);
+        (
+            caps.and_then(|c| c.total),
+            caps.and_then(|c| c.models.get(model).copied()),
+        )
     }
-    [value, alternate]
-        .into_iter()
-        .filter(|candidate| !candidate.is_empty())
-        .any(|candidate| globs.iter().any(|glob| glob_match(glob, candidate)))
 }
 
 #[async_trait]
 impl Admission for PolicyAdmission {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the four rules are checked and then committed under one lock; splitting them would scatter the atomic reservation"
-    )]
     async fn reserve(&self, claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
         let now = (self.clock)();
         let policy = self.keys.get(claim.caller);
@@ -434,301 +336,94 @@ impl Admission for PolicyAdmission {
             }
         }
 
-        // Budget estimate is computed before the lock: it reads only config.
-        let reserved_usd = match policy.and_then(|p| p.budget.as_ref()) {
-            Some(budget) => Some((budget, self.estimate_usd(claim, budget)?)),
-            None => None,
+        // Budget estimate is computed before any counter moves: it reads
+        // only config.
+        let (budget_usd_per_day, estimate_usd) = match policy.and_then(|p| p.budget.as_ref()) {
+            Some(budget) => (Some(to_micro_usd(budget.usd_per_day)), {
+                let estimate = self.estimate_usd(claim, budget)?;
+                Some(estimate)
+            }),
+            None => (None, None),
         };
         let reserved_tokens = claim
             .estimated_input_tokens
             .saturating_add(claim.max_output_tokens.unwrap_or(0));
 
-        let mut state = self.lock();
-        let State {
-            keys,
-            leases,
-            next_lease,
-            inflight_members,
-            inflight_models,
-        } = &mut *state;
-
-        // Steps 4 and 5: windows and budget, checked against committed plus
-        // in-flight totals.
-        if let Some(policy) = policy {
-            let key = keys
-                .entry(claim.caller.to_owned())
-                .or_insert_with(|| KeyState::fresh(now));
-            key.roll(now);
-            let limits = &policy.limits;
-            if let Some(rpm) = limits.rpm
-                && key.minute.requests >= u64::from(rpm)
-            {
-                return Err(EngineError::RateLimited {
-                    message: format!("rpm limit {rpm} reached for this key"),
-                    retry_after: Some(until_next_minute(now)),
-                });
-            }
-            if let Some(rpd) = limits.rpd
-                && key.day.requests >= rpd
-            {
-                return Err(EngineError::RateLimited {
-                    message: format!("rpd limit {rpd} reached for this key"),
-                    retry_after: Some(until_next_day(now)),
-                });
-            }
-            if let Some(tpm) = limits.tpm
-                && key
-                    .minute
-                    .tokens
-                    .saturating_add(key.minute.reserved_tokens)
-                    .saturating_add(reserved_tokens)
-                    > tpm
-            {
-                return Err(EngineError::RateLimited {
-                    message: format!("tpm limit {tpm} would be exceeded for this key"),
-                    retry_after: Some(until_next_minute(now)),
-                });
-            }
-            if let Some((budget, estimate)) = &reserved_usd {
-                let committed = key
-                    .day
-                    .spent
-                    .checked_add(key.day.reserved)
-                    .unwrap_or(Decimal::MAX);
-                let projected = committed.checked_add(*estimate).unwrap_or(Decimal::MAX);
-                if projected > budget.usd_per_day {
-                    return Err(EngineError::BudgetExhausted {
-                        message: format!(
-                            "daily budget of {} USD would be exceeded for this key (spent {}, reserved in flight {}, this request {})",
-                            budget.usd_per_day.normalize(),
-                            key.day.spent.normalize(),
-                            key.day.reserved.normalize(),
-                            estimate.normalize()
-                        ),
-                        retry_after: Some(until_next_day(now)),
-                    });
-                }
-            }
-        }
-
-        // Step 7: concurrency caps on the member and its model.
-        let caps = self.caps.get(claim.member);
-        let member_cap = caps.and_then(|c| c.total);
-        let model_cap = caps.and_then(|c| c.models.get(claim.model).copied());
-        let model_key = (claim.member.to_owned(), claim.model.to_owned());
-        if let Some(cap) = member_cap {
-            let inflight = inflight_members.get(claim.member).copied().unwrap_or(0);
-            if inflight >= cap {
-                return Err(member_saturated(claim.member, cap));
-            }
-        }
-        if let Some(cap) = model_cap {
-            let inflight = inflight_models.get(&model_key).copied().unwrap_or(0);
-            if inflight >= cap {
-                return Err(model_saturated(claim.model, claim.member, cap));
-            }
-        }
-
-        // Every check passed: commit the whole reservation at once.
-        let mut lease = Lease {
-            caller: claim.caller.to_owned(),
-            member: claim.member.to_owned(),
-            model: claim.model.to_owned(),
-            minute: unix_minute(now),
-            day: now.date(),
-            reserved_tokens: 0,
-            reserved_usd: Decimal::ZERO,
-            holds_member_slot: member_cap.is_some(),
-            holds_model_slot: model_cap.is_some(),
+        let limits = policy.map_or(KeyWindowLimits::default(), |p| p.limits.clone());
+        let (member_cap, model_cap) = self.caps_for(claim.member, claim.model);
+        let demand = ReservationDemand {
+            now,
+            caller: claim.caller,
+            member: claim.member,
+            model: claim.model,
+            rpm: limits.rpm,
+            tpm: limits.tpm,
+            rpd: limits.rpd,
+            budget_usd_per_day,
+            estimate_usd,
+            reserved_tokens,
+            member_cap,
+            model_cap,
         };
-        if policy.is_some()
-            && let Some(key) = keys.get_mut(claim.caller)
-        {
-            key.minute.requests += 1;
-            key.day.requests += 1;
-            key.minute.reserved_tokens = key.minute.reserved_tokens.saturating_add(reserved_tokens);
-            lease.reserved_tokens = reserved_tokens;
-            if let Some((_, estimate)) = &reserved_usd {
-                key.day.reserved = key
-                    .day
-                    .reserved
-                    .checked_add(*estimate)
-                    .unwrap_or(Decimal::MAX);
-                lease.reserved_usd = *estimate;
-            }
-        }
-        if lease.holds_member_slot {
-            *inflight_members.entry(claim.member.to_owned()).or_insert(0) += 1;
-        }
-        if lease.holds_model_slot {
-            *inflight_models.entry(model_key).or_insert(0) += 1;
-        }
-        let id = *next_lease;
-        *next_lease += 1;
-        leases.insert(id, lease);
+        let lease = self.backend.admit(&demand).await?;
         Ok(AdmissionTicket {
             reserved: Some(reserved_tokens),
-            lease: Some(id),
+            lease: Some(lease),
+            caller: Some(claim.caller.to_owned()),
         })
     }
 
     fn settle(&self, ticket: &AdmissionTicket, outcome: &AdmissionOutcome<'_>) {
-        let Some(id) = ticket.lease else {
+        let Some(lease) = ticket.lease.as_ref() else {
             return;
         };
         let now = (self.clock)();
-        let mut state = self.lock();
-        let Some(lease) = state.leases.remove(&id) else {
+        let settlement = Settlement {
+            now,
+            succeeded: outcome.succeeded,
+            usage_tokens: outcome.usage.map(total_tokens),
+            charged_usd: outcome.cost.map(|cost| to_micro_usd(cost.total)),
+        };
+        self.backend.settle(lease, &settlement);
+        if outcome.cost.is_none()
+            && outcome.usage.is_some()
+            && ticket.caller.as_deref().is_some_and(|caller| {
+                self.keys
+                    .get(caller)
+                    .is_some_and(|policy| policy.budget.is_some())
+            })
+        {
             tracing::warn!(
-                lease = id,
-                "admission settle for an unknown lease; ignoring"
+                caller = ticket.caller.as_deref().unwrap_or_default(),
+                lease = lease.as_str(),
+                "usage settled against a budgeted key with no pricing for the model; nothing charged (unpriced)"
             );
-            return;
-        };
-        if lease.holds_member_slot
-            && let Some(count) = state.inflight_members.get_mut(&lease.member)
-        {
-            *count = count.saturating_sub(1);
-        }
-        if lease.holds_model_slot
-            && let Some(count) = state
-                .inflight_models
-                .get_mut(&(lease.member.clone(), lease.model.clone()))
-        {
-            *count = count.saturating_sub(1);
-        }
-        let Some(key) = state.keys.get_mut(&lease.caller) else {
-            return;
-        };
-        key.roll(now);
-        // Tokens: release the estimate and charge the provider-reported
-        // total, but only into the minute the request was admitted in — a
-        // window that already rolled over has no limit left to protect.
-        if key.minute.minute == lease.minute {
-            key.minute.reserved_tokens = key
-                .minute
-                .reserved_tokens
-                .saturating_sub(lease.reserved_tokens);
-            if let Some(usage) = outcome.usage {
-                key.minute.tokens = key.minute.tokens.saturating_add(total_tokens(usage));
-            }
-        }
-        // Money: release the reservation from the day it was made (if that
-        // day is still current) and charge what the provider billed to
-        // today — spend is never dropped at a midnight boundary.
-        if key.day.day == lease.day {
-            key.day.reserved = key
-                .day
-                .reserved
-                .checked_sub(lease.reserved_usd)
-                .unwrap_or(Decimal::ZERO)
-                .max(Decimal::ZERO);
-        }
-        match (outcome.cost, outcome.usage) {
-            (Some(cost), _) => {
-                key.day.spent = key
-                    .day
-                    .spent
-                    .checked_add(cost.total)
-                    .unwrap_or(Decimal::MAX);
-            }
-            (None, Some(_))
-                if lease.reserved_usd > Decimal::ZERO
-                    || self
-                        .keys
-                        .get(&lease.caller)
-                        .is_some_and(|p| p.budget.is_some()) =>
-            {
-                tracing::warn!(
-                    caller = %lease.caller,
-                    member = %lease.member,
-                    model = %lease.model,
-                    "usage settled against a budgeted key with no pricing for the model; nothing charged (unpriced)"
-                );
-            }
-            // No usage at all: the request failed before any cost. The
-            // reservation release above is the refund.
-            _ => {}
         }
     }
 
     /// Step 7 under failover: the in-flight slot moves to the member the
     /// ladder is about to try, so a capped member is capped however the
     /// request reached it. The whole move — release, saturation check,
-    /// acquire — happens under the one lock the reservation committed
-    /// under, so counts never drift.
+    /// acquire — happens atomically in the backend, so counts never drift.
     async fn rekey(
         &self,
         ticket: &AdmissionTicket,
         member: &str,
         model: &str,
     ) -> Result<(), EngineError> {
-        let Some(id) = ticket.lease else {
+        let Some(lease) = ticket.lease.as_ref() else {
             return Ok(());
         };
-        let mut state = self.lock();
-        let (old_member, old_model, held_member_slot, held_model_slot) = {
-            let Some(lease) = state.leases.get(&id) else {
-                tracing::warn!(lease = id, "admission rekey for an unknown lease; ignoring");
-                return Ok(());
-            };
-            if lease.member == member && lease.model == model {
-                return Ok(());
-            }
-            (
-                lease.member.clone(),
-                lease.model.clone(),
-                lease.holds_member_slot,
-                lease.holds_model_slot,
-            )
-        };
-        let caps = self.caps.get(member);
-        let member_cap = caps.and_then(|c| c.total);
-        let model_cap = caps.and_then(|c| c.models.get(model).copied());
-        if let Some(cap) = member_cap {
-            let inflight = state.inflight_members.get(member).copied().unwrap_or(0);
-            if inflight >= cap {
-                return Err(member_saturated(member, cap));
-            }
-        }
-        if let Some(cap) = model_cap {
-            let key = (member.to_owned(), model.to_owned());
-            let inflight = state.inflight_models.get(&key).copied().unwrap_or(0);
-            if inflight >= cap {
-                return Err(model_saturated(model, member, cap));
-            }
-        }
-        if held_member_slot && let Some(count) = state.inflight_members.get_mut(&old_member) {
-            *count = count.saturating_sub(1);
-        }
-        if held_model_slot
-            && let Some(count) = state.inflight_models.get_mut(&(old_member, old_model))
-        {
-            *count = count.saturating_sub(1);
-        }
-        if let Some(lease) = state.leases.get_mut(&id) {
-            lease.member = member.to_owned();
-            lease.model = model.to_owned();
-            lease.holds_member_slot = member_cap.is_some();
-            lease.holds_model_slot = model_cap.is_some();
-        }
-        if member_cap.is_some() {
-            *state.inflight_members.entry(member.to_owned()).or_insert(0) += 1;
-        }
-        if model_cap.is_some() {
-            *state
-                .inflight_models
-                .entry((member.to_owned(), model.to_owned()))
-                .or_insert(0) += 1;
-        }
-        Ok(())
+        let (member_cap, model_cap) = self.caps_for(member, model);
+        self.backend
+            .rekey(lease, member, model, member_cap, model_cap)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, Ordering};
 
     fn claim<'a>(
@@ -1073,7 +768,7 @@ mod tests {
         match &refused {
             EngineError::Overloaded { retry_after, .. } => {
                 assert!(
-                    retry_after.is_some_and(|wait| wait <= Duration::from_secs(5)),
+                    retry_after.is_some_and(|wait| wait <= std::time::Duration::from_secs(5)),
                     "Retry-After must be short, got {retry_after:?}"
                 );
             }
@@ -1182,6 +877,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn two_admissions_over_one_backend_share_one_budget() {
+        // The plan 09 property, at the seam: two PolicyAdmission instances
+        // (two replicas) built over one shared backend enforce one budget
+        // between them, without either seeing the other's process.
+        let backend: Arc<dyn AdmissionBackend> = Arc::new(MemoryAdmissionBackend::new());
+        let keys = HashMap::from([("key".to_owned(), budgeted("1"))]);
+        let pricing =
+            HashMap::from([(("p".to_owned(), "m".to_owned()), pricing("0.001", "0.001"))]);
+        let replica_a = Arc::new(PolicyAdmission::over_backend(
+            keys.clone(),
+            pricing.clone(),
+            HashMap::new(),
+            Arc::clone(&backend),
+        ));
+        let replica_b = Arc::new(PolicyAdmission::over_backend(
+            keys,
+            pricing,
+            HashMap::new(),
+            Arc::clone(&backend),
+        ));
+
+        let ticket = replica_a
+            .reserve(&claim("key", "p", "m", 500, Some(500)))
+            .await
+            .expect("replica a reserves the whole budget");
+        let refused = replica_b
+            .reserve(&claim("key", "p", "m", 1, Some(1)))
+            .await
+            .expect_err("replica b must see replica a's reservation");
+        assert!(matches!(refused, EngineError::BudgetExhausted { .. }));
+
+        // Refunding on one replica releases it for the other.
+        replica_a.settle(
+            &ticket,
+            &AdmissionOutcome {
+                succeeded: false,
+                usage: None,
+                cost: None,
+            },
+        );
+        replica_b
+            .reserve(&claim("key", "p", "m", 500, Some(500)))
+            .await
+            .expect("the refund is visible to replica b");
+    }
+
     #[test]
     fn noop_detection_ignores_policies_that_restrict_nothing() {
         let empty = PolicyAdmission::new(
@@ -1191,14 +933,5 @@ mod tests {
         );
         assert!(empty.is_noop());
         assert!(!admission(budgeted("1")).is_noop());
-    }
-
-    #[test]
-    fn window_resets_are_bounded() {
-        // 1_700_000_040 is a minute boundary; 30 seconds in, 30 remain.
-        let now = OffsetDateTime::from_unix_timestamp(1_700_000_070).expect("ts");
-        assert_eq!(until_next_minute(now), Duration::from_secs(30));
-        let day = until_next_day(now);
-        assert!(day >= Duration::from_secs(1) && day <= Duration::from_secs(86_400));
     }
 }

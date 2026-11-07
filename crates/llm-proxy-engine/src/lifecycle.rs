@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use time::OffsetDateTime;
 
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt};
@@ -279,7 +280,8 @@ async fn resolve_attempt(
     let keys = credential_pool(inner, &configured.provider_name);
     let cooling = inner
         .health
-        .cooling_credentials(&configured.provider_name, Instant::now());
+        .cooling_credentials(&configured.provider_name, OffsetDateTime::now_utc())
+        .await;
     let pick: CredentialPick = inner
         .credentials
         .pick(&CredentialQuery {
@@ -360,7 +362,8 @@ async fn admit(
     req: &EngineRequest,
     plan: &RoutePlan,
 ) -> Result<AdmissionTicket, EngineError> {
-    let first = ordered_candidates(inner, plan, Instant::now())
+    let first = ordered_candidates(inner, plan, OffsetDateTime::now_utc())
+        .await
         .first()
         .and_then(|index| plan.candidates.get(*index))
         .or_else(|| plan.candidates.first());
@@ -505,18 +508,21 @@ impl Ladder {
 /// The candidate order the ladder walks (plan 04 step 9): members past their
 /// cooldown first in configured order; when every member is cooling, the
 /// configured order stands — cooldowns reorder, they never refuse service.
-fn ordered_candidates(inner: &EngineInner, plan: &RoutePlan, now: Instant) -> Vec<usize> {
-    let available: Vec<usize> = plan
-        .candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| {
-            inner
-                .health
-                .provider_available(&candidate.target.provider_name, now)
-        })
-        .map(|(index, _)| index)
-        .collect();
+async fn ordered_candidates(
+    inner: &EngineInner,
+    plan: &RoutePlan,
+    now: OffsetDateTime,
+) -> Vec<usize> {
+    let mut available = Vec::new();
+    for (index, candidate) in plan.candidates.iter().enumerate() {
+        if inner
+            .health
+            .provider_available(&candidate.target.provider_name, now)
+            .await
+        {
+            available.push(index);
+        }
+    }
     if available.is_empty() {
         (0..plan.candidates.len()).collect()
     } else {
@@ -589,7 +595,7 @@ fn class_for_ladder(inner: &EngineInner, member: &str, error: &EngineError) -> E
 /// key to serve with; a failure deterministic for this request (a
 /// client-side 4xx, the client's own passthrough token being rejected)
 /// cools nothing — see [`member_cooldown_applies`].
-fn apply_cooldowns(
+async fn apply_cooldowns(
     inner: &EngineInner,
     ladder: &Ladder,
     provider: &str,
@@ -597,7 +603,7 @@ fn apply_cooldowns(
     class: &ErrorClass,
     feedback: CredentialFeedback,
 ) {
-    let now = Instant::now();
+    let now = OffsetDateTime::now_utc();
     let advised = match error {
         EngineError::Upstream { retry_after, .. } => *retry_after,
         _ => None,
@@ -607,15 +613,11 @@ fn apply_cooldowns(
     if feedback == CredentialFeedback::Rejected
         && let Some(id) = credential_id
     {
-        inner.health.cooldown_credential(provider, id, until);
+        inner.health.cooldown_credential(provider, id, until).await;
     }
-    if member_cooldown_applies(
-        class,
-        error,
-        feedback,
-        another_key_available(inner, provider, credential_id, now),
-    ) {
-        inner.health.cooldown_provider(provider, until);
+    let another_key = another_key_available(inner, provider, credential_id, now).await;
+    if member_cooldown_applies(class, error, feedback, another_key) {
+        inner.health.cooldown_provider(provider, until).await;
     }
 }
 
@@ -657,16 +659,17 @@ fn operator_credential_rejected(error: &EngineError, feedback: CredentialFeedbac
 /// recorded no credential id had no pool to rotate — nothing else to try.
 /// Reads the store after the rejected key's cooldown was written, so that
 /// key counts as unavailable.
-fn another_key_available(
+async fn another_key_available(
     inner: &EngineInner,
     provider: &str,
     rejected_credential: Option<&str>,
-    now: Instant,
+    now: OffsetDateTime,
 ) -> bool {
     if rejected_credential.is_none() {
         return false;
     }
-    credential_pool(inner, provider).len() > inner.health.cooling_credentials(provider, now).len()
+    let cooling = inner.health.cooling_credentials(provider, now).await;
+    credential_pool(inner, provider).len() > cooling.len()
 }
 
 /// Whether the RetryExhausted wrap applies: only when the route had a real
@@ -678,23 +681,26 @@ fn ladder_had_capacity(plan: &RoutePlan) -> bool {
 
 /// Wraps the ladder's last error for the client (plan 04 step 12): the
 /// proxy already did the retries, so the client must not stack its own.
-fn exhausted(
+async fn exhausted(
     inner: &EngineInner,
     plan: &RoutePlan,
     attempts: u32,
     last: EngineError,
 ) -> EngineError {
-    let retry_after = last
-        .retry_after()
-        .or_else(|| {
-            inner.health.soonest_reset(
-                plan.candidates
-                    .iter()
-                    .map(|c| c.target.provider_name.as_str()),
-                Instant::now(),
-            )
-        })
-        .or_else(|| (!plan.retry.cooldown.is_zero()).then_some(plan.retry.cooldown));
+    let members: Vec<&str> = plan
+        .candidates
+        .iter()
+        .map(|c| c.target.provider_name.as_str())
+        .collect();
+    let mut retry_after = last.retry_after();
+    if retry_after.is_none() {
+        retry_after = inner
+            .health
+            .soonest_reset(&members, OffsetDateTime::now_utc())
+            .await;
+    }
+    let retry_after =
+        retry_after.or_else(|| (!plan.retry.cooldown.is_zero()).then_some(plan.retry.cooldown));
     EngineError::RetryExhausted {
         attempts,
         last: Box::new(last),
@@ -734,7 +740,7 @@ async fn record_attempt_failure(
             latency: attempt_start.elapsed(),
         },
     );
-    apply_cooldowns(inner, ladder, member, error, &class, feedback);
+    apply_cooldowns(inner, ladder, member, error, &class, feedback).await;
     inner
         .credentials
         .feedback(member, ladder.current_credential.as_deref(), feedback);
@@ -1124,7 +1130,7 @@ async fn run_ladder_once(
         deadline: ladder_deadline(inner, &plan, req.start),
         seq: 0,
         first_member: None,
-        order: ordered_candidates(inner, &plan, Instant::now()),
+        order: ordered_candidates(inner, &plan, OffsetDateTime::now_utc()).await,
         request_id: req.request_id.clone(),
         current_credential: None,
         plan,
@@ -1350,7 +1356,9 @@ async fn run_ladder_once(
         EngineError::Internal("retry ladder ended without attempting".to_owned())
     });
     if ladder_had_capacity(&ladder.plan) {
-        Err(exhausted(inner, &ladder.plan, ladder.seq, last).into())
+        Err(exhausted(inner, &ladder.plan, ladder.seq, last)
+            .await
+            .into())
     } else {
         Err(last.into())
     }
@@ -1911,7 +1919,7 @@ fn build_core_event_stream(
                     deadline: ladder_deadline(&inner, &plan, req.start),
                     seq: 0,
                     first_member: None,
-                    order: ordered_candidates(&inner, &plan, Instant::now()),
+                    order: ordered_candidates(&inner, &plan, OffsetDateTime::now_utc()).await,
                     request_id: req.request_id.clone(),
                     current_credential: None,
                     plan,
@@ -1938,7 +1946,7 @@ fn build_core_event_stream(
             let last = stream.last_error.clone().unwrap_or_else(|| {
                 EngineError::Internal("retry ladder ended without attempting".to_owned())
             });
-            stop_with(&inner, &mut stream, last, true);
+            stop_with(&inner, &mut stream, last, true).await;
         }
         .instrument(stream_span),
     );
@@ -2106,12 +2114,13 @@ async fn stream_attempt(
             stream,
             EngineError::Internal("candidate index out of range".to_owned()),
             false,
-        );
+        )
+        .await;
         return false;
     };
     let member = candidate.target.provider_name.clone();
     if let Err(error) = refuse_switch(inner, &stream.ladder, &member) {
-        stop_with(inner, stream, error, false);
+        stop_with(inner, stream, error, false).await;
         return false;
     }
     // The cap follows the ladder (plan 05 step 7), same rule as the
@@ -2141,7 +2150,7 @@ async fn stream_attempt(
                 "retry ladder deadline exceeded before the next attempt".to_owned(),
             );
             stream.last_error = Some(timeout.clone());
-            stop_with(inner, stream, timeout, true);
+            stop_with(inner, stream, timeout, true).await;
             return false;
         }
         stream.ladder.seq += 1;
@@ -2157,7 +2166,7 @@ async fn stream_attempt(
         {
             Ok(attempt) => attempt,
             Err(error) => {
-                stop_with(inner, stream, error, false);
+                stop_with(inner, stream, error, false).await;
                 return false;
             }
         };
@@ -2188,7 +2197,7 @@ async fn stream_attempt(
                         &engine_error,
                         attempt_start.elapsed(),
                     );
-                    stop_with(inner, stream, engine_error, false);
+                    stop_with(inner, stream, engine_error, false).await;
                     return false;
                 }
             };
@@ -2386,9 +2395,14 @@ fn signal_pre_stream_error(inner: &EngineInner, stream: &mut StreamLadder, error
 
 /// Stops the task with `error`: signal the caller, settle the reservation.
 /// `wrap` decides the RetryExhausted wrap (plan 04 step 12).
-fn stop_with(inner: &Arc<EngineInner>, stream: &mut StreamLadder, error: EngineError, wrap: bool) {
+async fn stop_with(
+    inner: &Arc<EngineInner>,
+    stream: &mut StreamLadder,
+    error: EngineError,
+    wrap: bool,
+) {
     let final_error = if wrap && ladder_had_capacity(&stream.ladder.plan) {
-        exhausted(inner, &stream.ladder.plan, stream.ladder.seq, error)
+        exhausted(inner, &stream.ladder.plan, stream.ladder.seq, error).await
     } else {
         error
     };
@@ -2580,7 +2594,7 @@ async fn pre_commit_failure(
         ErrorClass::Transient { retry_after } => {
             if is_last_member_attempt && ladder.is_last_member(member) {
                 // Ladder exhausted (plan 04 step 12): wrap for the client.
-                let final_error = exhausted(inner, &ladder.plan, ladder.seq, error.clone());
+                let final_error = exhausted(inner, &ladder.plan, ladder.seq, error.clone()).await;
                 inner.metrics.record_failure();
                 signal_pre_stream_error(inner, stream, final_error.clone());
                 settle(inner, &stream.ticket, false, None, None);

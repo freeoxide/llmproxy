@@ -33,6 +33,7 @@
 #![deny(missing_docs)]
 
 pub mod admission;
+pub mod admission_backend;
 pub mod cache;
 pub mod catalog;
 pub mod classification;
@@ -55,6 +56,10 @@ use llm_proxy_storage::EventBus;
 use llm_proxy_transport::ProxyClient;
 
 pub use admission::{KeyPolicy, PolicyAdmission};
+pub use admission_backend::{
+    AdmissionBackend, LeaseId, MemoryAdmissionBackend, MicroUsd, ReservationDemand, Settlement,
+    from_micro_usd, to_micro_usd,
+};
 pub use cache::{
     IdempotencyClaim, IdempotencyStore, MemoryCache, SingleFlight, StoredOutcome, StreamShares,
 };
@@ -65,7 +70,7 @@ pub use error::{
 };
 pub use error_policy::{STATUS_POLICY, StatusCodePolicy, policy_for};
 pub use headers::select_forwarded_headers;
-pub use health::{AffinityTable, CooldownStore};
+pub use health::{AffinityTable, CooldownStore, Cooldowns};
 pub use traits::{
     Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, AllowAllAdmission, Cache,
     CacheEntry, CacheKey, ConfigCredentialSource, ConfigSource, CredentialFeedback, CredentialPick,
@@ -126,8 +131,10 @@ pub(crate) struct EngineInner {
     pub(crate) catalogs: Arc<ModelCatalogService>,
     pub(crate) metrics: Arc<Metrics>,
     /// Passive upstream health (plan 04 steps 3, 9): provider and
-    /// credential cooldowns keyed to real reset times.
-    pub(crate) health: Arc<CooldownStore>,
+    /// credential cooldowns keyed to real reset times. Behind the
+    /// [`Cooldowns`] trait since plan 09, so a replica deployment can hold
+    /// one cooldown view across instances.
+    pub(crate) health: Arc<dyn Cooldowns>,
     /// Sticky-session pins (plan 04 step 10).
     pub(crate) affinity: Arc<AffinityTable>,
     /// The token counter behind the input estimate admission and preflight
@@ -297,6 +304,7 @@ pub struct EngineBuilder {
     catalogs: Option<Arc<ModelCatalogService>>,
     metrics: Option<Arc<Metrics>>,
     counter: Option<Counter>,
+    cooldowns: Option<Arc<dyn Cooldowns>>,
 }
 
 impl EngineBuilder {
@@ -344,6 +352,7 @@ impl EngineBuilder {
             catalogs: None,
             metrics: None,
             counter: None,
+            cooldowns: None,
         }
     }
 
@@ -450,6 +459,16 @@ impl EngineBuilder {
         self
     }
 
+    /// Provide the cooldown view (plan 09 step 1): the local
+    /// [`CooldownStore`] by default, or a shared-store backend from an
+    /// optional replica crate, so every replica sees the same member
+    /// cooldowns.
+    #[must_use]
+    pub fn cooldowns(mut self, cooldowns: Arc<dyn Cooldowns>) -> Self {
+        self.cooldowns = Some(cooldowns);
+        self
+    }
+
     /// Assemble the engine.
     ///
     /// # Errors
@@ -467,7 +486,9 @@ impl EngineBuilder {
         let usage = self.usage.unwrap_or_else(|| {
             EventBusSink::new(Arc::new(llm_proxy_storage::NoopBus) as Arc<dyn EventBus>)
         });
-        let health = Arc::new(CooldownStore::new());
+        let health = self
+            .cooldowns
+            .unwrap_or_else(|| Arc::new(CooldownStore::new()));
         let affinity = Arc::new(AffinityTable::default());
         let idempotency = self
             .config
