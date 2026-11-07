@@ -5,7 +5,9 @@ use anyhow::{Context, Result, bail};
 use axum::serve::{Listener, ListenerExt};
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::LogFormat;
-use llm_proxy_server::{admin_router, build_router, shutdown_signal};
+#[cfg(not(feature = "admin-ui"))]
+use llm_proxy_server::admin_router;
+use llm_proxy_server::{build_router, shutdown_signal};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;
@@ -309,6 +311,31 @@ async fn bind_admin_listener(
     let Some(addr) = state.app_config().server.effective_admin_bind() else {
         bail!("admin API enabled but no admin bind could be derived");
     };
+    // The full admin surface (plan 09 steps 2-3) when the feature is on:
+    // key management, usage and config views, the web UI and MCP tools.
+    // Otherwise the read-only /usage API stands.
+    #[cfg(feature = "admin-ui")]
+    let router = {
+        use llm_proxy_admin::AdminSurface;
+        use secrecy::ExposeSecret;
+        let admin = state
+            .app_config()
+            .auth
+            .admin
+            .as_ref()
+            .expect("admin posture implies [auth.admin]");
+        let mut surface = AdminSurface::new(admin.token.expose_secret());
+        if let Some(keys) = crate::state::managed_key_store_for_serve(state.app_config()) {
+            surface = surface.keys(keys);
+        }
+        if let Some(storage) = state.app_config().storage.as_ref() {
+            surface = surface.usage(llm_proxy_storage::UsageReader::new(storage.path.clone()));
+        }
+        surface
+            .config(std::sync::Arc::clone(&state.app_config_arc()))
+            .router()
+    };
+    #[cfg(not(feature = "admin-ui"))]
     let Some(router) = admin_router(state) else {
         bail!("admin API enabled but no /usage router could be built");
     };

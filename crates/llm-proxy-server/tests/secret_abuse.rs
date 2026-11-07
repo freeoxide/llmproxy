@@ -88,6 +88,7 @@ mod tests {
     fn admin_config() -> AdminAuthConfig {
         AdminAuthConfig {
             token: secrecy::SecretString::from(ADMIN_TOKEN),
+            key_store: None,
         }
     }
 

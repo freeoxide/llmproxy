@@ -133,6 +133,7 @@ mod tests {
             path,
             Some(llm_proxy_core::AdminAuthConfig {
                 token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
             }),
             false,
         ));
@@ -153,6 +154,7 @@ mod tests {
             path,
             Some(llm_proxy_core::AdminAuthConfig {
                 token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
             }),
             true,
         ));
@@ -193,6 +195,7 @@ mod tests {
             path,
             Some(llm_proxy_core::AdminAuthConfig {
                 token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
             }),
             false,
         ));

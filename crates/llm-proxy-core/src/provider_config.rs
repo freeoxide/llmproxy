@@ -1050,6 +1050,11 @@ pub struct AdminAuthConfig {
     /// output and every `Serialize` path.
     #[serde(skip_serializing)]
     pub token: SecretString,
+    /// Where the admin surface persists managed client keys (plan 09 step
+    /// 2): a SQLite file. Absent means keys are managed only in
+    /// `[auth.clients]`. Requires the daemon's `admin-ui` feature.
+    #[serde(default)]
+    pub key_store: Option<std::path::PathBuf>,
 }
 
 const fn default_shutdown_timeout() -> Duration {
@@ -3990,6 +3995,7 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
         let mut next = current.clone();
         next.auth.admin = Some(AdminAuthConfig {
             token: secrecy::SecretString::from("token"),
+            key_store: None,
         });
         assert!(restart_required_changes(&current, &next).contains(&"auth.admin".to_owned()));
         // Storage ledger.
@@ -5803,6 +5809,7 @@ db_host = "postgres.example"
     fn admin_auth_config_debug_redacts_token() {
         let admin = AdminAuthConfig {
             token: SecretString::from("super-secret-admin-token"),
+            key_store: None,
         };
         let debug = format!("{admin:?}");
         assert!(

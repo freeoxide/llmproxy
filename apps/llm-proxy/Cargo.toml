@@ -27,6 +27,9 @@ default = []
 # start without the matching feature.
 store-redis = ["dep:llm-proxy-store-redis"]
 store-postgres = ["dep:llm-proxy-store-postgres"]
+# The admin surface (plan 09 steps 2-3): key management, usage and config
+# views, the web UI and MCP tools on the dedicated admin listener.
+admin-ui = ["dep:llm-proxy-admin"]
 
 [dependencies]
 llm-proxy-server = { workspace = true, features = ["admin"] }
@@ -45,6 +48,7 @@ llm-proxy-engine = { workspace = true }
 llm-proxy-storage = { workspace = true, features = ["sqlite"] }
 llm-proxy-store-redis = { workspace = true, optional = true }
 llm-proxy-store-postgres = { workspace = true, optional = true }
+llm-proxy-admin = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }

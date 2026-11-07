@@ -37,6 +37,52 @@ pub(crate) async fn load_toml_state(
     load_toml_state_from_config(app_config, path, adapter_registry).await
 }
 
+/// Opens the managed-key store when `[auth.admin.key_store]` is
+/// configured (plan 09 step 2). Without the `admin-ui` feature a
+/// configured store is a startup error, never a silent skip.
+#[cfg(feature = "admin-ui")]
+pub(crate) fn managed_key_store_for_serve(
+    config: &AppConfig,
+) -> Option<std::sync::Arc<llm_proxy_admin::ManagedKeys>> {
+    match managed_key_store(config) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "opening the managed-key store for the admin surface failed; key views are off"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(feature = "admin-ui")]
+fn managed_key_store(
+    config: &AppConfig,
+) -> Result<Option<std::sync::Arc<llm_proxy_admin::ManagedKeys>>> {
+    match config
+        .auth
+        .admin
+        .as_ref()
+        .and_then(|admin| admin.key_store.clone())
+    {
+        Some(path) => {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!("creating the managed-key store parent {}", parent.display())
+                })?;
+            }
+            let store = llm_proxy_admin::ManagedKeys::open(&path)
+                .with_context(|| format!("opening the managed-key store at {}", path.display()))?;
+            tracing::info!(store = %path.display(), "managed client keys enabled");
+            Ok(Some(std::sync::Arc::new(store)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Build the serving state from an already-loaded config: the path the serve
 /// command takes, so it can initialize the tracing subscriber from the
 /// config's `server.log_format` before anything logs through it (BUG-25).
@@ -60,7 +106,26 @@ pub async fn load_toml_state_from_config(
         }
     }
 
-    let client_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
+    // Managed keys (plan 09 step 2): when [auth.admin.key_store] is set
+    // (and the admin-ui feature is compiled in), the store's live keys
+    // authenticate alongside the [auth.clients] file keys. File keys win
+    // on id collisions, so the store can never shadow an operator key.
+    #[cfg(feature = "admin-ui")]
+    let auth_config = {
+        let mut merged = app_config.auth.clone();
+        if let Some(store) = managed_key_store(&app_config)? {
+            for (id, spec) in store
+                .client_specs()
+                .with_context(|| "reading managed keys from [auth.admin.key_store]")?
+            {
+                merged.clients.entry(id).or_insert(spec);
+            }
+        }
+        merged
+    };
+    #[cfg(not(feature = "admin-ui"))]
+    let auth_config = app_config.auth.clone();
+    let client_auth = llm_proxy_server::ClientAuth::from_config(&auth_config)
         .with_context(|| "building client auth from [auth] config")?;
 
     let egress_clients = build_egress_clients(&app_config, &registry)?;
@@ -799,6 +864,7 @@ enabled = true
                 clients: std::collections::HashMap::new(),
                 admin: Some(AdminAuthConfig {
                     token: secrecy::SecretString::from("admin-secret"),
+                    key_store: None,
                 }),
             },
             storage: Some(StorageConfig {

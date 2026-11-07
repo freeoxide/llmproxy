@@ -5,12 +5,12 @@
 //! a configured `[replica]` in a build without the matching feature is a
 //! startup error, never a silent single-node fallback.
 
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use llm_proxy_core::{AppConfig, ProviderRegistry, ReplicaBackend};
 use llm_proxy_server::AppState;
 use secrecy::ExposeSecret;
+#[cfg(any(feature = "store-redis", feature = "store-postgres"))]
+use std::sync::Arc;
 
 /// Applies `[replica]` to `state`, returning the replacement state.
 ///
@@ -34,7 +34,11 @@ pub async fn apply_replica(
             {
                 let store = llm_proxy_store_redis::RedisStore::connect(url, &replica.prefix)
                     .await
-                    .with_context(|| "connecting to the Redis replica store from [replica]")?;
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "connecting to the Redis replica store from [replica]: {error}"
+                        )
+                    })?;
                 let admission = llm_proxy_store_redis::replica_admission_over_config(
                     auth,
                     registry,
@@ -54,7 +58,7 @@ pub async fn apply_replica(
             #[cfg(not(feature = "store-redis"))]
             {
                 let _ = (url, auth, registry, state);
-                bail!(
+                anyhow::bail!(
                     "[replica] backend \"redis\" is configured but this build lacks the \
                      store-redis feature; rebuild with --features store-redis"
                 );
@@ -65,7 +69,11 @@ pub async fn apply_replica(
             {
                 let store = llm_proxy_store_postgres::PostgresStore::connect(url)
                     .await
-                    .with_context(|| "connecting to the Postgres replica store from [replica]")?;
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "connecting to the Postgres replica store from [replica]: {error}"
+                        )
+                    })?;
                 spawn_purge_timer(store.clone());
                 let admission = llm_proxy_store_postgres::replica_admission_over_config(
                     auth,
@@ -87,7 +95,7 @@ pub async fn apply_replica(
             #[cfg(not(feature = "store-postgres"))]
             {
                 let _ = (url, auth, registry, state);
-                bail!(
+                anyhow::bail!(
                     "[replica] backend \"postgres\" is configured but this build lacks the \
                      store-postgres feature; rebuild with --features store-postgres"
                 );

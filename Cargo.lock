@@ -2441,6 +2441,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "llm-proxy-admin"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "humantime",
+ "llm-proxy-core",
+ "llm-proxy-storage",
+ "rusqlite",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
 name = "llm-proxy-api"
 version = "0.1.0"
 dependencies = [
@@ -2472,6 +2495,7 @@ dependencies = [
  "insta",
  "libc",
  "llm-proxy-adapters",
+ "llm-proxy-admin",
  "llm-proxy-core",
  "llm-proxy-engine",
  "llm-proxy-protocol",
@@ -2948,6 +2972,7 @@ checksum = "aab41826031698d6ffcd9cff78ef56ef998e39dc7e5067cdfebe373842d4723b"
 dependencies = [
  "getrandom 0.4.2",
  "phc",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2965,6 +2990,7 @@ dependencies = [
  "base64ct",
  "ctutils",
  "getrandom 0.4.2",
+ "rand_core 0.10.1",
 ]
 
 [[package]]

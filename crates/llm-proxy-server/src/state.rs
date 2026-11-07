@@ -271,6 +271,13 @@ impl AppState {
         &self.app_config
     }
 
+    /// The config snapshot as an owned `Arc` (the admin surface holds one
+    /// for its sanitized config view).
+    #[must_use]
+    pub fn app_config_arc(&self) -> Arc<AppConfig> {
+        Arc::clone(&self.app_config)
+    }
+
     /// The live provider registry: the current engine's after a hot reload
     /// swapped it (plan 07 step 11), the startup registry before the first
     /// build. An owned `Arc`, because the answer can change between calls.

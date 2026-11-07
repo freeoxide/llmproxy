@@ -1,0 +1,37 @@
+[package]
+name = "llm-proxy-admin"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The optional admin surface for llm-proxy: key management, usage and config views, a small web UI, and the admin API exposed as MCP tools (plan 09 steps 2-3)."
+repository.workspace = true
+readme.workspace = true
+keywords = ["llm", "proxy", "admin", "mcp"]
+categories = ["web-programming::http-server"]
+
+[lints]
+workspace = true
+
+[dependencies]
+llm-proxy-core = { workspace = true }
+llm-proxy-storage = { workspace = true, features = ["sqlite"] }
+
+argon2 = { workspace = true, features = ["rand_core"] }
+axum = { workspace = true, features = ["macros", "json"] }
+rusqlite = { workspace = true, features = ["bundled"] }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+humantime = "2.3"
+time = { workspace = true }
+tokio = { workspace = true }
+tower-http = { version = "0.6", features = ["set-header", "trace", "catch-panic"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }
+tempfile = "3"
+tower = { workspace = true, features = ["util"] }
