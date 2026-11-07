@@ -48,6 +48,17 @@ pub enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Live-check every configured provider: reachability, and with --probe
+    /// a one-token request (which can cost money). Each failure names its fix.
+    Doctor {
+        /// Path to config file (must be TOML).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Also send one real one-token request per provider. Off by default:
+        /// probes spend upstream quota.
+        #[arg(long)]
+        probe: bool,
+    },
     /// List provider-scoped models.
     Models {
         /// Path to config file (must be TOML).

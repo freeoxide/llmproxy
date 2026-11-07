@@ -1323,7 +1323,10 @@ impl std::fmt::Debug for ProviderAdapterConfig {
     }
 }
 
-pub(crate) fn endpoint_without_query(endpoint: &str) -> &str {
+/// The endpoint URL with any query string removed, for safe display (query
+/// strings can carry credentials).
+#[must_use]
+pub fn endpoint_without_query(endpoint: &str) -> &str {
     endpoint
         .split_once('?')
         .map_or(endpoint, |(base, _query)| base)

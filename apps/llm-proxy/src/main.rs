@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
         }
         Commands::Init => cmd_init(),
         Commands::Validate { config } => cmd_validate(config.as_deref()),
+        Commands::Doctor { config, probe } => cmd_doctor(config.as_deref(), probe).await,
         Commands::Models {
             config,
             provider,
