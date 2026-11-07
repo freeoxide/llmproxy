@@ -17,14 +17,24 @@ use crate::paths::{config_dir, resolve_config};
 use crate::pid::{is_process_running, read_pid, remove_pid, write_pid, write_pid_value};
 use crate::state::init_tracing;
 
+/// Hot reload (plan 07 step 11): the SIGHUP listener needs the state
+/// before the router takes it.
+fn start_hot_reload(state: &llm_proxy_server::AppState, path: PathBuf, port_override: Option<u16>) {
+    let reload_state = state.clone();
+    let hot_reload_enabled = state.app_config().server.hot_reload;
+    if hot_reload_enabled {
+        info!(
+            "hot reload enabled: SIGHUP (or `llm-proxy reload`) re-reads the provider files; \
+             [server]/[auth]/[storage] changes are refused with a restart-required error"
+        );
+    }
+    spawn_reload_listener(reload_state, path, hot_reload_enabled, port_override);
+}
+
 /// Loads the TOML config and builds the serving state: the config loads
 /// before the subscriber is built so `server.log_format` is honoured
 /// (BUG-25, with `RUST_LOG_FORMAT` still winning), then the state —
 /// providers, auth, ledger, replica stores — comes up from it.
-#[expect(
-    clippy::unused_async,
-    reason = "the state loader is async so the replica stores can connect during it"
-)]
 async fn load_serve_state(
     path: &Path,
     port_override: Option<u16>,
@@ -97,20 +107,7 @@ pub async fn cmd_serve(
     };
     // Hot reload (plan 07 step 11): the SIGHUP listener needs the state
     // before the router takes it.
-    let reload_state = state.clone();
-    let hot_reload_enabled = state.app_config().server.hot_reload;
-    if hot_reload_enabled {
-        info!(
-            "hot reload enabled: SIGHUP (or `llm-proxy reload`) re-reads the provider files; \
-             [server]/[auth]/[storage] changes are refused with a restart-required error"
-        );
-    }
-    spawn_reload_listener(
-        reload_state,
-        path.clone(),
-        hot_reload_enabled,
-        port_override,
-    );
+    start_hot_reload(&state, path.clone(), port_override);
 
     let app = build_router(state);
 
