@@ -1120,6 +1120,8 @@ pub fn default_forwarded_inbound_headers(protocol: &str) -> &'static [&'static s
 /// Inbound headers that are never forwarded upstream, even when configured:
 /// client credentials, hop-by-hop and content headers the transport owns, and
 /// browser headers that leak the caller's environment or break upstreams.
+/// The proxy's own egress hop marker is owned by the transport and refused on
+/// ingress (backlog 32).
 pub const NEVER_FORWARDED_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -1138,6 +1140,7 @@ pub const NEVER_FORWARDED_HEADERS: &[&str] = &[
     "referer",
     "user-agent",
     "x-request-id",
+    "x-llm-proxy-hop",
 ];
 
 /// How the API key is sent in HTTP headers.

@@ -322,3 +322,137 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod loop_guard_tests {
+    use super::*;
+    use llm_proxy_core::HOP_HEADER;
+
+    fn plain_state() -> AppState {
+        let provider = ProviderConfig {
+            name: "mock".to_owned(),
+            api_key: secrecy::SecretString::from("test-key"),
+            auth_style: AuthStyle::XApiKey,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters: HashMap::from([(
+                "messages".to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "anthropic_messages".to_owned(),
+                    endpoint: "https://127.0.0.1:9/v1/messages".to_owned(),
+                    headers: std::sync::Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
+                },
+            )]),
+            routes: ProviderRoutesConfig {
+                messages: Some("messages".to_owned()),
+                chat_completions: None,
+            },
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        AppState::new(
+            AppConfig {
+                server: ServerConfig {
+                    bind: "127.0.0.1:3456".parse().unwrap(),
+                    request_timeout: Duration::from_secs(300),
+                    shutdown_timeout: Duration::from_secs(30),
+                    log_level: "info".to_owned(),
+                    hot_reload: false,
+                    allowed_origins: None,
+                    server_name: "loop-guard-test".to_owned(),
+                    rate_limit_rpm: 100,
+                    trust_forwarded_headers: false,
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    log_format: Default::default(),
+                    admin_bind: None,
+                    admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                },
+                auth: AuthConfig::default(),
+                storage: None,
+            },
+            registry,
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        )
+    }
+
+    fn post(path: &str, hop: bool) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json");
+        if hop {
+            builder = builder.header(HOP_HEADER, "1");
+        }
+        builder
+            .body(Body::from(
+                serde_json::json!({
+                    "model": "claude-sonnet-4-6",
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "max_tokens": 8
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    /// Backlog 32: a request already carrying this proxy's egress hop marker
+    /// is inside a forwarding loop; it is answered 508, not forwarded.
+    #[tokio::test]
+    async fn a_request_carrying_the_hop_marker_is_refused_with_508() {
+        let app = build_router(plain_state());
+        let response = app
+            .oneshot(post("/providers/mock/v1/messages", true))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "proxy_loop_detected");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("x-llm-proxy-hop")),
+            "the refusal must name the marker so the operator can find the loop: {body}"
+        );
+    }
+
+    /// The same request without the marker passes the loop guard and reaches
+    /// the engine (its upstream error is the observable proof).
+    #[tokio::test]
+    async fn the_same_request_without_the_marker_is_not_refused() {
+        let app = build_router(plain_state());
+        let response = app
+            .oneshot(post("/providers/mock/v1/messages", false))
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::LOOP_DETECTED,
+            "only looped requests are refused"
+        );
+    }
+}

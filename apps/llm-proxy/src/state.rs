@@ -35,7 +35,55 @@ pub(crate) fn load_toml_state(
     let proxy_client = ProxyClient::try_with_timeouts(&app_config.server.upstream_timeouts)
         .with_context(|| "building proxy HTTP client from [server.upstream_timeouts]")?;
 
+    let registry = load_registry_with_checks(&app_config, path, &adapter_registry)?;
+
     let providers_dir = providers_dir_for(path);
+    let cache_dir = providers_dir.join(".catalog");
+    for provider in registry.iter() {
+        if let Some(warning) = catalog_enforcement_warning(provider, &cache_dir) {
+            tracing::warn!(provider = %provider.name, "{warning}");
+        }
+    }
+
+    let client_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
+        .with_context(|| "building client auth from [auth] config")?;
+
+    let egress_clients = build_egress_clients(&app_config, &registry)?;
+
+    let event_bus = build_event_bus(&app_config)?;
+
+    info!(
+        config = %path.display(),
+        providers = registry.len(),
+        "loaded TOML config"
+    );
+
+    warn_admin_posture(&app_config);
+
+    Ok(AppState::new_with_catalog_dir(
+        app_config,
+        registry,
+        adapter_registry,
+        proxy_client,
+        build_info(),
+        Some(cache_dir),
+    )
+    .with_client_auth(std::sync::Arc::new(client_auth))
+    .with_egress_clients(egress_clients)
+    .with_event_bus(event_bus))
+}
+
+/// Loads the provider and pool registry from the directory beside
+/// `config_path` and runs every cross-check that needs both the app config
+/// and the registry: known protocol names, self-loop refusal (backlog 32),
+/// bare `/v1/*` target resolution, and the auth/passthrough combination.
+/// Shared by startup and `llm-proxy validate`, so both refuse the same set.
+pub fn load_registry_with_checks(
+    app_config: &AppConfig,
+    config_path: &Path,
+    adapter_registry: &ProviderAdapterRegistry,
+) -> Result<ProviderRegistry> {
+    let providers_dir = providers_dir_for(config_path);
     let registry = if providers_dir.exists() {
         ProviderRegistry::load_from_dir(&providers_dir)
             .with_context(|| format!("loading providers from {}", providers_dir.display()))?
@@ -48,6 +96,23 @@ pub(crate) fn load_toml_state(
     registry
         .validate_protocols(known_protocols)
         .with_context(|| "validating provider protocols")?;
+
+    // Self-loop refusal (backlog 32): an upstream that resolves to one of
+    // this instance's own listeners would forward to itself forever. The
+    // listeners are the main bind plus the admin bind when one is served.
+    let mut own_listeners = vec![app_config.server.bind];
+    if app_config.admin_posture().is_some() && app_config.server.dedicated_admin_listener() {
+        if let Some(admin_bind) = app_config.server.effective_admin_bind() {
+            own_listeners.push(admin_bind);
+        }
+    }
+    let loop_problems = llm_proxy_core::self_loop_problems(registry.iter(), &own_listeners);
+    if !loop_problems.is_empty() {
+        anyhow::bail!(
+            "refusing to run with a self-referential upstream: {}",
+            loop_problems.join("; ")
+        );
+    }
 
     // Bare `/v1/*` targets (plan 04 step 11) must name a loaded provider or
     // pool; the app config loads before provider files, so the cross-check
@@ -67,16 +132,14 @@ pub(crate) fn load_toml_state(
     llm_proxy_core::validate_passthrough_auth_combination(&app_config.auth, &providers)
         .with_context(|| "validating auth against provider passthrough configuration")?;
 
-    let cache_dir = providers_dir.join(".catalog");
-    for provider in registry.iter() {
-        if let Some(warning) = catalog_enforcement_warning(provider, &cache_dir) {
-            tracing::warn!(provider = %provider.name, "{warning}");
-        }
-    }
+    Ok(registry)
+}
 
-    let client_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
-        .with_context(|| "building client auth from [auth] config")?;
-
+/// Per-provider egress-proxy clients from `[provider.egress]`.
+fn build_egress_clients(
+    app_config: &AppConfig,
+    registry: &ProviderRegistry,
+) -> Result<std::collections::HashMap<String, std::sync::Arc<ProxyClient>>> {
     let mut egress_clients = std::collections::HashMap::new();
     for provider in registry.iter() {
         if let Some(egress) = &provider.egress {
@@ -98,8 +161,15 @@ pub(crate) fn load_toml_state(
             egress_clients.insert(provider.name.clone(), std::sync::Arc::new(client));
         }
     }
+    Ok(egress_clients)
+}
 
-    let event_bus: std::sync::Arc<dyn llm_proxy_storage::EventBus> = match &app_config.storage {
+/// The usage-ledger bus: SQLite when `[storage]` is configured, the no-op
+/// bus otherwise.
+fn build_event_bus(
+    app_config: &AppConfig,
+) -> Result<std::sync::Arc<dyn llm_proxy_storage::EventBus>> {
+    match &app_config.storage {
         Some(storage) => {
             let bus = llm_proxy_storage::SqliteEventBus::open(
                 &storage.path,
@@ -114,30 +184,10 @@ pub(crate) fn load_toml_state(
                 path = %storage.path.display(),
                 "persisting usage events to the SQLite ledger"
             );
-            std::sync::Arc::new(bus)
+            Ok(std::sync::Arc::new(bus))
         }
-        None => std::sync::Arc::new(llm_proxy_storage::NoopBus),
-    };
-
-    info!(
-        config = %path.display(),
-        providers = registry.len(),
-        "loaded TOML config"
-    );
-
-    warn_admin_posture(&app_config);
-
-    Ok(AppState::new_with_catalog_dir(
-        app_config,
-        registry,
-        adapter_registry,
-        proxy_client,
-        build_info(),
-        Some(cache_dir),
-    )
-    .with_client_auth(std::sync::Arc::new(client_auth))
-    .with_egress_clients(egress_clients)
-    .with_event_bus(event_bus))
+        None => Ok(std::sync::Arc::new(llm_proxy_storage::NoopBus)),
+    }
 }
 
 /// Emit the startup warnings naming the admin `/usage` mount posture.
@@ -771,5 +821,75 @@ enabled = true
             captured.contains("non-loopback"),
             "a non-loopback admin listener must be called out: {captured}"
         );
+    }
+}
+
+#[cfg(test)]
+mod self_loop_startup_tests {
+    use super::*;
+
+    fn write_config(dir: &std::path::Path, endpoint: &str) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir.join("providers")).unwrap();
+        std::fs::write(
+            dir.join("providers/loopy.toml"),
+            format!(
+                r#"[provider]
+name = "loopy"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "{endpoint}"
+[provider.routes]
+chat_completions = "chat"
+"#
+            ),
+        )
+        .unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#,
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn startup_refuses_an_upstream_on_the_own_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        // The main listener binds 127.0.0.1:3456; an upstream on the same
+        // loopback port (spelled by name, so DNS resolution is exercised)
+        // would forward to itself.
+        let path = write_config(dir.path(), "http://localhost:3456/v1/chat/completions");
+        let err = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .expect_err("startup must refuse a self-referential upstream");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("loopy") && message.contains("self-referential"),
+            "the refusal names the provider and the reason: {message}"
+        );
+    }
+
+    #[test]
+    fn startup_accepts_an_upstream_on_another_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "http://127.0.0.1:4567/v1/chat/completions");
+        load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .expect("an upstream on another port is not a loop");
     }
 }

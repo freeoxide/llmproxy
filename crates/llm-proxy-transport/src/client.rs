@@ -162,7 +162,11 @@ impl ProxyClient {
         let mut builder = self
             .http
             .post(&req.url)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            // Self-loop marker (backlog 32): any llm-proxy that receives a
+            // request already carrying it is forwarding to itself and
+            // answers 508 instead of looping.
+            .header(llm_proxy_core::HOP_HEADER, llm_proxy_core::HOP_HEADER_VALUE);
         if accept_event_stream {
             builder = builder.header("Accept", "text/event-stream");
         }
@@ -591,6 +595,34 @@ mod tests {
         wait_for_ready(addr).await;
 
         base
+    }
+
+    #[tokio::test]
+    async fn every_upstream_request_carries_the_hop_marker() {
+        // Backlog 32: the egress hop header is what lets a chained
+        // llm-proxy refuse a forwarding loop with 508 instead of looping.
+        let app = Router::new().route("/test", post(echo_handler));
+        let base = start_test_server(app).await;
+
+        let client = ProxyClient::new();
+        let req = ProxyRequest {
+            url: format!("{}/test", base),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: SecretString::from("key"),
+            },
+            body: vec![],
+            stream: false,
+            extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
+        };
+
+        let resp = client.send(req).await.unwrap();
+        let text = String::from_utf8(resp).unwrap();
+        assert!(
+            text.contains("x-llm-proxy-hop: 1"),
+            "the upstream must see the hop marker, got: {text}"
+        );
     }
 
     #[tokio::test]

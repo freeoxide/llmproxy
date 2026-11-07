@@ -65,12 +65,17 @@ pub fn router(state: AppState) -> Router {
 
     // Shared admission middleware; the body limit and timeout layer on top
     // are per endpoint family (conflict 16), so each family composes its own.
-    // The host/origin gate runs after the request id is injected and before
-    // client auth: under anonymous auth it is the DNS-rebinding defense
-    // (backlog 11), and under client keys it passes everything through.
+    // Order: request id, then the self-loop refusal (508, backlog 32), then
+    // the host/origin gate, then client auth. The host/origin gate is the
+    // DNS-rebinding defense (backlog 11) under anonymous auth; the loop
+    // refusal runs under every auth mode because a loop has no caller.
     let admission = |family: &'static str| {
         ServiceBuilder::new()
             .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
+            .layer(from_fn_with_state(
+                state.clone(),
+                crate::loop_guard::refuse_looped_requests,
+            ))
             .layer(from_fn_with_state(
                 state.clone(),
                 crate::host_guard::enforce_host_origin,

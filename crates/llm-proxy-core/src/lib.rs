@@ -16,6 +16,8 @@ pub mod metrics;
 pub mod provider_config;
 /// Provider registry: load provider TOML files and resolve route targets.
 pub mod provider_registry;
+/// Self-loop prevention (egress hop header, config-time upstream checks).
+pub mod self_loop;
 /// Token counting utilities.
 pub mod token;
 
@@ -45,4 +47,5 @@ pub use provider_config::{
 pub use provider_registry::{
     ProviderAdapterTargetConfig, ProviderRegistry, ProviderRouteResolutionError,
 };
+pub use self_loop::{HOP_HEADER, HOP_HEADER_VALUE, self_loop_problems};
 pub use token::{Counter, MessageContent};

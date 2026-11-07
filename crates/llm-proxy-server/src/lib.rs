@@ -6,6 +6,8 @@
 
 /// Host/Origin validation under anonymous auth (DNS-rebinding defense).
 pub mod host_guard;
+/// Ingress self-loop refusal (508 on requests carrying the egress hop marker).
+pub mod loop_guard;
 /// Middleware components (auth, rate limiter, request ID, IP extraction).
 pub mod middleware;
 /// Route handlers and router composition.

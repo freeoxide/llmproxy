@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use llm_proxy_adapters::ProviderAdapterRegistry;
-use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config};
+use llm_proxy_core::{AppConfig, load_app_config};
 
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{providers_dir_for, resolve_config};
@@ -39,35 +39,10 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     println!("  server_name:     {}", app_config.server.server_name);
 
     let providers_dir = providers_dir_for(&path);
-    let registry = if providers_dir.exists() {
-        ProviderRegistry::load_from_dir(&providers_dir)
-            .with_context(|| format!("loading providers from {}", providers_dir.display()))?
-    } else {
-        ProviderRegistry::from_providers(vec![])
-            .with_context(|| "building empty provider registry")?
-    };
-
+    // Every gate startup runs (protocols, self-loop, bare /v1 targets, the
+    // auth/passthrough combination) runs here too, on the same shared path.
     let adapter_registry = ProviderAdapterRegistry::builtin();
-    let known_protocols = adapter_registry.protocol_names();
-    registry
-        .validate_protocols(known_protocols)
-        .with_context(|| "validating provider protocols")?;
-
-    let providers: Vec<llm_proxy_core::ProviderConfig> = registry.iter().cloned().collect();
-    llm_proxy_core::validate_passthrough_auth_combination(&app_config.auth, &providers)
-        .with_context(|| "validating auth against provider passthrough configuration")?;
-
-    let bare_problems =
-        llm_proxy_core::bare_v1_target_problems(&app_config.server.bare_v1, |name| {
-            registry.contains_route(name)
-        });
-    if !bare_problems.is_empty() {
-        bail!(
-            "[server.bare_v1] has {} target error(s): {}",
-            bare_problems.len(),
-            bare_problems.join("; ")
-        );
-    }
+    let registry = crate::state::load_registry_with_checks(&app_config, &path, &adapter_registry)?;
 
     println!();
     println!("=== Providers ({} loaded) ===", registry.len());
@@ -195,6 +170,52 @@ mod tests {
 
         cmd_validate(Some(&config))
             .unwrap_or_else(|e| panic!("config.toml.example must validate as shipped: {e:#}"));
+    }
+
+    #[test]
+    fn cmd_validate_rejects_an_upstream_that_resolves_to_the_own_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/loopy.toml"),
+            r#"[provider]
+name = "loopy"
+api_key = "k"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "http://localhost:3456/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#,
+        )
+        .unwrap();
+
+        let err = cmd_validate(Some(&config))
+            .expect_err("an upstream naming this proxy's own listener is invalid");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("loopy") && message.contains("3456"),
+            "the error names the provider and the listener: {message}"
+        );
+        assert!(
+            message.contains("forever"),
+            "the error says what would happen: {message}"
+        );
     }
 
     #[test]
