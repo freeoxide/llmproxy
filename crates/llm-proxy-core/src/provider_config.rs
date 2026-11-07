@@ -610,11 +610,12 @@ impl ClientKeySpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyWindowLimits {
-    /// Requests per rolling 60-second window.
+    /// Requests per calendar minute (the window resets on the minute
+    /// boundary, it does not slide).
     #[serde(default)]
     pub rpm: Option<u32>,
     /// Tokens (input estimate at reserve, actual usage at settle) per
-    /// rolling 60-second window.
+    /// calendar minute, resetting on the minute boundary.
     #[serde(default)]
     pub tpm: Option<u64>,
     /// Requests per UTC day.
@@ -676,9 +677,11 @@ pub struct PricingSyncConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConcurrencyConfig {
-    /// Maximum in-flight requests against this provider (route name). A
-    /// pool's cap counts the whole pool; per-member caps apply when that
-    /// member is addressed directly. `None` = uncapped.
+    /// Maximum in-flight requests against this provider. The cap is per
+    /// member: on a pool route it applies while that member is the one
+    /// serving (the reservation moves to each member the ladder tries), so
+    /// a capped member is capped however the request reaches it. There is
+    /// no whole-pool cap. `None` = uncapped.
     #[serde(default)]
     pub total: Option<u32>,
     /// Tighter per-model caps (upstream model ids), overriding `total`

@@ -137,11 +137,9 @@ pub(super) fn route_error_response(protocol: ClientProtocol, error: &RouteError)
     let (status, _type, _message) = extract_error_fields(error);
     let should_retry = match error {
         RouteError::RetryExhausted { .. } => false,
-        _ => {
-            llm_proxy_engine::policy_for(status.as_u16())
-                .expect("every RouteError status is a policy row (tested)")
-                .should_retry
-        }
+        // A status outside the table (none ship today — the coverage test
+        // pins this) defaults to "do not retry".
+        _ => llm_proxy_engine::policy_for(status.as_u16()).is_some_and(|row| row.should_retry),
     };
     response.headers_mut().insert(
         "x-should-retry",

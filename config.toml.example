@@ -39,7 +39,7 @@ server_name = "llm-proxy"
 # input exceeds the window by margin_tokens — estimates use chars/4 for
 # non-OpenAI models and never count tools or images, so marginal cases
 # only warn.
-[preflight]
+[server.preflight]
 mode = "warn"
 margin_tokens = 512
 

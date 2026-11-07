@@ -191,7 +191,9 @@ fn pricing_entries(catalogue: &Value, models_dev_id: &str) -> Result<Vec<(String
 
 /// One catalogue price (USD per million tokens) as an exact per-token
 /// decimal, or `None` when the field is absent. Numbers are parsed through
-/// their shortest round-trip text so no float ever touches the money.
+/// their shortest round-trip text so no float ever touches the money; that
+/// text can be exponent form (`1e-6` is serde_json's rendering of
+/// `0.000001`), which the plain-decimal parser rejects.
 fn per_token(field: Option<&Value>) -> Result<Option<Decimal>> {
     let Some(field) = field else {
         return Ok(None);
@@ -202,6 +204,7 @@ fn per_token(field: Option<&Value>) -> Result<Option<Decimal>> {
         other => bail!("catalogue price is neither a number nor a string: {other}"),
     };
     let per_million = Decimal::from_str_exact(&text)
+        .or_else(|_| Decimal::from_scientific(&text))
         .with_context(|| format!("catalogue price {text:?} is not an exact decimal"))?;
     let per_token = per_million
         .checked_div(Decimal::from(1_000_000u64))
@@ -318,6 +321,59 @@ mod tests {
     fn an_unknown_models_dev_id_is_an_error_not_empty_pricing() {
         let error = pricing_entries(&sample_catalogue(), "ghost").expect_err("unknown id");
         assert!(error.to_string().contains("ghost"), "got {error:#}");
+    }
+
+    #[test]
+    fn an_exponent_form_price_is_parsed_not_rejected() {
+        // serde_json renders small floats in exponent form (shortest
+        // round-trip); the plain-decimal parser rejects that text, so the
+        // scientific parser must take over.
+        let number: Value = serde_json::from_str("1e-6").expect("exponent json");
+        assert_eq!(
+            number.to_string(),
+            "1e-6",
+            "precondition: the catalogue number really renders in exponent form"
+        );
+        let per_token = super::per_token(Some(&number))
+            .expect("an exponent-form price is an exact decimal")
+            .expect("and the field was present");
+        assert_eq!(per_token.normalize().to_string(), "0.000000000001");
+    }
+
+    #[test]
+    fn exponent_form_prices_do_not_abort_the_providers_sync() {
+        let cheap: Value = serde_json::from_str("1e-6").expect("exponent json");
+        let catalogue = serde_json::json!({
+            "tiny": {
+                "models": {
+                    "cheap-model": {
+                        "cost": { "input": cheap, "output": 2.0 }
+                    },
+                    "plain-model": {
+                        "cost": { "input": 3, "output": 4 }
+                    }
+                }
+            }
+        });
+        let entries = pricing_entries(&catalogue, "tiny")
+            .expect("the sync survives a price serde_json renders as 1e-6");
+        let map = entries_as_map(&entries);
+        assert_eq!(map.len(), 2, "both models are priced, got {map:?}");
+        let cheap = map
+            .get(&ModelId::new("cheap-model"))
+            .expect("the exponent-form model is priced");
+        assert_eq!(cheap.input.normalize().to_string(), "0.000000000001");
+        assert_eq!(cheap.output.normalize().to_string(), "0.000002");
+    }
+
+    #[test]
+    fn a_non_numeric_catalogue_price_is_still_rejected() {
+        let garbage = Value::String("free!".to_owned());
+        let error = super::per_token(Some(&garbage)).expect_err("not a number");
+        assert!(
+            error.to_string().contains("not an exact decimal"),
+            "got {error:#}"
+        );
     }
 
     #[test]

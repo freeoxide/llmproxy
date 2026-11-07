@@ -240,6 +240,22 @@ pub trait Admission: Debug + Send + Sync {
     fn settle(&self, ticket: &AdmissionTicket, outcome: &AdmissionOutcome<'_>) {
         let _ = (ticket, outcome);
     }
+
+    /// Move the reservation's in-flight slot to the member the ladder is
+    /// about to try (failover or a cooldown reorder, plan 05 step 7): the
+    /// serving member's concurrency cap is checked and its slot held, and
+    /// the previously reserved member's slot is released. Fails when the
+    /// new member's cap is saturated, in which case the ladder skips that
+    /// member. The default keeps whatever `reserve` keyed on.
+    async fn rekey(
+        &self,
+        ticket: &AdmissionTicket,
+        member: &str,
+        model: &str,
+    ) -> Result<(), EngineError> {
+        let _ = (ticket, member, model);
+        Ok(())
+    }
 }
 
 /// What is being admitted.
@@ -250,8 +266,11 @@ pub struct AdmissionClaim<'a> {
     /// The route the client addressed: a provider name or a pool name (what
     /// per-key provider allowlists match).
     pub provider: &'a str,
-    /// The member provider the first attempt targets: the pricing and
-    /// concurrency-cap key. Equals `provider` on a direct route.
+    /// The member provider the reservation starts on — the first member
+    /// the ladder will try, cooldown reorder included: the initial pricing
+    /// and concurrency-cap key. [`Admission::rekey`] moves the in-flight
+    /// slot when the ladder fails over. Equals `provider` on a direct
+    /// route.
     pub member: &'a str,
     /// The upstream model the first attempt encodes for (the billing key).
     pub model: &'a str,

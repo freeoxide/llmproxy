@@ -340,14 +340,19 @@ fn billed_cost(usage: &Usage, pricing: Option<&ModelPricing>) -> Option<Cost> {
 
 /// Slots 6 and 8 for one request: the token estimate, the context-window
 /// preflight (plan 05 step 8) and the admission reservation against the
-/// plan's first candidate (plan 05 step 4). Cache hits never reach here, so
-/// they are neither preflighted nor charged.
+/// member the ladder will try first — cooldown reorder included, so the
+/// concurrency slot starts on the member that will actually serve (plan 05
+/// step 4). Cache hits never reach here, so they are neither preflighted
+/// nor charged.
 async fn admit(
     inner: &Arc<EngineInner>,
     req: &EngineRequest,
     plan: &RoutePlan,
 ) -> Result<AdmissionTicket, EngineError> {
-    let first = plan.candidates.first();
+    let first = ordered_candidates(inner, plan, Instant::now())
+        .first()
+        .and_then(|index| plan.candidates.get(*index))
+        .or_else(|| plan.candidates.first());
     let member = first.map_or("", |candidate| candidate.target.provider_name.as_str());
     let model = first.map_or("", |candidate| candidate.target.upstream_model.as_str());
     let estimated_input_tokens = crate::preflight::estimate_input_tokens(&inner.counter, &req.core);
@@ -404,6 +409,27 @@ fn strip_provider_bound_state(core: &CoreRequest) -> CoreRequest {
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
     stripped
+}
+
+/// A failed non-streaming ladder: the error, plus the usage and cost the
+/// serving attempt reported when the provider billed it before the proxy
+/// refused the response (a post-call guard rejection). Budgets charge what
+/// providers bill, per attempt (plan 05 step 6), so settlement charges it
+/// even though the client gets an error.
+struct LadderFailure {
+    error: EngineError,
+    usage: Option<Usage>,
+    cost: Option<Cost>,
+}
+
+impl From<EngineError> for LadderFailure {
+    fn from(error: EngineError) -> Self {
+        Self {
+            error,
+            usage: None,
+            cost: None,
+        }
+    }
 }
 
 /// The per-request ladder state shared by both execution modes.
@@ -836,21 +862,29 @@ async fn run_once(
     }
 
     // Slots 6 and 8: preflight, then one reservation for the whole ladder;
-    // settlement happens exactly once at the end.
+    // settlement happens exactly once at the end. A failure that the
+    // provider still billed (a guard-rejected response) charges its usage.
     let ticket = admit(inner, req, &plan).await?;
 
     match run_ladder_once(inner, req, plan, &ticket, &cache_key).await {
         Ok(response) => Ok(response),
-        Err(error) => {
-            settle(inner, &ticket, false, None, None);
-            Err(error)
+        Err(failure) => {
+            settle(
+                inner,
+                &ticket,
+                false,
+                failure.usage.as_ref(),
+                failure.cost.as_ref(),
+            );
+            Err(failure.error)
         }
     }
 }
 
 /// Slots 7-13 of the non-streaming lifecycle against a reserved ticket: the
 /// attempt loop (plan 04 steps 1-5). The success path settles the ticket;
-/// every failure propagates to [`run_once`], which settles it as failed.
+/// every failure propagates to [`run_once`], which settles it as failed
+/// (with the billed usage when the failure carries one).
 #[expect(
     clippy::too_many_lines,
     reason = "one attempt loop: candidate iteration, credential rotation, \
@@ -863,7 +897,7 @@ async fn run_ladder_once(
     plan: RoutePlan,
     ticket: &AdmissionTicket,
     cache_key: &CacheKey<'_>,
-) -> Result<EngineResponse, EngineError> {
+) -> Result<EngineResponse, LadderFailure> {
     // Slot 7: pre-call guards, once per request — the request does not
     // change between attempts (only provider-bound hints do, which are not
     // the client's words).
@@ -871,7 +905,7 @@ async fn run_ladder_once(
         match guard.inspect_request(&req.core).await? {
             GuardDecision::Allow => {}
             GuardDecision::Reject(message) => {
-                return Err(EngineError::InvalidRequest(message));
+                return Err(EngineError::InvalidRequest(message).into());
             }
         }
     }
@@ -891,12 +925,22 @@ async fn run_ladder_once(
 
     'ladder: for &member_index in &order {
         let Some(candidate) = ladder.plan.candidates.get(member_index).cloned() else {
-            return Err(EngineError::Internal(
-                "candidate index out of range".to_owned(),
-            ));
+            return Err(EngineError::Internal("candidate index out of range".to_owned()).into());
         };
         let member = candidate.target.provider_name.clone();
         refuse_switch(inner, &ladder, &member)?;
+        // The cap follows the ladder (plan 05 step 7): move the in-flight
+        // slot to the member about to serve — failover and the first
+        // candidate both land here — and skip the member when its cap is
+        // saturated, exactly as a cooldown would.
+        if let Err(error) = inner
+            .admission
+            .rekey(ticket, &member, &candidate.target.upstream_model)
+            .await
+        {
+            last_error = Some(error);
+            continue 'ladder;
+        }
         if ladder.first_member.is_none() {
             ladder.first_member = Some(member.clone());
         }
@@ -949,7 +993,7 @@ async fn run_ladder_once(
                         class_for_ladder(inner, &member, &engine_error),
                         ErrorClass::Terminal
                     ) {
-                        return Err(engine_error);
+                        return Err(engine_error.into());
                     }
                     if attempt_in_member + 1 < ladder.attempts_per_member() {
                         let wait = next_wait(
@@ -983,18 +1027,6 @@ async fn run_ladder_once(
                 }
             };
 
-            // Slot 11: post-call guards. A guard rejection is proxy policy,
-            // not an upstream fault: no retry, no failover.
-            for guard in &inner.guards {
-                match guard.inspect_response(&core_resp).await? {
-                    GuardDecision::Allow => {}
-                    GuardDecision::Reject(message) => {
-                        return Err(EngineError::InvalidRequest(message));
-                    }
-                }
-            }
-
-            let latency = req.start.elapsed();
             let pricing = inner
                 .providers
                 .pricing_for(
@@ -1003,6 +1035,25 @@ async fn run_ladder_once(
                 )
                 .cloned();
             let cost = billed_cost(&core_resp.usage, pricing.as_ref());
+
+            // Slot 11: post-call guards. A guard rejection is proxy policy,
+            // not an upstream fault: no retry, no failover — but the
+            // provider billed this attempt, so its usage still reaches
+            // settlement (plan 05 step 6).
+            for guard in &inner.guards {
+                let error = match guard.inspect_response(&core_resp).await {
+                    Ok(GuardDecision::Allow) => continue,
+                    Ok(GuardDecision::Reject(message)) => EngineError::InvalidRequest(message),
+                    Err(error) => error,
+                };
+                return Err(LadderFailure {
+                    error,
+                    usage: Some(core_resp.usage.clone()),
+                    cost,
+                });
+            }
+
+            let latency = req.start.elapsed();
             core_resp.cost = cost.clone();
 
             emit_attempt(
@@ -1090,9 +1141,9 @@ async fn run_ladder_once(
         EngineError::Internal("retry ladder ended without attempting".to_owned())
     });
     if ladder_had_capacity(&ladder.plan) {
-        Err(exhausted(inner, &ladder.plan, ladder.seq, last))
+        Err(exhausted(inner, &ladder.plan, ladder.seq, last).into())
     } else {
-        Err(last)
+        Err(last.into())
     }
 }
 
@@ -1580,14 +1631,17 @@ async fn commit_and_stream(
     let ladder = &mut stream.ladder;
     let member = committed.ctx.provider_name.clone();
     let head = std::mem::take(&mut committed.head);
+    // The head's usage is captured before the guards see it: a rejected
+    // prefix was still billed by the provider, so its settlement charges
+    // what was reported (plan 05 step 6).
+    for core_event in head.iter() {
+        capture_lifecycle(&mut committed.ctx, core_event);
+    }
     if let Some(error) = vet_prefix(inner, &head).await {
         inner.metrics.record_failure();
         signal_pre_stream_error(inner, stream, error);
         committed.ctx.settle(inner, false);
         return;
-    }
-    for core_event in head.iter() {
-        capture_lifecycle(&mut committed.ctx, core_event);
     }
     // Same opt-in as the non-streaming path: only sticky pools pin.
     if ladder.plan.affinity.sticky
@@ -1661,6 +1715,17 @@ async fn stream_attempt(
     if let Err(error) = refuse_switch(inner, &stream.ladder, &member) {
         stop_with(inner, stream, error, false);
         return false;
+    }
+    // The cap follows the ladder (plan 05 step 7), same rule as the
+    // non-streaming path: a saturated member is skipped like a cooling one,
+    // and the last error surfaces when every member is capped.
+    if let Err(error) = inner
+        .admission
+        .rekey(&stream.ticket, &member, &candidate.target.upstream_model)
+        .await
+    {
+        stream.last_error = Some(error);
+        return true;
     }
     if stream.ladder.first_member.is_none() {
         stream.ladder.first_member = Some(member.clone());

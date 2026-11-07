@@ -11,21 +11,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::http::{StatusCode, header};
 use axum::routing::post;
 use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
 use llm_proxy_core::{
-    AppConfig, AuthStyle, ClientKeySpec, KeyBudgetConfig, KeyWindowLimits, ProviderAdapterConfig,
-    ProviderConfig, ProviderRegistry, ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
+    AppConfig, AuthStyle, ClientKeySpec, KeyBudgetConfig, KeyWindowLimits, PoolConfig,
+    ProviderAdapterConfig, ProviderConcurrencyConfig, ProviderConfig, ProviderRegistry,
+    ProviderRouteKind, ProviderRoutesConfig, RetryConfig, ServerConfig,
 };
 use llm_proxy_engine::{
     Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, Cache, CacheEntry, CacheKey,
-    ClientDialect, EngineBuilder, EngineError, EngineRequest, InboundRequest, KeyPolicy,
-    PolicyAdmission,
+    ClientDialect, EngineBuilder, EngineError, EngineRequest, Guard, GuardDecision, InboundRequest,
+    KeyPolicy, PolicyAdmission,
 };
 use llm_proxy_protocol::core::{
-    CoreContent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
+    CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreResponse, CoreRole, Cost, ModelRef,
+    SamplingOptions, Usage,
 };
 use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus};
 
@@ -396,6 +399,216 @@ async fn a_saturated_concurrency_cap_answers_503_and_frees_on_completion() {
         .expect("the slot freed at settlement");
 }
 
+/// A held upstream that counts arrivals before parking, so a test can wait
+/// until a request is genuinely in flight there (holding its slot).
+fn upstream_held_counting(
+    release: Arc<tokio::sync::watch::Receiver<bool>>,
+    arrivals: Arc<AtomicUsize>,
+) -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(move || {
+            let mut release = release.as_ref().clone();
+            let arrivals = Arc::clone(&arrivals);
+            async move {
+                arrivals.fetch_add(1, Ordering::SeqCst);
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":4}}"#,
+                )
+            }
+        }),
+    )
+}
+
+fn pool_member(
+    name: &str,
+    endpoint: String,
+    concurrency: Option<ProviderConcurrencyConfig>,
+) -> ProviderConfig {
+    let mut config = provider(endpoint, concurrency);
+    config.name = name.to_owned();
+    config
+}
+
+fn pool_engine_request(route: &str, request_id: &str, stream: bool) -> EngineRequest {
+    let mut core = core_request("claude-sonnet-4-6");
+    core.stream = stream;
+    EngineRequest::new(
+        route,
+        ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        core,
+        InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(
+                ClientWireFormat::AnthropicMessages,
+                serde_json::json!({}),
+            ),
+        },
+    )
+    .with_request_id(request_id)
+    .with_caller("anonymous")
+    .with_body_hash("hash")
+}
+
+/// A pool whose first member always 500s (every request fails over) and
+/// whose spare is capped at one in-flight request, parked on a gated
+/// upstream.
+async fn capped_spare_pool() -> (
+    llm_proxy_engine::Engine,
+    Arc<tokio::sync::watch::Sender<bool>>,
+    Arc<AtomicUsize>,
+) {
+    let failing = spawn_upstream(upstream_always_500()).await;
+    let release = Arc::new(tokio::sync::watch::Sender::new(false));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let held = spawn_upstream(upstream_held_counting(
+        Arc::new(release.subscribe()),
+        Arc::clone(&arrivals),
+    ))
+    .await;
+    let registry = ProviderRegistry::from_parts(
+        vec![
+            pool_member("flaky", failing, None),
+            pool_member(
+                "spare",
+                held,
+                Some(ProviderConcurrencyConfig {
+                    total: Some(1),
+                    models: HashMap::new(),
+                }),
+            ),
+        ],
+        vec![PoolConfig {
+            name: "pooled".to_owned(),
+            members: vec!["flaky".to_owned(), "spare".to_owned()],
+            retry: RetryConfig {
+                max_attempts: 1,
+                backoff: Duration::from_millis(5),
+                cooldown: Duration::ZERO,
+                total_timeout: Duration::ZERO,
+                hold: Duration::ZERO,
+            },
+            affinity: Default::default(),
+            health: Default::default(),
+        }],
+    )
+    .expect("registry with pool");
+    let admission = Arc::new(PolicyAdmission::from_config(
+        &llm_proxy_core::AuthConfig::default(),
+        &registry,
+    ));
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine");
+    (engine, release, arrivals)
+}
+
+/// Waits until `arrivals` requests have parked on the held upstream.
+async fn await_arrivals(arrivals: &Arc<AtomicUsize>, count: usize) {
+    for _ in 0..400 {
+        if arrivals.load(Ordering::SeqCst) >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        arrivals.load(Ordering::SeqCst),
+        count,
+        "the held upstream never saw the request"
+    );
+}
+
+#[tokio::test]
+async fn a_pool_failover_respects_the_serving_members_concurrency_cap() {
+    let (engine, release, arrivals) = capped_spare_pool().await;
+
+    // Request one fails over to the spare and parks there, holding its
+    // only in-flight slot.
+    let first = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .execute(pool_engine_request("pooled", "one", false))
+                .await
+                .expect("held request completes after release")
+        }
+    });
+    await_arrivals(&arrivals, 1).await;
+
+    // Request two also fails over; the spare's cap — not the first
+    // member's key the reservation started on — must refuse it, instead of
+    // letting it park unsynchronized on the capped member.
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.execute(pool_engine_request("pooled", "two", false)),
+    )
+    .await
+    .expect("the capped failover refuses fast instead of parking on the held upstream")
+    .expect_err("the spare is at its in-flight cap");
+    let EngineError::RetryExhausted { last, .. } = &second else {
+        panic!("expected an exhausted ladder, got {second:?}");
+    };
+    assert!(
+        matches!(**last, EngineError::Overloaded { .. }),
+        "the ladder's last error is the saturated cap, got {last:?}"
+    );
+    assert_eq!(second.status_code(), 503);
+
+    release.send_replace(true);
+    first.await.expect("held request joins");
+    engine
+        .execute(pool_engine_request("pooled", "three", false))
+        .await
+        .expect("the slot freed at settlement");
+}
+
+#[tokio::test]
+async fn a_streaming_pool_failover_respects_the_serving_members_concurrency_cap() {
+    let (engine, release, arrivals) = capped_spare_pool().await;
+
+    // A non-streaming request holds the spare's only slot.
+    let first = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .execute(pool_engine_request("pooled", "one", false))
+                .await
+                .expect("held request completes after release")
+        }
+    });
+    await_arrivals(&arrivals, 1).await;
+
+    // A streaming request that fails over must meet the same cap before
+    // any byte is committed.
+    let error = engine
+        .execute_stream(pool_engine_request("pooled", "two", true))
+        .await
+        .expect_err("the spare is at its in-flight cap");
+    let EngineError::RetryExhausted { last, .. } = &error else {
+        panic!("expected an exhausted ladder, got {error:?}");
+    };
+    assert!(
+        matches!(**last, EngineError::Overloaded { .. }),
+        "the ladder's last error is the saturated cap, got {last:?}"
+    );
+    assert_eq!(error.status_code(), 503);
+
+    release.send_replace(true);
+    first.await.expect("held request joins");
+}
+
 #[tokio::test]
 async fn per_key_allowlists_are_enforced_through_the_engine() {
     let ok = spawn_upstream(upstream_always_ok()).await;
@@ -526,4 +739,148 @@ async fn cache_hits_never_reserve_and_are_recorded_as_hits() {
         })
         .count();
     assert_eq!(hits, 1, "the hit is recorded as a hit on its ledger row");
+}
+
+/// Records every settlement the engine hands to admission: what a budget
+/// would be charged.
+#[derive(Debug, Default)]
+struct SettlementLog {
+    settled: std::sync::Mutex<Vec<(bool, Option<Usage>, Option<Cost>)>>,
+}
+
+#[async_trait]
+impl Admission for SettlementLog {
+    fn settle(&self, _ticket: &AdmissionTicket, outcome: &AdmissionOutcome<'_>) {
+        self.settled.lock().expect("settlement log").push((
+            outcome.succeeded,
+            outcome.usage.cloned(),
+            outcome.cost.cloned(),
+        ));
+    }
+}
+
+/// A post-call guard that refuses every response and every streamed event.
+#[derive(Debug)]
+struct RefuseEverything;
+
+#[async_trait]
+impl Guard for RefuseEverything {
+    async fn inspect_response(
+        &self,
+        _response: &CoreResponse,
+    ) -> Result<GuardDecision, EngineError> {
+        Ok(GuardDecision::Reject(
+            "refused by the test guard".to_owned(),
+        ))
+    }
+
+    async fn inspect_event(&self, _event: &CoreEvent) -> Result<GuardDecision, EngineError> {
+        Ok(GuardDecision::Reject(
+            "refused by the test guard".to_owned(),
+        ))
+    }
+}
+
+/// A complete Anthropic SSE response (7 in, 1 out) sent as one body, so the
+/// whole stream lands in the pre-commit head the guards vet.
+fn upstream_stream_in_one_body() -> Router {
+    Router::new().route(
+        "/{*path}",
+        post(|| async {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                concat!(
+                    "event: message_start\n",
+                    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_g\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n\n",
+                    "event: content_block_delta\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+                    "event: message_delta\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                ),
+            )
+        }),
+    )
+}
+
+fn guarded_engine(endpoint: String) -> (llm_proxy_engine::Engine, Arc<SettlementLog>) {
+    let registry =
+        ProviderRegistry::from_providers(vec![provider(endpoint, None)]).expect("registry");
+    let log = Arc::new(SettlementLog::default());
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&log) as Arc<dyn Admission>)
+        .guard(Arc::new(RefuseEverything))
+        .build()
+        .expect("engine");
+    (engine, log)
+}
+
+/// The one settlement the log holds, with the usage and cost it carried.
+fn only_settlement(log: &SettlementLog) -> (bool, Option<Usage>, Option<Cost>) {
+    let settled = log.settled.lock().expect("settlement log").clone();
+    let [only] = settled.as_slice() else {
+        panic!("exactly one settlement per request, got {settled:?}");
+    };
+    only.clone()
+}
+
+#[tokio::test]
+async fn a_guard_rejected_response_still_charges_what_the_provider_billed() {
+    let ok = spawn_upstream(upstream_always_ok()).await;
+    let (engine, log) = guarded_engine(ok);
+
+    let error = engine
+        .execute(pool_engine_request("fake", "guarded", false))
+        .await
+        .expect_err("the guard refuses the response");
+    assert_eq!(
+        error.status_code(),
+        400,
+        "a guard rejection is the proxy's own 400, got {error:?}"
+    );
+
+    // The provider answered and billed 10 in / 4 out before the proxy
+    // refused it: that usage, priced at the member's rate, reaches
+    // settlement — budgets charge what providers bill, per attempt.
+    let (succeeded, usage, cost) = only_settlement(&log);
+    assert!(!succeeded, "the request failed from the client's view");
+    let usage = usage.expect("the billed usage reaches settlement");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (10, 4));
+    assert_eq!(
+        cost.map(|cost| cost.total.normalize().to_string())
+            .as_deref(),
+        Some("0.0014"),
+        "priced at the member's 0.0001 per token"
+    );
+}
+
+#[tokio::test]
+async fn a_guard_rejected_stream_prefix_still_charges_what_the_provider_billed() {
+    let stream = spawn_upstream(upstream_stream_in_one_body()).await;
+    let (engine, log) = guarded_engine(stream);
+
+    let error = engine
+        .execute_stream(pool_engine_request("fake", "guarded-stream", true))
+        .await
+        .expect_err("the guard refuses the buffered prefix");
+    assert_eq!(
+        error.status_code(),
+        400,
+        "a guard rejection before commit is the proxy's own 400, got {error:?}"
+    );
+
+    let (succeeded, usage, cost) = only_settlement(&log);
+    assert!(!succeeded);
+    let usage = usage.expect("the usage the rejected prefix reported reaches settlement");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (7, 1));
+    assert_eq!(
+        cost.map(|cost| cost.total.normalize().to_string())
+            .as_deref(),
+        Some("0.0008"),
+        "priced at the member's 0.0001 per token"
+    );
 }

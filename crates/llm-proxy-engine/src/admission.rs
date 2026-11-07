@@ -23,15 +23,20 @@
 //!   fixed amount. Refusals are 402.
 //! - **What counts** (step 6). At settlement the reservation is released
 //!   and the budget is charged exactly what the provider billed: the
-//!   engine-computed cost of the usage the serving attempt reported. A
-//!   request that fails before any usage charges nothing (the reservation
-//!   is simply released: the refund). Cache hits never reach `reserve`, so
-//!   they charge nothing. Unpriced usage cannot be charged and is logged.
+//!   engine-computed cost of the usage the serving attempt reported —
+//!   including a response the proxy's own guards then refused, which the
+//!   provider billed all the same. A request that fails before any usage
+//!   charges nothing (the reservation is simply released: the refund).
+//!   Cache hits never reach `reserve`, so they charge nothing. Unpriced
+//!   usage cannot be charged and is logged.
 //! - **Concurrency** (step 7). `[provider.concurrency]` caps in-flight
 //!   requests per member and per upstream model; a saturated cap answers
 //!   503 with a one-second `Retry-After`, never 429, because capacity
 //!   shedding misread as rate limiting arms hour-long client backoff
-//!   ladders. The slot is held from admission to settlement.
+//!   ladders. The slot is held from admission to settlement, and moves
+//!   with the ladder: at each failover the slot is re-keyed to (and the
+//!   cap checked against) the member about to serve, so a capped member
+//!   is capped however the request reaches it.
 //!
 //! Every check and every mutation happens under one lock, so a reservation
 //! is atomic across all four rules. Keys without a policy entry and the
@@ -57,6 +62,22 @@ use crate::traits::{Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket
 /// The wait advised when a concurrency cap is saturated: short, because a
 /// slot frees as soon as any in-flight request settles.
 const SATURATED_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// The refusal a saturated member cap answers with (step 7).
+fn member_saturated(member: &str, cap: u32) -> EngineError {
+    EngineError::Overloaded {
+        message: format!("provider \"{member}\" is at its in-flight cap of {cap}"),
+        retry_after: Some(SATURATED_RETRY_AFTER),
+    }
+}
+
+/// The refusal a saturated per-model cap answers with (step 7).
+fn model_saturated(model: &str, member: &str, cap: u32) -> EngineError {
+    EngineError::Overloaded {
+        message: format!("model \"{model}\" on \"{member}\" is at its in-flight cap of {cap}"),
+        retry_after: Some(SATURATED_RETRY_AFTER),
+    }
+}
 
 /// One key's admission policy, as configured.
 #[derive(Debug, Clone, Default)]
@@ -495,27 +516,17 @@ impl Admission for PolicyAdmission {
         let member_cap = caps.and_then(|c| c.total);
         let model_cap = caps.and_then(|c| c.models.get(claim.model).copied());
         let model_key = (claim.member.to_owned(), claim.model.to_owned());
-        if let Some(cap) = member_cap
-            && inflight_members.get(claim.member).copied().unwrap_or(0) >= cap
-        {
-            return Err(EngineError::Overloaded {
-                message: format!(
-                    "provider \"{}\" is at its in-flight cap of {cap}",
-                    claim.member
-                ),
-                retry_after: Some(SATURATED_RETRY_AFTER),
-            });
+        if let Some(cap) = member_cap {
+            let inflight = inflight_members.get(claim.member).copied().unwrap_or(0);
+            if inflight >= cap {
+                return Err(member_saturated(claim.member, cap));
+            }
         }
-        if let Some(cap) = model_cap
-            && inflight_models.get(&model_key).copied().unwrap_or(0) >= cap
-        {
-            return Err(EngineError::Overloaded {
-                message: format!(
-                    "model \"{}\" on \"{}\" is at its in-flight cap of {cap}",
-                    claim.model, claim.member
-                ),
-                retry_after: Some(SATURATED_RETRY_AFTER),
-            });
+        if let Some(cap) = model_cap {
+            let inflight = inflight_models.get(&model_key).copied().unwrap_or(0);
+            if inflight >= cap {
+                return Err(model_saturated(claim.model, claim.member, cap));
+            }
         }
 
         // Every check passed: commit the whole reservation at once.
@@ -639,6 +650,78 @@ impl Admission for PolicyAdmission {
             // reservation release above is the refund.
             _ => {}
         }
+    }
+
+    /// Step 7 under failover: the in-flight slot moves to the member the
+    /// ladder is about to try, so a capped member is capped however the
+    /// request reached it. The whole move — release, saturation check,
+    /// acquire — happens under the one lock the reservation committed
+    /// under, so counts never drift.
+    async fn rekey(
+        &self,
+        ticket: &AdmissionTicket,
+        member: &str,
+        model: &str,
+    ) -> Result<(), EngineError> {
+        let Some(id) = ticket.lease else {
+            return Ok(());
+        };
+        let mut state = self.lock();
+        let (old_member, old_model, held_member_slot, held_model_slot) = {
+            let Some(lease) = state.leases.get(&id) else {
+                tracing::warn!(lease = id, "admission rekey for an unknown lease; ignoring");
+                return Ok(());
+            };
+            if lease.member == member && lease.model == model {
+                return Ok(());
+            }
+            (
+                lease.member.clone(),
+                lease.model.clone(),
+                lease.holds_member_slot,
+                lease.holds_model_slot,
+            )
+        };
+        let caps = self.caps.get(member);
+        let member_cap = caps.and_then(|c| c.total);
+        let model_cap = caps.and_then(|c| c.models.get(model).copied());
+        if let Some(cap) = member_cap {
+            let inflight = state.inflight_members.get(member).copied().unwrap_or(0);
+            if inflight >= cap {
+                return Err(member_saturated(member, cap));
+            }
+        }
+        if let Some(cap) = model_cap {
+            let key = (member.to_owned(), model.to_owned());
+            let inflight = state.inflight_models.get(&key).copied().unwrap_or(0);
+            if inflight >= cap {
+                return Err(model_saturated(model, member, cap));
+            }
+        }
+        if held_member_slot && let Some(count) = state.inflight_members.get_mut(&old_member) {
+            *count = count.saturating_sub(1);
+        }
+        if held_model_slot
+            && let Some(count) = state.inflight_models.get_mut(&(old_member, old_model))
+        {
+            *count = count.saturating_sub(1);
+        }
+        if let Some(lease) = state.leases.get_mut(&id) {
+            lease.member = member.to_owned();
+            lease.model = model.to_owned();
+            lease.holds_member_slot = member_cap.is_some();
+            lease.holds_model_slot = model_cap.is_some();
+        }
+        if member_cap.is_some() {
+            *state.inflight_members.entry(member.to_owned()).or_insert(0) += 1;
+        }
+        if model_cap.is_some() {
+            *state
+                .inflight_models
+                .entry((member.to_owned(), model.to_owned()))
+                .or_insert(0) += 1;
+        }
+        Ok(())
     }
 }
 
@@ -1028,6 +1111,75 @@ mod tests {
             .reserve(&claim("anonymous", "p", "m", 1, None))
             .await
             .expect("slots freed at settlement");
+    }
+
+    #[tokio::test]
+    async fn rekey_moves_the_in_flight_slot_to_the_member_being_tried() {
+        let admission = PolicyAdmission::new(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([
+                ("a".to_owned(), (Some(1), HashMap::new())),
+                ("b".to_owned(), (Some(1), HashMap::new())),
+            ]),
+        );
+        let ticket = admission
+            .reserve(&claim("anonymous", "a", "m", 1, None))
+            .await
+            .expect("slot on a");
+
+        // Re-keying to the member already held is a no-op, not a second
+        // slot: the cap of 1 is still saturated.
+        admission
+            .rekey(&ticket, "a", "m")
+            .await
+            .expect("same member: nothing to move");
+        assert!(matches!(
+            admission
+                .reserve(&claim("anonymous", "a", "m", 1, None))
+                .await,
+            Err(EngineError::Overloaded { .. })
+        ));
+
+        // The ladder fails over to "b": the slot moves.
+        admission
+            .rekey(&ticket, "b", "m")
+            .await
+            .expect("the slot moves to b");
+        // "a" was released by the move, so a fresh reservation fits there —
+        // the failed-over request no longer squats on its first member.
+        let second = admission
+            .reserve(&claim("anonymous", "a", "m", 1, None))
+            .await
+            .expect("a's slot was released by the move");
+        // "b" is held by the moved lease, so moving the second lease there
+        // is refused.
+        assert!(matches!(
+            admission.rekey(&second, "b", "m").await,
+            Err(EngineError::Overloaded { .. })
+        ));
+
+        // Settling the moved lease frees "b", the member it ended on.
+        admission.settle(
+            &ticket,
+            &AdmissionOutcome {
+                succeeded: false,
+                usage: None,
+                cost: None,
+            },
+        );
+        admission
+            .rekey(&second, "b", "m")
+            .await
+            .expect("settlement freed b, the member the lease ended on");
+        admission.settle(
+            &second,
+            &AdmissionOutcome {
+                succeeded: false,
+                usage: None,
+                cost: None,
+            },
+        );
     }
 
     #[test]

@@ -184,6 +184,24 @@ mod tests {
     }
 
     #[test]
+    fn cmd_validate_accepts_the_shipped_example_config() {
+        let example =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.toml.example");
+        let raw = std::fs::read_to_string(&example)
+            .unwrap()
+            // The example references env vars only inside commented-out
+            // lines, but config loading scans the raw text for them.
+            .replace("${HOME}", "/tmp")
+            .replace("${ADMIN_TOKEN}", "test-admin-token");
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, raw).unwrap();
+
+        cmd_validate(Some(&config))
+            .unwrap_or_else(|e| panic!("config.toml.example must validate as shipped: {e:#}"));
+    }
+
+    #[test]
     fn cmd_validate_rejects_a_bare_v1_target_naming_no_provider_or_pool() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
