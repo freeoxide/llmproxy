@@ -9,7 +9,6 @@ Each plan is one stage of work, with its scope, steps and finish line.
 
 | # | Plan | Status | Depends on |
 |---|---|---|---|
-| 05 | [Admission and budgets](plans/05-admission-and-budgets.md) | Not started | 04 |
 | 06 | [Cache and dedup](plans/06-cache-and-dedup.md) | Not started | 05 |
 | 07 | [Hardening and operations](plans/07-hardening-and-operations.md) | Not started | None; steps 10 and 11 need 03 |
 | 08 | [Client dialects](plans/08-client-dialects.md) | Not started | 03 |
@@ -62,6 +61,7 @@ Plan headers point to the [research audit](research/audit-2026-11-05/REPORT.md):
 
 ## Completed
 
+- [05. Admission and budgets](completed/05-admission-and-budgets.md)
 - [04. Routing and failover](completed/04-routing-and-failover.md)
 - [03. Engine and crate split](completed/03-engine.md)
 - [02. Request fidelity](completed/02-request-fidelity.md)

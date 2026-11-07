@@ -1,6 +1,6 @@
 # 05. Admission and budgets
 
-- **Status:** Not started
+- **Status:** Completed (2026-11-07)
 - **Depends on:** 04
 - **Audit rows:** None
 - **Code-audit bugs:** BUG-24
@@ -42,3 +42,24 @@ proposes three different admission models, and this plan replaces them with one.
 - A refund restores the budget when a request fails before any cost.
 - Lookup cost for a bad token doesn't grow with the number of keys.
 - Every status code the proxy produces is in the policy table, and a test enforces it.
+
+## Done
+
+- `llm_proxy_engine::error_policy` holds the one status table; the server renders
+  its `x-should-retry` row on every error plus any `Retry-After` advice, and
+  tests on both sides enforce that every engine and server status is a row.
+- Client tokens are `<key-id>.<secret>`: one argon2 verification per bad
+  prefixed token, zero for an unknown id, at any key count (the bare-secret
+  scan remains as the legacy fallback).
+- `PolicyAdmission` implements the `Admission` trait with the four rules in
+  one atomic reservation: glob allowlists (403, fail closed without a model),
+  rpm/tpm/rpd windows (429 with the reset), a `usd_per_day` budget that
+  reserves first (402) with an explicit unestimatable policy, and
+  per-provider and per-model in-flight caps (503 with a one-second
+  `Retry-After`). Settlement charges exactly what the provider billed and
+  refunds a failure before any usage.
+- Preflight estimates input tokens once (shared with admission) and warns by
+  default; enforce mode rejects only past the configured margin.
+- `llm-proxy pricing-sync` writes per-token pricing from models.dev into
+  opted-in provider files, and unpriced rows report `cost: null` with an
+  unpriced count in usage summaries (never `$0`).
