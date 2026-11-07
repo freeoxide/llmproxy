@@ -17,9 +17,11 @@ Two wheels are produced here: the Linux x86_64 manylinux wheel (built and
 install-tested) and a Windows x64 wheel
 (`llm_proxy-0.1.0-cp39-abi3-win_amd64.whl`, mingw-w64 cross-compilation via
 `RUSTC_WRAPPER= .venv/bin/maturin build --release --target
-x86_64-pc-windows-gnu -o dist`; built, not run, on this machine). macOS
-wheels are left to CI runners with Apple toolchains. The abi3 wheel supports
-CPython 3.9+.
+x86_64-pc-windows-gnu -o dist`). The Windows wheel is run-verified with the
+embeddable Windows CPython 3.13.5 under wine 10.0 — every shared-contract
+case, the error shape, streaming, cancellation and the ClientCancelled
+settlement pass (see `tests/windows_driver.py`). macOS wheels are left to
+CI runners with Apple toolchains. The abi3 wheel supports CPython 3.9+.
 
 ## Use
 
