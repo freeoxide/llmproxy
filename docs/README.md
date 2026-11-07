@@ -9,7 +9,6 @@ Each plan is one stage of work, with its scope, steps and finish line.
 
 | # | Plan | Status | Depends on |
 |---|---|---|---|
-| 10 | [Language bindings](plans/10-bindings.md) | Not started | 03, with a stable API |
 | 11 | [Research corrections](plans/11-research-corrections.md) | Not started | None |
 
 How to use them:
@@ -59,6 +58,7 @@ Plan headers point to the [research audit](research/audit-2026-11-05/REPORT.md):
 
 ## Completed
 
+- [10. Language bindings](completed/10-bindings.md)
 - [09. Optional crates](completed/09-optional-crates.md)
 - [08. Client dialects](completed/08-client-dialects.md)
 - [07. Hardening and operations](completed/07-hardening-and-operations.md)

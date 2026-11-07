@@ -13,6 +13,7 @@ crates/llm-proxy-protocol      OpenAI / Claude / Gemini wire types
 crates/llm-proxy-adapters      provider codecs (no I/O)
 crates/llm-proxy-transport     HTTP egress, credentials, discovery
 crates/llm-proxy-engine        request lifecycle (no HTTP) + traits
+crates/llm-proxy-bridge        JSON surface the Python/Node bindings wrap
 crates/llm-proxy-storage       usage ledger
 crates/llm-proxy-api           read-only /usage API
 crates/llm-proxy-server        axum routes and error mapping
@@ -29,6 +30,11 @@ crates/llm-proxy-mcp               MCP gateway ([mcp], own tokens)
 # EngineBuilder::guard (llm-proxy-guardrails never becomes a daemon
 # dependency).
 crates/llm-proxy-guardrails        guards with modes and fail policies
+
+# Language bindings (plan 10) — standalone workspaces packaged for PyPI/npm:
+bindings/python                 llm-proxy wheel (pyo3 + maturin)
+bindings/node                   @freeoxide/llm-proxy (napi-rs)
+bindings/shared                 binding contract cases and snapshots
 ~~~
 
 A bare `cargo build` compiles none of them (they sit outside
