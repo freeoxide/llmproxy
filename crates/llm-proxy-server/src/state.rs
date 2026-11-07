@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use llm_proxy_adapters::ProviderAdapterRegistry;
@@ -43,12 +43,41 @@ pub struct AppState {
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
     pub(crate) event_bus: Arc<dyn EventBus>,
     pub(crate) client_auth: Arc<ClientAuth>,
-    /// Materialized once and shared by every clone of this state: axum hands
-    /// each request its own `AppState` clone, and the engine carries
-    /// process-wide state (response cache, single-flight, idempotency,
-    /// cooldowns), so a per-clone cell would give every request a fresh,
-    /// empty engine.
-    engine: Arc<OnceLock<Result<Arc<Engine>, llm_proxy_engine::EngineError>>>,
+    /// The configuration snapshots the engine reads per pipeline stage (plan
+    /// 07 step 10): swapping the whole immutable snapshot is the one update
+    /// path; nothing merges into a live one.
+    pub(crate) config_source: Arc<llm_proxy_engine::SwappingConfigSource>,
+    /// Shared by every clone of this state: axum hands each request its own
+    /// `AppState` clone, and the engine carries process-wide state (response
+    /// cache, single-flight, idempotency, cooldowns), so a per-clone cell
+    /// would give every request a fresh, empty engine. The slot itself can be
+    /// swapped by a hot reload (plan 07 step 11); requests already holding an
+    /// engine clone finish on it.
+    engine: Arc<EngineSlot>,
+}
+
+/// The one engine slot, lazily built once and hot-swappable afterwards.
+#[derive(Debug, Default)]
+struct EngineSlot {
+    built: std::sync::RwLock<Option<Result<Arc<Engine>, llm_proxy_engine::EngineError>>>,
+}
+
+impl EngineSlot {
+    fn get(&self) -> Option<Result<Arc<Engine>, llm_proxy_engine::EngineError>> {
+        let guard = self
+            .built
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.clone()
+    }
+
+    fn set(&self, built: Result<Arc<Engine>, llm_proxy_engine::EngineError>) {
+        let mut guard = self
+            .built
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(built);
+    }
 }
 
 impl std::fmt::Debug for AppState {
@@ -120,8 +149,12 @@ impl AppState {
                 Arc::new(ClientAuth::fail_closed())
             }
         };
+        let app_config = Arc::new(app_config);
+        let config_source = Arc::new(llm_proxy_engine::SwappingConfigSource::new(Arc::clone(
+            &app_config,
+        )));
         Self {
-            app_config: Arc::new(app_config),
+            app_config,
             providers: Arc::new(providers),
             provider_adapters: Arc::new(provider_adapters),
             proxy_client: Arc::new(proxy_client),
@@ -134,7 +167,8 @@ impl AppState {
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
             client_auth,
-            engine: Arc::new(OnceLock::new()),
+            config_source,
+            engine: Arc::new(EngineSlot::default()),
         }
     }
 
@@ -215,54 +249,69 @@ impl AppState {
     ///
     /// [`llm_proxy_engine::EngineError`] when the provider set names a
     /// protocol no registered adapter serves (surfaced per request as a 500).
-    pub fn engine(&self) -> Result<&Arc<Engine>, llm_proxy_engine::EngineError> {
-        let built = self.engine.get_or_init(|| {
-            let mut builder = EngineBuilder::from_parts(
-                Arc::new(llm_proxy_engine::StaticConfigSource::new(Arc::clone(
-                    &self.app_config,
-                ))),
-                Arc::clone(&self.providers),
-                Arc::clone(&self.provider_adapters),
-                Arc::clone(&self.proxy_client),
-            )
-            .metrics(Arc::clone(&self.metrics))
-            .catalogs(Arc::clone(&self.model_catalogs))
-            .event_bus(Arc::clone(&self.event_bus))
-            .counter(self.token_counter.clone());
-            // The one admission step (plan 05): per-key policies from
-            // [auth.clients] and caps from [provider.concurrency]. With
-            // neither configured the engine keeps its allow-all default.
-            let admission = llm_proxy_engine::PolicyAdmission::from_config(
-                &self.app_config.auth,
-                &self.providers,
-            );
-            if !admission.is_noop() {
-                builder = builder.admission(Arc::new(admission));
+    pub fn engine(&self) -> Result<Arc<Engine>, llm_proxy_engine::EngineError> {
+        if let Some(built) = self.engine.get() {
+            return built;
+        }
+        let built = self.build_engine();
+        self.engine.set(built.clone());
+        built
+    }
+
+    /// The configuration snapshots the engine reads (plan 07 step 10): the
+    /// startup snapshot until swapped, whole-snapshot swaps only.
+    #[must_use]
+    pub fn config_source(&self) -> &Arc<llm_proxy_engine::SwappingConfigSource> {
+        &self.config_source
+    }
+
+    /// Builds a fresh engine from this state's current parts. Used for the
+    /// lazy first build and by the hot-reload path (plan 07 step 11), which
+    /// then swaps the slot; requests holding the previous engine finish on
+    /// it because they hold an `Arc` clone.
+    pub(crate) fn build_engine(&self) -> Result<Arc<Engine>, llm_proxy_engine::EngineError> {
+        let config = llm_proxy_engine::ConfigSource::load(&*self.config_source)
+            .unwrap_or_else(|_| Arc::clone(&self.app_config));
+        let mut builder = EngineBuilder::from_parts(
+            Arc::clone(&self.config_source) as Arc<dyn llm_proxy_engine::ConfigSource>,
+            Arc::clone(&self.providers),
+            Arc::clone(&self.provider_adapters),
+            Arc::clone(&self.proxy_client),
+        )
+        .metrics(Arc::clone(&self.metrics))
+        .catalogs(Arc::clone(&self.model_catalogs))
+        .event_bus(Arc::clone(&self.event_bus))
+        .counter(self.token_counter.clone());
+        // The one admission step (plan 05): per-key policies from
+        // [auth.clients] and caps from [provider.concurrency]. With
+        // neither configured the engine keeps its allow-all default.
+        let admission =
+            llm_proxy_engine::PolicyAdmission::from_config(&config.auth, &self.providers);
+        if !admission.is_noop() {
+            builder = builder.admission(Arc::new(admission));
+        }
+        // The opt-in response cache (plan 06): off by default, so with
+        // no [server.cache] the engine keeps its store-nothing default.
+        if config.server.cache.enabled {
+            builder = builder.cache(Arc::new(llm_proxy_engine::MemoryCache::new(
+                config.server.cache.ttl,
+                config.server.cache.max_entries,
+            )));
+        }
+        let egress = (*self.egress_clients).clone();
+        for provider in self.providers.iter() {
+            if provider.egress.is_some() && !egress.contains_key(&provider.name) {
+                tracing::warn!(
+                    provider = %provider.name,
+                    "provider has [provider.egress] configured but no egress client was wired; \
+                     its upstream traffic is leaving directly, not through the configured proxy"
+                );
             }
-            // The opt-in response cache (plan 06): off by default, so with
-            // no [server.cache] the engine keeps its store-nothing default.
-            if self.app_config.server.cache.enabled {
-                builder = builder.cache(Arc::new(llm_proxy_engine::MemoryCache::new(
-                    self.app_config.server.cache.ttl,
-                    self.app_config.server.cache.max_entries,
-                )));
-            }
-            let egress = (*self.egress_clients).clone();
-            for provider in self.providers.iter() {
-                if provider.egress.is_some() && !egress.contains_key(&provider.name) {
-                    tracing::warn!(
-                        provider = %provider.name,
-                        "provider has [provider.egress] configured but no egress client was wired; \
-                         its upstream traffic is leaving directly, not through the configured proxy"
-                    );
-                }
-            }
-            if !egress.is_empty() {
-                builder = builder.egress_clients(egress);
-            }
-            builder.build().map(Arc::new)
-        });
-        built.as_ref().map_err(std::clone::Clone::clone)
+        }
+        if !egress.is_empty() {
+            builder = builder.egress_clients(egress);
+        }
+        builder.build().map(Arc::new)
     }
 
     /// Access the provider model catalog service.

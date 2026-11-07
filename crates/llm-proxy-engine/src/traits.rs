@@ -616,6 +616,12 @@ impl UsageSink for EventBusSink {
 /// Supplies the configuration snapshot (audit conflict 11). TOML files are
 /// one source; programmatic config is another, and a record-store backend
 /// (key API, hot reload) is a later plan implementing this same trait.
+///
+/// One stated precedence governs what any snapshot contains —
+/// **CLI > env > config file > default** — resolved before the snapshot is
+/// built. A swap through [`SwappingConfigSource::swap`] replaces the whole
+/// snapshot; settings are never merged into a live one, and holders of an
+/// old snapshot's `Arc` keep it alive.
 pub trait ConfigSource: Debug + Send + Sync {
     /// The current configuration snapshot.
     fn load(&self) -> Result<Arc<AppConfig>, EngineError>;
@@ -639,6 +645,48 @@ impl StaticConfigSource {
 impl ConfigSource for StaticConfigSource {
     fn load(&self) -> Result<Arc<AppConfig>, EngineError> {
         Ok(Arc::clone(&self.config))
+    }
+}
+
+/// A [`ConfigSource`] whose immutable snapshot can be swapped atomically
+/// (plan 07 step 10, audit conflict 11). The engine reads the current
+/// snapshot per pipeline stage, so a swap takes effect for every request
+/// that has not yet read the affected setting; in-flight requests that
+/// already read the old snapshot finish on it. One writer swaps; any number
+/// of readers load.
+#[derive(Debug)]
+pub struct SwappingConfigSource {
+    current: std::sync::RwLock<Arc<AppConfig>>,
+}
+
+impl SwappingConfigSource {
+    /// Start from an initial snapshot.
+    #[must_use]
+    pub fn new(initial: Arc<AppConfig>) -> Self {
+        Self {
+            current: std::sync::RwLock::new(initial),
+        }
+    }
+
+    /// Replace the snapshot wholesale, returning the previous one so the
+    /// caller can diff or roll back. This never merges: the replacement must
+    /// be a complete, validated [`AppConfig`].
+    pub fn swap(&self, next: Arc<AppConfig>) -> Arc<AppConfig> {
+        let mut guard = self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *guard, next)
+    }
+}
+
+impl ConfigSource for SwappingConfigSource {
+    fn load(&self) -> Result<Arc<AppConfig>, EngineError> {
+        let guard = self
+            .current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(Arc::clone(&guard))
     }
 }
 

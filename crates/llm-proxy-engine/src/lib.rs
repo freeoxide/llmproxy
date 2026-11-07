@@ -70,7 +70,8 @@ pub use traits::{
     Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, AllowAllAdmission, Cache,
     CacheEntry, CacheKey, ConfigCredentialSource, ConfigSource, CredentialFeedback, CredentialPick,
     CredentialQuery, CredentialSource, EventBusSink, Guard, GuardDecision, InboundHeaders, NoCache,
-    RegistryRouter, ResolvedTarget, RoutePlan, RouteQuery, Router, StaticConfigSource, UsageSink,
+    RegistryRouter, ResolvedTarget, RoutePlan, RouteQuery, Router, StaticConfigSource,
+    SwappingConfigSource, UsageSink,
 };
 pub use types::{ClientDialect, EngineRequest, EngineResponse, EngineStream, InboundRequest};
 

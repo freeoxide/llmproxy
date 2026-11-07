@@ -304,7 +304,7 @@ pub(crate) async fn handle_core_once(
         inbound,
     );
     let engine = state.engine().map_err(RouteError::from)?;
-    run_once(engine, request, client_protocol).await
+    run_once(&engine, request, client_protocol).await
 }
 
 async fn run_once(
