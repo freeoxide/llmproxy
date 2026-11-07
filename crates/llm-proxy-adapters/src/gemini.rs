@@ -362,8 +362,25 @@ impl GeminiAdapter {
         target: &ProviderAdapterTarget,
         client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
-        // No client dialect shares Gemini's wire format, so every request is
-        // cross-format: settle the leftover client fields first.
+        let url = gemini_stream_url(expand_url_template(&target.endpoint, target)?, core.stream);
+
+        // Same-format passthrough (plan 08 step 2): a Gemini-dialect client
+        // forwards its raw body unchanged (the model lives in the URL, which
+        // the alias resolution above already rewrote; streaming lives in the
+        // method, which the URL rewrite above already selected).
+        if client.same_format_as(&ProtocolName::new(protocols::GEMINI_GENERATE_CONTENT))
+            && client.body_object().is_some()
+        {
+            let mut value = (*client.body).clone();
+            if let Some(hygiene) = &target.prompt_cache {
+                super::mutation::apply_prompt_hygiene(&mut value, hygiene, false);
+            }
+            let body = serde_json::to_vec(&value)?;
+            return Ok(build_proxy_request(body, target, core.stream, url, client));
+        }
+
+        // Every other client dialect is cross-format here: settle the
+        // leftover client fields first.
         let carried = super::client_wire::apply_field_policy(
             client,
             &ProtocolName::new(protocols::GEMINI_GENERATE_CONTENT),
@@ -539,7 +556,6 @@ impl GeminiAdapter {
                 serde_json::to_vec(&value)?
             }
         };
-        let url = gemini_stream_url(expand_url_template(&target.endpoint, target)?, core.stream);
 
         Ok(build_proxy_request(body, target, core.stream, url, client))
     }

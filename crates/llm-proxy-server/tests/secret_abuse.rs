@@ -122,6 +122,7 @@ mod tests {
             routes: ProviderRoutesConfig {
                 messages: Some("main".to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,

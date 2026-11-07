@@ -140,6 +140,7 @@ fn provider_named(name: &str, endpoint: String) -> ProviderConfig {
     let routes = ProviderRoutesConfig {
         messages: Some("messages".to_owned()),
         chat_completions: None,
+        ..Default::default()
     };
     ProviderConfig {
         name: name.to_owned(),

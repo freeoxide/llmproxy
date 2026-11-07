@@ -1349,6 +1349,12 @@ pub enum ProviderRouteKind {
     ChatCompletions,
     /// Anthropic-compatible `/messages` endpoint.
     Messages,
+    /// OpenAI-compatible `/v1/responses` endpoint (plan 08 step 1).
+    Responses,
+    /// Gemini-native
+    /// `/v1beta/models/{model}:generateContent|:streamGenerateContent`
+    /// endpoint (plan 08 step 2).
+    GenerateContent,
 }
 
 /// Maps [`ProviderRouteKind`] to adapter names within a provider.
@@ -1359,14 +1365,25 @@ pub enum ProviderRouteKind {
 /// [provider.routes]
 /// chat_completions = "openai_adapter"
 /// messages = "anthropic_adapter"
+/// responses = "responses_adapter"
+/// generate_content = "gemini_adapter"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderRoutesConfig {
-    /// Route kind: adapter name for the `chat_completions` endpoint.
+    /// Route kind: adapter name for the `chat_completions` endpoint. The
+    /// Ollama-native `/api/chat` and `/api/generate` routes (plan 08 step 3)
+    /// also resolve through this kind: they are chat endpoints reached in a
+    /// different client dialect.
     pub chat_completions: Option<String>,
     /// Route kind: adapter name for the `messages` endpoint.
     pub messages: Option<String>,
+    /// Route kind: adapter name for the `responses` endpoint.
+    #[serde(default)]
+    pub responses: Option<String>,
+    /// Route kind: adapter name for the `generate_content` endpoint.
+    #[serde(default)]
+    pub generate_content: Option<String>,
 }
 
 impl ProviderRoutesConfig {
@@ -1375,6 +1392,8 @@ impl ProviderRoutesConfig {
         match kind {
             ProviderRouteKind::ChatCompletions => self.chat_completions.as_deref(),
             ProviderRouteKind::Messages => self.messages.as_deref(),
+            ProviderRouteKind::Responses => self.responses.as_deref(),
+            ProviderRouteKind::GenerateContent => self.generate_content.as_deref(),
         }
     }
 }
@@ -2257,6 +2276,11 @@ fn validate_routes(provider: &ProviderConfig, name: &str) -> Result<(), ConfigVa
             provider.routes.chat_completions.as_ref(),
         ),
         ("messages", provider.routes.messages.as_ref()),
+        ("responses", provider.routes.responses.as_ref()),
+        (
+            "generate_content",
+            provider.routes.generate_content.as_ref(),
+        ),
     ] {
         let Some(adapter_name) = adapter_name else {
             continue;

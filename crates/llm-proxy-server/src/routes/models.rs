@@ -162,6 +162,8 @@ async fn handle_models_inner(
                 .map(|k| match k {
                     llm_proxy_core::ProviderRouteKind::ChatCompletions => "chat_completions",
                     llm_proxy_core::ProviderRouteKind::Messages => "messages",
+                    llm_proxy_core::ProviderRouteKind::Responses => "responses",
+                    llm_proxy_core::ProviderRouteKind::GenerateContent => "generate_content",
                 })
                 .collect(),
             context_length: entry.context_length,
@@ -185,7 +187,7 @@ async fn handle_models_inner(
     Ok(response)
 }
 
-fn map_catalog_error(error: ProviderError) -> RouteError {
+pub(super) fn map_catalog_error(error: ProviderError) -> RouteError {
     match error {
         ProviderError::Api { status, body, .. } => {
             let status_code = StatusCode::from_u16(status).unwrap_or_else(|_| {

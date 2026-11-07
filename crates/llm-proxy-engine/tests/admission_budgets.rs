@@ -150,6 +150,7 @@ fn provider(
         routes: ProviderRoutesConfig {
             messages: Some("messages".to_owned()),
             chat_completions: None,
+            ..Default::default()
         },
         model_aliases: HashMap::new(),
         discovery: None,

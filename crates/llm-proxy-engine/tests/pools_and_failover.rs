@@ -297,6 +297,7 @@ fn member(name: &str, endpoint: String, api_keys: Option<Vec<&str>>) -> Provider
         routes: ProviderRoutesConfig {
             messages: Some("messages".to_owned()),
             chat_completions: None,
+            ..Default::default()
         },
         model_aliases: std::collections::HashMap::new(),
         discovery: None,

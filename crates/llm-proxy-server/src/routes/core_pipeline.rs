@@ -17,9 +17,15 @@ use llm_proxy_engine::{
 };
 use llm_proxy_protocol::client::anthropic;
 use llm_proxy_protocol::client::anthropic::StreamEncoder as AnthropicStreamEncoder;
+use llm_proxy_protocol::client::gemini;
+use llm_proxy_protocol::client::gemini::StreamEncoder as GeminiStreamEncoder;
+use llm_proxy_protocol::client::ollama;
+use llm_proxy_protocol::client::ollama::StreamEncoder as OllamaStreamEncoder;
 use llm_proxy_protocol::client::openai_chat;
 use llm_proxy_protocol::client::openai_chat::StreamEncoder as OpenAiStreamEncoder;
-use llm_proxy_protocol::core::{CoreEvent, CoreRequest, ModelRef};
+use llm_proxy_protocol::client::responses;
+use llm_proxy_protocol::client::responses::StreamEncoder as ResponsesStreamEncoder;
+use llm_proxy_protocol::core::{CoreEvent, CoreRequest, CoreStreamError, ModelRef};
 use llm_proxy_storage::{EventBus, ProxyEvent, ResponseFailed};
 use secrecy::SecretString;
 use tracing::warn;
@@ -28,7 +34,7 @@ use crate::middleware::get_client_ip;
 use crate::state::AppState;
 
 use super::error_response::{
-    ClientProtocol, RouteError, extract_error_fields, route_error_variant_name,
+    ClientProtocol, RouteError, StreamWire, extract_error_fields, route_error_variant_name,
 };
 
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -264,6 +270,9 @@ fn engine_request(
     let dialect = match client_protocol {
         ClientProtocol::Anthropic => ClientDialect::Anthropic,
         ClientProtocol::OpenAiChat => ClientDialect::OpenAiChat,
+        ClientProtocol::OpenAiResponses => ClientDialect::OpenAiResponses,
+        ClientProtocol::Gemini => ClientDialect::Gemini,
+        ClientProtocol::Ollama => ClientDialect::Ollama,
     };
     EngineRequest::new(
         provider_name,
@@ -304,13 +313,14 @@ pub(crate) async fn handle_core_once(
         inbound,
     );
     let engine = state.engine().map_err(RouteError::from)?;
-    run_once(&engine, request, client_protocol).await
+    run_once(&engine, request, client_protocol, dispatch.ollama_generate).await
 }
 
 async fn run_once(
     engine: &Arc<Engine>,
     request: EngineRequest,
     client_protocol: ClientProtocol,
+    ollama_generate: bool,
 ) -> Result<Response<Body>, RouteError> {
     let request_id = request.request_id.clone();
     let outcome = engine.execute(request).await;
@@ -332,6 +342,22 @@ async fn run_once(
                     .and_then(|chat_resp| {
                         serde_json::to_vec(&chat_resp).map_err(|e| e.to_string())
                     }),
+                ClientProtocol::OpenAiResponses => responses::encode_response(&core_resp.core)
+                    .map_err(|e| e.to_string())
+                    .and_then(|resp| serde_json::to_vec(&resp).map_err(|e| e.to_string())),
+                ClientProtocol::Gemini => gemini::encode_response(&core_resp.core)
+                    .map_err(|e| e.to_string())
+                    .and_then(|resp| serde_json::to_vec(&resp).map_err(|e| e.to_string())),
+                ClientProtocol::Ollama => {
+                    let encoded = if ollama_generate {
+                        ollama::encode_generate_response(&core_resp.core)
+                    } else {
+                        ollama::encode_chat_response(&core_resp.core)
+                    };
+                    encoded
+                        .map_err(|e| e.to_string())
+                        .and_then(|resp| serde_json::to_vec(&resp).map_err(|e| e.to_string()))
+                }
             };
             match encoded {
                 Ok(bytes) => bytes,
@@ -365,19 +391,47 @@ pub(crate) struct CoreDispatch<'a> {
     pub(crate) provider_name: &'a str,
     pub(crate) route_kind: llm_proxy_core::ProviderRouteKind,
     pub(crate) client_protocol: ClientProtocol,
+    /// Ollama framing selector: `/api/generate` (true) or `/api/chat`.
+    pub(crate) ollama_generate: bool,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the encoders are built once per request and moved into the stream task; \
+              boxing them would add an allocation per dialect for no size win"
+)]
 enum ClientStreamEncoder {
     Anthropic(AnthropicStreamEncoder),
     OpenAi(OpenAiStreamEncoder),
+    Responses(ResponsesStreamEncoder),
+    Gemini(GeminiStreamEncoder),
+    Ollama(OllamaStreamEncoder),
 }
 enum ClientEncodedEvent {
-    Anthropic { event_type: String, json: String },
-    OpenAi { json: String },
+    /// An SSE event with an `event:` line (Anthropic, Responses).
+    Named { event_type: String, json: String },
+    /// An SSE data-only event (OpenAI Chat, Gemini `alt=sse`).
+    Data { json: String },
+    /// One raw JSON line (Ollama NDJSON; also the Gemini JSON-array chunk).
+    Line { json: String },
+}
+
+impl ClientEncodedEvent {
+    fn into_line(self) -> String {
+        match self {
+            Self::Named { json, .. } | Self::Data { json } | Self::Line { json } => json,
+        }
+    }
 }
 
 impl ClientStreamEncoder {
-    fn new(protocol: ClientProtocol, msg_id: String, model: String, core: &CoreRequest) -> Self {
+    fn new(
+        protocol: ClientProtocol,
+        msg_id: String,
+        model: String,
+        core: &CoreRequest,
+        ollama_generate: bool,
+    ) -> Self {
         match protocol {
             ClientProtocol::Anthropic => {
                 Self::Anthropic(AnthropicStreamEncoder::new(msg_id, model))
@@ -401,6 +455,13 @@ impl ClientStreamEncoder {
                     include_usage,
                 ))
             }
+            ClientProtocol::OpenAiResponses => {
+                Self::Responses(ResponsesStreamEncoder::new(msg_id, model))
+            }
+            ClientProtocol::Gemini => Self::Gemini(GeminiStreamEncoder::new(model)),
+            ClientProtocol::Ollama => {
+                Self::Ollama(OllamaStreamEncoder::new(model, ollama_generate))
+            }
         }
     }
     fn encode_event(
@@ -416,6 +477,18 @@ impl ClientStreamEncoder {
                 let chunks = enc.encode_event(event)?;
                 Ok(wrap_openai_events(chunks))
             }
+            Self::Responses(enc) => {
+                let events = enc.encode_event(event)?;
+                Ok(wrap_named_json(events))
+            }
+            Self::Gemini(enc) => {
+                let chunks = enc.encode_event(event)?;
+                Ok(wrap_data_json(chunks))
+            }
+            Self::Ollama(enc) => {
+                let objects = enc.encode_event(event)?;
+                Ok(wrap_data_json(objects))
+            }
         }
     }
     fn finish(
@@ -430,12 +503,27 @@ impl ClientStreamEncoder {
                 let chunks = enc.finish()?;
                 Ok(wrap_openai_events(chunks))
             }
+            Self::Responses(enc) => {
+                let events = enc.finish()?;
+                Ok(wrap_named_json(events))
+            }
+            Self::Gemini(enc) => {
+                let chunks = enc.finish()?;
+                Ok(wrap_data_json(chunks))
+            }
+            Self::Ollama(enc) => {
+                let objects = enc.finish()?;
+                Ok(wrap_data_json(objects))
+            }
         }
     }
     fn mark_finished(&mut self) {
         match self {
             Self::Anthropic(enc) => enc.mark_finished(),
             Self::OpenAi(enc) => enc.mark_finished(),
+            Self::Responses(enc) => enc.mark_finished(),
+            Self::Gemini(enc) => enc.mark_finished(),
+            Self::Ollama(enc) => enc.mark_finished(),
         }
     }
 }
@@ -448,7 +536,7 @@ fn wrap_anthropic_events(
         .filter_map(|me| match serde_json::to_string(&me) {
             Ok(json) => {
                 let event_type = me.r#type;
-                Some(ClientEncodedEvent::Anthropic { event_type, json })
+                Some(ClientEncodedEvent::Named { event_type, json })
             }
             Err(e) => {
                 warn!(error = %e, "failed to serialize Anthropic SSE event; dropping");
@@ -461,7 +549,7 @@ fn wrap_openai_events<T: serde::Serialize>(chunks: Vec<T>) -> Vec<ClientEncodedE
     chunks
         .into_iter()
         .filter_map(|chunk| match serde_json::to_string(&chunk) {
-            Ok(json) => Some(ClientEncodedEvent::OpenAi { json }),
+            Ok(json) => Some(ClientEncodedEvent::Data { json }),
             Err(e) => {
                 warn!(error = %e, "failed to serialize OpenAI SSE chunk; dropping");
                 None
@@ -469,16 +557,66 @@ fn wrap_openai_events<T: serde::Serialize>(chunks: Vec<T>) -> Vec<ClientEncodedE
         })
         .collect()
 }
+fn wrap_named_json(events: Vec<responses::ResponsesSseEvent>) -> Vec<ClientEncodedEvent> {
+    events
+        .into_iter()
+        .filter_map(|event| match serde_json::to_string(&event.payload) {
+            Ok(json) => Some(ClientEncodedEvent::Named {
+                event_type: event.event_type,
+                json,
+            }),
+            Err(e) => {
+                warn!(error = %e, "failed to serialize Responses SSE event; dropping");
+                None
+            }
+        })
+        .collect()
+}
+fn wrap_data_json(values: Vec<serde_json::Value>) -> Vec<ClientEncodedEvent> {
+    values
+        .into_iter()
+        .filter_map(|value| match serde_json::to_string(&value) {
+            Ok(json) => Some(ClientEncodedEvent::Data { json }),
+            Err(e) => {
+                warn!(error = %e, "failed to serialize stream chunk; dropping");
+                None
+            }
+        })
+        .collect()
+}
 fn client_event_to_sse(encoded: ClientEncodedEvent) -> Event {
     match encoded {
-        ClientEncodedEvent::Anthropic { event_type, json } => {
+        ClientEncodedEvent::Named { event_type, json } => {
             Event::default().event(&event_type).data(json)
         }
-        ClientEncodedEvent::OpenAi { json } => Event::default().data(json),
+        ClientEncodedEvent::Data { json } => Event::default().data(json),
+        ClientEncodedEvent::Line { json } => Event::default().data(json),
     }
 }
-fn openai_done_event() -> Event {
-    Event::default().data("[DONE]")
+/// The in-band error framing for dialects whose stream chunks cannot carry
+/// an error themselves. The Anthropic and Responses encoders render the
+/// error through their own event shapes.
+fn dialect_error_chunk(
+    protocol: ClientProtocol,
+    error: &CoreStreamError,
+) -> Option<ClientEncodedEvent> {
+    match protocol {
+        ClientProtocol::OpenAiChat => openai_chat::stream_error_sse_payload(error)
+            .map(|json| ClientEncodedEvent::Data { json }),
+        ClientProtocol::Gemini => {
+            let payload = gemini::error_payload(500, error.message());
+            let json = serde_json::to_string(&payload)
+                .unwrap_or_else(|_| "{\"error\":{\"code\":500}}".to_owned());
+            Some(ClientEncodedEvent::Data { json })
+        }
+        ClientProtocol::Ollama => {
+            let payload = ollama::error_payload(error.message());
+            let json = serde_json::to_string(&payload)
+                .unwrap_or_else(|_| "{\"error\":\"stream failed\"}".to_owned());
+            Some(ClientEncodedEvent::Line { json })
+        }
+        ClientProtocol::Anthropic | ClientProtocol::OpenAiResponses => None,
+    }
 }
 /// Extracts the upstream message id from the buffered prefix, falling back
 /// to a dialect-shaped generated id (client codec policy, not engine).
@@ -492,18 +630,24 @@ fn message_id_for(events: &[CoreEvent], protocol: ClientProtocol) -> String {
         .unwrap_or_else(|| match protocol {
             ClientProtocol::OpenAiChat => format!("chatcmpl-{}", uuid::Uuid::new_v4()),
             ClientProtocol::Anthropic => format!("msg_{}", uuid::Uuid::new_v4()),
+            ClientProtocol::OpenAiResponses => format!("resp_{}", uuid::Uuid::new_v4().simple()),
+            // Gemini and Ollama chunks carry no message id.
+            ClientProtocol::Gemini | ClientProtocol::Ollama => String::new(),
         })
 }
 
 /// Streaming: run the engine to the first committed byte, then encode the
-/// core events into the client's SSE dialect. Settlement is driven by the
-/// engine as the returned stream completes or is dropped.
+/// core events into the client's dialect framing (`wire`; SSE for the
+/// Anthropic/OpenAI/Gemini-SSE dialects, NDJSON for Ollama, a JSON array for
+/// Gemini without `alt=sse`). Settlement is driven by the engine as the
+/// returned stream completes or is dropped.
 pub(crate) async fn handle_core_stream(
     state: AppState,
     ctx: RequestContext,
     dispatch: CoreDispatch<'_>,
     core: CoreRequest,
     inbound: InboundRequest,
+    wire: StreamWire,
 ) -> Result<Response<Body>, RouteError> {
     let client_protocol = dispatch.client_protocol;
     let request = engine_request(
@@ -526,33 +670,65 @@ pub(crate) async fn handle_core_stream(
         message_id_for(&stream.head, client_protocol),
         core.model.requested.clone(),
         &core,
+        dispatch.ollama_generate,
     );
     let head_events = encode_head(&mut encoder, client_protocol, stream.head);
 
     let tail = encode_tail(encoder, client_protocol, stream.tail);
 
-    let all = futures::stream::iter(head_events)
-        .chain(tail)
-        .map(Ok::<_, std::convert::Infallible>);
-    let sse = Sse::new(all).keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
-    let response = sse.into_response();
-    let (mut parts, body) = response.into_parts();
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("text/event-stream"),
-    );
-    parts.headers.insert(
-        header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_static("no-cache"),
-    );
-    parts.headers.insert(
-        header::CONNECTION,
-        axum::http::HeaderValue::from_static("keep-alive"),
-    );
-    parts.headers.insert(
-        "x-accel-buffering",
-        axum::http::HeaderValue::from_static("no"),
-    );
+    let all = futures::stream::iter(head_events).chain(tail);
+    let (mut parts, body) = match wire {
+        StreamWire::SseNamed | StreamWire::SseData => {
+            let sse = Sse::new(
+                all.map(client_event_to_sse)
+                    .map(Ok::<_, std::convert::Infallible>),
+            )
+            .keep_alive(KeepAlive::new().interval(HEARTBEAT_INTERVAL));
+            let response = sse.into_response();
+            let (mut parts, body) = response.into_parts();
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/event-stream"),
+            );
+            parts.headers.insert(
+                header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            parts.headers.insert(
+                header::CONNECTION,
+                axum::http::HeaderValue::from_static("keep-alive"),
+            );
+            parts.headers.insert(
+                "x-accel-buffering",
+                axum::http::HeaderValue::from_static("no"),
+            );
+            (parts, body)
+        }
+        StreamWire::Ndjson => {
+            let lines = all.map(|event| {
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+                    "{}\n",
+                    event.into_line()
+                )))
+            });
+            let response = Response::new(Body::from_stream(lines));
+            let (mut parts, body) = response.into_parts();
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/x-ndjson"),
+            );
+            (parts, body)
+        }
+        StreamWire::JsonArray => {
+            let response = Response::new(Body::from_stream(json_array_stream(all)));
+            let (mut parts, body) = response.into_parts();
+            parts.headers.insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            (parts, body)
+        }
+    };
     parts.headers.insert(
         "x-request-id",
         request_id
@@ -563,46 +739,69 @@ pub(crate) async fn handle_core_stream(
     Ok(Response::from_parts(parts, body))
 }
 
+/// A JSON array of chunks: `"["`, the chunks separated by commas, `"]"` (the
+/// Gemini `streamGenerateContent` framing without `alt=sse`).
+fn json_array_stream<S>(
+    all: S,
+) -> impl futures::Stream<Item = Result<axum::body::Bytes, std::convert::Infallible>>
+where
+    S: futures::Stream<Item = ClientEncodedEvent>,
+{
+    futures::stream::once(async {
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"["))
+    })
+    .chain(all.enumerate().map(|(index, event)| {
+        let comma = if index == 0 { "" } else { "," };
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(format!(
+            "{comma}{}",
+            event.into_line()
+        )))
+    }))
+    .chain(futures::stream::once(async {
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"]"))
+    }))
+}
+
 /// Encodes the buffered prefix, applying the client-dialect error framing
 /// (an OpenAI leading error crosses as a bare error object plus `[DONE]`).
 fn encode_head(
     encoder: &mut ClientStreamEncoder,
     protocol: ClientProtocol,
     head: Vec<CoreEvent>,
-) -> Vec<Event> {
+) -> Vec<ClientEncodedEvent> {
     let mut events = Vec::new();
     for core_event in head {
         match &core_event {
-            CoreEvent::Error { error } if matches!(protocol, ClientProtocol::OpenAiChat) => {
-                // A leading error crosses the first-byte boundary as a bare
-                // error-object data line (the chunk schema cannot carry it).
-                // encode_event only succeeds here when a finish chunk was
-                // buffered, flushing it ahead of the error; its refusal
-                // otherwise is the codec's documented behaviour, not a
-                // failure — the bare error object and [DONE] below carry
-                // the error to the client.
+            CoreEvent::Error { error } => {
+                // A leading error crosses the first-byte boundary in the
+                // dialect's error framing. The encoder first: Anthropic and
+                // Responses render the error through their own event shapes,
+                // the OpenAI codec flushes a buffered finish chunk when one
+                // exists (its refusal otherwise is documented behaviour, not
+                // a failure), Gemini and Ollama self-finish and render
+                // nothing.
                 match encoder.encode_event(core_event.clone()) {
-                    Ok(encoded) => {
-                        events.append(&mut encoded.into_iter().map(client_event_to_sse).collect());
-                    }
+                    Ok(mut encoded) => events.append(&mut encoded),
                     Err(e) => {
                         tracing::trace!(
                             error = %e,
-                            "openai codec refused the leading error event; no buffered finish chunk to flush"
+                            "codec refused the leading error event; error framing follows"
                         );
                     }
                 }
-                if let Some(json_str) = openai_chat::stream_error_sse_payload(error) {
-                    events.push(Event::default().data(json_str));
+                if let Some(chunk) = dialect_error_chunk(protocol, error) {
+                    events.push(chunk);
                 }
-                events.push(openai_done_event());
+                if matches!(protocol, ClientProtocol::OpenAiChat) {
+                    events.push(ClientEncodedEvent::Data {
+                        json: "[DONE]".to_owned(),
+                    });
+                }
                 encoder.mark_finished();
                 return events;
             }
             _ => match encoder.encode_event(core_event) {
-                Ok(encoded) => {
-                    events.append(&mut encoded.into_iter().map(client_event_to_sse).collect());
-                }
+                Ok(mut encoded) => events.append(&mut encoded),
                 Err(e) => {
                     warn!(error = %e, "failed to encode buffered head event; dropping");
                 }
@@ -618,26 +817,25 @@ fn encode_head(
 /// schema cannot carry an error (the encoder would refuse and self-finish),
 /// so an OpenAI client gets the bare error object instead, and the synthetic
 /// terminal plus `[DONE]` still follow from the encoder's own flush. An
-/// Anthropic client gets a real `error` SSE event.
+/// Anthropic client gets a real `error` SSE event; a Responses client gets
+/// `response.failed`; Gemini and Ollama get their error chunk shapes.
 fn encode_one(
     encoder: &mut ClientStreamEncoder,
     protocol: ClientProtocol,
     core_event: CoreEvent,
-) -> Vec<Event> {
+) -> Vec<ClientEncodedEvent> {
     if let CoreEvent::Error { error } = &core_event
         && matches!(protocol, ClientProtocol::OpenAiChat)
     {
         let mut events = Vec::new();
-        if let Some(json_str) = openai_chat::stream_error_sse_payload(error) {
-            events.push(Event::default().data(json_str));
+        if let Some(chunk) = dialect_error_chunk(protocol, error) {
+            events.push(chunk);
         }
         return events;
     }
     let mut events = Vec::new();
     match encoder.encode_event(core_event) {
-        Ok(encoded) => {
-            events.extend(encoded.into_iter().map(client_event_to_sse));
-        }
+        Ok(mut encoded) => events.append(&mut encoded),
         Err(e) => {
             warn!(error = %e, "failed to encode stream event; dropping");
         }
@@ -646,26 +844,23 @@ fn encode_one(
 }
 
 /// An in-band error as the stream's last item (transport/decode failure
-/// after commit): the codec renders what it can, then an OpenAI client gets
-/// the bare error object and `[DONE]`; the encoder is marked finished so no
-/// synthetic terminal follows.
+/// after commit): the codec renders what it can, then the dialect's error
+/// framing; the encoder is marked finished so no synthetic terminal follows.
 fn encode_terminal_error(
     encoder: &mut ClientStreamEncoder,
     protocol: ClientProtocol,
     error: &llm_proxy_protocol::core::CoreStreamError,
-) -> Vec<Event> {
+) -> Vec<ClientEncodedEvent> {
     let mut events = Vec::new();
     // The encoder first: with a terminal buffered it flushes the finish
     // chunk the client is still owed ahead of the error; without one it
     // self-finishes and returns nothing. The OpenAI codec refuses the bare
-    // error event itself by design — the bare error object and [DONE] below
-    // carry the error — so a refusal is traced, not warned.
+    // error event itself by design — the dialect error chunk and [DONE]
+    // below carry the error — so a refusal is traced, not warned.
     match encoder.encode_event(CoreEvent::Error {
         error: error.clone(),
     }) {
-        Ok(encoded) => {
-            events.extend(encoded.into_iter().map(client_event_to_sse));
-        }
+        Ok(mut encoded) => events.append(&mut encoded),
         Err(e) => {
             tracing::trace!(
                 error = %e,
@@ -673,24 +868,31 @@ fn encode_terminal_error(
             );
         }
     }
+    if let Some(chunk) = dialect_error_chunk(protocol, error) {
+        events.push(chunk);
+    }
     if matches!(protocol, ClientProtocol::OpenAiChat) {
-        if let Some(json_str) = openai_chat::stream_error_sse_payload(error) {
-            events.push(Event::default().data(json_str));
-        }
-        events.push(openai_done_event());
+        events.push(ClientEncodedEvent::Data {
+            json: "[DONE]".to_owned(),
+        });
     }
     encoder.mark_finished();
     events
 }
 
 /// The terminal flush: `encoder.finish()` plus `[DONE]` for OpenAI.
-fn encode_finish(encoder: &mut ClientStreamEncoder, protocol: ClientProtocol) -> Vec<Event> {
+fn encode_finish(
+    encoder: &mut ClientStreamEncoder,
+    protocol: ClientProtocol,
+) -> Vec<ClientEncodedEvent> {
     let mut events = Vec::new();
     match encoder.finish() {
-        Ok(final_encoded) => {
-            events.extend(final_encoded.into_iter().map(client_event_to_sse));
+        Ok(mut final_encoded) => {
+            events.append(&mut final_encoded);
             if matches!(protocol, ClientProtocol::OpenAiChat) {
-                events.push(openai_done_event());
+                events.push(ClientEncodedEvent::Data {
+                    json: "[DONE]".to_owned(),
+                });
             }
         }
         Err(e) => {
@@ -700,7 +902,7 @@ fn encode_finish(encoder: &mut ClientStreamEncoder, protocol: ClientProtocol) ->
     events
 }
 
-/// Lazily encodes the engine's continuation stream into client SSE events.
+/// Lazily encodes the engine's continuation stream into client chunks.
 ///
 /// One-item lookahead on error events preserves the pre-split framing
 /// contract: an error followed by more events renders in-band only (the
@@ -711,7 +913,7 @@ fn encode_tail(
     encoder: ClientStreamEncoder,
     protocol: ClientProtocol,
     tail: BoxStream<'static, CoreEvent>,
-) -> BoxStream<'static, Event> {
+) -> BoxStream<'static, ClientEncodedEvent> {
     struct EncodeState {
         encoder: ClientStreamEncoder,
         protocol: ClientProtocol,

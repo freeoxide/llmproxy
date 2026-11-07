@@ -24,16 +24,22 @@ use secrecy::ExposeSecret;
 mod chat;
 mod core_pipeline;
 mod error_response;
+mod gemini_generate;
 mod health;
 mod messages;
 mod models;
+mod ollama;
+mod responses;
 mod token_count;
 
 use chat::{handle_bare_chat_completions, handle_chat_completions};
+use gemini_generate::handle_generate_content;
 use health::{health, ready, version};
 use llm_proxy_core::{family_max_body_bytes, family_request_timeout};
 use messages::{handle_bare_messages, handle_messages};
 use models::handle_models;
+use ollama::{handle_ollama_chat, handle_ollama_generate, handle_ollama_tags};
+use responses::handle_responses;
 use token_count::count_tokens;
 
 /// Endpoint families (audit conflict 16): admission, routing and accounting
@@ -42,6 +48,9 @@ pub(crate) const FAMILY_MESSAGES: &str = "messages";
 pub(crate) const FAMILY_COUNT_TOKENS: &str = "count_tokens";
 pub(crate) const FAMILY_CHAT_COMPLETIONS: &str = "chat_completions";
 pub(crate) const FAMILY_MODELS: &str = "models";
+pub(crate) const FAMILY_RESPONSES: &str = "responses";
+pub(crate) const FAMILY_GENERATE_CONTENT: &str = "generate_content";
+pub(crate) const FAMILY_OLLAMA: &str = "ollama";
 
 const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 
@@ -50,8 +59,6 @@ const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 /// admin `/usage` surface merges in only under the `admin_on_main_listener` opt-in.
 pub fn router(state: AppState) -> Router {
     let id_gen = Arc::clone(&state.request_id_gen);
-    let event_bus = Arc::clone(&state.event_bus);
-    let config = &state.app_config().server;
     let trace = TraceLayer::new_for_http().make_span_with(make_request_span);
     let lightweight = Router::new()
         .route("/health", get(health))
@@ -60,8 +67,49 @@ pub fn router(state: AppState) -> Router {
         .layer(
             ServiceBuilder::new()
                 .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
-                .layer(trace.clone()),
+                .layer(trace),
         );
+
+    let api = provider_api_router(&state);
+
+    let router = Router::new()
+        .merge(lightweight)
+        .merge(api)
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed);
+    let usage_on_main = match (
+        crate::admin_router(&state),
+        state.app_config.server.admin_on_main_listener,
+    ) {
+        (Some(usage), true) => Some(usage),
+        _ => None,
+    };
+    let router = match cors_layer_for(state.allowed_origins()) {
+        Some(cors) => router.layer(cors),
+        None => router,
+    };
+
+    let router: Router = router
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(CatchPanicLayer::new())
+        .with_state(state);
+    match usage_on_main {
+        Some(usage) => router.merge(usage),
+        None => router,
+    }
+}
+
+/// The provider-scoped API surface: every client dialect's route, each under
+/// its endpoint family's admission chain, plus the opt-in bare `/v1/*` routes
+/// (plan 04 step 11).
+fn provider_api_router(state: &AppState) -> Router<AppState> {
+    let id_gen = Arc::clone(&state.request_id_gen);
+    let event_bus = Arc::clone(&state.event_bus);
+    let config = &state.app_config().server;
+    let trace = TraceLayer::new_for_http().make_span_with(make_request_span);
 
     // Shared admission middleware; the body limit and timeout layer on top
     // are per endpoint family (conflict 16), so each family composes its own.
@@ -111,8 +159,34 @@ pub fn router(state: AppState) -> Router {
     let models = Router::new()
         .route("/providers/{provider}/v1/models", get(handle_models))
         .layer(admission(FAMILY_MODELS));
+    let responses = Router::new()
+        .route("/providers/{provider}/v1/responses", post(handle_responses))
+        .layer(admission(FAMILY_RESPONSES));
+    let generate_content = Router::new()
+        .route(
+            "/providers/{provider}/v1beta/models/{model_method}",
+            post(handle_generate_content),
+        )
+        .layer(admission(FAMILY_GENERATE_CONTENT));
+    let ollama = Router::new()
+        .route("/providers/{provider}/api/chat", post(handle_ollama_chat))
+        .route(
+            "/providers/{provider}/api/generate",
+            post(handle_ollama_generate),
+        )
+        .layer(admission(FAMILY_OLLAMA));
+    let ollama_tags = Router::new()
+        .route("/providers/{provider}/api/tags", get(handle_ollama_tags))
+        .layer(admission(FAMILY_MODELS));
 
-    let mut api = messages.merge(count_tokens).merge(chat).merge(models);
+    let mut api = messages
+        .merge(count_tokens)
+        .merge(chat)
+        .merge(models)
+        .merge(responses)
+        .merge(generate_content)
+        .merge(ollama)
+        .merge(ollama_tags);
 
     // Bare `/v1/*` is off by default (plan 04 step 11): with it off, those
     // paths fall through to the 404 fallback; enabled, the model name
@@ -126,35 +200,7 @@ pub fn router(state: AppState) -> Router {
             .layer(admission(FAMILY_CHAT_COMPLETIONS));
         api = api.merge(bare_messages).merge(bare_chat);
     }
-
-    let router = Router::new()
-        .merge(lightweight)
-        .merge(api)
-        .fallback(not_found)
-        .method_not_allowed_fallback(method_not_allowed);
-    let usage_on_main = match (
-        crate::admin_router(&state),
-        state.app_config.server.admin_on_main_listener,
-    ) {
-        (Some(usage), true) => Some(usage),
-        _ => None,
-    };
-    let router = match cors_layer_for(state.allowed_origins()) {
-        Some(cors) => router.layer(cors),
-        None => router,
-    };
-
-    let router: Router = router
-        .layer(SetResponseHeaderLayer::if_not_present(
-            header::X_CONTENT_TYPE_OPTIONS,
-            HeaderValue::from_static("nosniff"),
-        ))
-        .layer(CatchPanicLayer::new())
-        .with_state(state);
-    match usage_on_main {
-        Some(usage) => router.merge(usage),
-        None => router,
-    }
+    api
 }
 fn cors_layer_for(origins: Option<&[String]>) -> Option<CorsLayer> {
     let origins = origins?;
@@ -313,10 +359,16 @@ async fn normalize_error_responses(
     rewritten
 }
 fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
-    let is_openai_chat_path =
-        path.contains("/v1/chat/completions") || path.contains("/v1/chat/edits");
-    if is_openai_chat_path {
+    // The dialect of the path decides the error body shape for layer-level
+    // failures (auth, limits, 404/405) that never reach a route handler.
+    if path.contains("/v1/chat/completions") || path.contains("/v1/chat/edits") {
         error_response::ClientProtocol::OpenAiChat
+    } else if path.contains("/v1/responses") {
+        error_response::ClientProtocol::OpenAiResponses
+    } else if path.contains("/v1beta/") {
+        error_response::ClientProtocol::Gemini
+    } else if path.contains("/api/") {
+        error_response::ClientProtocol::Ollama
     } else {
         error_response::ClientProtocol::Anthropic
     }

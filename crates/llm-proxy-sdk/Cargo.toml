@@ -38,4 +38,5 @@ serde_json = { workspace = true }
 axum = { workspace = true, features = ["macros", "json"] }
 tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+secrecy = { workspace = true }
 llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }

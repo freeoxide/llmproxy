@@ -279,6 +279,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: Some("chat".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -922,6 +923,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: Some("chat".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,

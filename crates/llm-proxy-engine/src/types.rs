@@ -18,6 +18,14 @@ pub enum ClientDialect {
     OpenAiChat,
     /// Anthropic Messages (`/v1/messages`).
     Anthropic,
+    /// OpenAI Responses (`/v1/responses`; plan 08 step 1).
+    OpenAiResponses,
+    /// Gemini native
+    /// (`/v1beta/models/{model}:generateContent|:streamGenerateContent`;
+    /// plan 08 step 2).
+    Gemini,
+    /// Ollama native (`/api/chat` and `/api/generate`; plan 08 step 3).
+    Ollama,
 }
 
 /// Inbound request context the pipeline needs beyond the decoded core: the

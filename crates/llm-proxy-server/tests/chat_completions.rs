@@ -140,11 +140,13 @@ mod tests {
             llm_proxy_core::ProviderRoutesConfig {
                 messages: Some(adapter_name.to_owned()),
                 chat_completions: Some(adapter_name.to_owned()),
+                ..Default::default()
             }
         } else {
             llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some(adapter_name.to_owned()),
                 messages: None,
+                ..Default::default()
             }
         };
 
@@ -438,6 +440,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("openai-chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -1826,6 +1829,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -1859,6 +1863,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,

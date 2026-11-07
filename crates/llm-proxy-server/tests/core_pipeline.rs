@@ -173,14 +173,17 @@ mod tests {
             "anthropic_messages" => llm_proxy_core::ProviderRoutesConfig {
                 messages: Some(adapter_name.to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             "openai_chat_completions" => llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some(adapter_name.to_owned()),
                 messages: Some(adapter_name.to_owned()),
+                ..Default::default()
             },
             _ => llm_proxy_core::ProviderRoutesConfig {
                 messages: Some(adapter_name.to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
         };
 
@@ -1309,6 +1312,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 messages: Some("messages".to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             model_aliases: HashMap::from([(
                 "claude-alias".to_owned(),
@@ -2716,6 +2720,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 messages: Some("messages".to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -3180,6 +3185,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 messages: Some("messages".to_owned()),
                 chat_completions: Some("messages".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -3421,6 +3427,7 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 messages: None,
                 chat_completions: Some("messages".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,

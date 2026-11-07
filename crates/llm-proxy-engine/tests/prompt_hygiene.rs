@@ -73,6 +73,7 @@ fn provider(endpoint: String, prompt_cache: Option<PromptCacheConfig>) -> Provid
         routes: ProviderRoutesConfig {
             messages: Some("messages".to_owned()),
             chat_completions: None,
+            ..Default::default()
         },
         model_aliases: std::collections::HashMap::new(),
         discovery: None,

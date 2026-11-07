@@ -7,6 +7,42 @@ use serde::Serialize;
 pub(super) enum ClientProtocol {
     Anthropic,
     OpenAiChat,
+    /// OpenAI Responses (`/v1/responses`, the Codex dialect; plan 08).
+    OpenAiResponses,
+    /// Gemini native (`/v1beta/models/{model}:generateContent`; plan 08).
+    Gemini,
+    /// Ollama native (`/api/chat`, `/api/generate`; plan 08).
+    Ollama,
+}
+
+impl ClientProtocol {
+    /// The wire framing a streaming response for this dialect uses: SSE with
+    /// named events (Anthropic, Responses), SSE data-only lines (OpenAI Chat,
+    /// Gemini `alt=sse`), NDJSON lines (Ollama) or a JSON array of chunks
+    /// (Gemini `streamGenerateContent` without `alt=sse`).
+    pub(super) fn stream_wire(self) -> StreamWire {
+        match self {
+            Self::Anthropic | Self::OpenAiResponses => StreamWire::SseNamed,
+            Self::OpenAiChat => StreamWire::SseData,
+            // The Gemini route chooses between SSE and the JSON array from
+            // the `alt` query parameter; both flow through the same encoder.
+            Self::Gemini => StreamWire::SseData,
+            Self::Ollama => StreamWire::Ndjson,
+        }
+    }
+}
+
+/// How encoded stream chunks are framed onto the client connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamWire {
+    /// SSE with an `event:` line per chunk (Anthropic Messages, Responses).
+    SseNamed,
+    /// SSE data-only lines (OpenAI Chat, Gemini `alt=sse`).
+    SseData,
+    /// NDJSON: one JSON object per line (Ollama).
+    Ndjson,
+    /// A JSON array of chunks (Gemini without `alt=sse`).
+    JsonArray,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum AuthOwner {
@@ -130,7 +166,11 @@ struct OpenAiErrorDetail {
 pub(super) fn route_error_response(protocol: ClientProtocol, error: &RouteError) -> Response<Body> {
     let mut response = match protocol {
         ClientProtocol::Anthropic => anthropic_error_response(error),
-        ClientProtocol::OpenAiChat => openai_error_response(error),
+        ClientProtocol::OpenAiChat | ClientProtocol::OpenAiResponses => {
+            openai_error_response(error)
+        }
+        ClientProtocol::Gemini => gemini_error_response(error),
+        ClientProtocol::Ollama => ollama_error_response(error),
     };
     // One policy table (plan 05 step 1, audit conflict 14): every error
     // response carries the deliberate x-should-retry choice for its status,
@@ -190,6 +230,30 @@ fn openai_error_response(error: &RouteError) -> Response<Body> {
             code: serde_json::Value::Null,
         },
     };
+    let mut response = (status, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// Gemini error bodies: `{"error": {"code", "message", "status"}}`.
+fn gemini_error_response(error: &RouteError) -> Response<Body> {
+    let (status, _type, message) = extract_error_fields(error);
+    let body = llm_proxy_protocol::client::gemini::error_payload(status.as_u16(), &message);
+    let mut response = (status, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// Ollama error bodies: `{"error": "<message>"}`.
+fn ollama_error_response(error: &RouteError) -> Response<Body> {
+    let (status, _type, message) = extract_error_fields(error);
+    let body = llm_proxy_protocol::client::ollama::error_payload(&message);
     let mut response = (status, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,

@@ -278,6 +278,7 @@ fn echo_provider(endpoint: String) -> ProviderConfig {
     let routes = ProviderRoutesConfig {
         messages: Some("main".to_owned()),
         chat_completions: None,
+        ..Default::default()
     };
     ProviderConfig {
         name: "echo".to_owned(),

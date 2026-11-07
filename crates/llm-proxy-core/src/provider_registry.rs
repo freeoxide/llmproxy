@@ -454,6 +454,8 @@ impl ProviderRegistry {
             let route_name = match route_kind {
                 ProviderRouteKind::ChatCompletions => "chat_completions",
                 ProviderRouteKind::Messages => "messages",
+                ProviderRouteKind::Responses => "responses",
+                ProviderRouteKind::GenerateContent => "generate_content",
             };
             ProviderRouteResolutionError::UnsupportedRoute {
                 provider: provider.name.clone(),
@@ -610,6 +612,7 @@ mod tests {
             routes: ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::from([("short".to_owned(), "upstream".to_owned())]),
             discovery: None,
@@ -654,6 +657,7 @@ mod tests {
             routes: ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::from([(
                 "alias-name".to_owned(),
@@ -941,6 +945,7 @@ members = [{members}]
             routes: ProviderRoutesConfig {
                 chat_completions: Some("nonexistent_adapter".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -1109,6 +1114,7 @@ members = [{members}]
             routes: ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -1185,6 +1191,7 @@ members = [{members}]
             routes: ProviderRoutesConfig {
                 chat_completions: Some("nonexistent".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,

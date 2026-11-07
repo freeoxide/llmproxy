@@ -117,6 +117,7 @@ fn provider(endpoint: String) -> ProviderConfig {
     let routes = ProviderRoutesConfig {
         messages: Some("messages".to_owned()),
         chat_completions: None,
+        ..Default::default()
     };
     ProviderConfig {
         name: "fake".to_owned(),

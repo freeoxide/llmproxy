@@ -465,8 +465,35 @@ impl ResponsesAdapter {
         target: &ProviderAdapterTarget,
         client: &super::client_wire::ClientWireRequest,
     ) -> Result<super::ProxyRequest, ProviderError> {
-        // No client dialect shares the Responses wire format, so every
-        // request is cross-format: settle the leftover client fields first.
+        // Same-format passthrough (plan 08 step 1): a Responses-dialect
+        // client forwards its raw body with only the surgical edits — the
+        // model alias; everything else (`instructions`, `include`,
+        // `previous_response_id`, `store`, ...) survives byte-for-byte.
+        let url = expand_url_template(&target.endpoint, target)?;
+        if client.same_format_as(&ProtocolName::new(protocols::OPENAI_RESPONSES))
+            && let Some(raw) = client.body_object()
+        {
+            let mut obj = raw.clone();
+            obj.insert(
+                "model".to_owned(),
+                serde_json::Value::String(target.upstream_model.clone()),
+            );
+            let mut value = serde_json::Value::Object(obj);
+            if let Some(hygiene) = &target.prompt_cache {
+                super::mutation::apply_prompt_hygiene(&mut value, hygiene, false);
+            }
+            let body = serde_json::to_vec(&value)?;
+            return Ok(super::build_proxy_request(
+                body,
+                target,
+                core.stream,
+                url,
+                client,
+            ));
+        }
+
+        // Every other client dialect is cross-format here: settle the
+        // leftover client fields first.
         let carried = super::client_wire::apply_field_policy(
             client,
             &ProtocolName::new(protocols::OPENAI_RESPONSES),
@@ -625,7 +652,6 @@ impl ResponsesAdapter {
                 serde_json::to_vec(&value)?
             }
         };
-        let url = expand_url_template(&target.endpoint, target)?;
 
         Ok(build_proxy_request(body, target, core.stream, url, client))
     }

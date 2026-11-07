@@ -30,6 +30,14 @@ pub enum ClientWireFormat {
     AnthropicMessages,
     /// OpenAI Chat Completions (`/v1/chat/completions`).
     OpenAiChatCompletions,
+    /// OpenAI Responses (`/v1/responses`; plan 08 step 1).
+    OpenAiResponses,
+    /// Gemini native `generateContent` (plan 08 step 2).
+    GeminiGenerateContent,
+    /// Ollama `/api/chat` (plan 08 step 3).
+    OllamaChat,
+    /// Ollama `/api/generate` (plan 08 step 3).
+    OllamaGenerate,
 }
 
 impl ClientWireFormat {
@@ -39,6 +47,10 @@ impl ClientWireFormat {
         match self {
             Self::AnthropicMessages => "anthropic_messages",
             Self::OpenAiChatCompletions => "openai_chat_completions",
+            Self::OpenAiResponses => "openai_responses",
+            Self::GeminiGenerateContent => "gemini_generate_content",
+            Self::OllamaChat => "ollama_chat",
+            Self::OllamaGenerate => "ollama_generate",
         }
     }
 }
@@ -96,6 +108,12 @@ impl ClientWireRequest {
             ) | (
                 ClientWireFormat::OpenAiChatCompletions,
                 protocols::OPENAI_CHAT_COMPLETIONS
+            ) | (
+                ClientWireFormat::OpenAiResponses,
+                protocols::OPENAI_RESPONSES
+            ) | (
+                ClientWireFormat::GeminiGenerateContent,
+                protocols::GEMINI_GENERATE_CONTENT
             )
         )
     }
@@ -155,7 +173,9 @@ pub const OPENAI_CHAT_REQUEST_KEYS: &[&str] = &[
 ];
 
 /// Top-level keys of `body` that the typed decode for `format` does not
-/// consume; these are the fields the cross-format policy speaks about.
+/// consume; these are the fields the cross-format policy speaks about. The
+/// key lists for the plan-08 dialects live with their client codecs in
+/// `llm-proxy-protocol` (one definition, one path).
 #[must_use]
 pub fn extra_field_names(body: &Value, format: ClientWireFormat) -> Vec<&str> {
     let Some(obj) = body.as_object() else {
@@ -164,6 +184,18 @@ pub fn extra_field_names(body: &Value, format: ClientWireFormat) -> Vec<&str> {
     let known = match format {
         ClientWireFormat::AnthropicMessages => ANTHROPIC_MESSAGES_REQUEST_KEYS,
         ClientWireFormat::OpenAiChatCompletions => OPENAI_CHAT_REQUEST_KEYS,
+        ClientWireFormat::OpenAiResponses => {
+            llm_proxy_protocol::client::responses::RESPONSES_REQUEST_KEYS
+        }
+        ClientWireFormat::GeminiGenerateContent => {
+            llm_proxy_protocol::client::gemini::GEMINI_REQUEST_KEYS
+        }
+        ClientWireFormat::OllamaChat => {
+            llm_proxy_protocol::client::ollama::OLLAMA_CHAT_REQUEST_KEYS
+        }
+        ClientWireFormat::OllamaGenerate => {
+            llm_proxy_protocol::client::ollama::OLLAMA_GENERATE_REQUEST_KEYS
+        }
     };
     let mut extras: Vec<&str> = obj
         .keys()
@@ -281,18 +313,17 @@ pub fn apply_field_policy(
     )))
 }
 
-/// Server tools (Anthropic `{"type": "web_search_...", ...}`) decode as bare
-/// names in the core; forwarding them cross-format would silently change what
-/// the model can do, so they are rejected by name (or dropped whole under
-/// `lossy`, which the caller must then also drop from the tools list).
+/// Server tools (Anthropic `{"type": "web_search_...", ...}`, Responses
+/// `{"type": "web_search", ...}`, Gemini `{"googleSearch": {}}`) decode as
+/// bare names in the core or stay out of the core tool list; forwarding them
+/// cross-format would silently change what the model can do, so they are
+/// rejected by name (or dropped whole under `lossy`, which the caller must
+/// then also drop from the tools list).
 fn check_cross_format_tools(
     client: &ClientWireRequest,
     provider: &ProtocolName,
     lossy: bool,
 ) -> Result<(), ProviderError> {
-    if client.format != ClientWireFormat::AnthropicMessages {
-        return Ok(());
-    }
     let Some(obj) = client.body.as_object() else {
         return Ok(());
     };
@@ -301,12 +332,44 @@ fn check_cross_format_tools(
     };
     let mut server_tools: Vec<String> = Vec::new();
     for tool in tools.iter().filter_map(Value::as_object) {
-        if let Some(Value::String(kind)) = tool.get("type") {
-            let name = tool
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("<unnamed>");
-            server_tools.push(format!("type={kind} name={name}"));
+        let label = match client.format {
+            // Anthropic tools carry a `type`; function tools do not.
+            ClientWireFormat::AnthropicMessages => {
+                tool.get("type").and_then(Value::as_str).map(|kind| {
+                    let name = tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unnamed>");
+                    format!("type={kind} name={name}")
+                })
+            }
+            // Responses function tools are `{"type": "function", ...}`;
+            // every other type is a server tool.
+            ClientWireFormat::OpenAiResponses => match tool.get("type").and_then(Value::as_str) {
+                None | Some("function") => None,
+                Some(kind) => {
+                    let name = tool
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("<unnamed>");
+                    Some(format!("type={kind} name={name}"))
+                }
+            },
+            // Gemini tool objects are `{"functionDeclarations": [...]}`;
+            // anything else (googleSearch, codeExecution) is a server tool.
+            ClientWireFormat::GeminiGenerateContent => {
+                if tool.contains_key("functionDeclarations")
+                    || tool.contains_key("function_declarations")
+                {
+                    None
+                } else {
+                    tool.keys().next().cloned()
+                }
+            }
+            _ => None,
+        };
+        if let Some(label) = label {
+            server_tools.push(label);
         }
     }
     if server_tools.is_empty() {

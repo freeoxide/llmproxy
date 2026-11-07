@@ -25,6 +25,7 @@ Two fixture families, both replayed against a fake upstream in CI
 
 | Fixture | Client | Shape provenance |
 |---|---|---|
+| `codex/session-request.json` + `headers.json` | Codex CLI (OpenAI Responses dialect) | **Synthesized** — the Codex CLI is not installed in this environment and no upstream key exists, so the fixture was written from documentation: the Responses API request reference <https://platform.openai.com/docs/api-reference/responses> (`instructions`, typed `input` items including a replayed `reasoning` item with `encrypted_content`, strict-schema function `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning {effort, summary}`, `store: false`, `include: ["reasoning.encrypted_content"]`, `prompt_cache_key`, `stream`) and the Codex CLI's documented client behavior <https://github.com/openai/codex> (`originator`, `session_id`/`conversation_id` headers, the `codex_cli_rs` user agent, `OpenAI-Beta: responses=experimental`). Every id, credential and the encrypted reasoning value is a placeholder. A live capture of the real CLI remains an open item in the plan-08 report. |
 | `claude-code/session-request.json` | Claude Code (Anthropic Messages dialect) | Messages API reference <https://docs.anthropic.com/en/api/messages> (model, max_tokens, system array with `cache_control` incl. `ttl`, messages with text/tool_use/tool_result blocks, tools with `input_schema`, tool_choice with `disable_parallel_tool_use`, temperature, top_p, top_k, stop_sequences, metadata.user_id, thinking `{type, budget_tokens}`, stream); Claude Code system-prompt caching pattern per <https://code.claude.com/docs> (system array of text blocks, one carrying `cache_control`). |
 | `anthropic-sdk/tool-replay-request.json` | Anthropic SDK (Python/Typecript) | Messages API request schema as above; assistant tool_use replay + user tool_result (with `is_error`) per the tool-use guide <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use>. |
 | `anthropic-sdk/media-request.json` | Anthropic SDK (Messages dialect) | Image blocks with `url` and Files API `file` sources per the vision guide <https://platform.claude.com/docs/en/build-with-claude/vision>; `document` blocks with `url` and `base64` (`application/pdf`, with `cache_control`) sources per the PDF support guide <https://platform.claude.com/docs/en/build-with-claude/pdf-support>. The URLs, file id and PDF bytes are placeholders. |
@@ -32,10 +33,11 @@ Two fixture families, both replayed against a fake upstream in CI
 | `openai-sdk/chat-request.json` | OpenAI SDK (Chat Completions) | Chat Completions API reference <https://platform.openai.com/docs/api-reference/chat> — the full documented knob set: `response_format`, `parallel_tool_calls`, `seed`, `n`, `logprobs`, `logit_bias`, `frequency_penalty`, `presence_penalty`, `service_tier`, `prompt_cache_key`, `store`, `reasoning_effort`, `stream_options`, `stop`, `user`, plus multimodal `image_url` content parts per <https://platform.openai.com/docs/guides/images-vision>. |
 | `openai-sdk/stream-request.json` | OpenAI SDK, streaming | Same reference; `stream: true` with `stream_options.include_usage` per the streaming guide. |
 
-Codex CLI traffic is **not** captured or replayable here: Codex speaks the
-OpenAI Responses API, which the proxy does not yet expose as a client route
-(see plan 08), and the Codex CLI is not installed in this environment. It is
-listed as a partial step in the plan-02 report.
+A live capture of Codex CLI traffic is **not** possible in this environment
+(the CLI is not installed and no upstream API keys exist). The synthesized
+`codex/` fixture above replays through the Responses client route against a
+fake Responses upstream instead, under the same replay rule; swapping in a
+live capture later only replaces the fixture bytes.
 
 ## Replay rule
 

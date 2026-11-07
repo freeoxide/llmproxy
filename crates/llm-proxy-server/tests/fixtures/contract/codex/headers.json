@@ -1,0 +1,14 @@
+{
+  "content-type": "application/json",
+  "authorization": "Bearer codex-capture-fixture-key-not-real",
+  "accept": "text/event-stream",
+  "user-agent": "codex_cli_rs/0.50.0 (Linux 6.12.0-debian; x86_64) vscode/1.99",
+  "originator": "codex_cli_rs",
+  "OpenAI-Beta": "responses=experimental",
+  "session_id": "fixture-session-7f3a",
+  "conversation_id": "fixture-conversation-1c2b",
+  "x-stainless-lang": "rust",
+  "x-stainless-package-version": "0.50.0",
+  "x-stainless-os": "Linux",
+  "x-stainless-arch": "x86_64"
+}

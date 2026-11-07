@@ -133,6 +133,7 @@ async fn handle_messages_inner(
         provider_name: &provider,
         route_kind: ProviderRouteKind::Messages,
         client_protocol: ClientProtocol::Anthropic,
+        ollama_generate: false,
     };
     let inbound = core_pipeline::InboundRequest {
         auth: inbound_auth,
@@ -140,7 +141,15 @@ async fn handle_messages_inner(
         wire,
     };
     if is_streaming {
-        core_pipeline::handle_core_stream(state, ctx, dispatch, core, inbound).await
+        core_pipeline::handle_core_stream(
+            state,
+            ctx,
+            dispatch,
+            core,
+            inbound,
+            ClientProtocol::Anthropic.stream_wire(),
+        )
+        .await
     } else {
         core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound).await
     }

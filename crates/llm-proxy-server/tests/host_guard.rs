@@ -76,6 +76,7 @@ mod tests {
             routes: ProviderRoutesConfig {
                 messages: Some("messages".to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
@@ -351,6 +352,7 @@ mod loop_guard_tests {
             routes: ProviderRoutesConfig {
                 messages: Some("messages".to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,

@@ -71,6 +71,8 @@ pub(crate) fn route_kind_str(kind: ProviderRouteKind) -> &'static str {
     match kind {
         ProviderRouteKind::ChatCompletions => "chat_completions",
         ProviderRouteKind::Messages => "messages",
+        ProviderRouteKind::Responses => "responses",
+        ProviderRouteKind::GenerateContent => "generate_content",
     }
 }
 
@@ -78,6 +80,9 @@ pub(crate) fn client_dialect_str(dialect: ClientDialect) -> &'static str {
     match dialect {
         ClientDialect::OpenAiChat => "openai_chat",
         ClientDialect::Anthropic => "anthropic",
+        ClientDialect::OpenAiResponses => "openai_responses",
+        ClientDialect::Gemini => "gemini",
+        ClientDialect::Ollama => "ollama",
     }
 }
 

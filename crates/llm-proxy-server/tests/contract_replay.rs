@@ -183,50 +183,8 @@ mod tests {
         }
     }
 
-    fn state_with_provider(
-        upstream: &FakeUpstream,
-        protocol: &str,
-        route: &str,
-        lossy: bool,
-    ) -> AppState {
-        let adapter_name = "upstream";
-        let provider = ProviderConfig {
-            name: "fixture-provider".to_owned(),
-            api_key: secrecy::SecretString::from("operator-key"),
-            auth_style: AuthStyle::Bearer,
-            passthrough_auth: false,
-            api_keys: None,
-            retry: None,
-            egress: None,
-            adapters: HashMap::from([(
-                adapter_name.to_owned(),
-                ProviderAdapterConfig {
-                    protocol: protocol.to_owned(),
-                    endpoint: match protocol {
-                        "anthropic_messages" => format!("{}/v1/messages", upstream.base_url),
-                        _ => format!("{}/v1/chat/completions", upstream.base_url),
-                    },
-                    headers: Arc::new(HashMap::new()),
-                    forward_inbound_headers: None,
-                    lossy,
-                },
-            )]),
-            routes: llm_proxy_core::ProviderRoutesConfig {
-                messages: (route == "messages").then_some(adapter_name.to_owned()),
-                chat_completions: (route == "chat_completions").then_some(adapter_name.to_owned()),
-            },
-            model_aliases: HashMap::from([(
-                "claude-sonnet-4-5".to_owned(),
-                "claude-sonnet-4-5-20250929".to_owned(),
-            )]),
-            discovery: None,
-            catalog: None,
-            pricing: Default::default(),
-            concurrency: None,
-            pricing_sync: None,
-            prompt_cache: None,
-        };
-        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+    /// The standard test AppState around any provider set.
+    fn base_state(registry: ProviderRegistry) -> AppState {
         AppState::new(
             AppConfig {
                 server: ServerConfig {
@@ -265,6 +223,54 @@ mod tests {
         )
     }
 
+    fn state_with_provider(
+        upstream: &FakeUpstream,
+        protocol: &str,
+        route: &str,
+        lossy: bool,
+    ) -> AppState {
+        let adapter_name = "upstream";
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_owned(),
+            api_key: secrecy::SecretString::from("operator-key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters: HashMap::from([(
+                adapter_name.to_owned(),
+                ProviderAdapterConfig {
+                    protocol: protocol.to_owned(),
+                    endpoint: match protocol {
+                        "anthropic_messages" => format!("{}/v1/messages", upstream.base_url),
+                        _ => format!("{}/v1/chat/completions", upstream.base_url),
+                    },
+                    headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy,
+                },
+            )]),
+            routes: llm_proxy_core::ProviderRoutesConfig {
+                messages: (route == "messages").then_some(adapter_name.to_owned()),
+                chat_completions: (route == "chat_completions").then_some(adapter_name.to_owned()),
+                ..Default::default()
+            },
+            model_aliases: HashMap::from([(
+                "claude-sonnet-4-5".to_owned(),
+                "claude-sonnet-4-5-20250929".to_owned(),
+            )]),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        base_state(registry)
+    }
+
     fn fixture(path: &str) -> Value {
         let text = std::fs::read_to_string(format!(
             "{}/tests/fixtures/contract/{path}",
@@ -287,17 +293,25 @@ mod tests {
         builder: axum::http::request::Builder,
         path: &str,
     ) -> axum::http::request::Builder {
-        let headers = fixture(&format!("captured/{path}"));
+        apply_header_fixture(builder, &format!("captured/{path}"))
+    }
+
+    /// The same, for a synthesized header fixture (any fixture path).
+    fn apply_header_fixture(
+        builder: axum::http::request::Builder,
+        path: &str,
+    ) -> axum::http::request::Builder {
+        let headers = fixture(path);
         let map = headers
             .as_object()
-            .unwrap_or_else(|| panic!("captured headers {path} must be an object"));
+            .unwrap_or_else(|| panic!("header fixture {path} must be an object"));
         let mut builder = builder;
         for (name, value) in map {
             let value = value
                 .as_str()
-                .unwrap_or_else(|| panic!("captured header {name} must be a string"));
+                .unwrap_or_else(|| panic!("header fixture {name} must be a string"));
             let name = axum::http::HeaderName::try_from(name.as_str())
-                .unwrap_or_else(|e| panic!("captured header name {name:?} must be valid: {e}"));
+                .unwrap_or_else(|e| panic!("header fixture name {name:?} must be valid: {e}"));
             builder = builder.header(name, value);
         }
         builder
@@ -1186,5 +1200,204 @@ mod tests {
         );
         assert_eq!(upstream_body["stream_options"]["include_usage"], true);
         assert_eq!(upstream_body["temperature"], 0.1);
+    }
+
+    fn responses_sse_body() -> Body {
+        let events = vec![
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture_codex\",\"status\":\"in_progress\"}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_0\",\"output_index\":0,\"content_index\":0,\"delta\":\"fixed\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture_codex\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":120,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":48},\"total_tokens\":129}}}\n\n",
+        ];
+        let stream = futures::stream::iter(events.into_iter().map(|chunk| {
+            Ok::<bytes::Bytes, std::convert::Infallible>(bytes::Bytes::from(chunk.to_owned()))
+        }));
+        Body::from_stream(stream)
+    }
+
+    /// A fake Responses-protocol upstream: captures the request and answers
+    /// with the documented SSE sequence.
+    async fn spawn_responses_upstream() -> FakeUpstream {
+        let capture: Capture = Arc::new(tokio::sync::Mutex::new(None));
+        let capture_for_handler = Arc::clone(&capture);
+        let handler = Arc::new(move |headers: axum::http::HeaderMap, body: bytes::Bytes| {
+            let capture = Arc::clone(&capture_for_handler);
+            async move {
+                *capture.lock().await = Some((headers, body));
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    responses_sse_body(),
+                )
+                    .into_response()
+            }
+        });
+        let app = Router::new().route(
+            "/v1/responses",
+            post({
+                let handler = Arc::clone(&handler);
+                move |headers, body| handler(headers, body)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("fake upstream serves");
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fake upstream did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        FakeUpstream {
+            base_url: format!("http://{addr}"),
+            capture,
+        }
+    }
+
+    /// A Responses-protocol provider pointing at the fake upstream, with the
+    /// Codex model aliased.
+    fn responses_provider(upstream: &FakeUpstream) -> ProviderRegistry {
+        let adapter_name = "responses_upstream";
+        let provider = ProviderConfig {
+            name: "fixture-provider".to_owned(),
+            api_key: secrecy::SecretString::from("operator-key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters: HashMap::from([(
+                adapter_name.to_owned(),
+                ProviderAdapterConfig {
+                    protocol: "openai_responses".to_owned(),
+                    endpoint: format!("{}/v1/responses", upstream.base_url),
+                    headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
+                },
+            )]),
+            routes: llm_proxy_core::ProviderRoutesConfig {
+                responses: Some(adapter_name.to_owned()),
+                ..Default::default()
+            },
+            model_aliases: HashMap::from([(
+                "gpt-5.1-codex".to_owned(),
+                "gpt-5.1-codex-2030-09-17".to_owned(),
+            )]),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        ProviderRegistry::from_providers(vec![provider]).expect("registry")
+    }
+
+    #[tokio::test]
+    async fn codex_session_replays_through_the_responses_route() {
+        // The Codex fixture is synthesized from the documented Responses
+        // request shape (the Codex CLI could not be run here; see the
+        // fixture README). Same-format passthrough must carry it to a
+        // Responses upstream byte-identical apart from the model alias.
+        let upstream = spawn_responses_upstream().await;
+        let state = base_state(responses_provider(&upstream));
+        let app = build_router(state);
+
+        let body = fixture("codex/session-request.json");
+        let builder = apply_header_fixture(
+            Request::builder()
+                .method("POST")
+                .uri("/providers/fixture-provider/v1/responses"),
+            "codex/headers.json",
+        );
+        let resp = app
+            .oneshot(builder.body(Body::from(body.to_string())).expect("body"))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (headers, upstream_body) = captured(&upstream).await;
+        let mut expected = body.clone();
+        expected["model"] = Value::String("gpt-5.1-codex-2030-09-17".to_owned());
+        assert_eq!(
+            upstream_body, expected,
+            "the Codex session must reach the Responses upstream with only the model rewritten"
+        );
+        // The fields Codex hard-requires all survive.
+        assert_eq!(upstream_body["store"], false);
+        assert_eq!(upstream_body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(upstream_body["prompt_cache_key"], "fixture-session-7f3a");
+        assert_eq!(upstream_body["reasoning"]["summary"], "auto");
+        assert_eq!(upstream_body["parallel_tool_calls"], false);
+        assert_eq!(upstream_body["tools"][0]["strict"], true);
+        // The replayed reasoning item and tool state ride untouched.
+        assert_eq!(
+            upstream_body["input"][1]["encrypted_content"],
+            "gAAAAABfixture_encrypted_reasoning_not_real"
+        );
+        assert_eq!(upstream_body["input"][2]["call_id"], "call_fixture_0001");
+        // Codex client headers never reach the upstream.
+        for forbidden in [
+            "originator",
+            "session_id",
+            "conversation_id",
+            "openai-beta",
+            "x-stainless-lang",
+            "user-agent",
+        ] {
+            assert!(
+                !headers.contains_key(forbidden),
+                "{forbidden} from the Codex client set must never be forwarded"
+            );
+        }
+        for (_, value) in headers.iter() {
+            let text = value.to_str().unwrap_or_default();
+            assert!(
+                !text.contains("codex-capture-fixture-key-not-real"),
+                "the Codex client credential must never leak upstream: {text}"
+            );
+        }
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer operator-key")
+        );
+
+        // The response side: the upstream's Responses SSE must come back to
+        // the Codex client as Responses SSE with exact usage.
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        for expected in [
+            "event: response.created",
+            "event: response.output_item.added",
+            "event: response.output_text.delta",
+            "event: response.completed",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let completed = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str::<Value>(data).expect("valid json"))
+            .find(|value| value["type"] == "response.completed")
+            .expect("terminal event");
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 120);
+        assert_eq!(
+            completed["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            48
+        );
     }
 }
