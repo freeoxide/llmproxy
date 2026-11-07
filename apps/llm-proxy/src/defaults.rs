@@ -27,6 +27,7 @@ server_name = "llm-proxy"
 # [server.idempotency]
 # enabled = true
 # ttl = "24h"
+# max_entries = 1000
 "#;
 
 /// Default provider TOML for opencode-go.

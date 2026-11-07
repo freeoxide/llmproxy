@@ -158,13 +158,40 @@ impl FlightLead {
     }
 }
 
+/// The message the [`FlightLead`] drop backstop publishes: the leader ended
+/// unpublished (its handler future was dropped on a client disconnect, or it
+/// panicked). Followers match on it to re-execute the request themselves
+/// instead of failing with an internal error.
+pub(crate) const FLIGHT_LEADER_LOST: &str = "single-flight leader ended without an outcome";
+
+/// Whether `error` is the single-flight leader-loss backstop, which a
+/// follower answers by executing the request itself.
+pub(crate) fn is_flight_leader_lost(error: &EngineError) -> bool {
+    matches!(error, EngineError::Internal(message) if message == FLIGHT_LEADER_LOST)
+}
+
+/// The message a stream leader publishes when it goes away before its
+/// stream committed (its caller's connection dropped, or the task died):
+/// the joiner's first-byte wait resolves with it, and the joiner recognizes
+/// it to re-run the request itself instead of failing with an internal
+/// error. A stream that already committed never publishes this — its
+/// joiners are already replaying its collected events.
+pub(crate) const STREAM_LEADER_LOST: &str = "shared stream leader went away before its first byte";
+
+/// Whether `error` is the stream leader-loss sentinel, which a joiner
+/// answers by re-running the request itself.
+pub(crate) fn is_stream_leader_lost(error: &EngineError) -> bool {
+    matches!(error, EngineError::Internal(message) if message == STREAM_LEADER_LOST)
+}
+
 impl Drop for FlightLead {
     fn drop(&mut self) {
         if !self.published {
-            // The leader ended without publishing (a bug or a panic): fail
-            // the followers rather than leaving them waiting forever.
+            // The leader ended without publishing (a dropped handler future
+            // or a panic): fail the followers rather than leaving them
+            // waiting forever. They recognize this sentinel and re-execute.
             let _ = self.share.tx.send_replace(Some(Err(EngineError::Internal(
-                "single-flight leader ended without an outcome".to_owned(),
+                FLIGHT_LEADER_LOST.to_owned(),
             ))));
             self.registry.release(&self.identity, &self.share);
         }
@@ -270,10 +297,14 @@ pub(crate) enum StreamAcquire {
     Join(Arc<StreamShare>),
 }
 
-/// One shared streaming request: the events the leader has forwarded so far
-/// and the terminal outcome.
+/// One shared streaming request: the events the leader has forwarded so far,
+/// whether its stream committed to a client, and the terminal outcome.
 pub(crate) struct StreamShare {
     events: Mutex<Vec<CoreEvent>>,
+    /// The first-byte boundary: `Ok` once the leader committed its stream
+    /// (joiners may answer 200 and replay), or the leader's error when it
+    /// failed before any byte was committed (joiners fail the same way).
+    commit: watch::Sender<Option<Result<(), EngineError>>>,
     tx: watch::Sender<Option<StreamOutcome>>,
 }
 
@@ -292,6 +323,50 @@ impl StreamShare {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Marks the share's stream as committed: joiners may answer 200 and
+    /// replay its collected events.
+    pub(crate) fn signal_committed(&self) {
+        self.commit.send_if_modified(|slot| {
+            if slot.is_none() {
+                *slot = Some(Ok(()));
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Fails the first-byte wait when the leader ends without committing, so
+    /// a joiner sees the leader's error instead of waiting or streaming a
+    /// generic one. A stream that already committed keeps its `Ok`.
+    pub(crate) fn fail_commit_if_pending(&self, error: &EngineError) {
+        self.commit.send_if_modified(|slot| {
+            if slot.is_none() {
+                *slot = Some(Err(error.clone()));
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Wait for the leader's commit outcome: `Ok` once its stream committed,
+    /// or its error when it failed before the first byte. Resolves
+    /// immediately when the leader already crossed the boundary.
+    pub(crate) async fn committed(&self) -> Result<(), EngineError> {
+        let mut rx = self.commit.subscribe();
+        loop {
+            if let Some(outcome) = rx.borrow_and_update().clone() {
+                return outcome;
+            }
+            if rx.changed().await.is_err() {
+                return Err(EngineError::Internal(
+                    "shared stream leader vanished before its first byte".to_owned(),
+                ));
+            }
+        }
     }
 
     /// Wait for the leader's terminal outcome. Resolves immediately when the
@@ -326,9 +401,14 @@ impl StreamLead {
     }
 
     /// Publish the terminal outcome and release the claim. Called exactly
-    /// once per lead, on every path the stream task can end on.
+    /// once per lead, on every path the stream task can end on. A failure
+    /// published before the stream committed also fails the joiners'
+    /// first-byte wait with the same error.
     pub(crate) fn publish(mut self, outcome: StreamOutcome) {
         self.published = true;
+        if let Err(error) = outcome.clone() {
+            self.share.fail_commit_if_pending(&error);
+        }
         let _ = self.share.tx.send_replace(Some(outcome));
         self.registry.release(&self.identity, &self.share);
     }
@@ -337,9 +417,12 @@ impl StreamLead {
 impl Drop for StreamLead {
     fn drop(&mut self) {
         if !self.published {
-            let _ = self.share.tx.send_replace(Some(Err(EngineError::Internal(
-                "shared stream leader ended without an outcome".to_owned(),
-            ))));
+            // The leader died unpublished: fail the joiners' first-byte wait
+            // with the sentinel they re-run on, rather than leaving them
+            // waiting forever.
+            let error = EngineError::Internal(STREAM_LEADER_LOST.to_owned());
+            self.share.fail_commit_if_pending(&error);
+            let _ = self.share.tx.send_replace(Some(Err(error)));
             self.registry.release(&self.identity, &self.share);
         }
     }
@@ -379,8 +462,10 @@ impl StreamShares {
             return StreamAcquire::Join(Arc::clone(share));
         }
         let (tx, _rx) = watch::channel(None);
+        let (commit, _commit_rx) = watch::channel(None);
         let share = Arc::new(StreamShare {
             events: Mutex::new(Vec::new()),
+            commit,
             tx,
         });
         shares.insert(identity.clone(), Arc::clone(&share));
@@ -414,6 +499,27 @@ pub struct StoredOutcome {
     pub events: Vec<CoreEvent>,
 }
 
+/// What a claimed key is completed under, and what a retry must match: the
+/// body digest plus the provider route that ran the first request. A key
+/// reused against a different route with identical body bytes would else
+/// replay the first provider's response under the second provider's name.
+#[derive(Debug, Clone)]
+pub(crate) struct IdemMatch {
+    provider: String,
+    route_kind: ProviderRouteKind,
+    body_hash: String,
+}
+
+impl IdemMatch {
+    pub(crate) fn new(provider: &str, route_kind: ProviderRouteKind, body_hash: &str) -> Self {
+        Self {
+            provider: provider.to_owned(),
+            route_kind,
+            body_hash: body_hash.to_owned(),
+        }
+    }
+}
+
 /// What claiming an idempotency key returned.
 pub(crate) enum IdempotencyAcquire {
     /// Nobody holds this key: this request claims it and must complete or
@@ -422,10 +528,10 @@ pub(crate) enum IdempotencyAcquire {
     /// The first request with this key is still in flight: 409 (only while
     /// in flight; a retry after completion replays).
     InFlight,
-    /// A completed outcome exists for this key and body: replay it.
+    /// A completed outcome exists for this key, body and route: replay it.
     Replay(Box<StoredOutcome>),
-    /// A completed outcome exists for this key under a different body: the
-    /// client is reusing a key with different parameters.
+    /// A completed outcome exists for this key under a different body or
+    /// route: the client is reusing a key with different parameters.
     BodyMismatch,
 }
 
@@ -434,7 +540,7 @@ pub(crate) enum IdempotencyAcquire {
 pub struct IdempotencyClaim {
     store: Arc<IdempotencyStore>,
     key: IdemKey,
-    body_hash: String,
+    matched: IdemMatch,
     completed: bool,
 }
 
@@ -444,7 +550,7 @@ impl IdempotencyClaim {
     /// the key so a retry executes again.
     pub(crate) fn complete(mut self, outcome: StoredOutcome) {
         self.completed = true;
-        self.store.complete(&self.key, &self.body_hash, outcome);
+        self.store.complete(&self.key, &self.matched, outcome);
     }
 }
 
@@ -465,39 +571,58 @@ struct IdemKey {
 enum IdemEntry {
     InFlight,
     Completed {
-        body_hash: String,
+        matched: IdemMatch,
         outcome: Box<StoredOutcome>,
         completed_at: Instant,
+        /// Insertion generation, so a re-completed key's older queue slot
+        /// cannot evict or replay the newer entry.
+        generation: u64,
     },
+}
+
+#[derive(Default)]
+struct IdemTable {
+    entries: HashMap<IdemKey, IdemEntry>,
+    /// Completed entries in completion order with each insert's generation,
+    /// for the TTL sweep and FIFO eviction at the capacity bound. In-flight
+    /// claims are never queued: they end with their request.
+    order: VecDeque<(IdemKey, u64)>,
+    next_generation: u64,
 }
 
 /// The in-process `Idempotency-Key` store (plan 06 step 3, backlog 24):
 /// claims a key before budget checks, replays the stored response for a
 /// matching retry within the TTL, and reports in-flight conflicts (409) only
 /// while the first request runs. Keys are caller-scoped. Failures are not
-/// stored: a retry after a failed first attempt executes again.
+/// stored: a retry after a failed first attempt executes again. Completed
+/// outcomes are swept once past the TTL and bounded FIFO at `max_entries`,
+/// mirroring [`MemoryCache`].
 pub struct IdempotencyStore {
-    entries: Mutex<HashMap<IdemKey, IdemEntry>>,
+    table: Mutex<IdemTable>,
     ttl: Duration,
+    max_entries: usize,
 }
 
 impl std::fmt::Debug for IdempotencyStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Keys and outcomes are caller data; log only the shape.
         f.debug_struct("IdempotencyStore")
-            .field("entries", &self.entries.lock().map_or(0, |e| e.len()))
+            .field("entries", &self.table.lock().map_or(0, |t| t.entries.len()))
             .field("ttl", &self.ttl)
+            .field("max_entries", &self.max_entries)
             .finish()
     }
 }
 
 impl IdempotencyStore {
-    /// A store replaying outcomes for `ttl`.
+    /// A store replaying outcomes for `ttl`, holding at most `max_entries`
+    /// completed outcomes (the oldest completed is evicted first).
     #[must_use]
-    pub fn new(ttl: Duration) -> Self {
+    pub fn new(ttl: Duration, max_entries: usize) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            table: Mutex::new(IdemTable::default()),
             ttl,
+            max_entries,
         }
     }
 
@@ -505,62 +630,310 @@ impl IdempotencyStore {
         self: &Arc<Self>,
         caller: &str,
         idempotency_key: &str,
-        body_hash: &str,
+        matched: &IdemMatch,
     ) -> IdempotencyAcquire {
         let key = IdemKey {
             caller: caller.to_owned(),
             idempotency_key: idempotency_key.to_owned(),
         };
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        match entries.get_mut(&key) {
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        self.sweep_expired(&mut table);
+        match table.entries.get_mut(&key) {
             Some(IdemEntry::InFlight) => IdempotencyAcquire::InFlight,
             Some(IdemEntry::Completed {
-                body_hash: stored_hash,
+                matched: stored,
                 outcome,
                 completed_at,
+                ..
             }) => {
                 if completed_at.elapsed() >= self.ttl {
                     // The replay window passed: the key is claimable again.
-                    entries.insert(key.clone(), IdemEntry::InFlight);
+                    table.entries.insert(key.clone(), IdemEntry::InFlight);
                     return IdempotencyAcquire::Claim(IdempotencyClaim {
                         store: Arc::clone(self),
                         key,
-                        body_hash: body_hash.to_owned(),
+                        matched: matched.clone(),
                         completed: false,
                     });
                 }
-                if stored_hash == body_hash {
+                if stored.body_hash == matched.body_hash
+                    && stored.provider == matched.provider
+                    && stored.route_kind == matched.route_kind
+                {
                     IdempotencyAcquire::Replay(outcome.clone())
                 } else {
                     IdempotencyAcquire::BodyMismatch
                 }
             }
             None => {
-                entries.insert(key.clone(), IdemEntry::InFlight);
+                table.entries.insert(key.clone(), IdemEntry::InFlight);
                 IdempotencyAcquire::Claim(IdempotencyClaim {
                     store: Arc::clone(self),
                     key,
-                    body_hash: body_hash.to_owned(),
+                    matched: matched.clone(),
                     completed: false,
                 })
             }
         }
     }
 
-    fn complete(&self, key: &IdemKey, body_hash: &str, outcome: StoredOutcome) {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.insert(
+    fn complete(&self, key: &IdemKey, matched: &IdemMatch, outcome: StoredOutcome) {
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = table.next_generation;
+        table.next_generation += 1;
+        table.entries.insert(
             key.clone(),
             IdemEntry::Completed {
-                body_hash: body_hash.to_owned(),
+                matched: matched.clone(),
                 outcome: Box::new(outcome),
                 completed_at: Instant::now(),
+                generation,
             },
         );
+        table.order.push_back((key.clone(), generation));
+        self.sweep_expired(&mut table);
+        self.enforce_bound(&mut table);
     }
 
     fn release(&self, key: &IdemKey) {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        entries.remove(key);
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        table.entries.remove(key);
+    }
+
+    /// Drops completed entries past the TTL. Completed entries age in queue
+    /// order, so expired ones sit at the front; a superseded slot (its key
+    /// was re-completed or reclaimed in flight) drops without its entry.
+    fn sweep_expired(&self, table: &mut IdemTable) {
+        while let Some((key, generation)) = table.order.front().cloned() {
+            match table.entries.get(&key) {
+                Some(IdemEntry::Completed {
+                    completed_at,
+                    generation: current,
+                    ..
+                }) if *current == generation => {
+                    if completed_at.elapsed() < self.ttl {
+                        break;
+                    }
+                    table.entries.remove(&key);
+                    table.order.pop_front();
+                }
+                _ => {
+                    table.order.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Evicts the oldest completed entries until at most `max_entries`
+    /// remain. In-flight claims are never counted or evicted.
+    fn enforce_bound(&self, table: &mut IdemTable) {
+        let mut completed = table.order.len();
+        while completed > self.max_entries {
+            let Some((key, generation)) = table.order.pop_front() else {
+                break;
+            };
+            if let Some(IdemEntry::Completed {
+                generation: current,
+                ..
+            }) = table.entries.get(&key)
+                && *current == generation
+            {
+                table.entries.remove(&key);
+                completed -= 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matched(provider: &str, route_kind: ProviderRouteKind, body: &str) -> IdemMatch {
+        IdemMatch {
+            provider: provider.to_owned(),
+            route_kind,
+            body_hash: body.to_owned(),
+        }
+    }
+
+    fn claim_key(
+        store: &Arc<IdempotencyStore>,
+        key: &str,
+        matched: &IdemMatch,
+    ) -> IdempotencyAcquire {
+        store.claim("caller-a", key, matched)
+    }
+
+    fn complete_key(store: &Arc<IdempotencyStore>, key: &str, matched: &IdemMatch) {
+        let IdempotencyAcquire::Claim(claim) = claim_key(store, key, matched) else {
+            panic!("key {key} must be claimable");
+        };
+        claim.complete(StoredOutcome {
+            response: None,
+            events: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn completed_outcomes_expire_and_release_their_key() {
+        // A zero TTL means every completed outcome is past its replay window
+        // the moment it lands: the sweep must drop it, not retain it for
+        // reclaim-by-same-key only.
+        let store = Arc::new(IdempotencyStore::new(Duration::ZERO, 16));
+        complete_key(
+            &store,
+            "key-1",
+            &matched("prov", ProviderRouteKind::Messages, "body"),
+        );
+        assert!(
+            format!("{store:?}").contains("entries: 0"),
+            "an expired outcome must be swept, not held: {store:?}"
+        );
+        assert!(
+            matches!(
+                claim_key(
+                    &store,
+                    "key-1",
+                    &matched("prov", ProviderRouteKind::Messages, "body")
+                ),
+                IdempotencyAcquire::Claim(_)
+            ),
+            "the swept key is claimable again by any caller of claim"
+        );
+    }
+
+    #[test]
+    fn a_recompleted_expired_key_does_not_over_evict_at_the_bound() {
+        // The one sequence that leaves a superseded queue slot: key-a
+        // completes, key-b completes later, key-a expires while key-b is
+        // fresh, key-a is re-claimed and re-completed. The bound (2) must
+        // evict nothing here: the superseded slot is dropped by the TTL
+        // sweep that runs before the bound, and both live outcomes replay.
+        // If the bound ever charged superseded slots against the live count,
+        // key-b (the oldest live outcome) would be evicted and re-execute.
+        let store = Arc::new(IdempotencyStore::new(Duration::from_millis(500), 2));
+        let messages = ProviderRouteKind::Messages;
+        complete_key(&store, "key-a", &matched("prov", messages, "body-a"));
+        std::thread::sleep(Duration::from_millis(300));
+        complete_key(&store, "key-b", &matched("prov", messages, "body-b"));
+        std::thread::sleep(Duration::from_millis(300));
+        // key-a is past its 500ms TTL; key-b completed 300ms ago and is live.
+        complete_key(&store, "key-a", &matched("prov", messages, "body-a"));
+
+        assert!(
+            matches!(
+                claim_key(&store, "key-a", &matched("prov", messages, "body-a")),
+                IdempotencyAcquire::Replay(_)
+            ),
+            "the re-completed outcome replays"
+        );
+        assert!(
+            matches!(
+                claim_key(&store, "key-b", &matched("prov", messages, "body-b")),
+                IdempotencyAcquire::Replay(_)
+            ),
+            "the oldest live outcome must not be over-evicted by a superseded slot"
+        );
+
+        // The bound still evicts exactly the oldest live outcome when a third
+        // completes.
+        complete_key(&store, "key-c", &matched("prov", messages, "body-c"));
+        assert!(
+            matches!(
+                claim_key(&store, "key-b", &matched("prov", messages, "body-b")),
+                IdempotencyAcquire::Claim(_)
+            ),
+            "key-b is the oldest live outcome once the bound is exceeded"
+        );
+        assert!(
+            matches!(
+                claim_key(&store, "key-a", &matched("prov", messages, "body-a")),
+                IdempotencyAcquire::Replay(_)
+            ),
+            "the newest live outcome stays within the bound"
+        );
+    }
+
+    #[test]
+    fn the_bound_evicts_the_oldest_completed_outcome() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 1));
+        let messages = ProviderRouteKind::Messages;
+        complete_key(&store, "key-1", &matched("prov", messages, "body-1"));
+        complete_key(&store, "key-2", &matched("prov", messages, "body-2"));
+
+        assert!(
+            matches!(
+                claim_key(&store, "key-2", &matched("prov", messages, "body-2")),
+                IdempotencyAcquire::Replay(_)
+            ),
+            "the newest outcome stays within the bound"
+        );
+        assert!(
+            matches!(
+                claim_key(&store, "key-1", &matched("prov", messages, "body-1")),
+                IdempotencyAcquire::Claim(_)
+            ),
+            "the oldest outcome was evicted, so its key executes again"
+        );
+    }
+
+    #[test]
+    fn a_released_in_flight_key_is_never_swept_or_counted() {
+        // A dropped (failed) claim releases its key; the sweep and the bound
+        // must not resurrect or evict around in-flight state.
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 2));
+        let IdempotencyAcquire::Claim(claim) = claim_key(
+            &store,
+            "key-1",
+            &matched("prov", ProviderRouteKind::Messages, "body"),
+        ) else {
+            panic!("key must be claimable");
+        };
+        drop(claim);
+        assert!(
+            matches!(
+                claim_key(
+                    &store,
+                    "key-1",
+                    &matched("prov", ProviderRouteKind::Messages, "body")
+                ),
+                IdempotencyAcquire::Claim(_)
+            ),
+            "a released key is claimable again immediately"
+        );
+    }
+
+    #[test]
+    fn a_key_completed_under_one_route_does_not_replay_for_another() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 16));
+        let messages = ProviderRouteKind::Messages;
+        complete_key(&store, "key-1", &matched("prov-a", messages, "same-body"));
+
+        assert!(
+            matches!(
+                claim_key(&store, "key-1", &matched("prov-a", messages, "same-body")),
+                IdempotencyAcquire::Replay(_)
+            ),
+            "same provider, route and body replays"
+        );
+        assert!(
+            matches!(
+                claim_key(&store, "key-1", &matched("prov-b", messages, "same-body")),
+                IdempotencyAcquire::BodyMismatch
+            ),
+            "the same body bytes under another provider must not replay"
+        );
+        assert!(
+            matches!(
+                claim_key(
+                    &store,
+                    "key-1",
+                    &matched("prov-a", ProviderRouteKind::ChatCompletions, "same-body")
+                ),
+                IdempotencyAcquire::BodyMismatch
+            ),
+            "the same body bytes under another route kind must not replay"
+        );
     }
 }

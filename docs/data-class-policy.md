@@ -39,11 +39,13 @@ asserts that no recorded row contains prompt or response text.
 - **Stores:** the completed outcome of a request that carried an
   `Idempotency-Key` header: the full response (non-streaming) or the full
   collected event list (streaming), keyed by caller + key. The body digest
-  is stored alongside for match checking. Requests without the header store
-  nothing.
+  and provider route are stored alongside for match checking. Requests
+  without the header store nothing.
 - **Where:** in process memory. Nothing is written to disk.
-- **Retention:** `ttl` (default 24h) from completion. Failed requests are
-  not stored — their key is released so a retry executes.
+- **Retention:** `ttl` (default 24h) from completion, swept as it passes; at
+  most `max_entries` (default 1000) completed outcomes, oldest completed
+  evicted first. Failed requests are not stored — their key is released so a
+  retry executes.
 - **While in flight:** the first request holds the key; a concurrent request
   with the same key gets 409 until it finishes. Nothing is stored for the
   conflict itself.
@@ -54,6 +56,13 @@ asserts that no recorded row contains prompt or response text.
   The leader's events and outcome are held in memory **only while requests
   are waiting on them**, then dropped. Nothing persists after completion;
   there is no TTL because there is no storage.
+- A joiner shares the leader's fate while attached: if the leader is refused
+  (guard, budget) or fails before its first byte, the joiner gets the same
+  error, and if the leader goes away entirely before its first byte the
+  joiner re-runs the request once itself. Once a shared stream has committed,
+  a disconnecting leader ends it for its joiners too — they receive the
+  events collected so far followed by an in-band error, not the remainder of
+  the response.
 
 ### Prompt-cache hygiene — `[provider.prompt_cache]`
 

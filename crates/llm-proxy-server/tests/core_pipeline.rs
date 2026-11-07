@@ -2904,6 +2904,7 @@ mod tests {
                 config.server.idempotency = llm_proxy_core::IdempotencyConfig {
                     enabled: true,
                     ttl: Duration::from_secs(3600),
+                    max_entries: 1024,
                 };
             },
         );

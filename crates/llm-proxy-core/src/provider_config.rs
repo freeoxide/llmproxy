@@ -791,10 +791,18 @@ pub struct IdempotencyConfig {
     /// be non-zero when enabled.
     #[serde(default = "default_idempotency_ttl", with = "humantime_serde")]
     pub ttl: Duration,
+    /// Bound on stored completed outcomes (FIFO eviction at the bound;
+    /// expired outcomes are swept). In-flight claims are never counted.
+    #[serde(default = "default_idempotency_max_entries")]
+    pub max_entries: usize,
 }
 
 const fn default_idempotency_ttl() -> Duration {
     Duration::from_secs(24 * 60 * 60)
+}
+
+const fn default_idempotency_max_entries() -> usize {
+    1000
 }
 
 impl Default for IdempotencyConfig {
@@ -802,6 +810,7 @@ impl Default for IdempotencyConfig {
         Self {
             enabled: false,
             ttl: default_idempotency_ttl(),
+            max_entries: default_idempotency_max_entries(),
         }
     }
 }
@@ -2422,6 +2431,14 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             source: None,
         });
     }
+    if cfg.server.idempotency.enabled && cfg.server.idempotency.max_entries == 0 {
+        return Err(CoreError::ConfigValidation {
+            message: "server.idempotency.max_entries must be at least 1 when \
+                      Idempotency-Key handling is enabled"
+                .to_owned(),
+            source: None,
+        });
+    }
     if let Some(storage) = cfg.storage.as_ref() {
         validate_storage_config(storage)?;
     }
@@ -3417,6 +3434,41 @@ server_name = "test"
             error
                 .to_string()
                 .contains("server.request_timeout must be at least 1 second"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn load_app_config_rejects_a_zero_idempotency_max_entries_when_enabled() {
+        // max_entries = 0 would silently retain nothing — every completed
+        // outcome evicted the moment it lands, so no keyed retry ever
+        // replayed. An enabled store must hold at least one outcome, the
+        // same rule the response cache applies.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "test"
+
+[server.idempotency]
+enabled = true
+ttl = "24h"
+max_entries = 0
+"#,
+        )
+        .unwrap();
+
+        let error = load_app_config(&path).expect_err("zero max_entries must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("server.idempotency.max_entries must be at least 1"),
             "got: {error}"
         );
     }

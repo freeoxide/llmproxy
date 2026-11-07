@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -15,16 +16,18 @@ use axum::response::IntoResponse;
 use futures::StreamExt;
 use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
 use llm_proxy_core::{
-    AppConfig, AuthStyle, IdempotencyConfig, ProviderAdapterConfig, ProviderConfig,
-    ProviderRegistry, ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
+    AppConfig, AuthStyle, IdempotencyConfig, ModelId, ModelPricing, ProviderAdapterConfig,
+    ProviderConfig, ProviderRegistry, ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
 };
 use llm_proxy_engine::{
-    ClientDialect, Engine, EngineBuilder, EngineError, EngineRequest, InboundRequest, MemoryCache,
+    Admission, AdmissionClaim, AdmissionOutcome, AdmissionTicket, ClientDialect, Engine,
+    EngineBuilder, EngineError, EngineRequest, EngineStream, InboundRequest, MemoryCache,
 };
 use llm_proxy_protocol::core::{
     CoreContent, CoreEvent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
 };
 use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus};
+use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
 
 /// A slow fake upstream: counts calls and answers a fixed non-streaming
@@ -118,6 +121,10 @@ fn test_config() -> AppConfig {
 }
 
 fn provider(endpoint: String) -> ProviderConfig {
+    provider_named("fake", endpoint)
+}
+
+fn provider_named(name: &str, endpoint: String) -> ProviderConfig {
     let mut adapters = std::collections::HashMap::new();
     adapters.insert(
         "messages".to_owned(),
@@ -134,7 +141,7 @@ fn provider(endpoint: String) -> ProviderConfig {
         chat_completions: None,
     };
     ProviderConfig {
-        name: "fake".to_owned(),
+        name: name.to_owned(),
         api_key: secrecy::SecretString::from("upstream-key"),
         auth_style: AuthStyle::XApiKey,
         passthrough_auth: false,
@@ -188,12 +195,22 @@ fn engine_request(
     caller: &str,
     idempotency_key: Option<&str>,
 ) -> EngineRequest {
+    engine_request_for("fake", stream, prompt, caller, idempotency_key)
+}
+
+fn engine_request_for(
+    provider_name: &str,
+    stream: bool,
+    prompt: &str,
+    caller: &str,
+    idempotency_key: Option<&str>,
+) -> EngineRequest {
     let mut headers = std::collections::HashMap::new();
     if let Some(key) = idempotency_key {
         headers.insert("idempotency-key".to_owned(), key.to_owned());
     }
     EngineRequest::new(
-        "fake",
+        provider_name,
         ProviderRouteKind::Messages,
         ClientDialect::Anthropic,
         core_request(stream, prompt),
@@ -210,16 +227,28 @@ fn engine_request(
     .with_body_hash(body_hash_of(prompt))
 }
 
-fn build_engine(endpoint: String, bus: Arc<RecordingBus>, cache: Option<MemoryCache>) -> Engine {
-    let registry =
-        ProviderRegistry::from_providers(vec![provider(endpoint)]).expect("provider registry");
-    let mut builder = EngineBuilder::new(test_config())
+fn engine_with(
+    providers: Vec<ProviderConfig>,
+    config: AppConfig,
+    bus: Arc<RecordingBus>,
+    admission: Option<Arc<dyn Admission>>,
+    cache: Option<MemoryCache>,
+) -> Engine {
+    let registry = ProviderRegistry::from_providers(providers).expect("provider registry");
+    let mut builder = EngineBuilder::new(config)
         .providers(Arc::new(registry))
         .event_bus(bus as Arc<dyn EventBus>);
+    if let Some(admission) = admission {
+        builder = builder.admission(admission);
+    }
     if let Some(cache) = cache {
         builder = builder.cache(Arc::new(cache));
     }
     builder.build().expect("engine builds")
+}
+
+fn build_engine(endpoint: String, bus: Arc<RecordingBus>, cache: Option<MemoryCache>) -> Engine {
+    engine_with(vec![provider(endpoint)], test_config(), bus, None, cache)
 }
 
 fn response_text(response: &llm_proxy_engine::EngineResponse) -> String {
@@ -570,18 +599,19 @@ fn idempotency_config() -> AppConfig {
     config.server.idempotency = IdempotencyConfig {
         enabled: true,
         ttl: Duration::from_secs(3600),
+        max_entries: 1024,
     };
     config
 }
 
 fn build_idempotent_engine(endpoint: String, bus: Arc<RecordingBus>) -> Engine {
-    let registry =
-        ProviderRegistry::from_providers(vec![provider(endpoint)]).expect("provider registry");
-    EngineBuilder::new(idempotency_config())
-        .providers(Arc::new(registry))
-        .event_bus(bus as Arc<dyn EventBus>)
-        .build()
-        .expect("engine builds")
+    engine_with(
+        vec![provider(endpoint)],
+        idempotency_config(),
+        bus,
+        None,
+        None,
+    )
 }
 
 #[tokio::test]
@@ -824,4 +854,580 @@ async fn a_streaming_outcome_replays_as_a_stream_for_a_matching_retry() {
     let rows = completed_rows(&bus);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows.iter().filter(|(hit, _)| *hit).count(), 1);
+}
+
+/// A streaming upstream that commits the caller with one valid event and
+/// then fails in-band: an upstream `error` event, then the stream ends
+/// without a terminal. The leader's client sees a well-formed 200 whose
+/// stream ends in errors, exactly like a real mid-stream provider failure.
+fn mid_stream_failure_upstream(calls: Arc<AtomicUsize>, delay: Duration) -> Router {
+    Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                let chunks = vec![
+                    bytes::Bytes::from_static(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_f\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"upstream fell over mid-stream\"}}\n\n",
+                    ),
+                ];
+                let body_stream =
+                    futures::stream::iter(chunks).map(Ok::<_, std::convert::Infallible>);
+                (
+                    StatusCode::OK,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    Body::from_stream(body_stream),
+                )
+                    .into_response()
+            }
+        }),
+    )
+}
+
+/// A streaming upstream that waits `delay` and then refuses with a 400, so
+/// the leader fails before its first byte while a joiner is already waiting.
+fn delayed_400_upstream(calls: Arc<AtomicUsize>, delay: Duration) -> Router {
+    Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                (StatusCode::BAD_REQUEST, "model is not available").into_response()
+            }
+        }),
+    )
+}
+
+async fn collect_stream(stream: EngineStream) -> Vec<CoreEvent> {
+    let mut all = stream.head;
+    let mut tail = stream.tail;
+    while let Some(event) = tail.next().await {
+        all.push(event);
+    }
+    all
+}
+
+fn failed_rows(bus: &RecordingBus) -> Vec<String> {
+    bus.snapshot()
+        .into_iter()
+        .filter_map(|event| match event {
+            ProxyEvent::ResponseFailed(row) => Some(row.request_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failed_streaming_first_attempt_releases_its_key() {
+    // Done-when of the streaming idempotency claim: only a stream that runs
+    // cleanly to its terminal is stored. A stream that dies mid-response
+    // releases the key, so the keyed retry executes a fresh request instead
+    // of replaying the failed one for the TTL.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_upstream(mid_stream_failure_upstream(
+        Arc::clone(&calls),
+        Duration::from_millis(40),
+    ))
+    .await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_idempotent_engine(endpoint, Arc::clone(&bus));
+
+    let first = engine
+        .execute_stream(engine_request(
+            true,
+            "flaky prompt",
+            "caller-a",
+            Some("key-f"),
+        ))
+        .await
+        .expect("the first attempt still hands back a committed stream");
+    let events = collect_stream(first).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::Error { .. })),
+        "the first attempt fails in-band: {events:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let retry = engine
+        .execute_stream(engine_request(
+            true,
+            "flaky prompt",
+            "caller-a",
+            Some("key-f"),
+        ))
+        .await;
+    match retry {
+        Ok(_) => {}
+        Err(EngineError::IdempotencyInFlight) => panic!("a failed stream must release its key"),
+        Err(other) => panic!("the retry must execute as a fresh stream, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the keyed retry must execute upstream again, not replay the failed stream"
+    );
+}
+
+/// An admission step that waits (so a joiner arrives while the leader holds
+/// the flight) and then refuses, for the follower's error propagation.
+#[derive(Debug)]
+struct SlowRefusingAdmission;
+
+#[async_trait]
+impl Admission for SlowRefusingAdmission {
+    async fn reserve(&self, _claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        Err(EngineError::RateLimited {
+            message: "rpm window spent".to_owned(),
+            retry_after: Some(Duration::from_secs(5)),
+        })
+    }
+
+    fn settle(&self, _ticket: &AdmissionTicket, _outcome: &AdmissionOutcome<'_>) {}
+}
+
+#[tokio::test]
+async fn an_admission_refusal_reaches_single_flight_joiners() {
+    // The leader's admission error (429 here) is what its joiners get —
+    // not a 500 from the leader-without-outcome backstop.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_upstream(CountingUpstream::new(Duration::ZERO).router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        test_config(),
+        Arc::clone(&bus),
+        Some(Arc::new(SlowRefusingAdmission)),
+        None,
+    );
+
+    let leader = engine.execute(engine_request(false, "shared prompt", "caller-a", None));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let joiner = engine.execute(
+        engine_request(false, "shared prompt", "caller-a", None).with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+
+    let leader_err = leader.expect_err("the leader is refused");
+    let joiner_err = joiner.expect_err("the joiner is refused the same way");
+    assert!(
+        matches!(joiner_err, EngineError::RateLimited { .. }),
+        "the joiner must see the leader's admission refusal, got {joiner_err:?}"
+    );
+    assert_eq!(joiner_err.status_code(), 429);
+    assert_eq!(joiner_err.kind_name(), leader_err.kind_name());
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "nothing reached upstream");
+}
+
+#[tokio::test]
+async fn a_single_flight_follower_reexecutes_when_its_leader_vanishes() {
+    // The leader's handler future dropped mid-flight (its client went
+    // away): the joiner runs the request itself instead of failing with an
+    // internal error.
+    let upstream = CountingUpstream::new(Duration::from_millis(150));
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_engine(endpoint, Arc::clone(&bus), None);
+
+    let leader_engine = engine.clone();
+    let leader = tokio::spawn(async move {
+        leader_engine
+            .execute(engine_request(false, "shared prompt", "caller-a", None))
+            .await
+    });
+    // The joiner starts while the leader holds the flight; it cannot finish
+    // before the leader does, so it is parked on the shared outcome here.
+    let joiner = engine.execute(
+        engine_request(false, "shared prompt", "caller-a", None).with_request_id("req-joiner"),
+    );
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    leader.abort();
+
+    let response = joiner
+        .await
+        .expect("the joiner answers by running the request itself");
+    assert_eq!(response_text(&response), "hello from upstream");
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        2,
+        "the vanished leader's upstream call plus the joiner's own re-execution"
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_joiner_gets_the_leaders_pre_stream_error_not_a_broken_200() {
+    // The leader fails before its first byte (a terminal upstream 400): the
+    // joiner fails with the same error — not a 200 whose stream then ends in
+    // a generic in-band failure.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_upstream(delayed_400_upstream(
+        Arc::clone(&calls),
+        Duration::from_millis(120),
+    ))
+    .await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_engine(endpoint, Arc::clone(&bus), None);
+
+    let leader = engine.execute_stream(engine_request(true, "shared stream", "caller-a", None));
+    let joiner = engine.execute_stream(
+        engine_request(true, "shared stream", "caller-a", None).with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+
+    let leader_err = leader.expect_err("the leader's stream fails pre-commit");
+    let joiner_err = joiner.expect_err("the joiner must fail the same way, not stream a 200");
+    assert_eq!(
+        joiner_err.kind_name(),
+        leader_err.kind_name(),
+        "the joiner sees the leader's error ({leader_err:?}), got {joiner_err:?}"
+    );
+    assert_eq!(joiner_err.status_code(), 400);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        failed_rows(&bus).contains(&"req-joiner".to_owned()),
+        "the joiner's ledger row records the failure: {:?}",
+        failed_rows(&bus)
+    );
+    assert!(
+        !completed_rows(&bus).iter().any(|(hit, _)| *hit),
+        "no joiner row may claim a served copy for a failed shared stream"
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_joiner_of_a_failed_shared_stream_records_a_failed_row() {
+    // The leader committed, then its stream died in-band: the joiner's
+    // replay ends in the same error and its ledger row is a failure — not a
+    // completed served copy with synthetic zero usage.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_upstream(mid_stream_failure_upstream(
+        Arc::clone(&calls),
+        Duration::from_millis(120),
+    ))
+    .await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_engine(endpoint, Arc::clone(&bus), None);
+
+    let leader = engine.execute_stream(engine_request(true, "shared stream", "caller-a", None));
+    let joiner = engine.execute_stream(
+        engine_request(true, "shared stream", "caller-a", None).with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+    let leader = leader.expect("the leader committed before failing");
+    let joiner = joiner.expect("the joiner still gets the committed stream");
+
+    let leader_events = collect_stream(leader).await;
+    let joiner_events = collect_stream(joiner).await;
+    assert!(
+        joiner_events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::Error { .. })),
+        "the joiner's replay ends in the leader's error: {joiner_events:?}"
+    );
+    assert_eq!(joiner_events, leader_events);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let failed = failed_rows(&bus);
+    assert!(
+        failed.contains(&"req-joiner".to_owned()),
+        "the joiner records a failure row, got completed {:?} and failed {failed:?}",
+        completed_rows(&bus)
+    );
+    assert!(
+        !completed_rows(&bus)
+            .iter()
+            .any(|(hit, id)| *hit && id == "req-joiner"),
+        "the failed shared stream must not record the joiner as a completed hit"
+    );
+}
+
+#[tokio::test]
+async fn served_copies_record_no_cost() {
+    // Plan 05 step 6: cache hits charge nothing. The row keeps the stored
+    // usage for the record, but the cost lives only on the request that
+    // made the upstream call.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let mut priced = provider(endpoint);
+    priced.pricing.insert(
+        ModelId::new("claude-sonnet-4-6"),
+        ModelPricing {
+            input: Decimal::from_str_exact("0.000003").expect("price"),
+            output: Decimal::from_str_exact("0.000015").expect("price"),
+            ..ModelPricing::default()
+        },
+    );
+    let cache = MemoryCache::new(Duration::from_secs(60), 16);
+    let engine = engine_with(
+        vec![priced],
+        test_config(),
+        Arc::clone(&bus),
+        None,
+        Some(cache),
+    );
+
+    engine
+        .execute(engine_request(false, "priced prompt", "caller-a", None))
+        .await
+        .expect("first runs and is priced");
+    engine
+        .execute(engine_request(false, "priced prompt", "caller-a", None))
+        .await
+        .expect("second is served from the cache");
+
+    let rows: Vec<(bool, Option<_>)> = bus
+        .snapshot()
+        .into_iter()
+        .filter_map(|event| match event {
+            ProxyEvent::ResponseCompleted(row) => Some((row.cache_hit, row.cost)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 2);
+    let charged = rows.iter().find(|(hit, _)| !hit);
+    let served = rows.iter().find(|(hit, _)| *hit);
+    assert!(
+        charged.is_some_and(|(_, cost)| cost.is_some()),
+        "the request that made the upstream call carries its cost: {rows:?}"
+    );
+    assert!(
+        served.is_some_and(|(_, cost)| cost.is_none()),
+        "the served copy charges nothing: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_key_reused_across_providers_is_a_client_error() {
+    // Body bytes alone do not say which provider served them: the same
+    // caller, key and body against a second provider is a mismatch, not a
+    // replay of the first provider's response under the second's name.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = engine_with(
+        vec![
+            provider_named("fake", endpoint.clone()),
+            provider_named("other", endpoint),
+        ],
+        idempotency_config(),
+        Arc::clone(&bus),
+        None,
+        None,
+    );
+
+    engine
+        .execute(engine_request_for(
+            "fake",
+            false,
+            "same body",
+            "caller-a",
+            Some("key-x"),
+        ))
+        .await
+        .expect("first completes under the fake provider");
+    let error = engine
+        .execute(engine_request_for(
+            "other",
+            false,
+            "same body",
+            "caller-a",
+            Some("key-x"),
+        ))
+        .await
+        .expect_err("the same key under another provider is a mismatch");
+    assert!(matches!(error, EngineError::InvalidRequest(_)));
+    assert_eq!(error.status_code(), 400);
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        1,
+        "the mismatched retry must not execute"
+    );
+}
+
+/// A pre-call guard that waits (so a joiner attaches to the leader's share)
+/// and then rejects the request, for the streaming refusal propagation.
+#[derive(Debug)]
+struct SlowRejectingGuard;
+
+#[async_trait]
+impl llm_proxy_engine::Guard for SlowRejectingGuard {
+    async fn inspect_request(
+        &self,
+        _request: &CoreRequest,
+    ) -> Result<llm_proxy_engine::GuardDecision, EngineError> {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        Ok(llm_proxy_engine::GuardDecision::Reject(
+            "prompt blocked by policy".to_owned(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_streaming_leaders_admission_refusal_reaches_its_joiners() {
+    // Streaming twin of an_admission_refusal_reaches_single_flight_joiners:
+    // the leader's admission error (429 here) is what its joiners get before
+    // any 200 is sent — not a 500 from the lead drop backstop.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        test_config(),
+        Arc::clone(&bus),
+        Some(Arc::new(SlowRefusingAdmission)),
+        None,
+    );
+
+    let leader = engine.execute_stream(engine_request(true, "shared stream", "caller-a", None));
+    let joiner = engine.execute_stream(
+        engine_request(true, "shared stream", "caller-a", None).with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+
+    let leader_err = leader.expect_err("the leader is refused");
+    let joiner_err = joiner.expect_err("the joiner is refused the same way");
+    assert!(
+        matches!(joiner_err, EngineError::RateLimited { .. }),
+        "the joiner must see the leader's admission refusal, got {joiner_err:?}"
+    );
+    assert_eq!(joiner_err.status_code(), 429);
+    assert_eq!(joiner_err.kind_name(), leader_err.kind_name());
+    assert_eq!(
+        upstream.calls.load(Ordering::SeqCst),
+        0,
+        "nothing reached upstream"
+    );
+    assert!(
+        failed_rows(&bus).contains(&"req-joiner".to_owned()),
+        "the joiner's ledger row records the refusal: {:?}",
+        failed_rows(&bus)
+    );
+}
+
+#[tokio::test]
+async fn a_streaming_leaders_guard_rejection_reaches_its_joiners() {
+    // Same rule for a pre-call guard rejection: the joiner gets the leader's
+    // 400 with its message, not an internal error.
+    let upstream = CountingUpstream::new(Duration::ZERO);
+    let endpoint = spawn_upstream(upstream.router()).await;
+    let bus = Arc::new(RecordingBus::new());
+    let registry = ProviderRegistry::from_providers(vec![provider(endpoint)]).expect("registry");
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::clone(&bus) as Arc<dyn EventBus>)
+        .guard(Arc::new(SlowRejectingGuard))
+        .build()
+        .expect("engine builds");
+
+    let leader = engine.execute_stream(engine_request(true, "shared stream", "caller-a", None));
+    let joiner = engine.execute_stream(
+        engine_request(true, "shared stream", "caller-a", None).with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+
+    let leader_err = leader.expect_err("the leader is rejected by the guard");
+    let joiner_err = joiner.expect_err("the joiner is rejected the same way");
+    assert!(
+        matches!(&joiner_err, EngineError::InvalidRequest(message) if message.contains("prompt blocked")),
+        "the joiner must see the leader's guard rejection, got {joiner_err:?}"
+    );
+    assert_eq!(joiner_err.status_code(), 400);
+    assert_eq!(joiner_err.kind_name(), leader_err.kind_name());
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_streaming_follower_reruns_when_its_leader_vanishes_before_the_first_byte() {
+    // Streaming twin of a_single_flight_follower_reexecutes_when_its_leader_
+    // vanishes: the leader's caller disconnects while the joiner — whose own
+    // client is connected — waits on the shared first byte. The joiner re-runs
+    // the request itself instead of failing with an internal error.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&counted);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let chunks = vec![
+                    bytes::Bytes::from_static(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_v\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ),
+                ];
+                let body_stream =
+                    futures::stream::iter(chunks).map(Ok::<_, std::convert::Infallible>);
+                (
+                    StatusCode::OK,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    Body::from_stream(body_stream),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let endpoint = spawn_upstream(app).await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_engine(endpoint, Arc::clone(&bus), None);
+
+    let leader_engine = engine.clone();
+    let leader = tokio::spawn(async move {
+        leader_engine
+            .execute_stream(engine_request(true, "shared stream", "caller-a", None))
+            .await
+    });
+    // The joiner starts while the leader holds the share; it cannot get a
+    // first byte before the leader does, so it is parked on the shared
+    // commit wait when the leader goes away.
+    let joiner = engine.execute_stream(
+        engine_request(true, "shared stream", "caller-a", None).with_request_id("req-joiner"),
+    );
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    leader.abort();
+
+    let stream = joiner
+        .await
+        .expect("the joiner answers by running the request itself");
+    let events = collect_stream(stream).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MessageStop { .. })),
+        "the re-run stream completes: {events:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the vanished leader's upstream call plus the joiner's own re-run"
+    );
+    assert!(
+        !failed_rows(&bus).contains(&"req-joiner".to_owned()),
+        "the vanished leader is not the joiner's failure; the joiner's own run records its row"
+    );
+    assert!(
+        completed_rows(&bus)
+            .iter()
+            .any(|(_, id)| id == "req-joiner"),
+        "the joiner's re-run records a completed row: {:?}",
+        completed_rows(&bus)
+    );
 }

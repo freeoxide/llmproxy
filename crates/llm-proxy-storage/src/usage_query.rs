@@ -114,15 +114,17 @@ pub struct SummaryGroup {
     /// Failed requests.
     /// Failed requests.
     pub errors: i64,
-    /// Token totals.
-    /// Token totals, when usage was reported.
+    /// Token totals, when usage was reported. Served copies (cache hits,
+    /// shared calls, replays) are excluded: their one upstream call's tokens
+    /// are counted on the row that made the call.
     pub tokens: TokenCounts,
     /// Cost totals over the priced rows. `None` when no row in the group
     /// carries a computed cost: unpriced is a state, never a silent $0
     /// (BUG-24, plan 05 step 9).
     pub cost: Option<CostTotals>,
     /// Completed rows with reported usage but no computed cost: usage that
-    /// happened on an unpriced model.
+    /// happened on an unpriced model. Served copies never count: they
+    /// charge nothing by design, so they are not unpriced either.
     pub unpriced: i64,
     /// Requests answered from the response cache (plan 05 step 6): they
     /// cost nothing by design.
@@ -302,16 +304,25 @@ fn summary_sync(
 ) -> Result<Vec<SummaryGroup>, UsageQueryError> {
     let conn = UsageReader::open(path)?;
     let key = group.column();
+    // Served copies (`cache_hit = 1`) count as requests and hits but never
+    // as consumed tokens, cost or unpriced completions: their one upstream
+    // call's usage and cost live on the row of the request that made it
+    // (plan 05 step 6 — cache hits charge nothing).
     let sql = format!(
         "SELECT {key} AS k, COUNT(*), \
          SUM(CASE WHEN error_kind IS NOT NULL THEN 1 ELSE 0 END), \
-         COALESCE(SUM(COALESCE(input_tokens, 0)), 0), \
-         COALESCE(SUM(COALESCE(output_tokens, 0)), 0), \
-         COALESCE(SUM(COALESCE(reasoning_tokens, 0)), 0), \
-         COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0), \
-         COALESCE(SUM(COALESCE(cache_creation_tokens, 0)), 0), \
+         COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 0 \
+                THEN COALESCE(input_tokens, 0) ELSE 0 END), 0), \
+         COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 0 \
+                THEN COALESCE(output_tokens, 0) ELSE 0 END), 0), \
+         COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 0 \
+                THEN COALESCE(reasoning_tokens, 0) ELSE 0 END), 0), \
+         COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 0 \
+                THEN COALESCE(cache_read_tokens, 0) ELSE 0 END), 0), \
+         COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 0 \
+                THEN COALESCE(cache_creation_tokens, 0) ELSE 0 END), 0), \
          COALESCE(SUM(CASE WHEN error_kind IS NULL AND input_tokens IS NOT NULL \
-                AND cost_total IS NULL THEN 1 ELSE 0 END), 0), \
+                AND cost_total IS NULL AND COALESCE(cache_hit, 0) = 0 THEN 1 ELSE 0 END), 0), \
          COALESCE(SUM(CASE WHEN COALESCE(cache_hit, 0) = 1 THEN 1 ELSE 0 END), 0) \
          FROM requests \
          WHERE COALESCE(received_at, completed_at) >= ?1 \

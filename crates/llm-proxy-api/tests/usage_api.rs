@@ -189,6 +189,93 @@ mod tests {
         llm_proxy_api::UsageApi::new(path.to_owned(), ADMIN_TOKEN).router()
     }
 
+    /// Seeds a ledger with one priced completion and two served copies of it
+    /// (cache hits: usage kept for the record, no cost), for the summary's
+    /// served-copy accounting.
+    async fn seed_with_served_copies() -> Ledger {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(
+            &path,
+            llm_proxy_storage::RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                prune_every: std::time::Duration::from_secs(3600),
+            },
+        )
+        .expect("open ledger");
+        let t0 = OffsetDateTime::now_utc();
+        let second = std::time::Duration::from_secs(1);
+        let mut events = vec![
+            received_event("orig", "laptop", "prov-a", "claude-3", t0),
+            completed_event(
+                "orig",
+                "prov-a",
+                "claude-3",
+                t0 + second,
+                "0.1000000000000000000000001",
+            ),
+        ];
+        for (id, offset) in [("copy-1", 2), ("copy-2", 3)] {
+            events.push(received_event(
+                id,
+                "laptop",
+                "prov-a",
+                "claude-3",
+                t0 + second * offset,
+            ));
+            let mut served = completed_event(id, "prov-a", "claude-3", t0 + second * offset, "0");
+            if let ProxyEvent::ResponseCompleted(done) = &mut served {
+                done.cost = None;
+                done.cache_hit = true;
+            }
+            events.push(served);
+        }
+        for event in &events {
+            bus.emit(event);
+        }
+        let closer = std::sync::Arc::new(bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close joined");
+        Ledger {
+            _dir: dir,
+            path,
+            t0,
+        }
+    }
+
+    #[tokio::test]
+    async fn served_copies_never_inflate_tokens_cost_or_unpriced_counts() {
+        // Plan 05 step 6: cache hits charge nothing and are recorded as
+        // hits. One upstream call served to three requests must show one
+        // call's tokens and cost, two hits, and no unpriced completions.
+        let ledger = seed_with_served_copies().await;
+        let (status, body) = get_json(
+            app_for(&ledger.path),
+            "/usage/summary?group_by=provider",
+            Some(ADMIN_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let group = &body["groups"][0];
+        assert_eq!(group["requests"], 3, "every served request is a request");
+        assert_eq!(group["cache_hits"], 2);
+        assert_eq!(
+            group["tokens"]["input"], 100,
+            "one upstream call's tokens, not three"
+        );
+        assert_eq!(group["tokens"]["output"], 50);
+        assert_eq!(
+            group["cost"]["total"], "0.1000000000000000000000001",
+            "one upstream call's cost, not three"
+        );
+        assert_eq!(
+            group["unpriced"], 0,
+            "a served copy has no cost by design; it is not an unpriced completion"
+        );
+    }
+
     async fn get_json(app: axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
         let mut builder = Request::builder().uri(uri);
         if let Some(token) = token {

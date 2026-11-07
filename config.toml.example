@@ -61,6 +61,7 @@ margin_tokens = 512
 # [server.idempotency]
 # enabled = true
 # ttl = "24h"
+# max_entries = 1000
 
 # Client authentication for proxy routes.
 #

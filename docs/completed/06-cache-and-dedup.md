@@ -49,11 +49,17 @@ prompt caches from the proxy's own edits.
   identical concurrent requests from one caller share one upstream call.
   Non-streaming followers await the leader's outcome; streaming followers
   replay the leader's collected events. Nothing is retained after completion.
+  A leader that is refused or fails before its first byte fails its followers
+  with the same error; a leader that vanishes before its first byte makes its
+  followers (streaming and not) re-run the request once. Known limitation:
+  once a shared stream has committed, a disconnecting leader ends it for its
+  joiners, who receive the events collected so far and an in-band error
+  rather than the remainder of the response.
 - `Idempotency-Key` (opt-in, `[server.idempotency]`) is claimed at slot 4,
   before cache, single-flight and budget checks; a matching retry replays the
   stored response until the TTL, 409 only while the first request is in
-  flight, 400 for a key reused with a different body, and failures release
-  the key so a retry executes.
+  flight, 400 for a key reused with a different request (body or provider
+  route), and failures release the key so a retry executes.
 - The response cache (opt-in, `[server.cache]`) is an exact-match,
   caller-scoped, TTL-aged, capacity-bounded `MemoryCache` behind the `Cache`
   trait; hits and served copies record a row under plan 05's rule (usage

@@ -409,7 +409,8 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
         RouteError::IdempotencyInFlight => (
             StatusCode::CONFLICT,
             "invalid_request_error",
-            "a request with this Idempotency-Key is already in flight; retry              once it completes to replay its response"
+            "a request with this Idempotency-Key is already in flight; retry once \
+             it completes to replay its response"
                 .to_owned(),
         ),
         RouteError::NotFound => (
@@ -1134,6 +1135,21 @@ mod tests {
                     .get("x-should-retry")
                     .map(|v| v.to_str().unwrap()),
                 Some("true")
+            );
+            // The client-visible message reads as one sentence — no run of
+            // spaces where a string continuation was folded.
+            let body = axum::body::to_bytes(response.into_parts().1, 4096)
+                .await
+                .expect("body");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+            let message = json["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("retry once it completes to replay its response"),
+                "the 409 message must read cleanly: {message}"
+            );
+            assert!(
+                !message.contains("  "),
+                "the 409 message must not carry a run of spaces: {message}"
             );
         }
     }

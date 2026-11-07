@@ -4,7 +4,7 @@
 
 #![deny(missing_docs)]
 
-/// Middleware components (auth, dedup, rate limiter, request ID, IP extraction).
+/// Middleware components (auth, rate limiter, request ID, IP extraction).
 pub mod middleware;
 /// Route handlers and router composition.
 pub mod routes;

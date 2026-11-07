@@ -91,7 +91,9 @@ fn split_pointer(pointer: &str) -> Option<(String, String)> {
 /// turn). Markers the client already set count against the budget and are
 /// kept where they are.
 pub(crate) fn inject_anthropic_markers(request: &mut Value) {
-    let mut budget = ANTHROPIC_MAX_BREAKPOINTS - existing_markers(request);
+    // A client may carry more markers than the provider's budget allows:
+    // its own markers all stay (the budget for new ones is simply spent).
+    let mut budget = ANTHROPIC_MAX_BREAKPOINTS.saturating_sub(existing_markers(request));
 
     if budget > 0
         && let Some(tools) = request.get_mut("tools").and_then(Value::as_array_mut)
@@ -243,6 +245,46 @@ mod tests {
         assert!(request["messages"][1]["content"][0]["cache_control"].is_object());
         assert!(request["messages"][0]["content"][0]["cache_control"].is_null());
         assert!(request["messages"][3]["content"][0]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn more_client_markers_than_the_budget_add_none_and_do_not_panic() {
+        // Five client markers against Anthropic's four-marker budget: the
+        // client's markers are all kept and none are added — the subtraction
+        // on the budget must saturate, not underflow.
+        let mut request = json!({
+            "system": [
+                {"type": "text", "text": "one", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "m1", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "m2", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "m3", "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "unmarked"}
+                ]}
+            ]
+        });
+        inject_anthropic_markers(&mut request);
+        assert!(
+            request["system"][0]["cache_control"].is_object()
+                && request["system"][1]["cache_control"].is_object(),
+            "every client marker survives verbatim"
+        );
+        for (message, block) in [(0usize, 0usize), (0, 1), (1, 0)] {
+            assert!(
+                request["messages"][message]["content"][block]["cache_control"].is_object(),
+                "every client marker survives verbatim"
+            );
+        }
+        assert!(
+            request["messages"][1]["content"][1]["cache_control"].is_null(),
+            "no marker is injected once the client spent the budget and more"
+        );
+        assert_eq!(existing_markers(&request), 5);
     }
 
     #[test]

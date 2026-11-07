@@ -27,8 +27,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
 use crate::cache::{
-    FlightAcquire, IdempotencyAcquire, IdempotencyClaim, StoredOutcome, StreamAcquire, StreamLead,
-    StreamShare,
+    FlightAcquire, IdemMatch, IdempotencyAcquire, IdempotencyClaim, STREAM_LEADER_LOST,
+    StoredOutcome, StreamAcquire, StreamLead, StreamShare, is_flight_leader_lost,
+    is_stream_leader_lost,
 };
 use crate::classification::{ErrorClass, classify, next_wait};
 use crate::error::{AuthOwner, EngineError, map_provider_error, sanitize_upstream_error_body};
@@ -821,9 +822,9 @@ enum IdempotencyStep {
 
 /// Claims the idempotency key (slot 4) before cache lookup, single-flight
 /// and budget checks (plan 06 step 3). In-flight conflicts are 409; a key
-/// reused with a different body is a client error. An empty `body_hash`
-/// means the HTTP layer did not digest the body, so the key cannot be
-/// matched safely and is ignored.
+/// reused with a different body or under a different provider route is a
+/// client error. An empty `body_hash` means the HTTP layer did not digest
+/// the body, so the key cannot be matched safely and is ignored.
 fn idempotency_step(
     inner: &Arc<EngineInner>,
     req: &EngineRequest,
@@ -842,12 +843,16 @@ fn idempotency_step(
             "Idempotency-Key is longer than {MAX_IDEMPOTENCY_KEY_LEN} characters"
         )));
     }
-    match store.claim(&req.caller, key, &req.body_hash) {
+    // The match carries the provider route: body bytes alone do not say
+    // which provider served them, so a key reused across routes must not
+    // replay the first route's response under the second's name.
+    let matched = IdemMatch::new(&req.provider_name, req.route_kind, &req.body_hash);
+    match store.claim(&req.caller, key, &matched) {
         IdempotencyAcquire::Claim(claim) => Ok(IdempotencyStep::Claimed(claim)),
         IdempotencyAcquire::InFlight => Err(EngineError::IdempotencyInFlight),
         IdempotencyAcquire::Replay(outcome) => Ok(IdempotencyStep::Replay(outcome)),
         IdempotencyAcquire::BodyMismatch => Err(EngineError::InvalidRequest(
-            "Idempotency-Key was already used with a different request body".to_owned(),
+            "Idempotency-Key was already used with a different request".to_owned(),
         )),
     }
 }
@@ -855,6 +860,8 @@ fn idempotency_step(
 /// Records a row for a request answered without a fresh upstream attempt —
 /// a cache hit, a single-flight join, or an idempotent replay (plan 05 step
 /// 6's rule): the stored usage is kept for the record, nothing is charged.
+/// A served copy records no cost: the one upstream call's cost lives on the
+/// row of the request that made it.
 fn record_served_copy(
     inner: &EngineInner,
     req: &EngineRequest,
@@ -872,12 +879,37 @@ fn record_served_copy(
             upstream_message_id: served.id.clone(),
             model: ledger_model(&req.core.model, upstream_model),
             usage: served.usage.clone(),
-            cost: served.cost.clone(),
+            cost: None,
             stop_reason: served.stop_reason.clone(),
             latency_ms,
             credential_id: None,
             cache_hit: true,
         }));
+}
+
+/// One non-streaming request pass (slots 3-13). A single-flight follower
+/// whose leader vanished without publishing (its handler future dropped on a
+/// client disconnect, or a panic) re-executes the request itself once: the
+/// leader's disappearance must not answer the follower with an internal
+/// error for a request it never ran.
+async fn run_once(
+    inner: &Arc<EngineInner>,
+    req: &EngineRequest,
+) -> Result<EngineResponse, EngineError> {
+    let mut leader_losses_left = 1;
+    loop {
+        match run_once_attempt(inner, req).await {
+            Err(error) if leader_losses_left > 0 && is_flight_leader_lost(&error) => {
+                leader_losses_left -= 1;
+                tracing::debug!(
+                    request_id = %req.request_id,
+                    route = %req.provider_name,
+                    "single-flight leader vanished; re-executing the request"
+                );
+            }
+            outcome => return outcome,
+        }
+    }
 }
 
 #[expect(
@@ -886,7 +918,7 @@ fn record_served_copy(
               join read as one ordered sequence; splitting them would hide the order the \
               plan fixes"
 )]
-async fn run_once(
+async fn run_once_attempt(
     inner: &Arc<EngineInner>,
     req: &EngineRequest,
 ) -> Result<EngineResponse, EngineError> {
@@ -1010,7 +1042,17 @@ async fn run_once(
     // Slots 6 and 8: preflight, then one reservation for the whole ladder;
     // settlement happens exactly once at the end. A failure that the
     // provider still billed (a guard-rejected response) charges its usage.
-    let ticket = admit(inner, req, &plan).await?;
+    // An admission refusal reaches the followers as itself (402/429/…), not
+    // through the lead drop backstop's internal error.
+    let ticket = match admit(inner, req, &plan).await {
+        Ok(ticket) => ticket,
+        Err(error) => {
+            if let Some(lead) = lead {
+                lead.publish(Err(error.clone()));
+            }
+            return Err(error);
+        }
+    };
 
     match run_ladder_once(inner, req, plan, &ticket, &cache_key).await {
         Ok(response) => {
@@ -1326,11 +1368,12 @@ type ByteStream = std::pin::Pin<
 /// (plan 04 step 6) — and hands back the buffered prefix plus the
 /// continuation stream. Settlement happens inside the stream task as it
 /// completes or is cancelled.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the streaming entry mirrors run_once's slot order plus the first-byte window; \
-              the sequence is the specification"
-)]
+///
+/// A stream single-flight joiner whose leader went away before its first
+/// byte (its caller's connection dropped, or the task died) re-runs the
+/// request itself once, mirroring [`run_once`]'s non-streaming follower: the
+/// leader's disappearance must not answer a connected joiner with an
+/// internal error for a request it never ran.
 pub(crate) async fn execute_stream(
     inner: Arc<EngineInner>,
     req: EngineRequest,
@@ -1341,6 +1384,45 @@ pub(crate) async fn execute_stream(
 
     emit_request_received(&inner, &req, true);
 
+    let mut leader_losses_left = 1;
+    loop {
+        match execute_stream_attempt(Arc::clone(&inner), req.clone(), start).await {
+            Err(error) if leader_losses_left > 0 && is_stream_leader_lost(&error) => {
+                leader_losses_left -= 1;
+                tracing::debug!(
+                    request_id = %req.request_id,
+                    route = %req.provider_name,
+                    "stream single-flight leader vanished; re-running the request"
+                );
+            }
+            Err(error) if is_stream_leader_lost(&error) => {
+                // No leader stayed for this joiner even after re-running:
+                // record the failure it now owns.
+                emit_response_failed(
+                    &inner,
+                    &req.request_id,
+                    Some(&req.provider_name),
+                    Some(&req.core.model),
+                    &error,
+                    start,
+                );
+                return Err(error);
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the streaming entry mirrors run_once's slot order plus the first-byte window; \
+              the sequence is the specification"
+)]
+async fn execute_stream_attempt(
+    inner: Arc<EngineInner>,
+    req: EngineRequest,
+    start: Instant,
+) -> Result<EngineStream, EngineError> {
     // Slot 3: the route plan.
     let plan = resolve_plan(&inner, &req).await?;
     let first_model = plan
@@ -1406,32 +1488,60 @@ pub(crate) async fn execute_stream(
                     route = %req.provider_name,
                     "stream single-flight join"
                 );
+                // The joiner waits for the leader's first-byte outcome before
+                // it answers: a leader that fails before committing (guards,
+                // admission, a pre-stream upstream error) fails the joiner
+                // with that same error, not with a 200 whose stream then ends
+                // in a generic in-band failure.
+                if let Err(error) = share.committed().await {
+                    if !is_stream_leader_lost(&error) {
+                        emit_response_failed(
+                            &inner,
+                            &req.request_id,
+                            Some(&req.provider_name),
+                            Some(&req.core.model),
+                            &error,
+                            start,
+                        );
+                    }
+                    // A vanished leader is not this request's failure: the
+                    // caller of execute_stream re-runs the request once, and
+                    // records the row only when no leader stays.
+                    return Err(error);
+                }
                 return Ok(joined_stream(Arc::clone(&inner), &req, share));
             }
             StreamAcquire::Lead(lead) => stream_lead = Some(lead),
         }
     }
 
-    // Slot 7: pre-call guards, once per request.
+    // Slot 7: pre-call guards, once per request. A refusal reaches the
+    // joiners through the lead as itself, not through the drop backstop's
+    // internal error.
     for guard in &inner.guards {
-        match guard.inspect_request(&req.core).await? {
-            GuardDecision::Allow => {}
-            GuardDecision::Reject(message) => {
-                let error = EngineError::InvalidRequest(message);
-                emit_response_failed(
-                    &inner,
-                    &req.request_id,
-                    Some(&req.provider_name),
-                    Some(&req.core.model),
-                    &error,
-                    start,
-                );
-                return Err(error);
-            }
+        let refusal = match guard.inspect_request(&req.core).await {
+            Ok(GuardDecision::Allow) => continue,
+            Ok(GuardDecision::Reject(message)) => EngineError::InvalidRequest(message),
+            Err(error) => error,
+        };
+        emit_response_failed(
+            &inner,
+            &req.request_id,
+            Some(&req.provider_name),
+            Some(&req.core.model),
+            &refusal,
+            start,
+        );
+        if let Some(lead) = stream_lead.take() {
+            lead.publish(Err(refusal.clone()));
         }
+        return Err(refusal);
     }
 
     // Slots 6 and 8: preflight, then one reservation for the whole ladder.
+    // An admission refusal reaches the joiners as itself (402/429/…), not
+    // through the lead drop backstop's internal error — same rule as the
+    // non-streaming path.
     let ticket = match admit(&inner, &req, &plan).await {
         Ok(ticket) => ticket,
         Err(error) => {
@@ -1443,6 +1553,9 @@ pub(crate) async fn execute_stream(
                 &error,
                 start,
             );
+            if let Some(lead) = stream_lead.take() {
+                lead.publish(Err(error.clone()));
+            }
             return Err(error);
         }
     };
@@ -1904,9 +2017,9 @@ async fn commit_and_stream(
     }
     if let Some(error) = vet_prefix(inner, &head).await {
         inner.metrics.record_failure();
-        signal_pre_stream_error(inner, stream, error);
+        signal_pre_stream_error(inner, stream, error.clone());
         committed.ctx.settle(inner, false);
-        stream.finish_stream(false);
+        stream.finish_stream(StreamEnd::Failed(error));
         return;
     }
     // Same opt-in as the non-streaming path: only sticky pools pin.
@@ -1940,14 +2053,23 @@ async fn commit_and_stream(
         inner.metrics.record_client_cancel();
         record_client_cancelled(inner, &committed.ctx);
         committed.ctx.settle(inner, false);
-        stream.finish_stream(false);
+        // The leader's own caller is gone; joiners re-run the request rather
+        // than fail for a stream they never saw.
+        stream.finish_stream(StreamEnd::Failed(EngineError::Internal(
+            STREAM_LEADER_LOST.to_owned(),
+        )));
         return;
     }
-    let clean = stream_committed(inner, &mut committed.ctx, tx, committed.stream, cancel).await;
+    // The leader committed: joiners may answer 200 and replay the collected
+    // events (plan 06 step 2).
+    if let Some(share) = &committed.ctx.share {
+        share.signal_committed();
+    }
+    let end = stream_committed(inner, &mut committed.ctx, tx, committed.stream, cancel).await;
     // Publish the terminal outcome to single-flight joiners and store the
-    // collected events for idempotent replay on a clean end (plan 06 steps
-    // 2 and 3).
-    stream.finish_stream(clean);
+    // collected events for idempotent replay on a clean end only — a failed
+    // stream releases the key so a retry executes (plan 06 steps 2 and 3).
+    stream.finish_stream(end);
 }
 
 /// The task's IO handles: the client event channel and the cancellation
@@ -2141,27 +2263,41 @@ struct StreamLadder {
     idempotency: Option<IdempotencyClaim>,
 }
 
+/// How a committed or abandoned stream attempt ended, for the single-flight
+/// joiners and the idempotency claim: only a genuinely clean end completes
+/// the claim (failures release the key so a retry executes — plan 06 step 3,
+/// docs/data-class-policy.md "Failed requests are not stored"); the carried
+/// error reaches pre-commit joiners as their own first-byte outcome.
+enum StreamEnd {
+    /// The stream ran to a clean terminal event.
+    Clean,
+    /// The stream did not complete cleanly: it failed before committing
+    /// (joiners fail with this same error), failed in-band after committing,
+    /// or its client went away mid-stream.
+    Failed(EngineError),
+}
+
 impl StreamLadder {
     /// Publish the terminal outcome to stream joiners and, on a clean end,
     /// store the collected events for idempotent replay. A claim can only
     /// exist alongside a lead (both need the body digest), so the collected
     /// events are always available where a claim is.
-    fn finish_stream(&mut self, clean: bool) {
+    fn finish_stream(&mut self, end: StreamEnd) {
         if let Some(lead) = self.lead.take() {
             let share = lead.share();
-            if clean && let Some(claim) = self.idempotency.take() {
+            if matches!(end, StreamEnd::Clean)
+                && let Some(claim) = self.idempotency.take()
+            {
                 claim.complete(StoredOutcome {
                     response: None,
                     events: share.collected(),
                 });
             }
-            lead.publish(if clean {
-                Ok(())
-            } else {
-                Err(EngineError::Internal(
-                    "the shared stream ended before completing".to_owned(),
-                ))
-            });
+            let outcome = match end {
+                StreamEnd::Clean => Ok(()),
+                StreamEnd::Failed(error) => Err(error),
+            };
+            lead.publish(outcome);
         }
     }
 }
@@ -2252,11 +2388,12 @@ fn stop_with(inner: &Arc<EngineInner>, stream: &mut StreamLadder, error: EngineE
         error
     };
     inner.metrics.record_failure();
-    signal_pre_stream_error(inner, stream, final_error);
+    signal_pre_stream_error(inner, stream, final_error.clone());
     settle(inner, &stream.ticket, false, None, None);
-    // Joiners receive the same failure; the idempotency claim drops with the
+    // Joiners receive the same failure — a pre-commit failure reaches them
+    // as their own first-byte error; the idempotency claim drops with the
     // task, releasing the key (failures are not stored).
-    stream.finish_stream(false);
+    stream.finish_stream(StreamEnd::Failed(final_error));
 }
 
 /// Slot 11 for streams: the guards vet the buffered prefix; the first
@@ -2322,20 +2459,23 @@ async fn buffer_pre_commit(
         tokio::select! {
             _ = cancel.cancelled() => {
                 inner.metrics.record_client_cancel();
+                let cancelled = EngineError::Internal(
+                    "client disconnected before first byte".to_owned(),
+                );
                 let signalled = stream_ladder
                     .first_byte_tx
                     .take()
-                    .map(|tx| {
-                        tx.send(FirstByteResult::PreStreamError(EngineError::Internal(
-                            "client disconnected before first byte".to_owned(),
-                        )))
-                    })
+                    .map(|tx| tx.send(FirstByteResult::PreStreamError(cancelled.clone())))
                     .is_some_and(|result| result.is_ok());
                 if !signalled {
                     record_client_cancelled(inner, &ctx);
                 }
                 ctx.settle(inner, false);
-                stream_ladder.finish_stream(false);
+                // Joiners re-run the request: this failure belongs to the
+                // leader's caller, who is no longer connected.
+                stream_ladder.finish_stream(StreamEnd::Failed(EngineError::Internal(
+                    STREAM_LEADER_LOST.to_owned(),
+                )));
                 return PreCommit::Stop;
             }
             _ = hold_expired(hold_deadline), if pending.is_empty() => {
@@ -2427,9 +2567,9 @@ async fn pre_commit_failure(
         ErrorClass::Terminal => {
             let final_error = error.clone();
             inner.metrics.record_failure();
-            signal_pre_stream_error(inner, stream, final_error);
+            signal_pre_stream_error(inner, stream, final_error.clone());
             settle(inner, &stream.ticket, false, None, None);
-            stream.finish_stream(false);
+            stream.finish_stream(StreamEnd::Failed(final_error));
             false
         }
         ErrorClass::Transient { retry_after } => {
@@ -2437,9 +2577,9 @@ async fn pre_commit_failure(
                 // Ladder exhausted (plan 04 step 12): wrap for the client.
                 let final_error = exhausted(inner, &ladder.plan, ladder.seq, error.clone());
                 inner.metrics.record_failure();
-                signal_pre_stream_error(inner, stream, final_error);
+                signal_pre_stream_error(inner, stream, final_error.clone());
                 settle(inner, &stream.ticket, false, None, None);
-                stream.finish_stream(false);
+                stream.finish_stream(StreamEnd::Failed(final_error));
                 false
             } else {
                 if !is_last_member_attempt {
@@ -2457,7 +2597,8 @@ async fn pre_commit_failure(
 
 /// Drives the committed stream to its end: decode and forward events, mark
 /// in-band failures, finalize with the decoder's terminal, settle, and
-/// record the terminal row.
+/// record the terminal row. The returned [`StreamEnd`] carries the failure
+/// for joiners and the idempotency claim: only a clean end is stored.
 #[expect(
     clippy::too_many_lines,
     reason = "one committed-stream state machine: decode, forward, in-band failure, terminal flush and settlement read as a unit"
@@ -2468,18 +2609,20 @@ async fn stream_committed(
     tx: &tokio::sync::mpsc::Sender<CoreEvent>,
     mut stream: ByteStream,
     cancel_clone: &CancellationToken,
-) -> bool {
-    // `false` only when this client went away mid-stream; every natural end
-    // (clean, in-band failure, truncation) is `true`, since the caller saw
-    // a well-formed stream it can render.
-    let mut stream_failed = false;
+) -> StreamEnd {
+    // The first failure that marked this stream failed, if one did (in-band
+    // error, decode/framing fault, transport error, truncation). A client
+    // that went away mid-stream returns early instead.
+    let mut failure: Option<EngineError> = None;
     'outer: loop {
         tokio::select! {
             _ = cancel_clone.cancelled() => {
                 inner.metrics.record_client_cancel();
                 record_client_cancelled(inner, ctx);
                 ctx.settle(inner, false);
-                return false;
+                return StreamEnd::Failed(EngineError::Internal(
+                    "client disconnected before the stream completed".to_owned(),
+                ));
             }
             chunk = stream.next() => {
                 match chunk {
@@ -2504,7 +2647,7 @@ async fn stream_committed(
                                     &error,
                                     ctx.start,
                                 );
-                                stream_failed = true;
+                                failure = Some(error);
                                 break 'outer;
                             }
                         };
@@ -2529,7 +2672,7 @@ async fn stream_committed(
                                         &error,
                                         ctx.start,
                                     );
-                                    stream_failed = true;
+                                    failure = Some(error);
                                     break 'outer;
                                 }
                             };
@@ -2539,31 +2682,38 @@ async fn stream_committed(
                                     // In-band upstream failure after visible
                                     // output: mark it for the client and the
                                     // ledger, then keep the framing valid.
-                                    stream_failed = true;
+                                    let error = EngineError::ProviderDecode(
+                                        sanitize_upstream_error_body(core_event_message(
+                                            &core_event,
+                                        )),
+                                    );
+                                    failure = Some(error.clone());
                                     inner.metrics.record_failure();
                                     emit_response_failed(
                                         inner,
                                         &ctx.request_id,
                                         Some(ctx.provider_name.as_str()),
                                         Some(&ctx.ledger_model()),
-                                        &EngineError::ProviderDecode(
-                                            sanitize_upstream_error_body(core_event_message(
-                                                &core_event,
-                                            )),
-                                        ),
+                                        &error,
                                         ctx.start,
                                     );
                                     if tx.send(core_event).await.is_err() {
                                         record_client_cancelled(inner, ctx);
                                         ctx.settle(inner, false);
-                                        return false;
+                                        return StreamEnd::Failed(EngineError::Internal(
+                                            "client disconnected before the stream completed"
+                                                .to_owned(),
+                                        ));
                                     }
                                     continue;
                                 }
                                 if tx.send(core_event).await.is_err() {
                                     record_client_cancelled(inner, ctx);
                                     ctx.settle(inner, false);
-                                    return false;
+                                    return StreamEnd::Failed(EngineError::Internal(
+                                        "client disconnected before the stream completed"
+                                            .to_owned(),
+                                    ));
                                 }
                             }
                         }
@@ -2584,7 +2734,7 @@ async fn stream_committed(
                             &error,
                             ctx.start,
                         );
-                        stream_failed = true;
+                        failure = Some(error);
                         break 'outer;
                     }
                     None => break 'outer,
@@ -2618,21 +2768,24 @@ async fn stream_committed(
             }
         };
         if !emit_final_events(inner, ctx, tx, events).await {
-            return false;
+            return StreamEnd::Failed(EngineError::Internal(
+                "client disconnected before the stream completed".to_owned(),
+            ));
         }
     }
     if !ctx.decoder.saw_terminal() {
         // The upstream ended without a terminal event: keep valid client
         // framing (synthetic terminal below) but mark the failure in-band
         // and in the ledger.
-        stream_failed = true;
+        let error = EngineError::ProviderDecode(TRUNCATED_STREAM_MESSAGE.to_owned());
+        failure = Some(error.clone());
         inner.metrics.record_failure();
         emit_response_failed(
             inner,
             &ctx.request_id,
             Some(ctx.provider_name.as_str()),
             Some(&ctx.ledger_model()),
-            &EngineError::ProviderDecode(TRUNCATED_STREAM_MESSAGE.to_owned()),
+            &error,
             ctx.start,
         );
         let error = llm_proxy_protocol::core::CoreStreamError::new(
@@ -2644,13 +2797,17 @@ async fn stream_committed(
         if tx.send(event).await.is_err() {
             record_client_cancelled(inner, ctx);
             ctx.settle(inner, false);
-            return false;
+            return StreamEnd::Failed(EngineError::Internal(
+                "client disconnected before the stream completed".to_owned(),
+            ));
         }
     }
     match ctx.decoder.finish() {
         Ok(final_events) => {
             if !emit_final_events(inner, ctx, tx, final_events).await {
-                return false;
+                return StreamEnd::Failed(EngineError::Internal(
+                    "client disconnected before the stream completed".to_owned(),
+                ));
             }
         }
         Err(e) => {
@@ -2661,13 +2818,17 @@ async fn stream_committed(
             );
         }
     }
-    if stream_failed {
-        ctx.settle(inner, false);
-    } else {
-        record_stream_success(inner, ctx);
-        ctx.settle(inner, true);
+    match failure {
+        Some(error) => {
+            ctx.settle(inner, false);
+            StreamEnd::Failed(error)
+        }
+        None => {
+            record_stream_success(inner, ctx);
+            ctx.settle(inner, true);
+            StreamEnd::Clean
+        }
     }
-    true
 }
 
 /// The lifecycle facts a replayed stream carries onto its ledger row: the
@@ -2692,9 +2853,10 @@ fn replay_lifecycle_of(events: &[CoreEvent]) -> (Option<Usage>, Option<StopReaso
 
 /// The joiner's replay stream (plan 06 step 2), and the idempotent replay of
 /// stored events (plan 06 step 3): yield the shared or stored events in
-/// order. The row is written when the stream ends; a caller that drops the
-/// tail mid-replay is recorded as a client cancellation, mirroring the
-/// leader's task.
+/// order. The row is written when the stream ends — a completed served copy
+/// on a clean end, a failure row when the replayed events end in an error;
+/// a caller that drops the tail mid-replay is recorded as a client
+/// cancellation, mirroring the leader's task.
 struct StreamReplay {
     inner: Arc<EngineInner>,
     request_id: String,
@@ -2704,6 +2866,9 @@ struct StreamReplay {
     phase: ReplayPhase,
     usage: Option<Usage>,
     stop_reason: Option<StopReason>,
+    /// The in-band error the replayed events end with, when they do: the
+    /// row records the failure, not a completed hit.
+    failure: Option<(&'static str, String)>,
     recorded: bool,
 }
 
@@ -2715,7 +2880,31 @@ enum ReplayPhase {
     Done,
 }
 
+/// The `error_kind` string a replayed in-band error records on its row,
+/// matching the ledger's CamelCase kinds. The protocol enum is
+/// non-exhaustive; a future kind records under the generic `StreamError`.
+fn core_error_kind_name(kind: CoreStreamErrorKind) -> &'static str {
+    match kind {
+        CoreStreamErrorKind::InvalidRequest => "InvalidRequest",
+        CoreStreamErrorKind::Authentication => "Authentication",
+        CoreStreamErrorKind::Permission => "Permission",
+        CoreStreamErrorKind::RateLimit => "RateLimit",
+        CoreStreamErrorKind::Upstream => "Upstream",
+        CoreStreamErrorKind::Internal => "Internal",
+        _ => "StreamError",
+    }
+}
+
 impl StreamReplay {
+    /// Records the row the replay's end earns: a completed served copy on a
+    /// clean end, a failure row when the replayed events end in an error.
+    fn record_terminal_row(&mut self) {
+        match self.failure.clone() {
+            Some((kind, message)) => self.record_replay_failed(kind, &message),
+            None => self.record_completed(),
+        }
+    }
+
     fn record_completed(&mut self) {
         self.recorded = true;
         self.inner.metrics.record_cache_hit();
@@ -2742,6 +2931,30 @@ impl StreamReplay {
                     .unwrap_or(u64::MAX),
                 credential_id: None,
                 cache_hit: true,
+            }));
+    }
+
+    /// The replay ended in an in-band error: record the failure the leader's
+    /// stream also recorded, not a completed served copy.
+    fn record_replay_failed(&mut self, kind: &'static str, message: &str) {
+        self.recorded = true;
+        self.inner.metrics.record_failure();
+        self.inner
+            .usage
+            .record(&ProxyEvent::ResponseFailed(ResponseFailed {
+                request_id: self.request_id.clone(),
+                timestamp: time::OffsetDateTime::now_utc(),
+                provider: Some(self.provider.clone()),
+                model: Some(self.model.clone()),
+                error_kind: kind.to_owned(),
+                message: message.to_owned(),
+                http_status: 200,
+                latency_ms: self
+                    .start
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
             }));
     }
 
@@ -2806,22 +3019,35 @@ async fn replay_next(mut state: StreamReplay) -> Option<(CoreEvent, StreamReplay
         let (usage, stop_reason) = replay_lifecycle_of(&events);
         state.usage = usage;
         state.stop_reason = stop_reason;
+        state.failure = replay_failure_of(&events);
         state.phase = ReplayPhase::Replaying(events.into_iter());
     }
     let ReplayPhase::Replaying(events) = &mut state.phase else {
         // Waiting was handled above; Done never reaches the driver again.
-        state.record_completed();
+        state.record_terminal_row();
         state.phase = ReplayPhase::Done;
         return None;
     };
     match events.next() {
         Some(event) => Some((event, state)),
         None => {
-            state.record_completed();
+            state.record_terminal_row();
             state.phase = ReplayPhase::Done;
             None
         }
     }
+}
+
+/// The in-band error a replay ends with, when it ends in one: the last
+/// `Error` event in the collected list, which the leader's stream also
+/// recorded as its failure.
+fn replay_failure_of(events: &[CoreEvent]) -> Option<(&'static str, String)> {
+    events.iter().rev().find_map(|event| match event {
+        CoreEvent::Error { error } => {
+            Some((core_error_kind_name(error.kind), error.message().to_owned()))
+        }
+        _ => None,
+    })
 }
 
 /// A joiner's view of a shared streaming request (plan 06 step 2): the
@@ -2843,6 +3069,7 @@ fn joined_stream(
                 phase: ReplayPhase::Waiting(share),
                 usage: None,
                 stop_reason: None,
+                failure: None,
                 recorded: false,
             },
             replay_next,
@@ -2870,6 +3097,7 @@ fn replay_events_stream(
                 phase: ReplayPhase::Replaying(events.into_iter()),
                 usage,
                 stop_reason,
+                failure: None,
                 recorded: false,
             },
             replay_next,

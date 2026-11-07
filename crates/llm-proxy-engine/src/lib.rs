@@ -465,7 +465,12 @@ impl EngineBuilder {
             .load()
             .ok()
             .filter(|config| config.server.idempotency.enabled)
-            .map(|config| Arc::new(IdempotencyStore::new(config.server.idempotency.ttl)));
+            .map(|config| {
+                Arc::new(IdempotencyStore::new(
+                    config.server.idempotency.ttl,
+                    config.server.idempotency.max_entries,
+                ))
+            });
         let router: Arc<dyn Router> = match self.router {
             Some(router) => router,
             None => Arc::new(
