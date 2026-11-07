@@ -26,13 +26,12 @@ axum = { workspace = true, features = ["macros", "json"] }
 serde_json = { workspace = true }
 sha2 = "0.10"
 time = { workspace = true }
-tokio = { workspace = true }
 tower-http = { version = "0.6", features = ["trace", "catch-panic", "set-header"] }
-tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+tracing = { workspace = true }
 llm-proxy-storage = { workspace = true, features = ["test-utils"] }
 tower = { workspace = true, features = ["util"] }
 axum = { workspace = true, features = ["macros", "json"] }
