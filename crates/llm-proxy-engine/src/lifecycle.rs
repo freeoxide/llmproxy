@@ -998,6 +998,7 @@ async fn run_once_attempt(
         provider: &req.provider_name,
         route_kind: req.route_kind,
         model: &first_model,
+        request: &req.core,
         body_hash: &req.body_hash,
         streaming: false,
     };
@@ -1525,6 +1526,7 @@ async fn execute_stream_attempt(
             provider: &req.provider_name,
             route_kind: req.route_kind,
             model: &first_model,
+            request: &req.core,
             body_hash: &req.body_hash,
             streaming: true,
         };

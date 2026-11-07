@@ -1,0 +1,32 @@
+[package]
+name = "llm-proxy-semantic-cache"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The optional semantic response cache for llm-proxy (plan 09 step 5, audit conflict 7): off by default, caller-scoped keys, near-duplicate prompts reuse stored responses under the plan 06 data policy."
+repository.workspace = true
+readme.workspace = true
+keywords = ["llm", "proxy", "cache", "embeddings"]
+categories = ["web-programming::http-server"]
+
+[lints]
+workspace = true
+
+[dependencies]
+llm-proxy-core = { workspace = true }
+llm-proxy-engine = { workspace = true }
+llm-proxy-protocol = { workspace = true }
+
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true, features = ["macros", "json"] }
+llm-proxy-adapters = { workspace = true }
+llm-proxy-storage = { workspace = true }
+secrecy = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

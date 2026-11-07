@@ -21,6 +21,8 @@ server = ["dep:llm-proxy-server"]
 sqlite = ["llm-proxy-storage/sqlite"]
 # The read-only admin /usage API mounted behind [auth.admin].
 admin = ["llm-proxy-server/admin"]
+# The semantic response cache (plan 09 step 5).
+semantic-cache = ["llm-proxy-server/semantic-cache"]
 # Everything the standalone daemon needs.
 full = ["server", "sqlite", "admin"]
 

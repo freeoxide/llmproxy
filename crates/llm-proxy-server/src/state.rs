@@ -380,6 +380,18 @@ impl AppState {
                 config.server.cache.max_entries,
             )));
         }
+        // The opt-in semantic cache (plan 09 step 5): off by default, and
+        // only when the optional crate is compiled in. The exact-match
+        // cache above stays the behavior for [server.cache]; the two
+        // features are distinct opt-ins.
+        #[cfg(feature = "semantic-cache")]
+        if config.server.semantic_cache.enabled {
+            let semantic = Arc::new(llm_proxy_semantic_cache::SemanticCache::new(
+                config.server.semantic_cache.clone(),
+                Box::new(llm_proxy_semantic_cache::NgramEmbedder::new()),
+            ));
+            builder = builder.cache(semantic);
+        }
         if !egress.is_empty() {
             builder = builder.egress_clients(egress);
         }

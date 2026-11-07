@@ -2614,6 +2614,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "llm-proxy-semantic-cache"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "llm-proxy-adapters",
+ "llm-proxy-core",
+ "llm-proxy-engine",
+ "llm-proxy-protocol",
+ "llm-proxy-storage",
+ "secrecy",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "llm-proxy-server"
 version = "0.1.0"
 dependencies = [
@@ -2626,6 +2645,7 @@ dependencies = [
  "llm-proxy-core",
  "llm-proxy-engine",
  "llm-proxy-protocol",
+ "llm-proxy-semantic-cache",
  "llm-proxy-storage",
  "llm-proxy-transport",
  "rust_decimal",

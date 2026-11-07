@@ -140,6 +140,16 @@ pub async fn load_toml_state_from_config(
 
     warn_admin_posture(&app_config);
 
+    // [server.semantic_cache] with the feature off is a startup error,
+    // never a silent skip (the same posture as [replica]).
+    #[cfg(not(feature = "semantic-cache"))]
+    if app_config.server.semantic_cache.enabled {
+        anyhow::bail!(
+            "[server.semantic_cache] is enabled but this build lacks the semantic-cache \
+             feature; rebuild with --features semantic-cache"
+        );
+    }
+
     let base = AppState::new_with_catalog_dir(
         app_config.clone(),
         registry.clone(),
@@ -997,6 +1007,47 @@ server_name = "t"
         )
         .await
         .expect("an upstream on another port is not a loop");
+    }
+
+    #[tokio::test]
+    async fn semantic_cache_without_the_feature_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3458"
+request_timeout = "300s"
+log_level = "info"
+server_name = "semantic-refusal"
+
+[server.semantic_cache]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let result = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await;
+        // With the semantic-cache feature the daemon serves it; without
+        // the feature the opt-in is a startup error, never a silent skip.
+        #[cfg(feature = "semantic-cache")]
+        assert!(result.is_ok(), "with the feature the opt-in serves");
+        #[cfg(not(feature = "semantic-cache"))]
+        match result {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("semantic-cache"),
+                    "the refusal names the feature, got: {message}"
+                );
+            }
+            Ok(_) => panic!("[server.semantic_cache] must never be silently skipped"),
+        }
     }
 
     #[tokio::test]

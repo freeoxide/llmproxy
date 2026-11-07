@@ -338,7 +338,10 @@ pub trait Cache: Debug + Send + Sync {
     }
 }
 
-/// A cache key: identifies one normalized request, caller-scoped.
+/// A cache key: identifies one normalized request, caller-scoped. The
+/// exact-match cache keys on `body_hash`; a semantic cache (plan 09 step
+/// 5) instead embeds the request's text from `request`, with everything
+/// else — caller, provider, route, model — still scoping the key.
 #[derive(Debug)]
 pub struct CacheKey<'a> {
     /// The caller identity (key id or `"anonymous"`).
@@ -353,6 +356,9 @@ pub struct CacheKey<'a> {
     pub body_hash: &'a str,
     /// Whether the client asked for a stream.
     pub streaming: bool,
+    /// The normalized request itself (plan 09 step 5): what a semantic
+    /// cache embeds instead of the exact body hash.
+    pub request: &'a CoreRequest,
 }
 
 /// A cached response.

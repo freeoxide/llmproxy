@@ -30,6 +30,8 @@ store-postgres = ["dep:llm-proxy-store-postgres"]
 # The admin surface (plan 09 steps 2-3): key management, usage and config
 # views, the web UI and MCP tools on the dedicated admin listener.
 admin-ui = ["dep:llm-proxy-admin"]
+# The semantic response cache (plan 09 step 5).
+semantic-cache = ["llm-proxy-server/semantic-cache"]
 
 [dependencies]
 llm-proxy-server = { workspace = true, features = ["admin"] }
