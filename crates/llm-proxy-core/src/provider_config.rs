@@ -188,6 +188,13 @@ pub struct ServerConfig {
     /// Context-window preflight (plan 05 step 8): warn by default.
     #[serde(default)]
     pub preflight: PreflightConfig,
+    /// Exact-match response cache (plan 06): off by default; stores complete
+    /// non-streaming responses per caller for the configured TTL.
+    #[serde(default)]
+    pub cache: ResponseCacheConfig,
+    /// `Idempotency-Key` replay (plan 06): off by default.
+    #[serde(default)]
+    pub idempotency: IdempotencyConfig,
 }
 
 /// Per-endpoint-family settings (audit conflict 16): the body limit and
@@ -729,6 +736,74 @@ pub enum PreflightMode {
     /// Warn as above, and reject (400) only when the estimated input
     /// exceeds the window by at least `margin_tokens`.
     Enforce,
+}
+
+/// Response cache (`[server.cache]`, plan 06): opt-in exact-match storage of
+/// complete non-streaming responses, keyed per caller (caller, provider,
+/// route, upstream model, body digest). Off by default: with it off the
+/// proxy stores no prompt or response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseCacheConfig {
+    /// Whether completed responses are stored and answered from the cache.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long a stored response stays fresh. A lookup after the TTL is a
+    /// miss. Must be non-zero when enabled.
+    #[serde(default = "default_response_cache_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+    /// Bound on stored responses (FIFO eviction at the bound).
+    #[serde(default = "default_response_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+const fn default_response_cache_ttl() -> Duration {
+    Duration::from_secs(600)
+}
+
+const fn default_response_cache_max_entries() -> usize {
+    1000
+}
+
+impl Default for ResponseCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl: default_response_cache_ttl(),
+            max_entries: default_response_cache_max_entries(),
+        }
+    }
+}
+
+/// `Idempotency-Key` replay (`[server.idempotency]`, plan 06): opt-in. A
+/// request that carries an `Idempotency-Key` header claims the key before
+/// budget checks; a matching retry after completion replays the stored
+/// response, and a request arriving while the first is still in flight gets
+/// 409. Off by default: with it off the header is ignored and nothing is
+/// retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdempotencyConfig {
+    /// Whether `Idempotency-Key` headers are honoured.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long a completed outcome is replayed for a matching retry. Must
+    /// be non-zero when enabled.
+    #[serde(default = "default_idempotency_ttl", with = "humantime_serde")]
+    pub ttl: Duration,
+}
+
+const fn default_idempotency_ttl() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+impl Default for IdempotencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl: default_idempotency_ttl(),
+        }
+    }
 }
 
 /// Admin API configuration (`[auth.admin]` section of `config.toml`).
@@ -2254,6 +2329,32 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
         });
     }
     validate_auth_config(&cfg.auth, cfg.server.bind)?;
+    if cfg.server.cache.enabled {
+        if cfg.server.cache.ttl.is_zero() {
+            return Err(CoreError::ConfigValidation {
+                message: "server.cache.ttl must be greater than 0s when the \
+                          response cache is enabled"
+                    .to_owned(),
+                source: None,
+            });
+        }
+        if cfg.server.cache.max_entries == 0 {
+            return Err(CoreError::ConfigValidation {
+                message: "server.cache.max_entries must be at least 1 when the \
+                          response cache is enabled"
+                    .to_owned(),
+                source: None,
+            });
+        }
+    }
+    if cfg.server.idempotency.enabled && cfg.server.idempotency.ttl.is_zero() {
+        return Err(CoreError::ConfigValidation {
+            message: "server.idempotency.ttl must be greater than 0s when \
+                      Idempotency-Key handling is enabled"
+                .to_owned(),
+            source: None,
+        });
+    }
     if let Some(storage) = cfg.storage.as_ref() {
         validate_storage_config(storage)?;
     }

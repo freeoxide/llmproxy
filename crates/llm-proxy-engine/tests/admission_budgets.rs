@@ -107,6 +107,8 @@ fn test_config() -> AppConfig {
             server_name: "admission-test".to_owned(),
             rate_limit_rpm: 1000,
             trust_forwarded_headers: false,
+            cache: Default::default(),
+            idempotency: Default::default(),
             log_format: Default::default(),
             admin_bind: None,
             admin_on_main_listener: false,
@@ -208,6 +210,35 @@ fn engine_request(caller: &str, model: &str) -> EngineRequest {
     .with_request_id(format!("req-{model}"))
     .with_caller(caller.to_owned())
     .with_body_hash("hash")
+}
+
+/// A request with a distinct body, for tests of concurrent *demand*:
+/// identical concurrent requests from one caller share one upstream call
+/// since plan 06, so a test that means "another request" must send one.
+fn distinct_engine_request(caller: &str, model: &str, nonce: &str) -> EngineRequest {
+    let mut core = core_request(model);
+    if let Some(message) = core.messages.first_mut()
+        && let Some(CoreContent::Text { text, .. }) = message.content.first_mut()
+    {
+        *text = format!("hello {nonce}");
+    }
+    EngineRequest::new(
+        "fake",
+        ProviderRouteKind::Messages,
+        ClientDialect::Anthropic,
+        core,
+        InboundRequest {
+            auth: None,
+            headers: Default::default(),
+            wire: ClientWireRequest::new(
+                ClientWireFormat::AnthropicMessages,
+                serde_json::json!({}),
+            ),
+        },
+    )
+    .with_request_id(format!("req-{model}-{nonce}"))
+    .with_caller(caller.to_owned())
+    .with_body_hash(format!("hash-{nonce}"))
 }
 
 #[tokio::test]
@@ -315,7 +346,11 @@ async fn concurrent_requests_cannot_overspend_the_budget_by_more_than_reserved()
         let engine = engine.clone();
         handles.push(tokio::spawn(async move {
             engine
-                .execute(engine_request("laptop", "claude-sonnet-4-6"))
+                .execute(distinct_engine_request(
+                    "laptop",
+                    "claude-sonnet-4-6",
+                    &index.to_string(),
+                ))
                 .await
                 .map(|_| ())
                 .map_err(|error| error.status_code())
@@ -376,7 +411,11 @@ async fn a_saturated_concurrency_cap_answers_503_and_frees_on_completion() {
     // Give the first request a moment to reserve; then the cap is full.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let error = engine
-        .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+        .execute(distinct_engine_request(
+            "anonymous",
+            "claude-sonnet-4-6",
+            "while-held",
+        ))
         .await
         .expect_err("cap of 1 is held");
     match &error {
@@ -393,7 +432,11 @@ async fn a_saturated_concurrency_cap_answers_503_and_frees_on_completion() {
     release.send_replace(true);
     first.await.expect("task joins");
     engine
-        .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+        .execute(distinct_engine_request(
+            "anonymous",
+            "claude-sonnet-4-6",
+            "after-release",
+        ))
         .await
         .expect("the slot freed at settlement");
 }
@@ -437,7 +480,15 @@ fn pool_member(
 }
 
 fn pool_engine_request(route: &str, request_id: &str, stream: bool) -> EngineRequest {
+    // Each request id is a distinct request (plan 06: identical concurrent
+    // requests from one caller would share one upstream call instead of
+    // exercising the failover ladder).
     let mut core = core_request("claude-sonnet-4-6");
+    if let Some(message) = core.messages.first_mut()
+        && let Some(CoreContent::Text { text, .. }) = message.content.first_mut()
+    {
+        *text = format!("hello {request_id}");
+    }
     core.stream = stream;
     EngineRequest::new(
         route,
@@ -455,7 +506,7 @@ fn pool_engine_request(route: &str, request_id: &str, stream: bool) -> EngineReq
     )
     .with_request_id(request_id)
     .with_caller("anonymous")
-    .with_body_hash("hash")
+    .with_body_hash(format!("hash-{request_id}"))
 }
 
 /// A pool whose first member always 500s (every request fails over) and

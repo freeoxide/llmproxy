@@ -146,8 +146,28 @@ mod tests {
         mock_endpoint: &str,
         protocol: &str,
         adapter_name: &str,
+        model_name: &str,
+        pricing: HashMap<llm_proxy_core::ModelId, llm_proxy_core::ModelPricing>,
+    ) -> AppState {
+        state_with_provider_edited(
+            mock_endpoint,
+            protocol,
+            adapter_name,
+            model_name,
+            pricing,
+            |_| {},
+        )
+    }
+
+    /// [`state_with_provider`] with an edit applied to the app config before
+    /// the state is built (the plan 06 opt-ins, per test).
+    fn state_with_provider_edited(
+        mock_endpoint: &str,
+        protocol: &str,
+        adapter_name: &str,
         _model_name: &str,
         pricing: HashMap<llm_proxy_core::ModelId, llm_proxy_core::ModelPricing>,
+        edit: impl FnOnce(&mut AppConfig),
     ) -> AppState {
         let routes = match protocol {
             "anthropic_messages" => llm_proxy_core::ProviderRoutesConfig {
@@ -197,7 +217,7 @@ mod tests {
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
-        let app_config = AppConfig {
+        let mut app_config = AppConfig {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(300),
@@ -208,6 +228,8 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
+                cache: Default::default(),
+                idempotency: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
@@ -219,6 +241,7 @@ mod tests {
             auth: Default::default(),
             storage: None,
         };
+        edit(&mut app_config);
 
         AppState::new(
             app_config,
@@ -1248,6 +1271,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end stream scenario plus its ledger assertions; the two config \
+                  fields plan 06 added pushed it over the mechanical line budget"
+    )]
     async fn streaming_alias_rows_keep_model_upstream() {
         use std::sync::Arc;
 
@@ -1304,6 +1332,8 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
+                cache: Default::default(),
+                idempotency: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
@@ -2703,6 +2733,8 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 1,
                     trust_forwarded_headers: false,
+                    cache: Default::default(),
+                    idempotency: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
@@ -2793,6 +2825,112 @@ mod tests {
             StatusCode::OK,
             "the retired dedup window must not 409 the second identical request"
         );
+    }
+
+    #[tokio::test]
+    async fn response_cache_opt_in_serves_the_second_identical_request() {
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_provider_edited(
+            &mock_url,
+            "anthropic_messages",
+            "messages",
+            "claude-sonnet-4-6",
+            HashMap::new(),
+            |config| {
+                config.server.cache = llm_proxy_core::ResponseCacheConfig {
+                    enabled: true,
+                    ttl: Duration::from_secs(60),
+                    max_entries: 16,
+                };
+            },
+        )
+        .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", false);
+        let first = app.clone().oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+
+        // Where the retired dedup window answered 409, the cache answers
+        // the identical request with the stored response.
+        let second = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        // The first response returns the upstream bytes verbatim
+        // (same-format passthrough); the hit re-encodes the stored core
+        // response, so the equality that matters is content equality.
+        let first_json: Value = serde_json::from_slice(&first_bytes).unwrap();
+        let second_json: Value = serde_json::from_slice(&second_bytes).unwrap();
+        assert_eq!(
+            first_json["content"], second_json["content"],
+            "a cache hit returns the stored response content"
+        );
+        assert_eq!(first_json["id"], second_json["id"]);
+        assert_eq!(first_json["usage"], second_json["usage"]);
+
+        let rows: Vec<bool> = bus
+            .snapshot()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProxyEvent::ResponseCompleted(row) => Some(row.cache_hit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().filter(|hit| **hit).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_opt_in_replays_for_a_matching_retry() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_provider_edited(
+            &mock_url,
+            "anthropic_messages",
+            "messages",
+            "claude-sonnet-4-6",
+            HashMap::new(),
+            |config| {
+                config.server.idempotency = llm_proxy_core::IdempotencyConfig {
+                    enabled: true,
+                    ttl: Duration::from_secs(3600),
+                };
+            },
+        );
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", false);
+        let keyed = |body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/providers/mock-provider/v1/messages")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "retry-after-timeout-1")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(keyed(&body)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+
+        // A client retry after a timeout replays the stored response instead
+        // of executing and billing again.
+        let second = app.oneshot(keyed(&body)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(first_bytes, second_bytes);
     }
 
     #[tokio::test]
@@ -3056,6 +3194,8 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
+                    cache: Default::default(),
+                    idempotency: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
@@ -3293,6 +3433,8 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
+                cache: Default::default(),
+                idempotency: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,

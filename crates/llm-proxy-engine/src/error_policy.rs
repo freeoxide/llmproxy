@@ -158,6 +158,7 @@ mod tests {
             EngineError::ModelNotAllowed("x".to_owned()),
             EngineError::Unauthorized,
             EngineError::InvalidRequest("x".to_owned()),
+            EngineError::IdempotencyInFlight,
             EngineError::ProviderDecode("x".to_owned()),
             EngineError::UpstreamTimeout("x".to_owned()),
             EngineError::AffinityRefused {

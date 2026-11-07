@@ -238,6 +238,8 @@ mod tests {
                     server_name: "contract-test".to_owned(),
                     rate_limit_rpm: 1000,
                     trust_forwarded_headers: false,
+                    cache: Default::default(),
+                    idempotency: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,

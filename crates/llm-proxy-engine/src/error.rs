@@ -71,6 +71,11 @@ pub enum EngineError {
     /// 3, backlog 18): 403.
     #[error("{0}")]
     Forbidden(String),
+    /// Another request from this caller holds the same `Idempotency-Key`
+    /// and is still in flight (plan 06 step 3, backlog 24): 409 only while
+    /// it runs. A retry after it completes replays the stored response.
+    #[error("a request with this Idempotency-Key is already in flight")]
+    IdempotencyInFlight,
     /// The client request is not representable (bad body or cross-format
     /// field rejection naming the fields).
     #[error("{0}")]
@@ -151,6 +156,7 @@ impl EngineError {
             Self::BudgetExhausted { .. } => "BudgetExhausted",
             Self::Overloaded { .. } => "Overloaded",
             Self::Forbidden(_) => "Forbidden",
+            Self::IdempotencyInFlight => "IdempotencyInFlight",
             Self::InvalidRequest(_) => "InvalidRequest",
             Self::ProviderDecode(_) => "ProviderDecode",
             Self::Upstream { .. } => "Upstream",
@@ -177,6 +183,7 @@ impl EngineError {
             Self::BudgetExhausted { .. } => 402,
             Self::Overloaded { .. } => 503,
             Self::Forbidden(_) => 403,
+            Self::IdempotencyInFlight => 409,
             Self::InvalidRequest(_) => 400,
             Self::ProviderDecode(_) => 502,
             Self::UpstreamTimeout(_) => 504,

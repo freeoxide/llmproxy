@@ -38,3 +38,4 @@ uuid = { workspace = true }
 [dev-dependencies]
 axum = { workspace = true, features = ["macros", "json"] }
 llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }
+sha2 = "0.10"

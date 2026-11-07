@@ -13,8 +13,10 @@
 //! 2. Apply caller limits and key allowlists — server middleware today, the
 //!    [`Admission`] trait's slot later.
 //! 3. Resolve the route — [`Router`].
-//! 4. Claim the idempotency key — later plan.
-//! 5. Look up the cache and join single-flight — [`Cache`].
+//! 4. Claim the idempotency key — [`IdempotencyStore`] (opt-in; 409 only
+//!    while the first request runs, replay after).
+//! 5. Look up the cache, then join or lead per-caller single-flight —
+//!    [`Cache`], [`SingleFlight`], [`StreamShares`].
 //! 6. Reserve budget — [`Admission`].
 //! 7. Pre-call guards — [`Guard`].
 //! 8. Request mutations in fixed phases — adapter encode (same-format
@@ -31,6 +33,7 @@
 #![deny(missing_docs)]
 
 pub mod admission;
+pub mod cache;
 pub mod catalog;
 pub mod classification;
 pub mod error;
@@ -52,6 +55,9 @@ use llm_proxy_storage::EventBus;
 use llm_proxy_transport::ProxyClient;
 
 pub use admission::{KeyPolicy, PolicyAdmission};
+pub use cache::{
+    IdempotencyClaim, IdempotencyStore, MemoryCache, SingleFlight, StoredOutcome, StreamShares,
+};
 pub use catalog::{ModelCatalogService, write_catalog_atomic};
 pub use classification::{ErrorClass, classify, parse_duration_suffix, parse_retry_after};
 pub use error::{
@@ -126,6 +132,13 @@ pub(crate) struct EngineInner {
     /// The token counter behind the input estimate admission and preflight
     /// share (plan 05 steps 4 and 8).
     pub(crate) counter: Counter,
+    /// Per-caller single-flight for non-streaming requests (plan 06 step 2).
+    pub(crate) singleflight: Arc<SingleFlight>,
+    /// Per-caller single-flight for streaming requests (plan 06 step 2).
+    pub(crate) stream_shares: Arc<StreamShares>,
+    /// The opt-in `Idempotency-Key` store (plan 06 step 3); `None` when the
+    /// feature is off, in which case the header is ignored.
+    pub(crate) idempotency: Option<Arc<IdempotencyStore>>,
 }
 
 impl std::fmt::Debug for EngineInner {
@@ -145,6 +158,9 @@ impl std::fmt::Debug for EngineInner {
             .field("health", &self.health)
             .field("affinity", &self.affinity)
             .field("counter", &self.counter)
+            .field("singleflight", &self.singleflight)
+            .field("stream_shares", &self.stream_shares)
+            .field("idempotency", &self.idempotency)
             .finish()
     }
 }
@@ -444,6 +460,12 @@ impl EngineBuilder {
         });
         let health = Arc::new(CooldownStore::new());
         let affinity = Arc::new(AffinityTable::default());
+        let idempotency = self
+            .config
+            .load()
+            .ok()
+            .filter(|config| config.server.idempotency.enabled)
+            .map(|config| Arc::new(IdempotencyStore::new(config.server.idempotency.ttl)));
         let router: Arc<dyn Router> = match self.router {
             Some(router) => router,
             None => Arc::new(
@@ -471,6 +493,9 @@ impl EngineBuilder {
             health,
             affinity,
             counter: self.counter.unwrap_or_default(),
+            singleflight: Arc::new(SingleFlight::new()),
+            stream_shares: Arc::new(StreamShares::new()),
+            idempotency,
         };
         let inner = Arc::new(inner);
         crate::probe::spawn_pool_probes(&inner);

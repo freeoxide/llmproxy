@@ -73,6 +73,7 @@ pub fn classify(error: &EngineError) -> ErrorClass {
         | EngineError::RateLimited { .. }
         | EngineError::BudgetExhausted { .. }
         | EngineError::Overloaded { .. }
+        | EngineError::IdempotencyInFlight
         | EngineError::Forbidden(_)
         | EngineError::InvalidRequest(_) => ErrorClass::Terminal,
         EngineError::RetryExhausted { .. } | EngineError::AffinityRefused { .. } => {

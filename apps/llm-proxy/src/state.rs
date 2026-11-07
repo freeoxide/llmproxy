@@ -698,6 +698,8 @@ enabled = true
                 server_name: "posture-test".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
+                cache: Default::default(),
+                idempotency: Default::default(),
                 log_format: Default::default(),
                 admin_bind,
                 admin_on_main_listener: on_main,

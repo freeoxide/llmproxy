@@ -2348,6 +2348,7 @@ dependencies = [
  "rust_decimal",
  "secrecy",
  "serde_json",
+ "sha2",
  "thiserror",
  "time",
  "tokio",

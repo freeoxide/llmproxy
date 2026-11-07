@@ -86,6 +86,10 @@ pub(super) enum RouteError {
     /// 3): 403.
     #[error("{0}")]
     Forbidden(String),
+    /// Another request from this caller holds the same `Idempotency-Key`
+    /// and is still in flight (plan 06 step 3): 409 while it runs.
+    #[error("a request with this Idempotency-Key is already in flight")]
+    IdempotencyInFlight,
     #[error("not found")]
     NotFound,
     #[error("request timeout")]
@@ -279,6 +283,7 @@ impl From<llm_proxy_engine::EngineError> for RouteError {
                 retry_after_secs: secs(retry_after),
             },
             E::Forbidden(m) => Self::Forbidden(m),
+            E::IdempotencyInFlight => Self::IdempotencyInFlight,
             E::Internal(m) => Self::Internal(m),
             other => Self::Internal(other.to_string()),
         }
@@ -302,6 +307,7 @@ pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
         RouteError::BudgetExhausted { .. } => "BudgetExhausted",
         RouteError::Overloaded { .. } => "Overloaded",
         RouteError::Forbidden(_) => "Forbidden",
+        RouteError::IdempotencyInFlight => "IdempotencyInFlight",
         RouteError::NotFound => "NotFound",
         RouteError::RequestTimeout => "RequestTimeout",
         RouteError::PayloadTooLarge => "PayloadTooLarge",
@@ -399,6 +405,12 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             StatusCode::FORBIDDEN,
             "permission_error",
             truncate_error_body(message),
+        ),
+        RouteError::IdempotencyInFlight => (
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "a request with this Idempotency-Key is already in flight; retry              once it completes to replay its response"
+                .to_owned(),
         ),
         RouteError::NotFound => (
             StatusCode::NOT_FOUND,
@@ -1109,6 +1121,23 @@ mod tests {
         assert_eq!(json["error"]["message"], "rate limit exceeded");
     }
 
+    #[tokio::test]
+    async fn idempotency_in_flight_renders_409_in_both_dialects() {
+        for protocol in [ClientProtocol::Anthropic, ClientProtocol::OpenAiChat] {
+            let response = route_error_response(protocol, &RouteError::IdempotencyInFlight);
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            // The policy row's deliberate choice: a stock SDK that auto-retries
+            // 409 clears this by itself once the first request finishes.
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-should-retry")
+                    .map(|v| v.to_str().unwrap()),
+                Some("true")
+            );
+        }
+    }
+
     #[test]
     fn client_protocol_equality() {
         assert_eq!(ClientProtocol::Anthropic, ClientProtocol::Anthropic);
@@ -1157,6 +1186,7 @@ mod tests {
                 retry_after_secs: Some(1),
             },
             RouteError::Forbidden("no".into()),
+            RouteError::IdempotencyInFlight,
             RouteError::NotFound,
             RouteError::RequestTimeout,
             RouteError::PayloadTooLarge,

@@ -43,7 +43,12 @@ pub struct AppState {
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
     pub(crate) event_bus: Arc<dyn EventBus>,
     pub(crate) client_auth: Arc<ClientAuth>,
-    engine: OnceLock<Result<Arc<Engine>, llm_proxy_engine::EngineError>>,
+    /// Materialized once and shared by every clone of this state: axum hands
+    /// each request its own `AppState` clone, and the engine carries
+    /// process-wide state (response cache, single-flight, idempotency,
+    /// cooldowns), so a per-clone cell would give every request a fresh,
+    /// empty engine.
+    engine: Arc<OnceLock<Result<Arc<Engine>, llm_proxy_engine::EngineError>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -129,7 +134,7 @@ impl AppState {
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
             client_auth,
-            engine: OnceLock::new(),
+            engine: Arc::new(OnceLock::new()),
         }
     }
 
@@ -234,6 +239,14 @@ impl AppState {
             if !admission.is_noop() {
                 builder = builder.admission(Arc::new(admission));
             }
+            // The opt-in response cache (plan 06): off by default, so with
+            // no [server.cache] the engine keeps its store-nothing default.
+            if self.app_config.server.cache.enabled {
+                builder = builder.cache(Arc::new(llm_proxy_engine::MemoryCache::new(
+                    self.app_config.server.cache.ttl,
+                    self.app_config.server.cache.max_entries,
+                )));
+            }
             let egress = (*self.egress_clients).clone();
             for provider in self.providers.iter() {
                 if provider.egress.is_some() && !egress.contains_key(&provider.name) {
@@ -294,6 +307,8 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
+                cache: Default::default(),
+                idempotency: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
