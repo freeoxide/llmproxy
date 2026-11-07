@@ -141,10 +141,6 @@ pub struct ServerConfig {
     /// authentication, rate-limit bypass, or audit logging.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
-    /// Window for rejecting identical path/body requests. `0s` disables deduplication.
-    #[serde(default = "default_dedup_window")]
-    #[serde(with = "humantime_serde")]
-    pub dedup_window: Duration,
     /// Public server name reported in version/health endpoints.
     pub server_name: String,
     /// Cross-origin origins permitted to call the proxy from a browser.
@@ -753,10 +749,6 @@ pub struct AdminAuthConfig {
 
 const fn default_shutdown_timeout() -> Duration {
     Duration::from_secs(30)
-}
-
-const fn default_dedup_window() -> Duration {
-    Duration::ZERO
 }
 
 const fn default_prune_interval() -> Duration {
@@ -2261,16 +2253,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             source: None,
         });
     }
-    if u64::try_from(cfg.server.dedup_window.as_millis()).is_err() {
-        return Err(CoreError::ConfigValidation {
-            message: format!(
-                "server.dedup_window is {:?}, whose millisecond magnitude does \
-                 not fit u64; use a smaller window (0s disables deduplication)",
-                cfg.server.dedup_window
-            ),
-            source: None,
-        });
-    }
     validate_auth_config(&cfg.auth, cfg.server.bind)?;
     if let Some(storage) = cfg.storage.as_ref() {
         validate_storage_config(storage)?;
@@ -3149,7 +3131,6 @@ server_name = "test"
 
         assert_eq!(config.server.rate_limit_rpm, 100);
         assert!(!config.server.trust_forwarded_headers);
-        assert_eq!(config.server.dedup_window, Duration::ZERO);
         assert_eq!(config.server.shutdown_timeout, Duration::from_secs(30));
     }
 
@@ -3249,7 +3230,9 @@ server_name = "test"
     }
 
     #[test]
-    fn load_app_config_rejects_dedup_window_exceeding_u64_millis() {
+    fn load_app_config_rejects_the_retired_dedup_window_field() {
+        // The dedup window was retired (plan 06 step 1): a config that still
+        // names it must fail loudly, not silently change dedup behaviour.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(
@@ -3258,7 +3241,7 @@ server_name = "test"
 [server]
 bind = "127.0.0.1:3456"
 request_timeout = "300s"
-dedup_window = "5000000000000000000s"
+dedup_window = "500ms"
 log_level = "info"
 hot_reload = false
 server_name = "test"
@@ -3266,10 +3249,10 @@ server_name = "test"
         )
         .unwrap();
 
-        let error = load_app_config(&path).expect_err("oversized dedup window must be rejected");
+        let error = load_app_config(&path).expect_err("retired dedup_window must be rejected");
         assert!(
-            error.to_string().contains("server.dedup_window")
-                && error.to_string().contains("does not fit u64"),
+            error.to_string().contains("unknown field")
+                && error.to_string().contains("dedup_window"),
             "got: {error}"
         );
     }

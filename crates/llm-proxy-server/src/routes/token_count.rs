@@ -134,9 +134,8 @@ async fn count_tokens_inner(
         return Err(err);
     }
     core_pipeline::validate_json_content_type(headers).inspect_err(&emit_failed)?;
-    let request_path = format!("/providers/{provider}/v1/messages/count_tokens");
-    let ctx = core_pipeline::prepare_request(state, &meta, headers, &body, &request_path)
-        .inspect_err(&emit_failed)?;
+    let ctx =
+        core_pipeline::prepare_request(state, &meta, headers, &body).inspect_err(&emit_failed)?;
     let req: MessageRequest = match axum::Json::<MessageRequest>::from_bytes(&body) {
         Ok(axum::Json(value)) => value,
         Err(rejection) => {

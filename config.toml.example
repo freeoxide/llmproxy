@@ -17,8 +17,6 @@ rate_limit_rpm = 100
 # Use X-Forwarded-For / X-Real-IP for client identity. Enable only behind a
 # trusted reverse proxy that overwrites these headers.
 trust_forwarded_headers = false
-# Window for rejecting identical path/body requests. "0ms" disables dedup.
-dedup_window = "0ms"
 server_name = "llm-proxy"
 # Dedicated listener for the read-only admin /usage API. Only read when
 # [auth.admin] is configured. Defaults to "127.0.0.1" on the port after

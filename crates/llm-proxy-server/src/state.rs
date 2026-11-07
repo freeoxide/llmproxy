@@ -8,7 +8,7 @@ use llm_proxy_engine::{Engine, EngineBuilder, ModelCatalogService};
 use llm_proxy_storage::{EventBus, NoopBus};
 use llm_proxy_transport::ProxyClient;
 
-use crate::middleware::{ClientAuth, RateLimiter, RequestDeduplicator, RequestIdGenerator};
+use crate::middleware::{ClientAuth, RateLimiter, RequestIdGenerator};
 
 /// Static information about this binary.
 #[derive(Debug, Clone)]
@@ -39,7 +39,6 @@ pub struct AppState {
     pub(crate) token_counter: Counter,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) rate_limiter: Arc<RateLimiter>,
-    pub(crate) request_dedup: Arc<RequestDeduplicator>,
     pub(crate) request_id_gen: Arc<RequestIdGenerator>,
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
     pub(crate) event_bus: Arc<dyn EventBus>,
@@ -59,7 +58,6 @@ impl std::fmt::Debug for AppState {
             .field("token_counter", &self.token_counter)
             .field("metrics", &self.metrics)
             .field("rate_limiter", &self.rate_limiter)
-            .field("request_dedup", &self.request_dedup)
             .field("request_id_gen", &self.request_id_gen)
             .field("model_catalogs", &self.model_catalogs)
             .field("event_bus", &self.event_bus)
@@ -107,8 +105,6 @@ impl AppState {
         catalog_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let rate_limit_rpm = app_config.server.rate_limit_rpm;
-        let dedup_window_ms =
-            u64::try_from(app_config.server.dedup_window.as_millis()).unwrap_or(0);
         let client_auth = match ClientAuth::from_config(&app_config.auth) {
             Ok(auth) => Arc::new(auth),
             Err(error) => {
@@ -129,7 +125,6 @@ impl AppState {
             token_counter: Counter::new(),
             metrics: Arc::new(Metrics::new()),
             rate_limiter: Arc::new(RateLimiter::new(rate_limit_rpm)),
-            request_dedup: Arc::new(RequestDeduplicator::with_window_ms(dedup_window_ms)),
             request_id_gen: Arc::new(RequestIdGenerator::new()),
             model_catalogs: Arc::new(ModelCatalogService::new(catalog_dir)),
             event_bus: Arc::new(NoopBus) as Arc<dyn EventBus>,
@@ -299,7 +294,6 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
@@ -411,7 +405,6 @@ mod tests {
             "token_counter",
             "metrics",
             "rate_limiter",
-            "request_dedup",
             "request_id_gen",
             "model_catalogs",
             "event_bus",

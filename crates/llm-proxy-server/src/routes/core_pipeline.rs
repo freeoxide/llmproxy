@@ -42,14 +42,13 @@ pub(crate) struct RequestContext {
     pub(crate) body_hash: String,
 }
 
-/// Applies caller limits (rate limit, dedup) — pipeline slots 1 and 2 —
-/// before the engine takes over.
+/// Applies caller limits (rate limiting — pipeline slot 2) before the engine
+/// takes over.
 pub(crate) fn prepare_request(
     state: &AppState,
     meta: &crate::middleware::RequestMeta,
     headers: &HeaderMap,
     body: &[u8],
-    path: &str,
 ) -> Result<RequestContext, RouteError> {
     let caller = &meta.caller;
     let connect_info = meta.connect_info.as_ref();
@@ -70,11 +69,6 @@ pub(crate) fn prepare_request(
             message: "rate limit exceeded".to_owned(),
             retry_after_secs: Some(1),
         });
-    }
-
-    if state.request_dedup.is_duplicate_with_path(path, body) {
-        state.metrics.record_deduplicated();
-        return Err(RouteError::Conflict);
     }
 
     Ok(RequestContext {

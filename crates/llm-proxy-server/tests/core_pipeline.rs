@@ -208,7 +208,6 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
@@ -1305,7 +1304,6 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
@@ -2705,7 +2703,6 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 1,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
@@ -2771,106 +2768,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_request_returns_409() {
+    async fn identical_requests_are_never_answered_409_by_default() {
+        // The dedup window was retired (plan 06 step 1): identical requests
+        // are answered, never 409-rejected, when every opt-in is off. Each
+        // one reaches the upstream; per-caller single-flight only merges
+        // requests that are in flight at the same instant, and these two are
+        // sequential.
         let mock_url = spawn_mock_anthropic_non_stream().await;
-        let provider = ProviderConfig {
-            name: "mock-provider".to_owned(),
-            api_key: secrecy::SecretString::from("test-key"),
-            auth_style: AuthStyle::Bearer,
-            passthrough_auth: false,
-            api_keys: None,
-            retry: None,
-            egress: None,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "messages".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "anthropic_messages".to_owned(),
-                        endpoint: mock_url,
-                        headers: std::sync::Arc::new(HashMap::new()),
-                        forward_inbound_headers: None,
-                        lossy: false,
-                    },
-                );
-                m
-            },
-            routes: llm_proxy_core::ProviderRoutesConfig {
-                messages: Some("messages".to_owned()),
-                chat_completions: None,
-            },
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-            pricing: Default::default(),
-            concurrency: None,
-            pricing_sync: None,
-        };
-        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
-        let state = AppState::new(
-            AppConfig {
-                server: ServerConfig {
-                    bind: "127.0.0.1:3456".parse().unwrap(),
-                    request_timeout: Duration::from_secs(300),
-                    shutdown_timeout: Duration::from_secs(30),
-                    log_level: "info".to_owned(),
-                    hot_reload: false,
-                    allowed_origins: None,
-                    server_name: "test-proxy".to_owned(),
-                    rate_limit_rpm: 100,
-                    trust_forwarded_headers: false,
-                    dedup_window: Duration::from_secs(60),
-                    log_format: Default::default(),
-                    admin_bind: None,
-                    admin_on_main_listener: false,
-                    endpoint_families: Default::default(),
-                    upstream_timeouts: Default::default(),
-                    bare_v1: Default::default(),
-                    preflight: Default::default(),
-                },
-                auth: Default::default(),
-                storage: None,
-            },
-            registry,
-            ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
-            BuildInfo {
-                name: "test",
-                version: "0.0.0",
-                target: "test",
-                git_sha: "test",
-            },
-        );
+        let state = state_with_anthropic_provider(&mock_url);
         let app = build_router(state);
 
         let body = make_messages_body("claude-sonnet-4-6", false);
 
         let resp1 = app.clone().oneshot(messages_request(&body)).await.unwrap();
-        assert_ne!(
+        assert_eq!(
             resp1.status(),
-            StatusCode::CONFLICT,
-            "first request should not be a duplicate"
+            StatusCode::OK,
+            "first request must be answered, not rejected"
         );
 
         let resp2 = app.oneshot(messages_request(&body)).await.unwrap();
         assert_eq!(
             resp2.status(),
-            StatusCode::CONFLICT,
-            "second identical request should be deduplicated"
-        );
-        let resp_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(resp_body["type"], "error");
-        assert!(
-            resp_body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("duplicate"),
-            "error message should mention 'duplicate'"
+            StatusCode::OK,
+            "the retired dedup window must not 409 the second identical request"
         );
     }
 
@@ -3135,7 +3056,6 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
@@ -3373,7 +3293,6 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,

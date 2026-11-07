@@ -143,7 +143,6 @@ mod tests {
                     server_name: "secret-abuse-test".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::ZERO,
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: on_main,

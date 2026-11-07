@@ -36,10 +36,6 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
         "  trust_forwarded_headers: {}",
         app_config.server.trust_forwarded_headers
     );
-    println!(
-        "  dedup_window:    {}ms",
-        app_config.server.dedup_window.as_millis()
-    );
     println!("  server_name:     {}", app_config.server.server_name);
 
     let providers_dir = providers_dir_for(&path);

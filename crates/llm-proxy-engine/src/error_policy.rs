@@ -15,8 +15,9 @@
 //! - Client-fixable failures (400, 401, 403, 404, 405, 413, 402) say
 //!   `x-should-retry: false`: the same request will fail the same way until
 //!   the client or operator changes something.
-//! - The proxy's own timeout (408) and the dedup conflict (409) say `true`:
-//!   both clear by themselves within a bounded, short window.
+//! - The proxy's own timeout (408) and the in-flight idempotency conflict
+//!   (409) say `true`: both clear by themselves within a bounded, short
+//!   window.
 //! - Rate windows (429) say `true` and carry `Retry-After` with the window
 //!   reset when the proxy knows it.
 //! - Spend budgets (402) say `false` even though the budget eventually
@@ -85,7 +86,8 @@ pub const STATUS_POLICY: &[StatusCodePolicy] = &[
     StatusCodePolicy {
         code: 409,
         should_retry: true,
-        note: "duplicate request in the dedup window; retry after a beat",
+        note: "another request holds this Idempotency-Key; it clears when that \
+               request finishes",
     },
     StatusCodePolicy {
         code: 413,

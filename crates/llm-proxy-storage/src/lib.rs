@@ -60,8 +60,8 @@ pub struct RequestReceived {
     pub model: ModelRef,
     /// Whether the request requested streaming.
     pub streaming: bool,
-    /// SHA-256 of the raw client request body for dedup/correlation (not the
-    /// body itself, which may contain secrets).
+    /// SHA-256 of the raw client request body for correlation and cache keys
+    /// (not the body itself, which may contain secrets).
     pub body_hash: String,
     /// Session id attributed to the request (plan 04 step 10, backlog 17):
     /// the inbound session header (for example

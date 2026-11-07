@@ -15,7 +15,6 @@ log_level = "info"
 hot_reload = false
 rate_limit_rpm = 100
 trust_forwarded_headers = false
-dedup_window = "0ms"
 server_name = "llm-proxy"
 "#;
 

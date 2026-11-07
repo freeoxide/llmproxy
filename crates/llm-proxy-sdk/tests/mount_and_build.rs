@@ -26,7 +26,6 @@ fn app_config() -> core::AppConfig {
             server_name: "sdk-test".to_owned(),
             rate_limit_rpm: 10_000,
             trust_forwarded_headers: false,
-            dedup_window: Duration::ZERO,
             log_format: Default::default(),
             admin_bind: None,
             admin_on_main_listener: false,

@@ -15,91 +15,6 @@ use sha2::{Digest, Sha256};
 
 use argon2::PasswordVerifier;
 
-const MAX_DEDUP_ENTRIES: usize = 10_000;
-
-/// Inbound header names that are never forwarded upstream regardless of the
-/// per-provider allowlist: client credentials, hop-by-hop and content headers
-/// the transport owns, and browser headers that leak the caller's environment
-/// or break upstreams (row 12, backlog 10).
-const MAX_DEDUP_BODY_SIZE: usize = 64 * 1024;
-
-/// Deduplicates requests by SHA-256 hash of the request path and body.
-///
-/// A second identical path+body inside the window (default 500 ms; 0
-/// disables) is rejected.
-#[derive(Debug)]
-pub struct RequestDeduplicator {
-    in_flight: Mutex<HashMap<[u8; 32], Instant>>,
-    window_ms: u64,
-}
-
-impl RequestDeduplicator {
-    /// Create a new deduplicator with a 500 ms window.
-    pub fn new() -> Self {
-        Self::with_window_ms(500)
-    }
-
-    /// Create a new deduplicator with a custom deduplication window.
-    pub fn with_window_ms(window_ms: u64) -> Self {
-        Self {
-            in_flight: Mutex::new(HashMap::new()),
-            window_ms,
-        }
-    }
-
-    /// Check whether this request body is a duplicate.
-    ///
-    /// Deprecated: prefer [`Self::is_duplicate_with_path`], which includes the
-    /// request path in the hash.
-    #[deprecated(note = "use is_duplicate_with_path instead")]
-    pub fn is_duplicate(&self, body: &[u8]) -> bool {
-        self.is_duplicate_with_path("", body)
-    }
-
-    /// Check whether this request is a duplicate, keyed by path and body.
-    /// The path distinguishes requests to different protocol endpoints
-    /// that carry the same body.
-    pub fn is_duplicate_with_path(&self, path: &str, body: &[u8]) -> bool {
-        if self.window_ms == 0 {
-            return false;
-        }
-        if body.len() > MAX_DEDUP_BODY_SIZE {
-            return false;
-        }
-        let hash = Self::hash_path_body(path, body);
-        let now = Instant::now();
-
-        let mut map = self.in_flight.lock().unwrap_or_else(|e| {
-            tracing::warn!("request deduplicator mutex poisoned; recovering from panic");
-            e.into_inner()
-        });
-
-        map.retain(|_, t| now.duration_since(*t).as_millis() < self.window_ms as u128);
-
-        if map.contains_key(&hash) {
-            return true;
-        }
-
-        if map.len() < MAX_DEDUP_ENTRIES {
-            map.insert(hash, now);
-        }
-        false
-    }
-
-    fn hash_path_body(path: &str, body: &[u8]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(path.as_bytes());
-        hasher.update(body);
-        hasher.finalize().into()
-    }
-}
-
-impl Default for RequestDeduplicator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 const MAX_RATE_LIMIT_BUCKETS: usize = 100_000;
 
 #[derive(Debug)]
@@ -998,26 +913,6 @@ mod tests {
     }
 
     #[test]
-    fn dedup_new_request_is_not_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    fn dedup_same_body_is_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    fn dedup_different_body_is_not_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(!dedup.is_duplicate_with_path("", b"world"));
-    }
-
-    #[test]
     fn request_id_format() {
         let generator = RequestIdGenerator::new();
         let id = generator.next_id();
@@ -1048,42 +943,6 @@ mod tests {
             assert!(limiter.is_allowed("10.0.0.1"));
         }
         assert!(limiter.is_allowed("10.0.0.2"));
-    }
-
-    #[test]
-    fn dedup_same_body_different_path_is_not_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", b"hello"));
-        assert!(!dedup.is_duplicate_with_path("/v1/chat/completions", b"hello"));
-    }
-
-    #[test]
-    fn dedup_same_body_same_path_is_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", b"hello"));
-        assert!(dedup.is_duplicate_with_path("/v1/messages", b"hello"));
-    }
-
-    #[test]
-    fn dedup_custom_window() {
-        let dedup = RequestDeduplicator::with_window_ms(1000);
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    fn dedup_zero_window_is_disabled() {
-        let dedup = RequestDeduplicator::with_window_ms(0);
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    #[expect(deprecated, reason = "is_duplicate shim is exercised directly here")]
-    fn dedup_path_less_shim_still_works() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate(b"hello"));
-        assert!(dedup.is_duplicate(b"hello"));
     }
 
     #[test]
@@ -1174,28 +1033,6 @@ mod tests {
         assert!(
             !limiter.is_allowed("10.0.0.1"),
             "second request should be rejected at 1 RPM limit"
-        );
-    }
-
-    #[test]
-    fn dedup_large_body_is_not_tracked() {
-        let dedup = RequestDeduplicator::with_window_ms(5000);
-        let large_body = vec![b'x'; 65 * 1024];
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", &large_body));
-        assert!(
-            !dedup.is_duplicate_with_path("/v1/messages", &large_body),
-            "large body should not be tracked for dedup"
-        );
-    }
-
-    #[test]
-    fn dedup_body_at_cap_is_still_tracked() {
-        let dedup = RequestDeduplicator::with_window_ms(5000);
-        let body_at_cap = vec![b'x'; 64 * 1024];
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", &body_at_cap));
-        assert!(
-            dedup.is_duplicate_with_path("/v1/messages", &body_at_cap),
-            "body at exactly the cap should still be tracked"
         );
     }
 

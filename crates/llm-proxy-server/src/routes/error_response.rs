@@ -86,8 +86,6 @@ pub(super) enum RouteError {
     /// 3): 403.
     #[error("{0}")]
     Forbidden(String),
-    #[error("duplicate request")]
-    Conflict,
     #[error("not found")]
     NotFound,
     #[error("request timeout")]
@@ -304,7 +302,6 @@ pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
         RouteError::BudgetExhausted { .. } => "BudgetExhausted",
         RouteError::Overloaded { .. } => "Overloaded",
         RouteError::Forbidden(_) => "Forbidden",
-        RouteError::Conflict => "Conflict",
         RouteError::NotFound => "NotFound",
         RouteError::RequestTimeout => "RequestTimeout",
         RouteError::PayloadTooLarge => "PayloadTooLarge",
@@ -402,11 +399,6 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             StatusCode::FORBIDDEN,
             "permission_error",
             truncate_error_body(message),
-        ),
-        RouteError::Conflict => (
-            StatusCode::CONFLICT,
-            "invalid_request_error",
-            "duplicate request, please retry".to_owned(),
         ),
         RouteError::NotFound => (
             StatusCode::NOT_FOUND,
@@ -534,13 +526,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
-    #[test]
-    fn anthropic_conflict_returns_409() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::Anthropic, &err);
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-    }
-
     #[tokio::test]
     async fn internal_error_message_is_sanitized_in_response_body() {
         let err = RouteError::Internal("secret config detail: /etc/proxy.toml".into());
@@ -635,13 +620,6 @@ mod tests {
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    #[test]
-    fn openai_conflict_returns_409() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
-        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -797,24 +775,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["error"]["type"], "rate_limit_error");
         assert_eq!(json["error"]["message"], "rate limit exceeded");
-        assert!(json["error"]["code"].is_null());
-    }
-
-    #[tokio::test]
-    async fn openai_conflict_body_has_correct_structure() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-        assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("duplicate")
-        );
         assert!(json["error"]["code"].is_null());
     }
 
@@ -1149,24 +1109,6 @@ mod tests {
         assert_eq!(json["error"]["message"], "rate limit exceeded");
     }
 
-    #[tokio::test]
-    async fn anthropic_conflict_body_has_correct_structure() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::Anthropic, &err);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-        assert_eq!(json["type"], "error");
-        assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("duplicate")
-        );
-    }
-
     #[test]
     fn client_protocol_equality() {
         assert_eq!(ClientProtocol::Anthropic, ClientProtocol::Anthropic);
@@ -1215,7 +1157,6 @@ mod tests {
                 retry_after_secs: Some(1),
             },
             RouteError::Forbidden("no".into()),
-            RouteError::Conflict,
             RouteError::NotFound,
             RouteError::RequestTimeout,
             RouteError::PayloadTooLarge,

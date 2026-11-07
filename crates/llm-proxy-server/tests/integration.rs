@@ -34,7 +34,6 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
@@ -108,7 +107,6 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
@@ -843,7 +841,6 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
@@ -971,7 +968,6 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::from_millis(500),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
@@ -1071,7 +1067,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_request_emits_one_response_failed_with_409() {
+    async fn identical_requests_each_run_the_pipeline_no_409() {
+        // The dedup window was retired (plan 06 step 1): with every opt-in
+        // off, the second identical request runs the pipeline again — the
+        // upstream (unreachable here, so 502) is attempted once per request
+        // and each emits its own failure row. Nothing answers 409.
         let (state, bus) = state_with_provider_and_bus();
         let app = build_router(state);
         let body = json!({
@@ -1087,28 +1087,29 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let _ = app.clone().oneshot(make_req()).await.unwrap();
-        let resp = app.oneshot(make_req()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-
-        let conflicts: Vec<_> = bus
-            .snapshot()
-            .into_iter()
-            .filter_map(|e| match e {
-                ProxyEvent::ResponseFailed(f) if f.http_status == 409 => Some(f),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            conflicts.len(),
-            1,
-            "dedup Conflict must emit exactly one 409 ResponseFailed"
-        );
+        let resp1 = app.clone().oneshot(make_req()).await.unwrap();
+        let resp2 = app.oneshot(make_req()).await.unwrap();
+        for (label, resp) in [("first", &resp1), ("second", &resp2)] {
+            assert_ne!(
+                resp.status(),
+                StatusCode::CONFLICT,
+                "the retired dedup window must not 409 the {label} identical request"
+            );
+        }
+        assert_eq!(resp1.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(resp2.status(), StatusCode::BAD_GATEWAY);
 
         assert_eq!(
             count_events(&bus, "response_failed"),
             2,
-            "two requests (one downstream failure + one dedup conflict) must emit exactly two ResponseFailed total"
+            "each of the two identical requests emits exactly one ResponseFailed"
+        );
+        assert!(
+            bus.snapshot().iter().all(|event| !matches!(
+                event,
+                ProxyEvent::ResponseFailed(f) if f.http_status == 409
+            )),
+            "no 409 row may be written with every opt-in off"
         );
     }
 

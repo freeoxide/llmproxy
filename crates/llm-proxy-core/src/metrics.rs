@@ -29,7 +29,7 @@ pub struct Metrics {
     requests_failed: AtomicI64,
     upstream_calls: AtomicI64,
     rate_limited: AtomicI64,
-    deduplicated: AtomicI64,
+    cache_hits: AtomicI64,
     client_cancelled: AtomicI64,
     /// Ring-buffer holding the last [`LATENCY_CAP`] latency samples.
     latencies: Mutex<VecDeque<Duration>>,
@@ -48,7 +48,7 @@ impl Metrics {
             requests_failed: AtomicI64::new(0),
             upstream_calls: AtomicI64::new(0),
             rate_limited: AtomicI64::new(0),
-            deduplicated: AtomicI64::new(0),
+            cache_hits: AtomicI64::new(0),
             client_cancelled: AtomicI64::new(0),
             latencies: Mutex::new(VecDeque::with_capacity(LATENCY_CAP)),
             model_counts: Mutex::new(HashMap::new()),
@@ -127,9 +127,10 @@ impl Metrics {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a deduplicated (cache-hit) request.
-    pub fn record_deduplicated(&self) {
-        self.deduplicated.fetch_add(1, Ordering::Relaxed);
+    /// Record a request served without a fresh upstream attempt: a response
+    /// cache hit, a single-flight join, or an idempotent replay (plan 06).
+    pub fn record_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Take an approximate point-in-time snapshot of all counters.
@@ -144,7 +145,7 @@ impl Metrics {
         let requests_failed = self.requests_failed.load(Ordering::Relaxed);
         let upstream_calls = self.upstream_calls.load(Ordering::Relaxed);
         let rate_limited = self.rate_limited.load(Ordering::Relaxed);
-        let deduplicated = self.deduplicated.load(Ordering::Relaxed);
+        let cache_hits = self.cache_hits.load(Ordering::Relaxed);
         let client_cancelled = self.client_cancelled.load(Ordering::Relaxed);
 
         let latencies = self
@@ -170,7 +171,7 @@ impl Metrics {
             requests_failed,
             upstream_calls,
             rate_limited,
-            deduplicated,
+            cache_hits,
             client_cancelled,
             latencies,
             model_counts,
@@ -202,8 +203,9 @@ pub struct Snapshot {
     pub upstream_calls: i64,
     /// Requests rejected by the rate limiter.
     pub rate_limited: i64,
-    /// Requests that were deduplicated before reaching upstream.
-    pub deduplicated: i64,
+    /// Requests served without a fresh upstream attempt: a response cache
+    /// hit, a single-flight join, or an idempotent replay.
+    pub cache_hits: i64,
     /// Requests whose client disconnected (or were torn down by the timeout
     /// layer) mid-stream; tracked separately from `requests_failed`.
     pub client_cancelled: i64,
@@ -273,7 +275,7 @@ mod tests {
         assert_eq!(snap.requests_failed, 0);
         assert_eq!(snap.upstream_calls, 0);
         assert_eq!(snap.rate_limited, 0);
-        assert_eq!(snap.deduplicated, 0);
+        assert_eq!(snap.cache_hits, 0);
         assert_eq!(snap.client_cancelled, 0);
         assert!(snap.latencies.is_empty());
         assert!(snap.model_counts.is_empty());
@@ -350,16 +352,16 @@ mod tests {
     }
 
     #[test]
-    fn record_rate_limited_and_deduplicated() {
+    fn record_rate_limited_and_cache_hit() {
         let m = Metrics::new();
         m.record_rate_limited();
         m.record_rate_limited();
         m.record_rate_limited();
-        m.record_deduplicated();
+        m.record_cache_hit();
 
         let snap = m.get_snapshot();
         assert_eq!(snap.rate_limited, 3);
-        assert_eq!(snap.deduplicated, 1);
+        assert_eq!(snap.cache_hits, 1);
     }
 
     #[test]
@@ -423,7 +425,7 @@ mod tests {
                 m.record_rate_limited();
             }
             if i % 7 == 0 {
-                m.record_deduplicated();
+                m.record_cache_hit();
             }
         }
 

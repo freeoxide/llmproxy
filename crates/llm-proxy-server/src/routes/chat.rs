@@ -92,9 +92,8 @@ async fn handle_chat_completions_inner(
     }
     core_pipeline::validate_json_content_type(&headers).inspect_err(&emit_failed)?;
 
-    let request_path = format!("/providers/{provider}/v1/chat/completions");
-    let ctx = core_pipeline::prepare_request(&state, &meta, &headers, &body, &request_path)
-        .inspect_err(&emit_failed)?;
+    let ctx =
+        core_pipeline::prepare_request(&state, &meta, &headers, &body).inspect_err(&emit_failed)?;
     let raw: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,
         Err(e) => {

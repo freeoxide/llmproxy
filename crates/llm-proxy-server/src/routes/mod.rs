@@ -432,7 +432,6 @@ mod auth_gate_tests {
                 server_name: "gate-test".to_owned(),
                 rate_limit_rpm,
                 trust_forwarded_headers: false,
-                dedup_window: std::time::Duration::ZERO,
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,

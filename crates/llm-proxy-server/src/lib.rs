@@ -14,8 +14,7 @@ pub mod shutdown;
 pub mod state;
 
 pub use middleware::{
-    CallerId, ClientAuth, ClientAuthError, RateLimiter, RequestDeduplicator, RequestId,
-    RequestIdGenerator,
+    CallerId, ClientAuth, ClientAuthError, RateLimiter, RequestId, RequestIdGenerator,
 };
 pub use shutdown::shutdown_signal;
 pub use state::{AppState, BuildInfo};
