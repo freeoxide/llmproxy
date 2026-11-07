@@ -31,4 +31,3 @@ uuid = { workspace = true }
 [dev-dependencies]
 llm-proxy-core = { workspace = true }
 llm-proxy-protocol = { workspace = true }
-rust_decimal = { workspace = true }

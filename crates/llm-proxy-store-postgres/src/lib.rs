@@ -151,6 +151,29 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// Number of usage events whose JSON payload matches
+    /// `payload->>'field' = value` — the feed check for drain jobs and
+    /// tests.
+    ///
+    /// # Errors
+    ///
+    /// [`PostgresStoreError::Query`] when the count fails.
+    pub async fn count_usage_events_where(
+        &self,
+        field: &str,
+        value: &str,
+    ) -> Result<u64, PostgresStoreError> {
+        let client = self.connection().await?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*) FROM usage_events WHERE payload->>$1 = $2",
+                &[&field, &value],
+            )
+            .await?;
+        let count: i64 = row.get(0);
+        Ok(count.max(0) as u64)
+    }
+
     /// Deletes window rows that can no longer be queried: minute rows
     /// older than two minutes, day rows older than one day, and leases
     /// older than the lease TTL. Call on a timer.
