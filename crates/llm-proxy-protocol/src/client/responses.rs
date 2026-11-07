@@ -837,8 +837,15 @@ impl StreamEncoder {
         }
     }
 
-    /// The response skeleton every terminal event embeds.
-    fn response_object(&self, status: &str, error: Value) -> Value {
+    /// The response skeleton every terminal event embeds; `incomplete_details`
+    /// comes from the same [`stop_status`] mapping as the non-streaming
+    /// encode.
+    fn response_object(
+        &self,
+        status: &str,
+        incomplete_details: Option<Value>,
+        error: Value,
+    ) -> Value {
         // Output items in output order: the finished ones, the open text or
         // reasoning item, then any tool calls still open.
         let mut items: Vec<(usize, Value)> = self
@@ -872,8 +879,10 @@ impl StreamEncoder {
             "status": status,
         });
         response["error"] = error;
-        if status == "incomplete" {
-            response["incomplete_details"] = serde_json::json!({"reason": "max_output_tokens"});
+        if let Some(details) = incomplete_details
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert("incomplete_details".to_owned(), details);
         }
         response
     }
@@ -964,7 +973,7 @@ impl StreamEncoder {
                 let mut payload = self.base_payload();
                 payload.insert(
                     "response".into(),
-                    self.response_object("in_progress", Value::Null),
+                    self.response_object("in_progress", None, Value::Null),
                 );
                 events.push(self.event("response.created", payload));
             }
@@ -1156,6 +1165,7 @@ impl StreamEncoder {
                 "response".into(),
                 self.response_object(
                     "failed",
+                    None,
                     serde_json::json!({
                         "code": Value::Null,
                         "message": error.message(),
@@ -1171,9 +1181,12 @@ impl StreamEncoder {
             );
             StopReason::EndTurn
         });
-        let (status, _) = stop_status(&stop);
+        let (status, incomplete_details) = stop_status(&stop);
         let mut payload = self.base_payload();
-        payload.insert("response".into(), self.response_object(status, Value::Null));
+        payload.insert(
+            "response".into(),
+            self.response_object(status, incomplete_details, Value::Null),
+        );
         let event_type = finish_from_status(status);
         events.push(self.event(event_type, payload));
         events
@@ -1456,6 +1469,67 @@ mod tests {
         let value = encode_response(&resp).expect("encode");
         assert_eq!(value["status"], "incomplete");
         assert_eq!(value["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn stream_terminal_reports_the_same_incomplete_reason_as_the_response() {
+        for (stop_reason, reason) in [
+            (StopReason::MaxTokens, "max_output_tokens"),
+            (StopReason::Refusal, "content_filter"),
+        ] {
+            let resp = CoreResponse {
+                id: None,
+                model: ModelRef {
+                    requested: "m".into(),
+                    upstream: None,
+                },
+                content: vec![CoreContent::Text {
+                    text: "partial".into(),
+                    cache: None,
+                }],
+                stop_reason: stop_reason.clone(),
+                stop_sequence: None,
+                usage: Usage::synthetic_zero(),
+                provider_meta: serde_json::Map::new(),
+                cost: None,
+            };
+            let non_streaming = encode_response(&resp).expect("encode");
+            let mut encoder = StreamEncoder::new("resp_1".into(), "m".into());
+            let events = stream_events(
+                &mut encoder,
+                vec![
+                    CoreEvent::MessageStart {
+                        id: Some("resp_1".into()),
+                        model: ModelRef {
+                            requested: "m".into(),
+                            upstream: None,
+                        },
+                    },
+                    CoreEvent::ContentStart {
+                        index: 0,
+                        kind: ContentKind::Text,
+                    },
+                    CoreEvent::TextDelta {
+                        index: 0,
+                        text: "partial".into(),
+                    },
+                    CoreEvent::MessageStop {
+                        stop_reason: stop_reason.clone(),
+                        stop_sequence: None,
+                    },
+                ],
+            );
+            let terminal = events.last().cloned().unwrap_or_default();
+            assert_eq!(terminal["type"], "response.incomplete", "{stop_reason:?}");
+            assert_eq!(
+                terminal["response"]["incomplete_details"]["reason"], reason,
+                "{stop_reason:?}"
+            );
+            assert_eq!(
+                terminal["response"]["incomplete_details"], non_streaming["incomplete_details"],
+                "{stop_reason:?}: streaming and non-streaming must agree"
+            );
+        }
     }
 
     #[test]

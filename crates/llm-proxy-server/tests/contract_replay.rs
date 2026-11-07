@@ -1437,10 +1437,12 @@ mod tests {
         // skills ride as developer messages, the turn carries medium
         // effort, and the session is stored with encrypted reasoning.
         assert_eq!(upstream_body["input"][0]["role"], "developer");
-        assert!(upstream_body["input"][2]["content"][0]["text"]
-            .as_str()
-            .expect("text")
-            .starts_with("<environment_context>"));
+        assert!(
+            upstream_body["input"][2]["content"][0]["text"]
+                .as_str()
+                .expect("text")
+                .starts_with("<environment_context>")
+        );
         assert_eq!(upstream_body["reasoning"]["effort"], "medium");
         assert_eq!(upstream_body["reasoning"]["summary"], "auto");
         assert_eq!(upstream_body["store"], false);

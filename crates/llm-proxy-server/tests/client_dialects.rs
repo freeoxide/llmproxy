@@ -667,6 +667,100 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // System-role turns (an Ollama `system` message, a Responses
+    // `developer` item) reach an Anthropic upstream's system prompt.
+    // ------------------------------------------------------------------
+
+    /// The text of every top-level `system` block the upstream received.
+    fn upstream_system_texts(upstream_body: &Value) -> Vec<&str> {
+        upstream_body["system"]
+            .as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn ollama_system_message_reaches_an_anthropic_upstream() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::ChatCompletions,
+            true,
+        );
+        let app = build_router(state);
+        let request = json!({
+            "model": "llama3.1",
+            "messages": [
+                {"role": "system", "content": "you are terse"},
+                {"role": "user", "content": "weather in SF?"}
+            ],
+            "stream": false
+        });
+        let response = app
+            .oneshot(post_json("/providers/dialect-provider/api/chat", &request))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let upstream_body = captured(&upstream).await;
+        assert_eq!(
+            upstream_system_texts(&upstream_body),
+            ["you are terse"],
+            "{upstream_body}"
+        );
+        let roles: Vec<&str> = upstream_body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|message| message["role"].as_str())
+            .collect();
+        assert_eq!(roles, ["user"], "{upstream_body}");
+    }
+
+    #[tokio::test]
+    async fn responses_developer_message_reaches_an_anthropic_upstream() {
+        let upstream = spawn_fake_upstream(Behavior::AnthropicNonStream { tool_call: false }).await;
+        let state = state_with_provider(
+            &upstream,
+            "anthropic_messages",
+            ProviderRouteKind::Responses,
+            false,
+        );
+        let app = build_router(state);
+        let mut request = responses_request(false);
+        request["input"] = json!([
+            {"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "sandbox: read-only"}
+            ]},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "weather in SF?"}
+            ]}
+        ]);
+        let response = app
+            .oneshot(post_json(
+                "/providers/dialect-provider/v1/responses",
+                &request,
+            ))
+            .await
+            .expect("served");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // `instructions` stays first; the developer turn follows it.
+        let upstream_body = captured(&upstream).await;
+        assert_eq!(
+            upstream_system_texts(&upstream_body),
+            ["you are terse", "sandbox: read-only"],
+            "{upstream_body}"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Shared scenario 2: tool calls cross into each dialect's shape.
     // ------------------------------------------------------------------
 

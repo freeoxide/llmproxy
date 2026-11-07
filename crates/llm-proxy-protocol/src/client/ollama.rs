@@ -159,7 +159,7 @@ fn decode_messages(messages: &Value) -> Result<Vec<CoreMessage>, ProtocolError> 
         )));
     };
     let mut decoded = Vec::new();
-    for message in items {
+    for (message_index, message) in items.iter().enumerate() {
         let obj = message
             .as_object()
             .ok_or_else(|| ProtocolError::InvalidRequest("messages must be objects".into()))?;
@@ -202,7 +202,7 @@ fn decode_messages(messages: &Value) -> Result<Vec<CoreMessage>, ProtocolError> 
             });
             continue;
         }
-        let content = decode_message_content(obj, &decoded)?;
+        let content = decode_message_content(obj, message_index)?;
         decoded.push(CoreMessage { role, content });
     }
     // Ollama correlates tool results by order/name, not id: match each result
@@ -211,11 +211,11 @@ fn decode_messages(messages: &Value) -> Result<Vec<CoreMessage>, ProtocolError> 
     Ok(decoded)
 }
 
-/// The content blocks of one user/assistant message: text, `images` and
-/// `tool_calls` in order.
+/// The content blocks of the user/assistant message at `message_index`:
+/// text, `images` and `tool_calls` in order.
 fn decode_message_content(
     obj: &Map<String, Value>,
-    decoded: &[CoreMessage],
+    message_index: usize,
 ) -> Result<Vec<CoreContent>, ProtocolError> {
     let mut content = Vec::new();
     if let Some(text) = obj.get("content").and_then(Value::as_str)
@@ -233,15 +233,22 @@ fn decode_message_content(
                     "images entries must be base64 strings".into(),
                 ));
             };
+            // Ollama sends bare base64 with no MIME hint: label the image by
+            // its file signature. An unrecognised signature keeps the PNG
+            // label (the upstream validates the bytes), with a warning.
+            let media_type = sniff_image_media_type(data).unwrap_or_else(|| {
+                tracing::warn!("Ollama: unrecognised image signature; labelling it image/png");
+                "image/png"
+            });
             content.push(CoreContent::Image {
                 source: serde_json::json!({
-                    "type": "base64", "media_type": "image/png", "data": data,
+                    "type": "base64", "media_type": media_type, "data": data,
                 }),
             });
         }
     }
     if let Some(Value::Array(calls)) = obj.get("tool_calls") {
-        for call in calls {
+        for (call_index, call) in calls.iter().enumerate() {
             let function = call
                 .as_object()
                 .and_then(|c| c.get("function"))
@@ -265,9 +272,11 @@ fn decode_message_content(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new()));
-            // Ollama tool calls carry no id; a stable synthetic id keeps
-            // downstream adapters able to correlate results to calls.
-            let id = format!("ollama-call-{}", decoded.len());
+            // Ollama tool calls carry no id; the message and call positions
+            // give a synthetic id that is unique across the request (and
+            // stable as the conversation grows), so adapters can correlate
+            // results to calls.
+            let id = format!("ollama-call-{message_index}-{call_index}");
             content.push(CoreContent::ToolUse {
                 id,
                 name,
@@ -277,6 +286,49 @@ fn decode_message_content(
         }
     }
     Ok(content)
+}
+
+/// The media type of base64 image data, read from its file signature.
+/// Covers the formats the cross-format upstreams accept; `None` otherwise.
+fn sniff_image_media_type(data: &str) -> Option<&'static str> {
+    match decode_base64_prefix(data)? {
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P'] => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// The first 12 bytes of base64 `data`, decoded from its first 16
+/// characters: enough for a file signature, without a base64 dependency.
+fn decode_base64_prefix(data: &str) -> Option<[u8; 12]> {
+    let mut head = [0u8; 12];
+    let chars = data.as_bytes().get(..16)?;
+    for (quad, out) in chars.chunks_exact(4).zip(head.chunks_exact_mut(3)) {
+        let mut word = 0u32;
+        for &c in quad {
+            word = (word << 6) | base64_sextet(c)?;
+        }
+        let [_, b0, b1, b2] = word.to_be_bytes();
+        for (slot, byte) in out.iter_mut().zip([b0, b1, b2]) {
+            *slot = byte;
+        }
+    }
+    Some(head)
+}
+
+/// The 6-bit value of one base64 character (standard or URL-safe alphabet).
+fn base64_sextet(c: u8) -> Option<u32> {
+    let value = match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' | b'-' => 62,
+        b'/' | b'_' => 63,
+        _ => return None,
+    };
+    Some(u32::from(value))
 }
 
 /// Decode a raw `/api/chat` request body into a normalised [`CoreRequest`].
@@ -773,9 +825,76 @@ mod tests {
         match &core.messages[3].content[0] {
             CoreContent::ToolResult { tool_use_id, .. } => {
                 // The result is correlated to the call by tool name.
-                assert_eq!(tool_use_id, "ollama-call-2");
+                assert_eq!(tool_use_id, "ollama-call-2-0");
             }
             other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parallel_tool_calls_in_one_message_get_distinct_ids() {
+        // Two calls of the same tool in one assistant turn, answered in
+        // order: each call needs its own id (upstreams reject or mis-pair
+        // duplicates) and each result must land on its own call.
+        let body = serde_json::json!({
+            "model": "llama3.1",
+            "messages": [
+                {"role": "user", "content": "weather in SF and NYC?"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"function": {"name": "get_weather", "arguments": {"city": "SF"}}},
+                    {"function": {"name": "get_weather", "arguments": {"city": "NYC"}}}
+                ]},
+                {"role": "tool", "content": "72F", "tool_name": "get_weather"},
+                {"role": "tool", "content": "60F", "tool_name": "get_weather"}
+            ]
+        });
+        let core = decode_chat_request(&body).expect("decode");
+        let call_ids: Vec<&str> = core
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                CoreContent::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let result_ids: Vec<&str> = core
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                CoreContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(call_ids.len(), 2, "{call_ids:?}");
+        assert_ne!(call_ids[0], call_ids[1], "each call needs its own id");
+        assert_eq!(result_ids, call_ids, "results answer the calls in order");
+    }
+
+    #[test]
+    fn images_are_labelled_by_their_file_signature() {
+        // Ollama `images` are bare base64; upstreams that validate media
+        // types reject (or mis-decode) a JPEG labelled image/png. Each data
+        // string is the base64 of a real file header.
+        for (data, media_type) in [
+            ("iVBORw0KGgoAAAANSUhEUg==", "image/png"),
+            ("/9j/4AAQSkZJRgABAQAAAQ==", "image/jpeg"),
+            ("R0lGODlhAQABAIAAAAAAAA==", "image/gif"),
+            ("UklGRhoAAABXRUJQVlA4TA==", "image/webp"),
+        ] {
+            let body = serde_json::json!({
+                "model": "llava",
+                "messages": [{"role": "user", "content": "what is this?", "images": [data]}]
+            });
+            let core = decode_chat_request(&body).expect("decode");
+            match &core.messages[0].content[1] {
+                CoreContent::Image { source } => {
+                    assert_eq!(source["media_type"], media_type, "{data}");
+                    assert_eq!(source["data"], data, "the bytes ride unchanged");
+                }
+                other => panic!("expected Image, got {other:?}"),
+            }
         }
     }
 

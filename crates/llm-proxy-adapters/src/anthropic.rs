@@ -662,7 +662,7 @@ fn encode_normalized_request(
         target.lossy,
     )?;
 
-    let system = encode_system(&core.system);
+    let system = encode_system(&core.system, &core.messages);
     let messages = encode_messages(&core.messages);
     let tools = encode_tools_for_target(core, client, target);
     let tool_choice = encode_tool_choice_for_target(core, client);
@@ -969,12 +969,17 @@ fn encode_content_blocks(content: &[CoreContent]) -> serde_json::Value {
     serde_json::Value::Array(blocks)
 }
 
-fn encode_system(system: &[CoreContent]) -> Option<serde_json::Value> {
-    if system.is_empty() {
-        return None;
-    }
+/// The top-level `system` blocks: the core system prompt, then the content of
+/// every system-role message in conversation order. Anthropic has no system
+/// role inside `messages`, so those turns are hoisted here rather than lost.
+fn encode_system(system: &[CoreContent], messages: &[CoreMessage]) -> Option<serde_json::Value> {
+    let hoisted = messages
+        .iter()
+        .filter(|msg| msg.role == CoreRole::System)
+        .flat_map(|msg| &msg.content);
     let blocks: Vec<serde_json::Value> = system
         .iter()
+        .chain(hoisted)
         .filter_map(|c| match c {
             CoreContent::Text { text, cache } => {
                 if text.is_empty() {
@@ -1024,13 +1029,8 @@ fn encode_messages(core_messages: &[CoreMessage]) -> Vec<serde_json::Value> {
                     "content": content,
                 }));
             }
-            CoreRole::System => {
-                tracing::warn!(
-                    role = "system",
-                    "Anthropic adapter received system-role message in messages; \
-                     dropping because Anthropic does not support system role in messages"
-                );
-            }
+            // Hoisted into the top-level `system` by `encode_system`.
+            CoreRole::System => {}
             CoreRole::Tool => {
                 let content = encode_content_blocks(&msg.content);
                 messages.push(serde_json::json!({
@@ -1417,6 +1417,60 @@ mod tests {
 
         let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).unwrap();
         assert!(body.get("system").is_some());
+    }
+
+    #[test]
+    fn system_role_messages_are_hoisted_into_the_system_prompt() {
+        // Ollama `system` messages, Gemini `system` contents and Responses
+        // `developer` items decode as inline system-role messages. Anthropic
+        // has no system role in `messages`, so their text must reach the
+        // top-level system (after the core prompt, in order), not vanish.
+        let text = |text: &str| CoreContent::Text {
+            text: text.into(),
+            cache: None,
+        };
+        let mut core = make_core_request(vec![
+            CoreMessage {
+                role: CoreRole::System,
+                content: vec![text("be terse")],
+            },
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![text("hi")],
+            },
+            CoreMessage {
+                role: CoreRole::Assistant,
+                content: vec![text("hello")],
+            },
+            CoreMessage {
+                role: CoreRole::System,
+                content: vec![text("answer in French")],
+            },
+            CoreMessage {
+                role: CoreRole::User,
+                content: vec![text("and now?")],
+            },
+        ]);
+        core.system = vec![text("You are helpful")];
+        let proxy_req = AnthropicAdapter::new()
+            .encode_request(&core, &make_target(), &chat_client(&core))
+            .expect("encode");
+
+        let body: serde_json::Value = serde_json::from_slice(&proxy_req.body).expect("json body");
+        let system: Vec<&str> = body["system"]
+            .as_array()
+            .expect("system blocks")
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect();
+        assert_eq!(system, ["You are helpful", "be terse", "answer in French"]);
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter_map(|message| message["role"].as_str())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
     }
 
     #[test]

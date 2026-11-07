@@ -90,7 +90,7 @@ pub fn decode_request(
                 "contents must not be empty".into(),
             ));
         }
-        for content in items {
+        for (content_index, content) in items.iter().enumerate() {
             let content_obj = content.as_object().ok_or_else(|| {
                 ProtocolError::InvalidRequest(format!(
                     "contents entries must be objects, found {}",
@@ -117,8 +117,8 @@ pub fn decode_request(
                 .cloned()
                 .unwrap_or_default();
             let mut blocks = Vec::new();
-            for part in parts {
-                decode_part(&part, &mut blocks)?;
+            for (part_index, part) in parts.iter().enumerate() {
+                decode_part(part, content_index, part_index, &mut blocks)?;
             }
             messages.push(CoreMessage {
                 role,
@@ -151,7 +151,13 @@ pub fn decode_request(
     })
 }
 
-fn decode_part(part: &Value, blocks: &mut Vec<CoreContent>) -> Result<(), ProtocolError> {
+/// Decode the part at `parts[part_index]` of `contents[content_index]`.
+fn decode_part(
+    part: &Value,
+    content_index: usize,
+    part_index: usize,
+    blocks: &mut Vec<CoreContent>,
+) -> Result<(), ProtocolError> {
     let obj = part.as_object().ok_or_else(|| {
         ProtocolError::InvalidRequest(format!(
             "parts must be objects, found {}",
@@ -173,9 +179,11 @@ fn decode_part(part: &Value, blocks: &mut Vec<CoreContent>) -> Result<(), Protoc
             .get("args")
             .cloned()
             .unwrap_or_else(|| Value::Object(Map::new()));
-        // Gemini tool calls carry no id; a stable synthetic id keeps the core
-        // (and any provider adapter) able to correlate results to calls.
-        let id = format!("gemini_call_{}", blocks.len());
+        // Gemini tool calls carry no id; the content and part positions give
+        // a synthetic id that is unique across the request (and stable as
+        // the conversation grows), so the core and any provider adapter can
+        // correlate results to calls.
+        let id = format!("gemini_call_{content_index}_{part_index}");
         blocks.push(CoreContent::ToolUse {
             id,
             name: name.to_owned(),
@@ -693,7 +701,7 @@ mod tests {
         match &core.messages[2].content[0] {
             CoreContent::ToolResult { tool_use_id, .. } => {
                 // The result is correlated to the replayed call by name.
-                assert_eq!(tool_use_id, "gemini_call_0");
+                assert_eq!(tool_use_id, "gemini_call_1_0");
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
@@ -702,6 +710,56 @@ mod tests {
             Some(CoreToolChoice::Tool { ref name }) if name == "get_weather"
         ));
         assert_eq!(core.tools.len(), 1);
+    }
+
+    #[test]
+    fn function_calls_in_different_turns_get_distinct_ids() {
+        // Normal multi-turn tool traffic: every model turn's call sits at
+        // part 0. The calls need distinct ids across the request (upstreams
+        // reject or mis-pair duplicates), and each functionResponse must
+        // land on the call of its own turn.
+        let body = serde_json::json!({
+            "contents": [
+                {"role": "user", "parts": [{"text": "weather in SF, then the time?"}]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "get_weather", "args": {"city": "SF"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "get_weather", "response": {"temp": 72}}}
+                ]},
+                {"role": "model", "parts": [
+                    {"functionCall": {"name": "get_time", "args": {"city": "SF"}}}
+                ]},
+                {"role": "user", "parts": [
+                    {"functionResponse": {"name": "get_time", "response": {"time": "09:00"}}}
+                ]}
+            ]
+        });
+        let core = decode_request(&body, "gemini-2.5-pro", false).expect("decode");
+        let call_ids: Vec<&str> = core
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                CoreContent::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let result_ids: Vec<&str> = core
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                CoreContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(call_ids.len(), 2, "{call_ids:?}");
+        assert_ne!(call_ids[0], call_ids[1], "each call needs its own id");
+        assert_eq!(
+            result_ids, call_ids,
+            "each result answers its own turn's call"
+        );
     }
 
     #[test]
