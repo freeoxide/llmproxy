@@ -21,6 +21,10 @@ use crate::state::init_tracing;
 /// before the subscriber is built so `server.log_format` is honoured
 /// (BUG-25, with `RUST_LOG_FORMAT` still winning), then the state —
 /// providers, auth, ledger, replica stores — comes up from it.
+#[expect(
+    clippy::unused_async,
+    reason = "the state loader is async so the replica stores can connect during it"
+)]
 async fn load_serve_state(
     path: &Path,
     port_override: Option<u16>,
@@ -72,18 +76,7 @@ pub async fn cmd_serve(
         return spawn_in_background(config_path.as_deref(), port_override);
     }
 
-    // BUG-25: the config loads before the subscriber is built, so
-    // `server.log_format` is honoured; a set `RUST_LOG_FORMAT` still wins
-    // (see `startup_log_format`).
-    let app_config = llm_proxy_core::load_app_config(&path)
-        .with_context(|| format!("loading TOML config from {}", path.display()))?;
-    let app_config = apply_port_override(app_config, port_override);
-    init_tracing(&crate::state::startup_log_format(&app_config));
-
-    let adapter_registry = ProviderAdapterRegistry::builtin();
-
-    let state =
-        crate::state::load_toml_state_from_config(app_config, &path, adapter_registry).await?;
+    let state = load_serve_state(&path, port_override).await?;
 
     let admin = bind_admin_listener(&state).await?;
     let mcp = bind_mcp_gateway(&state).await?;
