@@ -4,7 +4,20 @@
 // native structured results into thrown ProxyErrors and an async-iterable
 // stream. No engine logic lives here.
 
-const native = require('./binding.js');
+let native;
+try {
+  native = require('./binding.js');
+} catch (error) {
+  // The generated loader prefers the msvc binary and only tries the gnu one
+  // on GNU-built node distributions; this package ships the gnu binary, so
+  // fall back to it before giving up (it loads in MSVC-built node too — the
+  // napi boundary is a plain C ABI).
+  try {
+    native = require('./llm-proxy.win32-x64-gnu.node');
+  } catch {
+    throw error;
+  }
+}
 
 class ProxyError extends Error {
   constructor(info) {

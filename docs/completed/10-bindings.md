@@ -55,9 +55,12 @@ the engine and add no logic of their own, so they start once its API has stopped
   built here: `llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl`
   (installed into a fresh venv whose `pip install` runs no Rust; 13 pytest
   tests pass against the installed wheel) and
-  `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation;
-  verified as a PE module importing `python3.dll`, but built-not-run — no
-  Windows host here). macOS wheels need CI runners with Apple toolchains.
+  `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation),
+  which is run-verified with the embeddable Windows CPython 3.13.5 under
+  wine 10.0: every shared-contract case, the error shape, streaming,
+  cancellation and the `ClientCancelled` settlement pass
+  (`bindings/python/tests/windows_driver.py`). macOS wheels need CI runners
+  with Apple toolchains.
 - **Node package (step 3).** `bindings/node`: napi-rs + `@napi-rs/cli`
   (`napi build --platform --release`). The native module returns structured
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
@@ -69,8 +72,11 @@ the engine and add no logic of their own, so they start once its API has stopped
   Windows x64 binary (`llm-proxy.win32-x64-gnu.node`) is produced by
   mingw-w64 cross-compilation — the napi import library generated from the
   official `node.exe` exports (objdump export table → dlltool) — and
-  verified as a PE module importing the `napi_*` symbols from `node.exe`;
-  built-not-run on this machine. The npm name is scoped
+  run-verified: the full 13-test contract suite passes under wine 10.0 with
+  the official node-v20.19.2 win-x64 `node.exe`, and `index.js` gained a
+  fallback that loads the gnu binary when the generated loader's msvc-first
+  path finds no msvc binary (official node.exe is MSVC-built). The npm name
+  is scoped
   (`@freeoxide/llm-proxy`) because the unscoped `llm-proxy` on npm belongs
   to an unrelated package. macOS binaries need CI runners with Apple
   toolchains.

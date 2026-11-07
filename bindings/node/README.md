@@ -28,8 +28,16 @@ the napi import library is generated from the official `node.exe` exports
 
 (`RUSTC_WRAPPER=` disables the host's rustc cache, which does not handle
 cross-compiler names.) The Windows binary links against `node.exe`'s
-`napi_*` exports and is built, not run, on this machine; an msvc build and
-macOS binaries are left to CI runners with those toolchains.
+`napi_*` exports; `index.js` falls back to it when the generated loader's
+msvc-first path finds no msvc binary (official node.exe is MSVC-built, and
+the gnu binary loads there too — the napi boundary is a plain C ABI).
+Run-verified under wine 10.0 with the official node-v20.19.2 win-x64
+`node.exe`:
+
+    wine <node.exe> test/bindings.test.js   # 13/13 with llm-proxy.win32-x64-gnu.node
+
+An msvc build and macOS binaries are left to CI runners with those
+toolchains.
 
 ## Use
 
