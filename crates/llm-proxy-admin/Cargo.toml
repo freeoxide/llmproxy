@@ -29,9 +29,7 @@ humantime = "2.3"
 time = { workspace = true }
 tokio = { workspace = true }
 tower-http = { version = "0.6", features = ["set-header", "trace", "catch-panic"] }
-tracing = { workspace = true }
 
 [dev-dependencies]
 llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }
-tempfile = "3"
 tower = { workspace = true, features = ["util"] }
