@@ -451,22 +451,9 @@ impl ProviderRegistry {
         })?;
 
         let adapter_name = provider.routes.get(route_kind).ok_or_else(|| {
-            let route_name = match route_kind {
-                ProviderRouteKind::ChatCompletions => "chat_completions",
-                ProviderRouteKind::Messages => "messages",
-                ProviderRouteKind::Responses => "responses",
-                ProviderRouteKind::GenerateContent => "generate_content",
-                ProviderRouteKind::Embeddings => "embeddings",
-                ProviderRouteKind::Rerank => "rerank",
-                ProviderRouteKind::AudioTranscriptions => "audio_transcriptions",
-                ProviderRouteKind::AudioSpeech => "audio_speech",
-                ProviderRouteKind::ImagesGenerations => "images_generations",
-                ProviderRouteKind::Files => "files",
-                ProviderRouteKind::Batches => "batches",
-            };
             ProviderRouteResolutionError::UnsupportedRoute {
                 provider: provider.name.clone(),
-                route: route_name,
+                route: route_kind.config_key(),
             }
         })?;
 

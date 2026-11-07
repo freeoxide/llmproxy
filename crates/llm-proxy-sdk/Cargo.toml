@@ -23,6 +23,8 @@ sqlite = ["llm-proxy-storage/sqlite"]
 admin = ["llm-proxy-server/admin"]
 # The semantic response cache (plan 09 step 5).
 semantic-cache = ["llm-proxy-server/semantic-cache"]
+# The non-chat endpoint families on the router (plan 09 step 7).
+endpoint-families = ["llm-proxy-server/endpoint-families"]
 # Everything the standalone daemon needs.
 full = ["server", "sqlite", "admin"]
 

@@ -31,12 +31,21 @@ crates/llm-proxy-mcp               MCP gateway ([mcp], own tokens)
 A bare `cargo build` compiles none of them (they sit outside
 `default-members`); `cargo build --workspace` builds everything.
 
-Live integration suites for the replica stores and the MCP gateway ship
-`#[ignore]`d so the default test run needs no servers; set
-`LLM_PROXY_TEST_REDIS`, `LLM_PROXY_TEST_POSTGRES` or
+The non-chat endpoint families (embeddings, rerank, audio, images, files
+and batches) are a daemon feature too: build with
+`--features endpoint-families` and map them in `[provider.routes]`
+(`embeddings`, `rerank`, `audio_transcriptions`, `audio_speech`,
+`images_generations`, `files`, `batches`). A provider that routes a
+family in a build without the feature refuses to start.
+
+Live integration suites for the replica stores, the MCP gateway and the
+endpoint families ship `#[ignore]`d so the default test run needs no
+servers; set `LLM_PROXY_TEST_REDIS`, `LLM_PROXY_TEST_POSTGRES`,
 `LLM_PROXY_TEST_MCP_UPSTREAM` (plus `LLM_PROXY_TEST_MCP_CLIENT` to also
-drive the gateway from the official MCP Inspector CLI) and run the
-matching crate's tests with `-- --ignored`.
+drive the gateway from the official MCP Inspector CLI) or the
+`LLM_PROXY_TEST_*_URL` variables listed in
+`crates/llm-proxy-server/tests/live_families.rs`, and run the matching
+crate's tests with `-- --ignored`.
 
 ## Build
 

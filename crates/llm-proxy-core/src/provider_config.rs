@@ -1509,6 +1509,41 @@ pub enum ProviderRouteKind {
     Batches,
 }
 
+impl ProviderRouteKind {
+    /// Every route kind, in `[provider.routes]` declaration order.
+    pub const ALL: [Self; 11] = [
+        Self::ChatCompletions,
+        Self::Messages,
+        Self::Responses,
+        Self::GenerateContent,
+        Self::Embeddings,
+        Self::Rerank,
+        Self::AudioTranscriptions,
+        Self::AudioSpeech,
+        Self::ImagesGenerations,
+        Self::Files,
+        Self::Batches,
+    ];
+
+    /// This kind's key in `[provider.routes]`.
+    #[must_use]
+    pub const fn config_key(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Messages => "messages",
+            Self::Responses => "responses",
+            Self::GenerateContent => "generate_content",
+            Self::Embeddings => "embeddings",
+            Self::Rerank => "rerank",
+            Self::AudioTranscriptions => "audio_transcriptions",
+            Self::AudioSpeech => "audio_speech",
+            Self::ImagesGenerations => "images_generations",
+            Self::Files => "files",
+            Self::Batches => "batches",
+        }
+    }
+}
+
 /// Maps [`ProviderRouteKind`] to adapter names within a provider.
 ///
 /// Defined in TOML as:
@@ -3292,6 +3327,25 @@ pub fn load_provider_config(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn each_route_kind_is_listed_once_under_its_toml_key() {
+        let mut seen = std::collections::HashSet::new();
+        for kind in ProviderRouteKind::ALL {
+            assert!(seen.insert(kind), "{kind:?} listed twice");
+            // The key is the one [provider.routes] actually parses
+            // (unknown keys are refused), and it reaches this kind.
+            let routes: ProviderRoutesConfig =
+                toml::from_str(&format!("{} = \"adapter\"", kind.config_key()))
+                    .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            assert_eq!(routes.get(kind), Some("adapter"), "{kind:?}");
+            let others = ProviderRouteKind::ALL
+                .iter()
+                .filter(|other| routes.get(**other).is_some())
+                .count();
+            assert_eq!(others, 1, "{kind:?}'s key sets only {kind:?}");
+        }
+    }
 
     #[test]
     fn passthrough_providers_with_client_keys_are_refused() {

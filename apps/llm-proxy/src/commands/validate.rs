@@ -69,17 +69,11 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
         println!("  (none)");
     } else {
         for provider in registry.iter() {
-            let route_count = provider
-                .routes
-                .chat_completions
-                .iter()
-                .chain(provider.routes.messages.iter())
-                .count();
             println!(
                 "  {} ({} adapters, {} routes, {} aliases)",
                 provider.name,
                 provider.adapters.len(),
-                route_count,
+                configured_routes(provider).len(),
                 provider.model_aliases.len()
             );
         }
@@ -118,17 +112,24 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Every route `provider` configures, as (`[provider.routes]` key, adapter
+/// name), in declaration order.
+fn configured_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<(&'static str, &str)> {
+    llm_proxy_core::ProviderRouteKind::ALL
+        .iter()
+        .filter_map(|kind| {
+            provider
+                .routes
+                .get(*kind)
+                .map(|adapter| (kind.config_key(), adapter))
+        })
+        .collect()
+}
+
 fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<String> {
     println!("{}:", provider.name);
 
-    let route_entries: Vec<(&str, &String)> = provider
-        .routes
-        .chat_completions
-        .as_ref()
-        .map(|a| ("chat_completions", a))
-        .into_iter()
-        .chain(provider.routes.messages.as_ref().map(|a| ("messages", a)))
-        .collect();
+    let route_entries = configured_routes(provider);
 
     if route_entries.is_empty() {
         println!("  (no routes configured)");
@@ -152,6 +153,41 @@ fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<Strin
 mod tests {
     use super::*;
     use crate::defaults::DEFAULT_CONFIG_TOML;
+
+    #[test]
+    fn validate_lists_every_configured_route_kind() {
+        // A provider routing a dialect route and two endpoint families:
+        // all three are listed (and counted), not only chat and messages.
+        let provider: llm_proxy_core::ProviderConfig = toml::from_str::<toml::Table>(
+            r#"[provider]
+name = "mixed"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.resp]
+protocol = "openai_responses"
+endpoint = "http://127.0.0.1:9/v1/responses"
+[provider.adapters.embed]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/embeddings"
+[provider.routes]
+responses = "resp"
+embeddings = "embed"
+batches = "embed"
+"#,
+        )
+        .ok()
+        .and_then(|table| table.get("provider").cloned())
+        .and_then(|provider| provider.try_into().ok())
+        .expect("provider parses");
+        assert_eq!(
+            configured_routes(&provider),
+            vec![
+                ("responses", "resp"),
+                ("embeddings", "embed"),
+                ("batches", "embed")
+            ]
+        );
+    }
 
     #[test]
     fn cmd_validate_valid_config_file() {

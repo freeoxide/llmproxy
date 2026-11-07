@@ -156,8 +156,10 @@ impl ProxyClient {
 
     fn build_request(
         &self,
+        method: reqwest::Method,
         req: &ProxyRequest,
         accept_event_stream: bool,
+        default_json_content_type: bool,
     ) -> reqwest::RequestBuilder {
         // The JSON default applies only when the caller did not pick a
         // content type: family handlers (plan 09 step 7) forward audio
@@ -166,28 +168,27 @@ impl ProxyClient {
             .extra_headers
             .get("content-type")
             .or_else(|| req.forwarded_headers.get("content-type"));
-        // The JSON default applies only when the caller did not pick a
-        // content type: family handlers (plan 09 step 7) forward audio
-        // and file bodies with the client's own multipart or binary type.
-        let builder = self.http.post(&req.url);
+        let builder = self.http.request(method, &req.url);
         // Self-loop marker (backlog 32): any llm-proxy that receives a
         // request already carrying it is forwarding to itself and
         // answers 508 instead of looping.
         let builder = builder.header(llm_proxy_core::HOP_HEADER, llm_proxy_core::HOP_HEADER_VALUE);
         let builder = match caller_content_type {
             Some(content_type) => builder.header("Content-Type", content_type),
-            None => builder.header("Content-Type", "application/json"),
+            None if default_json_content_type => builder.header("Content-Type", "application/json"),
+            None => builder,
         };
         let mut builder = builder;
         if accept_event_stream {
             builder = builder.header("Accept", "text/event-stream");
         }
         builder = apply_auth(builder, &req.auth);
-        for (name, value) in &req.forwarded_headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        for (name, value) in &req.extra_headers {
-            builder = builder.header(name.as_str(), value.as_str());
+        // Content-Type is a singleton field and was set once above; the
+        // builder appends, so copying it again here would send it twice.
+        for (name, value) in req.forwarded_headers.iter().chain(&req.extra_headers) {
+            if !name.eq_ignore_ascii_case("content-type") {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
         }
         builder
     }
@@ -195,7 +196,7 @@ impl ProxyClient {
     /// Sends a non-streaming request and returns the response body bytes.
     /// Sets `Content-Type: application/json` but not `Accept: text/event-stream`.
     pub async fn send(&self, req: ProxyRequest) -> Result<Vec<u8>, ProviderError> {
-        let builder = self.build_request(&req, false);
+        let builder = self.build_request(reqwest::Method::POST, &req, false, true);
 
         let resp =
             tokio::time::timeout(self.upstream_headers_timeout, builder.body(req.body).send())
@@ -224,7 +225,7 @@ impl ProxyClient {
         Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send + 'static>>,
         ProviderError,
     > {
-        let builder = self.build_request(&req, true);
+        let builder = self.build_request(reqwest::Method::POST, &req, true, true);
 
         let resp =
             tokio::time::timeout(self.upstream_headers_timeout, builder.body(req.body).send())
@@ -257,6 +258,90 @@ impl ProxyClient {
             self.stream_idle_timeout,
         )))
     }
+
+    /// Sends a non-streaming request with the caller's method and returns
+    /// the upstream's whole answer: its success status, the headers that
+    /// describe the body, and the body. For pass-through handlers (the
+    /// non-chat endpoint families, plan 09 step 7) whose clients read the
+    /// provider's own format: a `GET` file download or an audio body must
+    /// keep its status and content type.
+    ///
+    /// A bodiless request sends no body and no `Content-Type`; any other
+    /// request without a caller content type is sent as JSON. Status >= 400
+    /// is a [`ProviderError::Api`], exactly as for [`Self::send`].
+    ///
+    /// # Errors
+    ///
+    /// [`ProviderError`] for transport failures, the headers deadline, and
+    /// upstream error statuses.
+    pub async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        req: ProxyRequest,
+    ) -> Result<UpstreamResponse, ProviderError> {
+        let bodiless = req.body.is_empty()
+            && matches!(
+                method,
+                reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::DELETE
+            );
+        let builder = self.build_request(method, &req, false, !req.body.is_empty());
+        let builder = if bodiless {
+            builder
+        } else {
+            builder.body(req.body)
+        };
+
+        let resp = tokio::time::timeout(self.upstream_headers_timeout, builder.send())
+            .await
+            .map_err(|elapsed| ProviderError::Http {
+                message: format!(
+                    "upstream request timed out waiting for response headers within \
+                 {}s (upstream headers timeout): {elapsed}; aborting to avoid an \
+                 open-ended stall (audit transport-no-upstream-timeout)",
+                    self.upstream_headers_timeout.as_secs()
+                ),
+                timeout: true,
+                redirect: false,
+            })
+            .and_then(|result| result.map_err(provider_error_from_reqwest))?;
+
+        if resp.status().as_u16() >= 400 {
+            let status = resp.status().as_u16();
+            let headers = error_headers(&resp);
+            let body_text = read_error_body_bounded(resp, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+            return Err(ProviderError::api_with_headers(status, body_text, headers));
+        }
+        let header = |name: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let status = resp.status().as_u16();
+        let content_type = header(reqwest::header::CONTENT_TYPE);
+        let content_disposition = header(reqwest::header::CONTENT_DISPOSITION);
+        let body = resp.bytes().await.map_err(provider_error_from_reqwest)?;
+        Ok(UpstreamResponse {
+            status,
+            content_type,
+            content_disposition,
+            body: body.to_vec(),
+        })
+    }
+}
+
+/// A complete upstream answer from [`ProxyClient::send_raw`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UpstreamResponse {
+    /// The upstream's success status (below 400).
+    pub status: u16,
+    /// The upstream's `Content-Type`, when it sent one.
+    pub content_type: Option<String>,
+    /// The upstream's `Content-Disposition` (file downloads), when sent.
+    pub content_disposition: Option<String>,
+    /// The complete response body.
+    pub body: Vec<u8>,
 }
 
 struct IdleTimeoutStream {
@@ -635,6 +720,153 @@ mod tests {
             text.contains("x-llm-proxy-hop: 1"),
             "the upstream must see the hop marker, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_caller_content_type_is_sent_exactly_once() {
+        // Content-Type is a singleton field: a family handler's multipart
+        // type must reach the upstream once, not once per header source.
+        async fn content_types(headers: HeaderMap) -> String {
+            headers
+                .get_all("content-type")
+                .iter()
+                .map(|value| value.to_str().unwrap_or("?").to_owned())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+        let base = start_test_server(Router::new().route("/test", post(content_types))).await;
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert(
+            "content-type".to_owned(),
+            "multipart/form-data; boundary=abc".to_owned(),
+        );
+        let req = ProxyRequest {
+            url: format!("{base}/test"),
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: SecretString::from("key"),
+            },
+            body: b"--abc--\r\n".to_vec(),
+            stream: false,
+            extra_headers,
+            forwarded_headers: std::collections::HashMap::new(),
+        };
+        let seen = ProxyClient::new().send(req).await.unwrap();
+        assert_eq!(
+            String::from_utf8(seen).unwrap(),
+            "multipart/form-data; boundary=abc"
+        );
+    }
+
+    fn raw_request(url: String, body: &[u8]) -> ProxyRequest {
+        ProxyRequest {
+            url,
+            auth: AuthHeaders {
+                style: AuthStyle::Bearer,
+                api_key: SecretString::from("key"),
+            },
+            body: body.to_vec(),
+            stream: false,
+            extra_headers: std::collections::HashMap::new(),
+            forwarded_headers: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_raw_uses_the_callers_method_and_keeps_the_upstreams_content_headers() {
+        // What the upstream saw, answered with a file-download shape.
+        async fn describe(
+            method: axum::http::Method,
+            headers: HeaderMap,
+            body: bytes::Bytes,
+        ) -> impl IntoResponse {
+            let seen = format!(
+                "{method} content-types={} body={}",
+                headers.get_all("content-type").iter().count(),
+                body.len()
+            );
+            (
+                StatusCode::CREATED,
+                [
+                    ("content-type", "audio/wav"),
+                    ("content-disposition", "attachment; filename=\"a.wav\""),
+                ],
+                seen,
+            )
+        }
+        let app = Router::new().route(
+            "/res",
+            axum::routing::get(describe).delete(describe).post(describe),
+        );
+        let base = start_test_server(app).await;
+        let client = ProxyClient::new();
+
+        let got = client
+            .send_raw(
+                reqwest::Method::GET,
+                raw_request(format!("{base}/res"), b""),
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.status, 201, "the upstream's own success status");
+        assert_eq!(got.content_type.as_deref(), Some("audio/wav"));
+        assert_eq!(
+            got.content_disposition.as_deref(),
+            Some("attachment; filename=\"a.wav\"")
+        );
+        assert_eq!(
+            String::from_utf8(got.body).unwrap(),
+            "GET content-types=0 body=0",
+            "a bodiless GET carries no body and no content type"
+        );
+
+        let deleted = client
+            .send_raw(
+                reqwest::Method::DELETE,
+                raw_request(format!("{base}/res"), b""),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(deleted.body).unwrap(),
+            "DELETE content-types=0 body=0"
+        );
+
+        let posted = client
+            .send_raw(
+                reqwest::Method::POST,
+                raw_request(format!("{base}/res"), br#"{"a":1}"#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(posted.body).unwrap(),
+            "POST content-types=1 body=7",
+            "a body without a caller type is sent once as JSON"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_raw_reports_an_error_status_as_an_api_error() {
+        let app = Router::new().route(
+            "/gone",
+            axum::routing::get(|| async { (StatusCode::NOT_FOUND, r#"{"error":"no such file"}"#) }),
+        );
+        let base = start_test_server(app).await;
+        let error = ProxyClient::new()
+            .send_raw(
+                reqwest::Method::GET,
+                raw_request(format!("{base}/gone"), b""),
+            )
+            .await
+            .unwrap_err();
+        match error {
+            ProviderError::Api { status, body, .. } => {
+                assert_eq!(status, 404);
+                assert!(body.contains("no such file"), "{body}");
+            }
+            other => panic!("expected an API error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

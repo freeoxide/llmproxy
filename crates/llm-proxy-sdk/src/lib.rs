@@ -47,8 +47,9 @@
 //!
 //! Cargo features: `server` (the axum binding, default), `sqlite` (the
 //! persistent ledger, default), `admin` (the read-only usage API),
-//! `semantic-cache` (the optional semantic cache, plan 09 step 5). With
-//! all defaults off you get the engine, adapters and transport only.
+//! `semantic-cache` (the optional semantic cache, plan 09 step 5),
+//! `endpoint-families` (the non-chat routes, plan 09 step 7). With all
+//! defaults off you get the engine, adapters and transport only.
 
 #![deny(missing_docs)]
 

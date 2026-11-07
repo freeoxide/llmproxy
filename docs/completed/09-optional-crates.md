@@ -97,14 +97,25 @@ unless real use says otherwise.
   headers. The daemon binds it from `[mcp]` behind `mcp-gateway`;
   tests run against in-repo fake upstream MCP servers.
 - Non-chat families (step 7, conflict 16) behind the server's
-  `endpoint-families` feature: embeddings, rerank, audio
-  transcriptions/speech, images, files and batch, each a family-specific
-  handler (new `ProviderRouteKind` variants, per-family
-  `[server.endpoint_families]` limits) around the generic spine — the
-  same registry routing, admission, transport and ledger as chat, never
-  forced through the chat core. JSON families get the one surgical edit
-  (model aliasing, unknown fields preserved); audio and file bodies pass
-  through verbatim with the client's content type.
+  `endpoint-families` feature (also exposed by the daemon and the SDK;
+  a provider that routes a family in a build without it refuses to
+  start): embeddings, rerank, audio transcriptions/speech, images, files
+  and batch, each a family-specific handler (new `ProviderRouteKind`
+  variants, per-family `[server.endpoint_families]` limits) around the
+  generic spine — the same registry routing, admission, credential
+  choice (including `passthrough_auth`), `[provider.egress]` transport
+  and ledger as chat, never forced through the chat core. JSON families
+  (speech included) get the one surgical edit (model aliasing, unknown
+  fields preserved); multipart uploads pass through verbatim with the
+  client's content type. The client's method and query reach the
+  upstream (`GET`/`DELETE` on files, list/retrieve/cancel on batches); a
+  resource path must be plain identifier segments, so nothing can resolve
+  outside the family's endpoint; answers keep the upstream's status,
+  `Content-Type` and `Content-Disposition`. Failures follow the one
+  client-status policy, plus one stated rule: an upstream `404` on a
+  request that names a resource is that resource's absence (`404`), not
+  an upstream fault. Family calls use the provider's base key; extra
+  pool keys are not rotated on these routes.
 - Live-server verification: a Docker daemon was available, so both
   replica stores ran against the real servers — Redis 7
   (`LLM_PROXY_TEST_REDIS`, `tests/live_server.rs`: two instances enforce
@@ -137,8 +148,29 @@ unless real use says otherwise.
   initialization-era client (like the Inspector) rejects such a server,
   so the negotiated revision is now echoed, exactly as the reference
   server does. The admin `/mcp` endpoint gained the same negotiation.
-- Verification gap that remains, recorded here rather than hidden: the
-  non-chat families were verified against loopback fakes per family
-  (model aliasing, provider credential, verbatim audio/file bytes,
-  usage rows, 404 on an unconfigured family) — no live LLM provider was
-  contacted, since this environment has no upstream API keys.
+- Live family verification, against real implementations of each
+  family's wire API run locally: llama.cpp `llama-server` (embeddings,
+  rerank), speaches (Kokoro speech, faster-whisper transcription),
+  stable-diffusion.cpp `sd-server` (images) and Llama Stack 0.7.3
+  (`inline::localfs` files, `inline::reference` batches answered by a
+  llama.cpp chat model). `tests/live_families.rs` runs every family
+  through the router (`LLM_PROXY_TEST_EMBEDDINGS_URL`,
+  `LLM_PROXY_TEST_RERANK_URL`, `LLM_PROXY_TEST_AUDIO_URL`,
+  `LLM_PROXY_TEST_IMAGES_URL`, `LLM_PROXY_TEST_FILES_URL`; `#[ignore]`d
+  without them), and the daemon binary was driven end to end by the
+  official OpenAI Python SDK (every family, including the whole
+  upload/list/download/batch/delete lifecycle) and the Cohere SDK
+  (rerank). The live runs found bugs the loopback fakes could not, each
+  fixed with a regression test that failed first: files and batches
+  served only `POST`, so their lifecycle was unreachable; speech bodies
+  were not aliased and its audio was relabelled `application/json`;
+  every upstream failure became a `502` carrying the upstream's error
+  body; a resource path such as `..%2F..%2Fchat%2Fcompletions` reached
+  other upstream paths on the operator's key; family calls ignored
+  `[provider.egress]` and `passthrough_auth`; a caller content type was
+  sent twice; the daemon had no way to enable the families; and
+  `llm-proxy validate` listed only chat and messages routes.
+- Not verified: hosted providers' own endpoints (OpenAI, Cohere and the
+  like). This environment has no upstream API keys, so the families were
+  verified against the self-hosted servers above, which implement the
+  same documented wire APIs.

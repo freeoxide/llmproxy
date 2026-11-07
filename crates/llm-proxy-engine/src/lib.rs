@@ -281,6 +281,15 @@ impl Engine {
         &self.inner.adapters
     }
 
+    /// The transport clients this engine sends with: handlers that egress
+    /// outside the chat lifecycle (the non-chat endpoint families, plan 09
+    /// step 7) pick a provider's client here, so `[provider.egress]`
+    /// governs every surface and follows hot reloads with the engine.
+    #[must_use]
+    pub fn transport(&self) -> &TransportTable {
+        &self.inner.transport
+    }
+
     /// The model catalog service (discovery cache and enforcement).
     #[must_use]
     pub fn catalogs(&self) -> &ModelCatalogService {

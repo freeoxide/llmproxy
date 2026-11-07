@@ -35,6 +35,10 @@ semantic-cache = ["llm-proxy-server/semantic-cache"]
 # The MCP gateway (plan 09 step 6): `[mcp]` starts it on its own
 # listener with its own tokens.
 mcp-gateway = ["dep:llm-proxy-mcp"]
+# The non-chat endpoint families (plan 09 step 7): embeddings, rerank,
+# audio, images, files and batches. Provider routes naming a family
+# refuse to start without it.
+endpoint-families = ["llm-proxy-server/endpoint-families"]
 
 [dependencies]
 llm-proxy-server = { workspace = true, features = ["admin"] }

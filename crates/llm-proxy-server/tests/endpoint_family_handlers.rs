@@ -3,7 +3,12 @@
 //! registry, admits through the same step the chat pipeline uses,
 //! forwards with the provider's credential and the surgical edit (model
 //! aliasing), and writes usage rows. Audio and file bodies pass through
-//! verbatim; unknown JSON fields survive.
+//! verbatim; unknown JSON fields survive. Requests keep the client's
+//! method and query, answers keep the upstream's status and content
+//! type, and upstream failures follow the one client-status policy.
+//!
+//! The fake upstream answers the way the real implementations do (see
+//! `live_families.rs`, which runs the same shapes against them).
 
 #![cfg(test)]
 #![cfg(feature = "endpoint-families")]
@@ -14,8 +19,8 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::http::{Request, StatusCode, header};
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{
     AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
@@ -27,43 +32,126 @@ use llm_proxy_transport::ProxyClient;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
-/// Records one (path, auth, content_type, body) per upstream request.
-type Capture = Arc<Mutex<Vec<(String, String, String, Bytes)>>>;
+/// One request as the upstream saw it.
+#[derive(Debug, Clone)]
+struct Seen {
+    method: Method,
+    path: String,
+    query: Option<String>,
+    auth: String,
+    content_types: Vec<String>,
+    body: Bytes,
+}
+
+type Capture = Arc<Mutex<Vec<Seen>>>;
+
+/// What the fake answers for a path: the real servers' shapes for the
+/// families, and scripted failures for the paths that name one.
+fn answer(path: &str) -> Response {
+    let json = |status: StatusCode, body: &'static str| {
+        (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+    };
+    if path.ends_with("audio/speech") {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "audio/wav")],
+            &b"RIFF\x24\x00\x00\x00WAVEfmt "[..],
+        )
+            .into_response();
+    }
+    if path.ends_with("audio/transcriptions") {
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "the quick brown fox",
+        )
+            .into_response();
+    }
+    if path.ends_with("/content") {
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"in.jsonl\"",
+                ),
+            ],
+            "{\"custom_id\":\"a\"}\n",
+        )
+            .into_response();
+    }
+    if path.contains("missing") {
+        return json(
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"No such File object: file-missing","type":"invalid_request_error"}}"#,
+        );
+    }
+    if path.contains("rejected") {
+        return json(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"upstream-private detail: purpose must be batch"}}"#,
+        );
+    }
+    if path.contains("denied") {
+        return json(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"Incorrect API key provided: sk-ups*****-key"}}"#,
+        );
+    }
+    if path.contains("throttled") {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::RETRY_AFTER, "7"),
+            ],
+            r#"{"error":{"message":"slow down"}}"#,
+        )
+            .into_response();
+    }
+    if path.contains("notthere") {
+        return json(StatusCode::NOT_FOUND, r#"{"detail":"Not Found"}"#);
+    }
+    json(
+        StatusCode::OK,
+        r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":5,"total_tokens":5}}"#,
+    )
+}
 
 async fn spawn_upstream() -> (String, Capture) {
     let captured: Capture = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&captured);
     let app = Router::new().route(
         "/{*path}",
-        axum::routing::post(
-            move |path: axum::extract::Path<String>,
-                  headers: axum::http::HeaderMap,
+        axum::routing::any(
+            move |method: Method,
+                  path: axum::extract::Path<String>,
+                  uri: Uri,
+                  headers: HeaderMap,
                   body: Bytes| {
                 let sink = Arc::clone(&sink);
                 async move {
-                    let auth = headers
-                        .get(header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default()
-                        .to_owned();
-                    let content_type = headers
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default()
-                        .to_owned();
-                    sink.lock().await.push((
-                        path.to_string(),
-                        auth,
-                        content_type,
-                        body.clone(),
-                    ));
-                    // Echo a family-shaped JSON answer.
-                    (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/json")],
-                        r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"text-embedding-3-small","usage":{"prompt_tokens":5,"total_tokens":5}}"#,
-                    )
-                        .into_response()
+                    let header_text = |name: header::HeaderName| {
+                        headers
+                            .get(name)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned()
+                    };
+                    sink.lock().await.push(Seen {
+                        method,
+                        path: path.to_string(),
+                        query: uri.query().map(str::to_owned),
+                        auth: header_text(header::AUTHORIZATION),
+                        content_types: headers
+                            .get_all(header::CONTENT_TYPE)
+                            .iter()
+                            .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                            .collect(),
+                        body: body.clone(),
+                    });
+                    answer(&path)
                 }
             },
         ),
@@ -80,22 +168,27 @@ async fn spawn_upstream() -> (String, Capture) {
     (format!("http://{addr}/v1"), captured)
 }
 
-fn provider_config(endpoint: &str) -> ProviderConfig {
+/// Each family at its own endpoint under `base`, as a real provider
+/// lays them out.
+fn provider_config(base: &str) -> ProviderConfig {
     let mut adapters: HashMap<String, ProviderAdapterConfig> = HashMap::new();
-    for family in [
-        ProviderRouteKind::Embeddings,
-        ProviderRouteKind::Rerank,
-        ProviderRouteKind::AudioTranscriptions,
-        ProviderRouteKind::AudioSpeech,
-        ProviderRouteKind::ImagesGenerations,
-        ProviderRouteKind::Files,
-        ProviderRouteKind::Batches,
+    for (family, path) in [
+        (ProviderRouteKind::Embeddings, "embeddings"),
+        (ProviderRouteKind::Rerank, "rerank"),
+        (
+            ProviderRouteKind::AudioTranscriptions,
+            "audio/transcriptions",
+        ),
+        (ProviderRouteKind::AudioSpeech, "audio/speech"),
+        (ProviderRouteKind::ImagesGenerations, "images/generations"),
+        (ProviderRouteKind::Files, "files"),
+        (ProviderRouteKind::Batches, "batches"),
     ] {
         adapters.insert(
             format!("{family:?}"),
             ProviderAdapterConfig {
                 protocol: "openai_chat_completions".to_owned(),
-                endpoint: endpoint.to_owned(),
+                endpoint: format!("{base}/{path}"),
                 headers: Arc::new(HashMap::new()),
                 forward_inbound_headers: None,
                 lossy: false,
@@ -107,6 +200,7 @@ fn provider_config(endpoint: &str) -> ProviderConfig {
         "embed-small".to_owned(),
         "text-embedding-3-small".to_owned(),
     );
+    model_aliases.insert("voice".to_owned(), "tts-1-hd".to_owned());
     ProviderConfig {
         name: "fake".to_owned(),
         api_key: secrecy::SecretString::from("sk-upstream-key"),
@@ -186,13 +280,48 @@ fn base_config() -> AppConfig {
     }
 }
 
-async fn fixture() -> (Router, Capture, Arc<RecordingBus>) {
-    let (endpoint, captured) = spawn_upstream().await;
-    let registry = ProviderRegistry::from_providers(vec![provider_config(&endpoint)])
-        .expect("registry builds");
+fn app_over(config: ProviderConfig) -> (Router, Arc<RecordingBus>) {
+    let registry = ProviderRegistry::from_providers(vec![config]).expect("registry builds");
     let bus = Arc::new(RecordingBus::new());
     let app = build_router(state(base_config(), registry, Arc::clone(&bus)));
+    (app, bus)
+}
+
+async fn fixture() -> (Router, Capture, Arc<RecordingBus>) {
+    let (endpoint, captured) = spawn_upstream().await;
+    let (app, bus) = app_over(provider_config(&endpoint));
     (app, captured, bus)
+}
+
+async fn call(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    content_type: Option<&str>,
+    body: &'static [u8],
+) -> Response {
+    let mut request = Request::builder().method(method).uri(uri);
+    if let Some(content_type) = content_type {
+        request = request.header(header::CONTENT_TYPE, content_type);
+    }
+    app.clone()
+        .oneshot(request.body(Body::from(body)).expect("request"))
+        .await
+        .expect("served")
+}
+
+async fn body_of(response: Response) -> Bytes {
+    axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body")
+}
+
+fn header_of(response: &Response, name: header::HeaderName) -> &str {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
 }
 
 #[tokio::test]
@@ -213,11 +342,17 @@ async fn embeddings_routes_through_with_the_model_alias_and_credential() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let requests = captured.lock().await;
-    let (path, auth, content_type, upstream_body) = &requests[0];
-    assert_eq!(path, "v1", "routed to the configured family endpoint");
-    assert_eq!(auth, "Bearer sk-upstream-key", "the provider credential");
-    assert!(content_type.starts_with("application/json"));
-    let parsed: serde_json::Value = serde_json::from_slice(upstream_body).expect("json");
+    let seen = &requests[0];
+    assert_eq!(
+        seen.path, "v1/embeddings",
+        "routed to the configured family endpoint"
+    );
+    assert_eq!(
+        seen.auth, "Bearer sk-upstream-key",
+        "the provider credential"
+    );
+    assert_eq!(seen.content_types, vec!["application/json".to_owned()]);
+    let parsed: serde_json::Value = serde_json::from_slice(&seen.body).expect("json");
     assert_eq!(
         parsed["model"].as_str(),
         Some("text-embedding-3-small"),
@@ -256,18 +391,14 @@ async fn rerank_and_images_and_batches_share_the_spine() {
         "/providers/fake/v1/images/generations",
         "/providers/fake/v1/batches",
     ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(uri)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"model":"embed-small"}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("served");
+        let response = call(
+            &app,
+            "POST",
+            uri,
+            Some("application/json"),
+            br#"{"model":"embed-small"}"#,
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
     }
     assert_eq!(captured.lock().await.len(), 3, "each family routed once");
@@ -277,82 +408,455 @@ async fn rerank_and_images_and_batches_share_the_spine() {
 async fn audio_bodies_pass_through_verbatim_with_their_content_type() {
     let (app, captured, _bus) = fixture().await;
     // A synthetic multipart body; the proxy must not rewrite it.
-    let multipart = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF-bytes\r\n--boundary--\r\n";
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/providers/fake/v1/audio/transcriptions")
-                .header(
-                    header::CONTENT_TYPE,
-                    "multipart/form-data; boundary=boundary",
-                )
-                .body(Body::from(multipart))
-                .expect("request"),
-        )
-        .await
-        .expect("served");
+    let multipart = b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\nRIFF-bytes\r\n--boundary--\r\n";
+    let response = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/audio/transcriptions",
+        Some("multipart/form-data; boundary=boundary"),
+        multipart,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let requests = captured.lock().await;
-    let (_, _, content_type, body) = &requests[0];
     assert!(
-        content_type.starts_with("multipart/form-data"),
-        "the client's boundary survives, got {content_type}"
+        header_of(&response, header::CONTENT_TYPE).starts_with("text/plain"),
+        "a plain-text transcript keeps its content type"
     );
-    assert!(
-        body.windows(b"RIFF-bytes".len())
-            .any(|window| window == b"RIFF-bytes"),
+    assert_eq!(body_of(response).await.as_ref(), b"the quick brown fox");
+    let requests = captured.lock().await;
+    let seen = &requests[0];
+    assert_eq!(
+        seen.content_types,
+        vec!["multipart/form-data; boundary=boundary".to_owned()],
+        "the client's boundary survives, sent once"
+    );
+    assert_eq!(
+        seen.body.as_ref(),
+        multipart,
         "audio bytes are forwarded verbatim"
     );
 }
 
 #[tokio::test]
-async fn file_subpaths_are_appended_to_the_family_endpoint() {
+async fn speech_is_a_json_request_aliased_and_answered_with_the_upstreams_audio() {
     let (app, captured, _bus) = fixture().await;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/providers/fake/v1/files/file-abc/content")
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .body(Body::from("file-bytes"))
-                .expect("request"),
-        )
-        .await
-        .expect("served");
+    let response = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/audio/speech",
+        Some("application/json"),
+        br#"{"model":"voice","input":"hello","voice":"alloy","response_format":"wav"}"#,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let requests = captured.lock().await;
-    let (path, _, _, body) = &requests[0];
     assert_eq!(
-        path.as_str(),
-        "v1/file-abc/content",
-        "the captured tail is appended to the family endpoint"
+        header_of(&response, header::CONTENT_TYPE),
+        "audio/wav",
+        "the audio is not relabelled as JSON"
     );
-    assert_eq!(&body[..], b"file-bytes");
+    assert_eq!(
+        body_of(response).await.as_ref(),
+        b"RIFF\x24\x00\x00\x00WAVEfmt "
+    );
+    let requests = captured.lock().await;
+    let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("json");
+    assert_eq!(
+        sent["model"].as_str(),
+        Some("tts-1-hd"),
+        "speech requests are JSON, so the alias applies"
+    );
 }
 
 #[tokio::test]
-async fn an_unconfigured_family_answers_404_with_a_named_route() {
-    // A registry with no family routes: the family kind is unconfigured.
+async fn file_and_batch_resources_keep_the_clients_method_and_query() {
+    let (app, captured, _bus) = fixture().await;
+    let exchanges = [
+        ("GET", "/providers/fake/v1/files?purpose=batch&limit=2"),
+        ("GET", "/providers/fake/v1/files/file-abc"),
+        ("GET", "/providers/fake/v1/files/file-abc/content"),
+        ("DELETE", "/providers/fake/v1/files/file-abc"),
+        ("GET", "/providers/fake/v1/batches?limit=1&after=batch_0"),
+        ("GET", "/providers/fake/v1/batches/batch_1"),
+        ("POST", "/providers/fake/v1/batches/batch_1/cancel"),
+    ];
+    for (method, uri) in exchanges {
+        let response = call(&app, method, uri, None, b"").await;
+        assert_eq!(response.status(), StatusCode::OK, "{method} {uri}");
+    }
+    let seen: Vec<(String, String, Option<String>, Vec<String>, usize)> = captured
+        .lock()
+        .await
+        .iter()
+        .map(|s| {
+            (
+                s.method.to_string(),
+                s.path.clone(),
+                s.query.clone(),
+                s.content_types.clone(),
+                s.body.len(),
+            )
+        })
+        .collect();
+    let bodiless = |method: &str, path: &str, query: Option<&str>| {
+        (
+            method.to_owned(),
+            path.to_owned(),
+            query.map(str::to_owned),
+            Vec::<String>::new(),
+            0,
+        )
+    };
+    assert_eq!(
+        seen,
+        vec![
+            bodiless("GET", "v1/files", Some("purpose=batch&limit=2")),
+            bodiless("GET", "v1/files/file-abc", None),
+            bodiless("GET", "v1/files/file-abc/content", None),
+            bodiless("DELETE", "v1/files/file-abc", None),
+            bodiless("GET", "v1/batches", Some("limit=1&after=batch_0")),
+            bodiless("GET", "v1/batches/batch_1", None),
+            bodiless("POST", "v1/batches/batch_1/cancel", None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_file_download_keeps_the_upstreams_content_headers() {
+    let (app, _captured, _bus) = fixture().await;
+    let response = call(
+        &app,
+        "GET",
+        "/providers/fake/v1/files/file-abc/content",
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_of(&response, header::CONTENT_TYPE),
+        "application/octet-stream"
+    );
+    assert_eq!(
+        header_of(&response, header::CONTENT_DISPOSITION),
+        "attachment; filename=\"in.jsonl\""
+    );
+    assert_eq!(body_of(response).await.as_ref(), b"{\"custom_id\":\"a\"}\n");
+}
+
+#[tokio::test]
+async fn the_endpoint_query_survives_and_the_resource_goes_before_it() {
+    // Azure-style endpoints carry their API version in the query.
+    let (endpoint, captured) = spawn_upstream().await;
+    let mut config = provider_config(&endpoint);
+    for adapter in config.adapters.values_mut() {
+        adapter.endpoint = format!("{}?api-version=2024-10-21", adapter.endpoint);
+    }
+    let (app, _bus) = app_over(config);
+
+    let response = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/batches/batch_1/cancel",
+        None,
+        b"",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = call(&app, "GET", "/providers/fake/v1/files?limit=5", None, b"").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let seen: Vec<(String, Option<String>)> = captured
+        .lock()
+        .await
+        .iter()
+        .map(|s| (s.path.clone(), s.query.clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (
+                "v1/batches/batch_1/cancel".to_owned(),
+                Some("api-version=2024-10-21".to_owned())
+            ),
+            (
+                "v1/files".to_owned(),
+                Some("api-version=2024-10-21&limit=5".to_owned())
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn resource_paths_that_could_leave_the_family_are_refused() {
+    let (app, captured, bus) = fixture().await;
+    for (method, uri) in [
+        (
+            "POST",
+            "/providers/fake/v1/batches/..%2F..%2Fchat%2Fcompletions",
+        ),
+        ("POST", "/providers/fake/v1/batches/b/../../embeddings"),
+        ("GET", "/providers/fake/v1/files/%2e%2e/%2e%2e/models"),
+        ("GET", "/providers/fake/v1/files/file-abc%3Fpurpose=x"),
+    ] {
+        let response = call(&app, method, uri, None, b"").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_of(response).await).expect("json error");
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "an OpenAI-shaped error: {body}"
+        );
+    }
+    assert!(
+        captured.lock().await.is_empty(),
+        "nothing outside the family endpoint reached the upstream"
+    );
+    assert!(
+        bus.snapshot()
+            .iter()
+            .all(|event| matches!(event, ProxyEvent::ResponseFailed(_))),
+        "each refusal writes a failure row and nothing else"
+    );
+}
+
+#[tokio::test]
+async fn upstream_failures_follow_the_one_client_status_policy() {
     let (endpoint, _captured) = spawn_upstream().await;
     let mut config = provider_config(&endpoint);
-    config.routes.embeddings = None;
-    let registry = ProviderRegistry::from_providers(vec![config]).expect("registry");
-    let bus = Arc::new(RecordingBus::new());
-    let app = build_router(state(base_config(), registry, Arc::clone(&bus)));
+    // Point three families at scripted failures.
+    for (name, path) in [
+        ("Rerank", "rejected"),
+        ("ImagesGenerations", "denied"),
+        ("Embeddings", "throttled"),
+    ] {
+        if let Some(adapter) = config.adapters.get_mut(name) {
+            adapter.endpoint = format!("{endpoint}/{path}");
+        }
+    }
+    let (app, _bus) = app_over(config);
+    let post = |uri: &'static str| call(&app, "POST", uri, Some("application/json"), b"{}");
 
-    let response = app
+    // A client-fixable 400 passes through, without the upstream's text.
+    let rejected = post("/providers/fake/v1/rerank").await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        header_of(&rejected, "x-should-retry".parse().expect("name")),
+        "false"
+    );
+    let text = String::from_utf8_lossy(&body_of(rejected).await).into_owned();
+    assert!(
+        !text.contains("upstream-private"),
+        "no upstream body: {text}"
+    );
+
+    // The operator's credential failing is the proxy's problem: 502,
+    // and the upstream's key hint never reaches the client.
+    let denied = post("/providers/fake/v1/images/generations").await;
+    assert_eq!(denied.status(), StatusCode::BAD_GATEWAY);
+    let text = String::from_utf8_lossy(&body_of(denied).await).into_owned();
+    assert!(!text.contains("sk-ups"), "no key hint: {text}");
+
+    // A rate limit passes through with the upstream's reset advice.
+    let throttled = post("/providers/fake/v1/embeddings").await;
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(header_of(&throttled, header::RETRY_AFTER), "7");
+}
+
+#[tokio::test]
+async fn an_unknown_upstream_resource_is_a_404_not_an_upstream_fault() {
+    let (endpoint, _captured) = spawn_upstream().await;
+    let mut config = provider_config(&endpoint);
+    if let Some(adapter) = config.adapters.get_mut("Embeddings") {
+        adapter.endpoint = format!("{endpoint}/notthere");
+    }
+    let (app, _bus) = app_over(config);
+
+    // The client named a resource the provider does not have.
+    for (method, uri) in [
+        ("GET", "/providers/fake/v1/files/file-missing"),
+        ("POST", "/providers/fake/v1/batches/batch_missing/cancel"),
+    ] {
+        let response = call(&app, method, uri, None, b"").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        assert_eq!(
+            header_of(&response, "x-should-retry".parse().expect("name")),
+            "false"
+        );
+    }
+
+    // A collection endpoint that 404s is a misconfigured upstream, which
+    // is still the proxy's fault.
+    let misrouted = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/embeddings",
+        Some("application/json"),
+        b"{}",
+    )
+    .await;
+    assert_eq!(misrouted.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn a_provider_with_egress_sends_its_family_traffic_through_its_proxy() {
+    // [provider.egress]: the engine routes this provider's chat traffic
+    // through its forward proxy, so its family calls must go there too,
+    // never directly. The upstream host does not resolve; only the proxy
+    // can answer.
+    let proxy = Router::new().fallback(|uri: Uri| async move {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "proxied": uri.to_string() }).to_string(),
+        )
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let proxy_addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, proxy).await {
+            tracing::trace!(%error, "fake egress proxy stopped");
+        }
+    });
+
+    let config = provider_config("http://egress-upstream.invalid/v1");
+    let registry = ProviderRegistry::from_providers(vec![config]).expect("registry builds");
+    let egress = ProxyClient::try_with_egress_proxy(&format!("http://{proxy_addr}"))
+        .expect("egress client builds");
+    let bus = Arc::new(RecordingBus::new());
+    let app = build_router(
+        state(base_config(), registry, Arc::clone(&bus))
+            .with_egress_clients(HashMap::from([("fake".to_owned(), Arc::new(egress))])),
+    );
+
+    let response = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/embeddings",
+        Some("application/json"),
+        br#"{"model":"embed-small","input":"hi"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&body_of(response).await).expect("json");
+    assert_eq!(
+        body["proxied"].as_str(),
+        Some("http://egress-upstream.invalid/v1/embeddings"),
+        "the family call went through the provider's egress proxy"
+    );
+}
+
+#[tokio::test]
+async fn a_passthrough_provider_gets_the_clients_own_key_on_family_calls() {
+    let (endpoint, captured) = spawn_upstream().await;
+    let mut config = provider_config(&endpoint);
+    config.passthrough_auth = true;
+    config.api_key = secrecy::SecretString::from("sk-operator-key-never-sent");
+    let (app, _bus) = app_over(config);
+
+    let with_key = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/providers/fake/v1/embeddings")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"model":"embed-small"}"#))
+                .header(header::AUTHORIZATION, "Bearer sk-client-own-key")
+                .body(Body::from(r#"{"model":"embed-small","input":"hi"}"#))
                 .expect("request"),
         )
         .await
         .expect("served");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(with_key.status(), StatusCode::OK);
+    assert_eq!(
+        captured.lock().await[0].auth,
+        "Bearer sk-client-own-key",
+        "the client's key, as on the chat routes"
+    );
+
+    // Without a key there is nothing to forward: refused before egress.
+    let without_key = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/embeddings",
+        Some("application/json"),
+        br#"{"model":"embed-small","input":"hi"}"#,
+    )
+    .await;
+    assert_eq!(without_key.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(captured.lock().await.len(), 1, "no second upstream call");
+}
+
+#[tokio::test]
+async fn layer_refusals_on_a_family_path_use_the_openai_error_shape() {
+    // The limit layer and the method fallback answer before the handler;
+    // their bodies follow the path's dialect, which for every family is
+    // OpenAI's.
+    let (endpoint, captured) = spawn_upstream().await;
+    let registry =
+        ProviderRegistry::from_providers(vec![provider_config(&endpoint)]).expect("registry");
+    let mut config = base_config();
+    config.server.endpoint_families.insert(
+        "embeddings".to_owned(),
+        llm_proxy_core::EndpointFamilyConfig {
+            max_body_bytes: 64,
+            request_timeout: Duration::from_secs(30),
+        },
+    );
+    let app = build_router(state(config, registry, Arc::new(RecordingBus::new())));
+
+    let too_large = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/embeddings",
+        Some("application/json"),
+        &[b'x'; 1024],
+    )
+    .await;
+    let wrong_method = call(&app, "DELETE", "/providers/fake/v1/files", None, b"").await;
+    for (response, status) in [
+        (too_large, StatusCode::PAYLOAD_TOO_LARGE),
+        (wrong_method, StatusCode::METHOD_NOT_ALLOWED),
+    ] {
+        assert_eq!(response.status(), status);
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_of(response).await).expect("json error");
+        assert!(
+            body.get("type").is_none() && body["error"]["message"].is_string(),
+            "an OpenAI error body, not another dialect's: {body}"
+        );
+    }
+    assert!(captured.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn an_unconfigured_family_is_refused_with_its_route_named() {
+    // A registry with no family routes: the family kind is unconfigured,
+    // refused as the chat routes refuse an unconfigured route kind.
+    let (endpoint, captured) = spawn_upstream().await;
+    let mut config = provider_config(&endpoint);
+    config.routes.embeddings = None;
+    let (app, bus) = app_over(config);
+
+    let response = call(
+        &app,
+        "POST",
+        "/providers/fake/v1/embeddings",
+        Some("application/json"),
+        br#"{"model":"embed-small"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&body_of(response).await).expect("json error");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("\"embeddings\""),
+        "the refusal names the missing route: {message}"
+    );
+    assert!(captured.lock().await.is_empty(), "no upstream call");
     // The refusal is accounted.
     assert!(
         matches!(bus.snapshot().first(), Some(ProxyEvent::ResponseFailed(_))),

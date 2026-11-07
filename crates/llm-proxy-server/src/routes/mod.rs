@@ -38,8 +38,8 @@ use chat::{handle_bare_chat_completions, handle_chat_completions};
 #[cfg(feature = "endpoint-families")]
 use families::{
     FAMILY_AUDIO_SPEECH, FAMILY_AUDIO_TRANSCRIPTIONS, FAMILY_BATCHES, FAMILY_EMBEDDINGS,
-    FAMILY_FILES, FAMILY_IMAGES_GENERATIONS, FAMILY_RERANK, FamilySpec, handle_json_family,
-    handle_raw_family, handle_subpath_family,
+    FAMILY_FILES, FAMILY_IMAGES_GENERATIONS, FAMILY_RERANK, FamilySpec, handle_family,
+    handle_family_resource,
 };
 use gemini_generate::handle_generate_content;
 use health::{health, ready, version};
@@ -209,78 +209,95 @@ fn provider_api_router(state: &AppState) -> Router<AppState> {
     // Non-chat families (plan 09 step 7), each behind its own admission
     // chain: its body limit and timeout from
     // [server.endpoint_families], the same loop/host/auth gates, and a
-    // family-specific handler. (path, route kind, json body, family name)
+    // family-specific handler. Each route serves the methods of the
+    // family's documented API; the handler forwards the client's method.
     #[cfg(feature = "endpoint-families")]
-    for (path, kind, json, family_name) in [
-        (
-            "/providers/{provider}/v1/embeddings",
-            llm_proxy_core::ProviderRouteKind::Embeddings,
-            true,
-            FAMILY_EMBEDDINGS,
-        ),
-        (
-            "/providers/{provider}/v1/rerank",
-            llm_proxy_core::ProviderRouteKind::Rerank,
-            true,
-            FAMILY_RERANK,
-        ),
-        (
-            "/providers/{provider}/v1/images/generations",
-            llm_proxy_core::ProviderRouteKind::ImagesGenerations,
-            true,
-            FAMILY_IMAGES_GENERATIONS,
-        ),
-        (
-            "/providers/{provider}/v1/batches",
-            llm_proxy_core::ProviderRouteKind::Batches,
-            true,
-            FAMILY_BATCHES,
-        ),
-        (
-            "/providers/{provider}/v1/batches/{*tail}",
-            llm_proxy_core::ProviderRouteKind::Batches,
-            true,
-            FAMILY_BATCHES,
-        ),
-        (
-            "/providers/{provider}/v1/audio/transcriptions",
-            llm_proxy_core::ProviderRouteKind::AudioTranscriptions,
-            false,
-            FAMILY_AUDIO_TRANSCRIPTIONS,
-        ),
-        (
-            "/providers/{provider}/v1/audio/speech",
-            llm_proxy_core::ProviderRouteKind::AudioSpeech,
-            false,
-            FAMILY_AUDIO_SPEECH,
-        ),
-        (
-            "/providers/{provider}/v1/files",
-            llm_proxy_core::ProviderRouteKind::Files,
-            false,
-            FAMILY_FILES,
-        ),
-        (
-            "/providers/{provider}/v1/files/{*tail}",
-            llm_proxy_core::ProviderRouteKind::Files,
-            false,
-            FAMILY_FILES,
-        ),
-    ] {
-        let subpath = path.contains("{*tail}");
-        let handler = if subpath {
-            post(handle_subpath_family)
-        } else if json {
-            post(handle_json_family)
-        } else {
-            post(handle_raw_family)
-        };
-        api = api.merge(
-            Router::new()
-                .route(path, handler)
-                .route_layer(family(FamilySpec { kind, json }))
-                .layer(admission(family_name)),
-        );
+    {
+        use axum::routing::{MethodFilter, on};
+        use llm_proxy_core::ProviderRouteKind as Kind;
+        let create = MethodFilter::POST;
+        let list_or_create = MethodFilter::GET.or(MethodFilter::POST);
+        // (path, route kind, JSON request body, family name, methods)
+        for (path, kind, json, family_name, methods) in [
+            (
+                "/providers/{provider}/v1/embeddings",
+                Kind::Embeddings,
+                true,
+                FAMILY_EMBEDDINGS,
+                create,
+            ),
+            (
+                "/providers/{provider}/v1/rerank",
+                Kind::Rerank,
+                true,
+                FAMILY_RERANK,
+                create,
+            ),
+            (
+                "/providers/{provider}/v1/images/generations",
+                Kind::ImagesGenerations,
+                true,
+                FAMILY_IMAGES_GENERATIONS,
+                create,
+            ),
+            (
+                "/providers/{provider}/v1/audio/transcriptions",
+                Kind::AudioTranscriptions,
+                false,
+                FAMILY_AUDIO_TRANSCRIPTIONS,
+                create,
+            ),
+            // Speech takes JSON (so the alias applies) and answers audio.
+            (
+                "/providers/{provider}/v1/audio/speech",
+                Kind::AudioSpeech,
+                true,
+                FAMILY_AUDIO_SPEECH,
+                create,
+            ),
+            // Files: list and upload; retrieve, download and delete.
+            (
+                "/providers/{provider}/v1/files",
+                Kind::Files,
+                false,
+                FAMILY_FILES,
+                list_or_create,
+            ),
+            (
+                "/providers/{provider}/v1/files/{*resource}",
+                Kind::Files,
+                false,
+                FAMILY_FILES,
+                MethodFilter::GET.or(MethodFilter::DELETE),
+            ),
+            // Batches: list and create; retrieve and cancel.
+            (
+                "/providers/{provider}/v1/batches",
+                Kind::Batches,
+                true,
+                FAMILY_BATCHES,
+                list_or_create,
+            ),
+            (
+                "/providers/{provider}/v1/batches/{*resource}",
+                Kind::Batches,
+                true,
+                FAMILY_BATCHES,
+                list_or_create,
+            ),
+        ] {
+            let route = if path.ends_with("{*resource}") {
+                on(methods, handle_family_resource)
+            } else {
+                on(methods, handle_family)
+            };
+            api = api.merge(
+                Router::new()
+                    .route(path, route)
+                    .route_layer(family(FamilySpec { kind, json }))
+                    .layer(admission(family_name)),
+            );
+        }
     }
 
     // Bare `/v1/*` is off by default (plan 04 step 11): with it off, those
@@ -453,10 +470,26 @@ async fn normalize_error_responses(
     }
     rewritten
 }
+/// Path prefixes of the non-chat endpoint families (plan 09 step 7): all
+/// of them are OpenAI-dialect APIs.
+const OPENAI_FAMILY_PATHS: &[&str] = &[
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/audio/",
+    "/v1/images/",
+    "/v1/files",
+    "/v1/batches",
+];
+
 fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
     // The dialect of the path decides the error body shape for layer-level
     // failures (auth, limits, 404/405) that never reach a route handler.
-    if path.contains("/v1/chat/completions") || path.contains("/v1/chat/edits") {
+    if path.contains("/v1/chat/completions")
+        || path.contains("/v1/chat/edits")
+        || OPENAI_FAMILY_PATHS
+            .iter()
+            .any(|prefix| path.contains(prefix))
+    {
         error_response::ClientProtocol::OpenAiChat
     } else if path.contains("/v1/responses") {
         error_response::ClientProtocol::OpenAiResponses

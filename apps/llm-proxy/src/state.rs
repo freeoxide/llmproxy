@@ -223,7 +223,46 @@ pub fn load_registry_with_checks(
     llm_proxy_core::validate_passthrough_auth_combination(&app_config.auth, &providers)
         .with_context(|| "validating auth against provider passthrough configuration")?;
 
+    // A family route (plan 09 step 7) in a build without the families
+    // would answer 404 forever: a startup error, never a silent skip.
+    #[cfg(not(feature = "endpoint-families"))]
+    {
+        let configured = providers_with_family_routes(&registry);
+        if !configured.is_empty() {
+            anyhow::bail!(
+                "providers {} route a non-chat endpoint family (embeddings, rerank, audio, \
+                 images, files or batches) but this build lacks the endpoint-families \
+                 feature; rebuild with --features endpoint-families",
+                configured.join(", ")
+            );
+        }
+    }
+
     Ok(registry)
+}
+
+/// Providers whose `[provider.routes]` name a non-chat endpoint family.
+#[cfg(not(feature = "endpoint-families"))]
+fn providers_with_family_routes(registry: &ProviderRegistry) -> Vec<String> {
+    use llm_proxy_core::ProviderRouteKind as Kind;
+    const FAMILIES: [Kind; 7] = [
+        Kind::Embeddings,
+        Kind::Rerank,
+        Kind::AudioTranscriptions,
+        Kind::AudioSpeech,
+        Kind::ImagesGenerations,
+        Kind::Files,
+        Kind::Batches,
+    ];
+    registry
+        .iter()
+        .filter(|provider| {
+            FAMILIES
+                .iter()
+                .any(|kind| provider.routes.get(*kind).is_some())
+        })
+        .map(|provider| provider.name.clone())
+        .collect()
 }
 
 /// Per-provider egress-proxy clients from `[provider.egress]` — also the
@@ -1007,6 +1046,59 @@ server_name = "t"
         )
         .await
         .expect("an upstream on another port is not a loop");
+    }
+
+    #[tokio::test]
+    async fn family_routes_need_the_endpoint_families_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/embedder.toml"),
+            r#"[provider]
+name = "embedder"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.embed]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/embeddings"
+[provider.routes]
+embeddings = "embed"
+"#,
+        )
+        .unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3459"
+request_timeout = "300s"
+log_level = "info"
+server_name = "family-refusal"
+"#,
+        )
+        .unwrap();
+        let result = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await;
+        // With the feature the routes serve; without it a configured
+        // family would answer 404 forever, so startup refuses instead.
+        #[cfg(feature = "endpoint-families")]
+        assert!(result.is_ok(), "with the feature the family routes serve");
+        #[cfg(not(feature = "endpoint-families"))]
+        match result {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("embedder") && message.contains("endpoint-families"),
+                    "the refusal names the provider and the feature, got: {message}"
+                );
+            }
+            Ok(_) => panic!("family routes must never be silently unserved"),
+        }
     }
 
     #[tokio::test]
