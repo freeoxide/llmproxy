@@ -215,6 +215,10 @@ pub struct ServerConfig {
     /// `Idempotency-Key` replay (plan 06): off by default.
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
+    /// Metrics export (plan 07 step 7, backlog 21): the in-process counters
+    /// are always kept; this adds export paths, off by default.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// Per-endpoint-family settings (audit conflict 16): the body limit and
@@ -833,6 +837,65 @@ impl Default for IdempotencyConfig {
             max_entries: default_idempotency_max_entries(),
         }
     }
+}
+
+/// Metrics export settings (`[server.metrics]`, plan 07 step 7, backlog 21).
+/// The existing in-process counters are always kept; this section only adds
+/// export paths, both off by default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsConfig {
+    /// OTLP export over HTTP JSON to a collector (for example an OpenTelemetry
+    /// Collector at `http://127.0.0.1:4318/v1/metrics`). Absent = off.
+    #[serde(default)]
+    pub otlp: Option<OtlpMetricsConfig>,
+}
+
+/// OTLP metric export: one endpoint, one interval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpMetricsConfig {
+    /// The collector's full metrics endpoint URL (`.../v1/metrics`).
+    pub endpoint: String,
+    /// How often counters are pushed. Default 60s; must be positive.
+    #[serde(default = "default_otlp_interval", with = "humantime_serde")]
+    pub interval: Duration,
+}
+
+const fn default_otlp_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+/// Validates `[server.metrics]`: the OTLP endpoint must be an http(s) URL
+/// with a host, and the interval positive.
+pub fn validate_metrics_config(metrics: &MetricsConfig) -> Result<(), CoreError> {
+    let Some(otlp) = &metrics.otlp else {
+        return Ok(());
+    };
+    let endpoint = otlp.endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(CoreError::ConfigValidation {
+            message: "server.metrics.otlp.endpoint must not be empty".to_owned(),
+            source: None,
+        });
+    }
+    let scheme = endpoint.split("://").next().unwrap_or_default();
+    if !matches!(scheme, "http" | "https") {
+        return Err(CoreError::ConfigValidation {
+            message: format!(
+                "server.metrics.otlp.endpoint must be an http:// or https:// URL, got {:?}",
+                endpoint
+            ),
+            source: None,
+        });
+    }
+    if otlp.interval.is_zero() {
+        return Err(CoreError::ConfigValidation {
+            message: "server.metrics.otlp.interval must be positive".to_owned(),
+            source: None,
+        });
+    }
+    Ok(())
 }
 
 /// Admin API configuration (`[auth.admin]` section of `config.toml`).
@@ -2543,6 +2606,7 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     if let Some(storage) = cfg.storage.as_ref() {
         validate_storage_config(storage)?;
     }
+    validate_metrics_config(&cfg.server.metrics)?;
     validate_admin_mount(&cfg)?;
     validate_upstream_timeouts(&cfg.server.upstream_timeouts).map_err(|error| {
         CoreError::ConfigValidation {
@@ -3199,6 +3263,37 @@ chat_completions = "chat"
                 "the error must say what a pointer is: {error}"
             );
         }
+    }
+
+    #[test]
+    fn metrics_config_validates_the_otlp_endpoint_and_interval() {
+        let good = toml::from_str::<MetricsConfig>(
+            "[otlp]\nendpoint = \"http://127.0.0.1:4318/v1/metrics\"\ninterval = \"30s\"\n",
+        )
+        .expect("metrics config parses");
+        validate_metrics_config(&good).expect("a full http endpoint and positive interval pass");
+
+        let default_interval = toml::from_str::<MetricsConfig>(
+            "[otlp]\nendpoint = \"https://collector.internal/v1/metrics\"\n",
+        )
+        .expect("metrics config parses");
+        validate_metrics_config(&default_interval)
+            .expect("the interval defaults without being spelled out");
+
+        for bad in [
+            "[otlp]\nendpoint = \"\"\n",
+            "[otlp]\nendpoint = \"grpc://collector:4317\"\n",
+            "[otlp]\nendpoint = \"http://127.0.0.1:4318/v1/metrics\"\ninterval = \"0s\"\n",
+        ] {
+            let config = toml::from_str::<MetricsConfig>(bad).expect("metrics config parses");
+            assert!(
+                validate_metrics_config(&config).is_err(),
+                "this metrics config must be refused: {bad}"
+            );
+        }
+
+        // Off by default: an absent section is valid.
+        validate_metrics_config(&MetricsConfig::default()).expect("default is off and fine");
     }
 
     #[test]

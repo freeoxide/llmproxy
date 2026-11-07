@@ -5,6 +5,7 @@ pub mod cli;
 pub mod commands;
 pub mod config_validation;
 pub mod defaults;
+pub mod otel_metrics;
 pub mod paths;
 pub mod permissions;
 pub mod pid;

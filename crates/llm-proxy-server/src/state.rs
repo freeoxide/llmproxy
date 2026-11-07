@@ -270,6 +270,12 @@ impl AppState {
         &self.model_catalogs
     }
 
+    /// The runtime metrics registry (also exported by the admin surface's
+    /// `/metrics` route and the opt-in OTLP push, plan 07 step 7).
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     /// Access the request/response event sink.
     ///
     /// Holds the bus so the serve path can [`EventBus::close`] it (flush the
@@ -309,6 +315,7 @@ mod tests {
                 trust_forwarded_headers: false,
                 cache: Default::default(),
                 idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,

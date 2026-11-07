@@ -23,6 +23,13 @@ workspace = true
 
 [dependencies]
 llm-proxy-server = { workspace = true, features = ["admin"] }
+
+# OTel OTLP metric export (plan 07 step 7, backlog 21). The blocking reqwest
+# client carries its own reactor thread, which is what the SDK's thread-based
+# PeriodicReader needs.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-json", "reqwest-blocking-client", "metrics"] }
 llm-proxy-core = { workspace = true }
 llm-proxy-adapters = { workspace = true }
 llm-proxy-transport = { workspace = true }
@@ -51,6 +58,7 @@ vergen-gix = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1.42", features = ["yaml", "filters"] }
+axum = { workspace = true }
 llm-proxy-protocol = { workspace = true }
 secrecy = { workspace = true }
 tempfile = "3"

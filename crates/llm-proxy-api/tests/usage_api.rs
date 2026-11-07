@@ -15,11 +15,11 @@ mod tests {
     use time::OffsetDateTime;
     use tower::ServiceExt;
 
-    const ADMIN_TOKEN: &str = "test-admin-token";
+    pub(super) const ADMIN_TOKEN: &str = "test-admin-token";
 
-    struct Ledger {
+    pub(super) struct Ledger {
         _dir: tempfile::TempDir,
-        path: std::path::PathBuf,
+        pub(super) path: std::path::PathBuf,
         t0: OffsetDateTime,
     }
 
@@ -112,7 +112,7 @@ mod tests {
         })
     }
 
-    async fn seed() -> Ledger {
+    pub(super) async fn seed() -> Ledger {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("usage.db");
         let bus = SqliteEventBus::open(
@@ -779,5 +779,97 @@ mod tests {
         tokio::task::spawn_blocking(move || closer.close())
             .await
             .expect("close joined");
+    }
+}
+
+#[cfg(test)]
+mod metrics_route {
+    use super::tests::ADMIN_TOKEN;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use llm_proxy_core::Metrics;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    /// Backlog 21: the admin surface serves the runtime counters as
+    /// Prometheus text, behind the admin token like every other route.
+    #[tokio::test]
+    async fn metrics_serves_prometheus_text_behind_the_admin_token() {
+        let ledger = super::tests::seed().await;
+        let metrics = Arc::new(Metrics::new());
+        metrics.record_request(false);
+        metrics.record_failure();
+        metrics.record_success("prov-a", "gpt-4o", Duration::from_millis(5));
+        let app = llm_proxy_api::UsageApi::new(ledger.path.clone(), ADMIN_TOKEN)
+            .with_metrics(Arc::clone(&metrics))
+            .router();
+
+        // No or wrong token: the same 401 as every other admin route.
+        for token in [None, Some("wrong-token")] {
+            let mut builder = Request::builder().uri("/metrics");
+            if let Some(token) = token {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).expect("request builds"))
+                .await
+                .expect("oneshot");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        // no-store applies here like everywhere on the admin surface.
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            text.contains("llm_proxy_requests_total 1"),
+            "the scraped exposition carries the live counter: {text}"
+        );
+        assert!(
+            text.contains("llm_proxy_requests_failed_total 1"),
+            "the scraped exposition carries the live counter: {text}"
+        );
+        assert!(
+            text.contains(r#"llm_proxy_model_requests_total{provider="prov-a",model="gpt-4o"} 1"#),
+            "the scraped exposition carries per-model counts: {text}"
+        );
+    }
+
+    /// Without metrics attached there is no /metrics route at all: the
+    /// surface keeps its exact shape unless the operator's server wired one.
+    #[tokio::test]
+    async fn without_metrics_attached_the_route_does_not_exist() {
+        let ledger = super::tests::seed().await;
+        let app = llm_proxy_api::UsageApi::new(ledger.path, ADMIN_TOKEN).router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

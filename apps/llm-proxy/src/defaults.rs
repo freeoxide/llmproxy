@@ -28,6 +28,12 @@ server_name = "llm-proxy"
 # enabled = true
 # ttl = "24h"
 # max_entries = 1000
+
+# Metrics export (plan 07): the admin listener serves /metrics (Prometheus)
+# behind the admin token; an OTLP push is opt-in here.
+# [server.metrics.otlp]
+# endpoint = "http://127.0.0.1:4318/v1/metrics"
+# interval = "60s"
 "#;
 
 /// Default provider TOML for opencode-go.

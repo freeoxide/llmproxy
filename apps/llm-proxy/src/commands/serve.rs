@@ -63,29 +63,20 @@ pub async fn cmd_serve(
 
     let admin = bind_admin_listener(&state).await?;
 
-    if let Err(first_err) = write_pid() {
-        if let Some(existing_pid) = read_pid()? {
-            if is_process_running(existing_pid) {
-                bail!(
-                    "server already running with PID {} (PID file: {})",
-                    existing_pid,
-                    crate::paths::pid_file_path().display()
-                );
-            }
-            info!("stale PID file found (PID {}), cleaning up", existing_pid);
-        }
-        remove_pid()?;
-        write_pid().with_context(|| {
-            format!(
-                "failed to create PID file after removing stale entry: {}",
-                first_err
-            )
-        })?;
-    }
+    claim_pid_file()?;
 
     let bind_addr = state.bind_address();
     let shutdown_deadline = state.shutdown_timeout();
     let event_bus = std::sync::Arc::clone(state.event_bus());
+    // Opt-in OTLP push of the runtime counters (plan 07 step 7): the guard
+    // keeps the export loop alive until the server stops, then flushes.
+    let otlp_guard = match state.app_config().server.metrics.otlp.as_ref() {
+        Some(otlp) => Some(
+            crate::otel_metrics::start_otlp_metrics(state.metrics(), &otlp.endpoint, otlp.interval)
+                .with_context(|| "starting OTLP metric export from [server.metrics.otlp]")?,
+        ),
+        None => None,
+    };
     let app = build_router(state);
 
     let listener = bind_listener(bind_addr).await?.tap_io(|tcp_stream| {
@@ -136,6 +127,10 @@ pub async fn cmd_serve(
         tracing::warn!(error = %e, "failed to remove PID file during shutdown");
     }
 
+    // Dropping the guard flushes the last OTLP export before the process
+    // goes away.
+    drop(otlp_guard);
+
     if let Err(close_err) = tokio::task::spawn_blocking(move || event_bus.close()).await {
         tracing::warn!(error = %close_err, "usage-ledger close task failed to join");
     }
@@ -150,6 +145,31 @@ pub async fn cmd_serve(
             Err(anyhow::anyhow!("server error: {}", e))
         }
     }
+}
+
+/// Writes the daemon's PID file, clearing a stale entry when the recorded
+/// process is gone and refusing when another server is alive.
+fn claim_pid_file() -> Result<()> {
+    if let Err(first_err) = write_pid() {
+        if let Some(existing_pid) = read_pid()? {
+            if is_process_running(existing_pid) {
+                bail!(
+                    "server already running with PID {} (PID file: {})",
+                    existing_pid,
+                    crate::paths::pid_file_path().display()
+                );
+            }
+            info!("stale PID file found (PID {}), cleaning up", existing_pid);
+        }
+        remove_pid()?;
+        write_pid().with_context(|| {
+            format!(
+                "failed to create PID file after removing stale entry: {}",
+                first_err
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Starts the one signal listener shared by every shutdown waiter, so the drain

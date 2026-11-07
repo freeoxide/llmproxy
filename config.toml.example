@@ -52,6 +52,16 @@ margin_tokens = 512
 # ttl = "10m"
 # max_entries = 1000
 
+# Metrics export (plan 07). The proxy's counters (requests, streams,
+# failures, upstream calls, rate limits, cache hits, cancellations,
+# latency quantiles, per-provider-model counts) are always kept in
+# process. The read-only admin listener serves them at /metrics in
+# Prometheus text format behind the admin token; this section adds an
+# opt-in OTLP push to a collector.
+# [server.metrics.otlp]
+# endpoint = "http://127.0.0.1:4318/v1/metrics"
+# interval = "60s"
+
 # Idempotency-Key replay (plan 06). Off by default: the header is ignored.
 # When enabled, a request carrying an "Idempotency-Key" header claims the
 # key before budget checks; a matching retry within `ttl` replays the

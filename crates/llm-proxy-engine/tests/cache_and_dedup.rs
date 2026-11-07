@@ -114,6 +114,7 @@ fn test_config() -> AppConfig {
             preflight: Default::default(),
             cache: Default::default(),
             idempotency: Default::default(),
+            metrics: Default::default(),
         },
         auth: Default::default(),
         storage: None,

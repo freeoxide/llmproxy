@@ -21,11 +21,14 @@ const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 
 pub(crate) struct UsageState {
     pub(crate) reader: UsageReader,
     pub(crate) admin: AdminAuth,
+    pub(crate) metrics: Option<std::sync::Arc<llm_proxy_core::Metrics>>,
 }
 
 /// Read-only, admin-authenticated `/usage` query surface over the usage
 /// ledger: every route is a `GET` behind the admin bearer token, and no
-/// response carries request bodies.
+/// response carries request bodies. With metrics attached, the same surface
+/// also serves `/metrics` (Prometheus exposition of the runtime counters,
+/// plan 07 step 7) behind the same token.
 #[derive(Debug)]
 pub struct UsageApi {
     state: UsageState,
@@ -40,8 +43,17 @@ impl UsageApi {
             state: UsageState {
                 reader: UsageReader::new(db_path),
                 admin: AdminAuth::new(admin_token),
+                metrics: None,
             },
         }
+    }
+
+    /// Attach the runtime metrics registry, enabling the `/metrics` route
+    /// (backlog 21).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<llm_proxy_core::Metrics>) -> Self {
+        self.state.metrics = Some(metrics);
+        self
     }
 
     /// The `/usage` router with state applied, ready to serve or merge; admin
@@ -50,10 +62,14 @@ impl UsageApi {
     #[must_use = "the Router must be used with a server or merged into one"]
     pub fn router(self) -> axum::Router {
         let state = self.state;
-        axum::Router::new()
+        let mut routes = axum::Router::new()
             .route("/usage/summary", get(summary))
             .route("/usage/requests", get(requests))
-            .route("/usage/keys", get(keys))
+            .route("/usage/keys", get(keys));
+        if state.metrics.is_some() {
+            routes = routes.route("/metrics", get(prometheus_metrics));
+        }
+        routes
             .layer(from_fn_with_state(state.clone(), require_admin))
             .layer(TraceLayer::new_for_http())
             .layer(SetResponseHeaderLayer::if_not_present(
@@ -76,6 +92,29 @@ impl UsageApi {
             .layer(CatchPanicLayer::new())
             .with_state(state)
     }
+}
+
+/// Prometheus exposition of the runtime counters (backlog 21): the same
+/// counters the admin API reports, in a scraper's format, behind the admin
+/// token.
+async fn prometheus_metrics(
+    State(state): State<UsageState>,
+) -> Result<axum::response::Response, UsageApiError> {
+    let Some(metrics) = state.metrics else {
+        return Err(UsageApiError::InvalidParam(
+            "metrics are not attached to this surface".to_owned(),
+        ));
+    };
+    let body = metrics.get_snapshot().to_prometheus_text();
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response())
 }
 
 #[derive(Debug)]

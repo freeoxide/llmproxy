@@ -35,6 +35,8 @@ pub fn build_router(state: AppState) -> Router {
 ///
 /// Returns `None` when no `[auth.admin]` token or `[storage]` is configured
 /// or the `admin` cargo feature is off; every route is a read-only `GET`.
+/// With metrics attached the same surface serves `/metrics` (Prometheus
+/// exposition, plan 07 step 7) behind the same token.
 #[must_use = "the Router must be used with a server"]
 pub fn admin_router(state: &AppState) -> Option<Router> {
     #[cfg(feature = "admin")]
@@ -44,6 +46,7 @@ pub fn admin_router(state: &AppState) -> Option<Router> {
         let storage = state.app_config().storage.as_ref()?;
         Some(
             llm_proxy_api::UsageApi::new(storage.path.clone(), admin.token.expose_secret())
+                .with_metrics(std::sync::Arc::clone(state.metrics()))
                 .router(),
         )
     }

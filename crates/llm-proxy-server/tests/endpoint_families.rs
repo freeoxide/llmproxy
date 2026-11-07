@@ -36,6 +36,7 @@ mod tests {
                 trust_forwarded_headers: false,
                 cache: Default::default(),
                 idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
