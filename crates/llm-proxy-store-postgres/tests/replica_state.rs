@@ -9,6 +9,7 @@
 //!     cargo test -p llm-proxy-store-postgres --test replica_state -- --ignored
 //! ```
 
+#![cfg(test)]
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -45,20 +46,6 @@ fn pricing() -> HashMap<(String, String), ModelPricing> {
         ..ModelPricing::default()
     };
     HashMap::from([(("p".to_owned(), "m".to_owned()), price)])
-}
-
-fn budgeted(usd: &str) -> HashMap<String, llm_proxy_engine::KeyPolicy> {
-    HashMap::from([(
-        "key".to_owned(),
-        llm_proxy_engine::KeyPolicy {
-            budget: Some(KeyBudgetConfig {
-                usd_per_day: usd.parse().expect("decimal"),
-                unestimatable: UnestimatableCostPolicy::Reject,
-                assumed_max_output_tokens: 100,
-            }),
-            ..llm_proxy_engine::KeyPolicy::default()
-        },
-    )])
 }
 
 async fn store() -> PostgresStore {

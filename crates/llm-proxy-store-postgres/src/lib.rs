@@ -171,7 +171,7 @@ impl PostgresStore {
             )
             .await?;
         let count: i64 = row.get(0);
-        Ok(count.max(0) as u64)
+        Ok(u64::try_from(count.max(0)).unwrap_or(0))
     }
 
     /// Deletes window rows that can no longer be queried: minute rows
