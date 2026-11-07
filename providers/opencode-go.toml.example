@@ -45,6 +45,14 @@ messages = "anthropic"
 # cache_creation = "0.000003"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
+#
+# In-flight request caps. A saturated cap answers 503 with a short
+# Retry-After, never 429. Absent = uncapped.
+#
+# [provider.concurrency]
+# total = 8
+# [provider.concurrency.models]
+# "gpt-4o" = 4
 
 # Route this provider's upstream traffic through a forward proxy.
 # Allowed schemes: socks5h:// (hostnames resolved at the proxy), socks5://,

@@ -34,6 +34,15 @@ server_name = "llm-proxy"
 # is not available.
 # admin_on_main_listener = false
 
+# Context-window preflight. "warn" (default) logs when the request may
+# not fit; "enforce" also rejects (400), but only when the estimated
+# input exceeds the window by margin_tokens — estimates use chars/4 for
+# non-OpenAI models and never count tools or images, so marginal cases
+# only warn.
+[preflight]
+mode = "warn"
+margin_tokens = 512
+
 # Client authentication for proxy routes.
 #
 # mode = "none" (default): no client authentication. Only permitted while
@@ -59,6 +68,28 @@ mode = "none"
 #
 # [auth.clients]
 # laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
+#
+# A key may instead be a table carrying its admission policy:
+#
+# [auth.clients.laptop]
+# verifier = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
+# # Glob allowlists. A restricted key whose request names no model is
+# # refused (403) rather than passed through unattributed.
+# allow_models = ["claude-*", "gpt-4o"]
+# allow_providers = ["anthropic", "openai"]
+# [auth.clients.laptop.limits]
+# rpm = 60
+# tpm = 200_000
+# rpd = 5_000
+# [auth.clients.laptop.budget]
+# # Spend cap per UTC day. Requests reserve their estimated cost first
+# # (input estimate + max_tokens at the model's pricing), so concurrent
+# # requests cannot overspend it by more than what is reserved. A model
+# # with no pricing entry cannot be estimated: "reject" it (default) or
+# # reserve a fixed amount:
+# usd_per_day = "10.00"
+# # unestimatable = "reject"
+# # unestimatable = { reserve_usd = { usd = "0.50" } }
 
 # Usage ledger persistence. Absent (the default) disables persistence:
 # usage events go to an in-memory no-op sink and nothing is written to disk.
