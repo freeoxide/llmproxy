@@ -13,8 +13,13 @@ Prebuilt wheels install with no Rust toolchain:
 pip install llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl
 ```
 
-Wheels for macOS and Windows are built by CI runners with those toolchains;
-the abi3 wheel supports CPython 3.9+.
+Two wheels are produced here: the Linux x86_64 manylinux wheel (built and
+install-tested) and a Windows x64 wheel
+(`llm_proxy-0.1.0-cp39-abi3-win_amd64.whl`, mingw-w64 cross-compilation via
+`RUSTC_WRAPPER= .venv/bin/maturin build --release --target
+x86_64-pc-windows-gnu -o dist`; built, not run, on this machine). macOS
+wheels are left to CI runners with Apple toolchains. The abi3 wheel supports
+CPython 3.9+.
 
 ## Use
 

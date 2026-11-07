@@ -12,5 +12,7 @@ Native packages wrapping the in-process engine through one shared surface,
 
 Each package's suite replays the same plan-02 contract fixtures and compares
 against the same snapshots, so the three implementations cannot drift apart.
-Linux wheels/binaries build on this machine; macOS and Windows artifacts come
-from CI runners with those toolchains.
+Linux artifacts are built and install-tested here; Windows x64 artifacts are
+produced by mingw-w64 cross-compilation (verified as PE modules with the
+right imports, not executed — no Windows host). macOS artifacts need CI
+runners with Apple toolchains.

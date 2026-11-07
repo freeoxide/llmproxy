@@ -51,11 +51,13 @@ the engine and add no logic of their own, so they start once its API has stopped
 - **Python package (step 2).** `bindings/python`: pyo3 0.30 (abi3-py39) +
   maturin. The extension converts dicts/lists to JSON and back; the
   pure-Python layer (`llm_proxy/__init__.py`) unpacks the error tuple into a
-  `ProxyError` with attributes and documents the surface. The wheel
-  `llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl` was built with
-  maturin 1.16 and installed into a fresh venv whose `pip install` runs no
-  Rust; 13 pytest tests pass against the installed wheel. macOS and Windows
-  wheels need CI runners with those toolchains (not available here).
+  `ProxyError` with attributes and documents the surface. Two wheels are
+  built here: `llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl`
+  (installed into a fresh venv whose `pip install` runs no Rust; 13 pytest
+  tests pass against the installed wheel) and
+  `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation;
+  verified as a PE module importing `python3.dll`, but built-not-run — no
+  Windows host here). macOS wheels need CI runners with Apple toolchains.
 - **Node package (step 3).** `bindings/node`: napi-rs + `@napi-rs/cli`
   (`napi build --platform --release`). The native module returns structured
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
@@ -63,10 +65,15 @@ the engine and add no logic of their own, so they start once its API has stopped
   `ProxyError`s and an async-iterable `Stream` whose `cancel()` settles as
   `ClientCancelled`. 13 `node --test` tests pass; `npm install` of the
   packed tarball (`npm pack` → `freeoxide-llm-proxy-0.1.0.tgz`) loads the
-  prebuilt `llm-proxy.linux-x64-gnu.node` with no Rust toolchain. The npm
-  name is scoped (`@freeoxide/llm-proxy`) because the unscoped `llm-proxy`
-  on npm belongs to an unrelated package. macOS and Windows binaries need CI
-  runners with those toolchains.
+  prebuilt `llm-proxy.linux-x64-gnu.node` with no Rust toolchain. A
+  Windows x64 binary (`llm-proxy.win32-x64-gnu.node`) is produced by
+  mingw-w64 cross-compilation — the napi import library generated from the
+  official `node.exe` exports (objdump export table → dlltool) — and
+  verified as a PE module importing the `napi_*` symbols from `node.exe`;
+  built-not-run on this machine. The npm name is scoped
+  (`@freeoxide/llm-proxy`) because the unscoped `llm-proxy` on npm belongs
+  to an unrelated package. macOS binaries need CI runners with Apple
+  toolchains.
 - **Shared tests (step 4).** `bindings/shared/cases.json` holds the shared
   cases: the plan-02 contract fixtures (Claude Code, the Anthropic SDK, the
   OpenAI SDK, Codex — captured and synthesized; provenance in the fixture

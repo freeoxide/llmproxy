@@ -17,8 +17,19 @@ toolchain is needed at install time:
 npm install @freeoxide/llm-proxy
 ```
 
-Binaries for macOS and Windows are built by CI runners with those
-toolchains; this repository's local builds produce the Linux binary.
+The local build produces the Linux binary
+(`llm-proxy.linux-x64-gnu.node`). A Windows x64 binary
+(`llm-proxy.win32-x64-gnu.node`) is produced by mingw-w64 cross-compilation:
+the napi import library is generated from the official `node.exe` exports
+(objdump export table -> dlltool), then
+
+    RUSTC_WRAPPER= LIBNODE_PATH=<dir with libnode.dll> \
+      cargo build --release --target x86_64-pc-windows-gnu
+
+(`RUSTC_WRAPPER=` disables the host's rustc cache, which does not handle
+cross-compiler names.) The Windows binary links against `node.exe`'s
+`napi_*` exports and is built, not run, on this machine; an msvc build and
+macOS binaries are left to CI runners with those toolchains.
 
 ## Use
 
