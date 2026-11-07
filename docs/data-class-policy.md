@@ -71,9 +71,75 @@ asserts that no recorded row contains prompt or response text.
   edge. It reads `[provider.prompt_cache]` from config; no request or
   response data is retained.
 
+## Opt-in stores from the optional crates (plan 09)
+
+Each crate below is compiled in only behind its cargo feature; with the
+feature off, nothing it would store exists anywhere.
+
+### Semantic cache — `[server.semantic_cache] enabled = true` (the
+`semantic-cache` feature)
+
+- **Stores:** per caller, the embedding of each cached prompt and the
+  complete non-streaming response it produced, bucketed by caller,
+  provider and model. Streaming responses are never stored (a streaming
+  lookup misses).
+- **Where:** in process memory. Nothing is written to disk; a restart
+  empties it.
+- **Retention:** `ttl` (default 10m) from storage; at most `max_entries`
+  (default 256) per caller, oldest evicted first.
+- **Served to:** the same caller only — the caller is part of the bucket
+  key, so one caller's stored response is never returned to another. A
+  stored prompt must reach the `threshold` cosine similarity (default
+  0.95) to be served; `1.0` behaves like an exact cache.
+- **Note:** the default embedder is offline and deterministic (hashed
+  character trigrams); it stores only the derived vector, never the
+  prompt text.
+
+### Managed client keys — `[auth.admin.key_store]` (the `admin-ui`
+feature)
+
+- **Stores:** one argon2id verifier per managed key, the key id, the
+  creation and revocation times, and the key's admission policy (model
+  and provider globs, rate windows, budget). **Never** a plaintext token:
+  the issued `<key-id>.<secret>` token is shown exactly once at creation.
+- **Where:** the configured SQLite file.
+- **Retention:** until revoked; revoked rows are kept (they stop
+  authenticating immediately) until the operator deletes the store.
+
+### Replica stores — `[replica]` (the `store-redis` / `store-postgres`
+features)
+
+- **Stores:** the same data the in-process admission state holds —
+  per-caller request counts, token reservations, micro-USD spend and
+  reservations, in-flight slot counts, lease records (caller, member,
+  model, reserved amounts), cooldown reset times, and usage events as
+  JSON (the same ledger rows, no prompt or response bytes). No prompt or
+  response content crosses this seam; the body digest is the only body
+  derivative.
+- **Where:** the configured Redis (keyed under the shared prefix; keys
+  expire on their window TTLs, leases after 1h) or Postgres (the
+  replica schema; window rows are purged on a timer).
+- **Retention:** window rows live only as long as their window (plus a
+  bounded grace); usage events live until the operator drains or drops
+  them.
+
+### MCP gateway — `[mcp]` (the `mcp-gateway` feature)
+
+- **Stores:** nothing persistent. Gateway sessions (token id, first and
+  last seen) live in process memory and age out after `session_ttl`.
+  Tool calls write the same usage-ledger rows as chat (route kind
+  `mcp`), with explicitly zero token usage. The gateway relays tool-call
+  arguments to the configured upstream MCP servers — the same egress the
+  proxy performs for chat — and retains none of them.
+
+### Guardrails — the `llm-proxy-guardrails` crate
+
+- **Stores:** nothing. Guards are configuration (patterns, actions);
+  masking rewrites text in flight. Fail-policy choices are logged as
+  events, without the text that triggered them.
+
 ## Not built
 
-- Payload logging, shadow evaluation and semantic caching are not in the
-  proxy. Optional crates (plan 09) that add stores must extend this page.
+- Payload logging and shadow evaluation are not in the proxy.
 - Subscription OAuth and client fingerprinting are out of scope; see the
   [credentials decision](goal.md#credentials).
