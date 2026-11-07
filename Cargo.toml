@@ -10,6 +10,7 @@ default-members = [
     "crates/llm-proxy-transport",
     "crates/llm-proxy-storage",
     "crates/llm-proxy-engine",
+    "crates/llm-proxy-bridge",
     "crates/llm-proxy-api",
     "crates/llm-proxy-server",
     "crates/llm-proxy-sdk",
@@ -23,6 +24,7 @@ members = [
     "crates/llm-proxy-transport",
     "crates/llm-proxy-storage",
     "crates/llm-proxy-engine",
+    "crates/llm-proxy-bridge",
     "crates/llm-proxy-api",
     "crates/llm-proxy-server",
     "crates/llm-proxy-sdk",
@@ -52,6 +54,8 @@ llm-proxy-adapters = { path = "crates/llm-proxy-adapters", version = "0.1.0" }
 llm-proxy-transport = { path = "crates/llm-proxy-transport", version = "0.1.0" }
 llm-proxy-storage = { path = "crates/llm-proxy-storage", version = "0.1.0", default-features = false }
 llm-proxy-engine = { path = "crates/llm-proxy-engine", version = "0.1.0" }
+# Not in [workspace.dependencies]: the bridge's consumers are the standalone
+# binding workspaces under bindings/, which reference it by path directly.
 llm-proxy-api = { path = "crates/llm-proxy-api", version = "0.1.0" }
 llm-proxy-server = { path = "crates/llm-proxy-server", version = "0.1.0" }
 llm-proxy-store-redis = { path = "crates/llm-proxy-store-redis", version = "0.1.0" }

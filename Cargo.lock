@@ -2525,6 +2525,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "llm-proxy-bridge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "llm-proxy-adapters",
+ "llm-proxy-core",
+ "llm-proxy-engine",
+ "llm-proxy-protocol",
+ "llm-proxy-storage",
+ "llm-proxy-transport",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "llm-proxy-core"
 version = "0.1.0"
 dependencies = [
