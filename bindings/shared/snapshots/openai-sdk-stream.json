@@ -1,0 +1,63 @@
+{
+  "error": null,
+  "response": null,
+  "stream_events": [
+    {
+      "MessageStart": {
+        "id": "chatcmpl-s",
+        "model": {
+          "requested": "gpt-4o-mini",
+          "upstream": null
+        }
+      }
+    },
+    {
+      "ContentStart": {
+        "index": 0,
+        "kind": "Text"
+      }
+    },
+    {
+      "TextDelta": {
+        "index": 0,
+        "text": "hi"
+      }
+    },
+    {
+      "MessageStop": {
+        "stop_reason": "EndTurn",
+        "stop_sequence": null
+      }
+    },
+    {
+      "UsageDelta": {
+        "usage": {
+          "cache_creation_input_tokens": null,
+          "cache_read_input_tokens": null,
+          "input_tokens": 10,
+          "output_tokens": 2,
+          "provenance": "ProviderReported",
+          "reasoning_tokens": null
+        }
+      }
+    }
+  ],
+  "upstream_headers": {
+    "authorization": "Bearer operator-openai-key",
+    "content-type": "application/json"
+  },
+  "upstream_request": {
+    "messages": [
+      {
+        "content": "Count to three.",
+        "role": "user"
+      }
+    ],
+    "model": "gpt-4o-mini",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "temperature": 0.1
+  }
+}

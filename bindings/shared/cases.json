@@ -1,0 +1,340 @@
+{
+  "fixture_root": "crates/llm-proxy-server/tests/fixtures/contract",
+  "upstream_responses": {
+    "anthropic_json": {
+      "kind": "json",
+      "body": {
+        "id": "msg_fixture_01",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "fixture reply"
+          }
+        ],
+        "model": "claude-sonnet-4-5-20250929",
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 100,
+          "output_tokens": 20,
+          "cache_creation_input_tokens": 64,
+          "cache_read_input_tokens": 32
+        }
+      }
+    },
+    "openai_chat_json": {
+      "kind": "json",
+      "body": {
+        "id": "chatcmpl-fixture-01",
+        "object": "chat.completion",
+        "created": 1770000000,
+        "model": "gpt-4o-2024-08-06",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "fixture reply"
+            },
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 25,
+          "completion_tokens": 7,
+          "total_tokens": 32
+        }
+      }
+    },
+    "anthropic_sse": {
+      "kind": "sse",
+      "events": [
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+      ]
+    },
+    "openai_chat_sse": {
+      "kind": "sse",
+      "events": [
+        "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1770000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1770000000,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"chatcmpl-s\",\"object\":\"chat.completion.chunk\",\"created\":1770000000,\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12}}\n\n",
+        "data: [DONE]\n\n"
+      ]
+    },
+    "responses_sse": {
+      "kind": "sse",
+      "events": [
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture_codex\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_0\",\"output_index\":0,\"content_index\":0,\"delta\":\"fixed\"}\n\n",
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture_codex\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":120,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":48},\"total_tokens\":129}}}\n\n"
+      ]
+    }
+  },
+  "providers": {
+    "anthropic-upstream": {
+      "name": "anthropic-upstream",
+      "api_key": "operator-anthropic-key",
+      "auth_style": "bearer",
+      "adapters": {
+        "messages": {
+          "protocol": "anthropic_messages",
+          "endpoint": "{upstream}/v1/messages"
+        }
+      },
+      "routes": {
+        "messages": "messages"
+      },
+      "model_aliases": {
+        "claude-sonnet-4-5": "claude-sonnet-4-5-20250929"
+      }
+    },
+    "openai-upstream": {
+      "name": "openai-upstream",
+      "api_key": "operator-openai-key",
+      "auth_style": "bearer",
+      "adapters": {
+        "chat": {
+          "protocol": "openai_chat_completions",
+          "endpoint": "{upstream}/v1/chat/completions"
+        }
+      },
+      "routes": {
+        "chat_completions": "chat"
+      }
+    },
+    "responses-upstream": {
+      "name": "responses-upstream",
+      "api_key": "operator-responses-key",
+      "auth_style": "bearer",
+      "adapters": {
+        "resp": {
+          "protocol": "openai_responses",
+          "endpoint": "{upstream}/v1/responses"
+        }
+      },
+      "routes": {
+        "responses": "resp"
+      },
+      "model_aliases": {
+        "gpt-5.1-codex": "gpt-5.1-codex-2030-09-17"
+      }
+    },
+    "cross-anthropic": {
+      "name": "cross-anthropic",
+      "api_key": "operator-anthropic-key",
+      "auth_style": "x-api-key",
+      "adapters": {
+        "messages": {
+          "protocol": "anthropic_messages",
+          "endpoint": "{upstream}/v1/messages"
+        }
+      },
+      "routes": {
+        "messages": "messages",
+        "chat_completions": "messages"
+      }
+    },
+    "anthropic-json-upstream": {
+      "name": "anthropic-json-upstream",
+      "api_key": "operator-anthropic-key",
+      "auth_style": "bearer",
+      "adapters": {
+        "messages": {
+          "protocol": "anthropic_messages",
+          "endpoint": "{upstream}/v1/messages"
+        }
+      },
+      "routes": {
+        "messages": "messages"
+      }
+    }
+  },
+  "header_subset": [
+    "authorization",
+    "x-api-key",
+    "anthropic-beta",
+    "x-claude-code-session-id",
+    "content-type"
+  ],
+  "cases": [
+    {
+      "name": "claude-code-session",
+      "provider": "anthropic-upstream",
+      "dialect": "anthropic_messages",
+      "fixture": "claude-code/session-request.json",
+      "stream": false,
+      "options": {
+        "headers": {
+          "authorization": "Bearer client-secret-token",
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "context-1m-2025-08-07",
+          "x-claude-code-session-id": "sess-fixture-1",
+          "origin": "https://evil.example",
+          "user-agent": "claude-cli/2.0.0 (external, cli)",
+          "accept-language": "en-US,en;q=0.9",
+          "x-request-id": "client-generated-id"
+        }
+      },
+      "upstream_response": "anthropic_json"
+    },
+    {
+      "name": "anthropic-sdk-tool-replay",
+      "provider": "anthropic-upstream",
+      "dialect": "anthropic_messages",
+      "fixture": "anthropic-sdk/tool-replay-request.json",
+      "stream": false,
+      "options": {
+        "headers": {
+          "authorization": "Bearer client-secret-token"
+        }
+      },
+      "upstream_response": "anthropic_json"
+    },
+    {
+      "name": "anthropic-sdk-stream",
+      "provider": "anthropic-upstream",
+      "dialect": "anthropic_messages",
+      "fixture": "captured/anthropic-sdk/stream-request.json",
+      "stream": true,
+      "options": {
+        "headers": {
+          "authorization": "Bearer client-secret-token"
+        }
+      },
+      "upstream_response": "anthropic_sse"
+    },
+    {
+      "name": "openai-sdk-chat",
+      "provider": "openai-upstream",
+      "dialect": "openai_chat_completions",
+      "fixture": "captured/openai-sdk/chat-request.json",
+      "stream": false,
+      "options": {
+        "headers": {
+          "authorization": "Bearer client-secret-token"
+        }
+      },
+      "upstream_response": "openai_chat_json"
+    },
+    {
+      "name": "openai-sdk-stream",
+      "provider": "openai-upstream",
+      "dialect": "openai_chat_completions",
+      "fixture": "captured/openai-sdk/stream-request.json",
+      "stream": true,
+      "options": {
+        "headers": {
+          "authorization": "Bearer client-secret-token"
+        }
+      },
+      "upstream_response": "openai_chat_sse"
+    },
+    {
+      "name": "codex-session",
+      "provider": "responses-upstream",
+      "dialect": "openai_responses",
+      "fixture": "codex/session-request.json",
+      "stream": true,
+      "options": {
+        "headers": {
+          "content-type": "application/json",
+          "authorization": "Bearer codex-capture-fixture-key-not-real",
+          "accept": "text/event-stream",
+          "user-agent": "codex_cli_rs/0.50.0 (Linux 6.12.0-debian; x86_64) vscode/1.99",
+          "originator": "codex_cli_rs",
+          "session_id": "fixture-session-7f3a",
+          "conversation_id": "fixture-conversation-1c2b",
+          "x-stainless-lang": "rust"
+        }
+      },
+      "upstream_response": "responses_sse"
+    },
+    {
+      "name": "cross-openai-to-anthropic",
+      "provider": "cross-anthropic",
+      "dialect": "openai_chat_completions",
+      "fixture": "captured/openai-sdk/chat-request.json",
+      "stream": false,
+      "options": {
+        "headers": {
+          "authorization": "Bearer client-secret-token"
+        }
+      },
+      "upstream_response": "anthropic_json"
+    }
+  ],
+  "translates": [
+    {
+      "name": "translate-claude-code-to-openai-chat",
+      "fixture": "claude-code/session-request.json",
+      "from": "anthropic_messages",
+      "to": "openai_chat_completions",
+      "mode": "request"
+    },
+    {
+      "name": "translate-openai-chat-to-anthropic",
+      "fixture": "captured/openai-sdk/chat-request.json",
+      "from": "openai_chat_completions",
+      "to": "anthropic_messages",
+      "mode": "request"
+    },
+    {
+      "name": "translate-response-anthropic-to-openai-chat",
+      "body": {
+        "id": "msg_fixture_01",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "fixture reply"
+          }
+        ],
+        "model": "claude-sonnet-4-5-20250929",
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 100,
+          "output_tokens": 20,
+          "cache_creation_input_tokens": 64,
+          "cache_read_input_tokens": 32
+        }
+      },
+      "from": "anthropic_messages",
+      "to": "openai_chat_completions",
+      "mode": "response"
+    }
+  ],
+  "cancellation": {
+    "dialect": "anthropic_messages",
+    "request": {
+      "model": "claude-sonnet-4-5",
+      "max_tokens": 64,
+      "stream": true,
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ]
+    },
+    "upstream_response": "anthropic_sse",
+    "gap_ms": 250,
+    "settle_timeout_secs": 5,
+    "stream_provider": "anthropic-upstream",
+    "followup_provider": "anthropic-json-upstream"
+  },
+  "normalizations": {
+    "note": "Applied identically by the Rust, Python and Node harnesses before snapshot comparison: every JSON number under a key named 'created' is replaced by this marker (the chat-completion encoder stamps wall-clock time).",
+    "key": "created",
+    "marker": "<created-timestamp>"
+  }
+}

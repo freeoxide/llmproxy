@@ -1,0 +1,66 @@
+{
+  "error": null,
+  "result": {
+    "max_completion_tokens": 16384,
+    "messages": [
+      {
+        "content": "You are a coding agent working inside a repository.",
+        "role": "system"
+      },
+      {
+        "content": "Long-term instructions that change rarely.",
+        "role": "system"
+      },
+      {
+        "content": "Summarize the failing tests in crates/llm-proxy-server.",
+        "role": "user"
+      },
+      {
+        "content": "I'll list the failing tests first.",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"command\":\"cargo test -p llm-proxy-server 2>&1 | grep FAILED\"}",
+              "name": "bash"
+            },
+            "id": "toolu_01ABC",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "test tests::messages_unknown_fields ... FAILED",
+        "role": "tool",
+        "tool_call_id": "toolu_01ABC"
+      }
+    ],
+    "model": "claude-sonnet-4-5",
+    "reasoning_effort": "medium",
+    "stop": "\n\nHuman:",
+    "temperature": 1.0,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "function": {
+          "description": "Run a shell command in the repository.",
+          "name": "bash",
+          "parameters": {
+            "properties": {
+              "command": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "command"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ],
+    "top_p": 0.95,
+    "user": "user_abc123"
+  }
+}

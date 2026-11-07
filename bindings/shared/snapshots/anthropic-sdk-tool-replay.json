@@ -1,0 +1,102 @@
+{
+  "error": null,
+  "response": {
+    "content": [
+      {
+        "text": "fixture reply",
+        "type": "text"
+      }
+    ],
+    "id": "msg_fixture_01",
+    "model": "claude-sonnet-4-5-20250929",
+    "role": "assistant",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "cache_creation_input_tokens": 64,
+      "cache_read_input_tokens": 32,
+      "input_tokens": 100,
+      "output_tokens": 20
+    }
+  },
+  "stream_events": null,
+  "upstream_headers": {
+    "authorization": "Bearer operator-anthropic-key",
+    "content-type": "application/json"
+  },
+  "upstream_request": {
+    "max_tokens": 4096,
+    "messages": [
+      {
+        "content": [
+          {
+            "source": {
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+              "media_type": "image/png",
+              "type": "base64"
+            },
+            "type": "image"
+          },
+          {
+            "text": "What is in this image?",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "id": "toolu_02DEF",
+            "input": {
+              "city": "San Francisco"
+            },
+            "name": "get_weather",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": "weather service unavailable",
+            "is_error": true,
+            "tool_use_id": "toolu_02DEF",
+            "type": "tool_result"
+          },
+          {
+            "text": "Try another source instead.",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-sonnet-4-5-20250929",
+    "stream": false,
+    "system": "You are a helpful assistant.",
+    "temperature": 0,
+    "tool_choice": {
+      "type": "any"
+    },
+    "tools": [
+      {
+        "description": "Get the current weather for a city.",
+        "input_schema": {
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        },
+        "name": "get_weather"
+      }
+    ]
+  }
+}
