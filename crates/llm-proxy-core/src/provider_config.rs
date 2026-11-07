@@ -143,7 +143,12 @@ pub struct ServerConfig {
     /// over it.
     #[serde(default)]
     pub log_format: LogFormat,
-    /// Reserved hot-reload flag. Configuration loading rejects `true`.
+    /// Enable hot reload of the provider and pool files (plan 07 step 11):
+    /// SIGHUP (or `llm-proxy reload`) re-reads them and swaps providers
+    /// without dropping in-flight requests. Changes anywhere else —
+    /// `[server]`, `[auth]`, `[storage]` — are refused with a
+    /// restart-required error instead of being half-applied. Default `false`:
+    /// without it, reload signals are ignored.
     pub hot_reload: bool,
     /// Per-client requests allowed per minute. `0` disables rate limiting.
     #[serde(default = "default_rate_limit_rpm")]
@@ -2551,14 +2556,6 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
     }
 
     let cfg: AppConfig = toml::from_str(&interpolated).map_err(CoreError::ConfigParse)?;
-    if cfg.server.hot_reload {
-        return Err(CoreError::ConfigValidation {
-            message:
-                "server.hot_reload=true is not supported; restart the server after config changes"
-                    .to_owned(),
-            source: None,
-        });
-    }
     const MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
     if cfg.server.request_timeout < MIN_REQUEST_TIMEOUT {
         return Err(CoreError::ConfigValidation {
@@ -2672,6 +2669,64 @@ pub fn bare_v1_target_problems(
         ));
     }
     problems
+}
+
+/// Names every change between two config snapshots that hot reload cannot
+/// apply and therefore refuses (plan 07 step 11, backlog 23): any `[server]`
+/// field (compared as rendered values, so the message can name the field),
+/// the auth mode, the set of client key ids, the admin token, and the
+/// storage ledger. Provider and pool files are reloadable and are not
+/// compared here. Empty result: the reload may proceed.
+///
+/// Secrets are compared by equality and never rendered; the client key
+/// *ids* are compared as a set (verifiers change by replacing a key under
+/// the same id — which keeps attribution intact and needs no restart).
+#[must_use]
+pub fn restart_required_changes(current: &AppConfig, next: &AppConfig) -> Vec<String> {
+    let mut changes = Vec::new();
+
+    let rendered = |config: &ServerConfig| serde_json::to_value(config).unwrap_or_default();
+    let (current_server, next_server) = (rendered(&current.server), rendered(&next.server));
+    if let (Some(current_map), Some(next_map)) =
+        (current_server.as_object(), next_server.as_object())
+    {
+        let mut keys: Vec<&String> = current_map.keys().chain(next_map.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if current_map.get(key) != next_map.get(key) {
+                changes.push(format!("server.{key}"));
+            }
+        }
+    } else if current_server != next_server {
+        changes.push("server".to_owned());
+    }
+
+    if current.auth.mode != next.auth.mode {
+        changes.push("auth.mode".to_owned());
+    }
+    fn key_set(config: &AppConfig) -> std::collections::BTreeSet<&str> {
+        config.auth.clients.keys().map(String::as_str).collect()
+    }
+    if key_set(current) != key_set(next) {
+        changes.push("auth.clients".to_owned());
+    }
+    let token_of = |config: &AppConfig| {
+        config
+            .auth
+            .admin
+            .as_ref()
+            .map(|admin| admin.token.expose_secret().to_owned())
+    };
+    if token_of(current) != token_of(next) {
+        changes.push("auth.admin".to_owned());
+    }
+    match (&current.storage, &next.storage) {
+        (Some(a), Some(b)) if a == b => {}
+        (None, None) => {}
+        _ => changes.push("storage".to_owned()),
+    }
+    changes
 }
 
 /// Validates one pool definition in isolation: non-empty name and members,
@@ -3655,8 +3710,89 @@ server_name = "test"
         assert_eq!(config.server.shutdown_timeout, Duration::from_secs(10));
     }
 
+    fn base_config() -> AppConfig {
+        toml::from_str::<AppConfig>(
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = true
+server_name = "t"
+
+[auth]
+mode = "client-keys"
+[auth.clients]
+laptop = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
+"#,
+        )
+        .expect("base config parses")
+    }
+
     #[test]
-    fn load_app_config_rejects_enabled_hot_reload() {
+    fn restart_required_changes_names_the_exact_server_field() {
+        let current = base_config();
+        let mut next = current.clone();
+        next.server.request_timeout = Duration::from_secs(120);
+        let changes = restart_required_changes(&current, &next);
+        assert_eq!(changes, vec!["server.request_timeout".to_owned()]);
+    }
+
+    #[test]
+    fn restart_required_changes_covers_auth_and_storage() {
+        let current = base_config();
+        // Same key ids, different mode.
+        let mut next = current.clone();
+        next.auth.mode = AuthMode::None;
+        assert!(restart_required_changes(&current, &next).contains(&"auth.mode".to_owned()));
+        // A new key id.
+        let mut next = current.clone();
+        next.auth.clients.insert(
+            "phone".to_owned(),
+            ClientKeySpec::Verifier(secrecy::SecretString::from("x")),
+        );
+        assert!(
+            restart_required_changes(&current, &next).contains(&"auth.clients".to_owned()),
+            "key ids are restart-required: verifiers feed the auth middleware"
+        );
+        // Admin token.
+        let mut next = current.clone();
+        next.auth.admin = Some(AdminAuthConfig {
+            token: secrecy::SecretString::from("token"),
+        });
+        assert!(restart_required_changes(&current, &next).contains(&"auth.admin".to_owned()));
+        // Storage ledger.
+        let mut next = current.clone();
+        next.storage = Some(StorageConfig {
+            path: "usage.db".into(),
+            max_age: None,
+            max_rows: None,
+            prune_interval: Duration::from_secs(3600),
+        });
+        assert!(restart_required_changes(&current, &next).contains(&"storage".to_owned()));
+    }
+
+    #[test]
+    fn restart_required_changes_allows_provider_only_edits_and_hot_reload_toggle_free_changes() {
+        let current = base_config();
+        let next = current.clone();
+        assert!(
+            restart_required_changes(&current, &next).is_empty(),
+            "an identical snapshot needs no restart"
+        );
+        // hot_reload itself flipping is a server change: the flag gates the
+        // SIGHUP wiring, so it lands on restart.
+        let mut next = current.clone();
+        next.server.hot_reload = false;
+        assert_eq!(
+            restart_required_changes(&current, &next),
+            vec!["server.hot_reload".to_owned()]
+        );
+    }
+
+    #[test]
+    fn load_app_config_accepts_enabled_hot_reload() {
+        // Plan 07 step 11: hot_reload now means something (SIGHUP reloads the
+        // provider and pool files), so it loads instead of being rejected.
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
         std::fs::write(
@@ -3672,13 +3808,8 @@ server_name = "test"
         )
         .unwrap();
 
-        let error = load_app_config(&path).expect_err("hot reload is unsupported");
-
-        assert!(
-            error
-                .to_string()
-                .contains("hot_reload=true is not supported")
-        );
+        let config = load_app_config(&path).expect("hot_reload=true loads");
+        assert!(config.server.hot_reload);
     }
 
     #[test]

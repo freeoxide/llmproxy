@@ -95,7 +95,8 @@ async fn handle_models_inner(
     // A pool name lists the union of its members' catalogs; a provider name
     // lists its own (plan 04 step 4: clients use the same URL shape either
     // way).
-    let member_names: Vec<String> = match state.providers().pool(provider_name) {
+    let live_providers = state.providers();
+    let member_names: Vec<String> = match live_providers.pool(provider_name) {
         Some(pool) => pool.members.clone(),
         None => {
             if state.providers().get(provider_name).is_none() {
@@ -117,7 +118,7 @@ async fn handle_models_inner(
     let mut entries = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
     for member_name in &member_names {
-        let Some(provider) = state.providers().get(member_name) else {
+        let Some(provider) = live_providers.get(member_name) else {
             continue;
         };
         let member_entries = state

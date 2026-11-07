@@ -20,6 +20,10 @@ async fn main() -> Result<()> {
             let paths = default_command_paths();
             cmd_stop(&paths)
         }
+        Commands::Reload => {
+            let paths = default_command_paths();
+            cmd_reload(&paths)
+        }
         Commands::Status => {
             let paths = default_command_paths();
             cmd_status(&paths)

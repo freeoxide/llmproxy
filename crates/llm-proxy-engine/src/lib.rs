@@ -239,6 +239,14 @@ impl Engine {
         &self.inner.providers
     }
 
+    /// The provider registry as an owned `Arc` (plan 07 step 11): handlers
+    /// that read the live provider set per request follow the current engine
+    /// after a hot reload swaps it.
+    #[must_use]
+    pub fn provider_registry(&self) -> Arc<ProviderRegistry> {
+        Arc::clone(&self.inner.providers)
+    }
+
     /// The provider adapter registry (the open provider set).
     #[must_use]
     pub fn adapters(&self) -> &ProviderAdapterRegistry {

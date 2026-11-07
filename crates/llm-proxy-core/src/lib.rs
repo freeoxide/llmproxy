@@ -41,7 +41,7 @@ pub use provider_config::{
     ProviderFile, ProviderRouteKind, ProviderRoutesConfig, ResponseCacheConfig, RetryConfig,
     ServerConfig, StaticModelCatalogEntry, StorageConfig, UnestimatableCostPolicy,
     UpstreamTimeoutsConfig, bare_v1_target_problems, family_max_body_bytes, family_request_timeout,
-    load_app_config, load_provider_config, validate_metrics_config,
+    load_app_config, load_provider_config, restart_required_changes, validate_metrics_config,
     validate_passthrough_auth_combination, validate_pool_config, validate_provider_config,
     validate_upstream_timeouts,
 };

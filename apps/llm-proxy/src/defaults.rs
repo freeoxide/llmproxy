@@ -12,6 +12,9 @@ bind = "127.0.0.1:3456"
 request_timeout = "300s"
 log_level = "info"
 # log_format = "plain"  # "plain" (default) | "json"; RUST_LOG_FORMAT env overrides at startup
+# Hot reload (plan 07): SIGHUP / `llm-proxy reload` re-reads the provider
+# files; server/auth/storage changes are refused with a restart-required
+# error. Off by default.
 hot_reload = false
 rate_limit_rpm = 100
 trust_forwarded_headers = false

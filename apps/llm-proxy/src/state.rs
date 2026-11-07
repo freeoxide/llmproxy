@@ -150,8 +150,9 @@ pub fn load_registry_with_checks(
     Ok(registry)
 }
 
-/// Per-provider egress-proxy clients from `[provider.egress]`.
-fn build_egress_clients(
+/// Per-provider egress-proxy clients from `[provider.egress]` — also the
+/// rebuild path for a hot reload (plan 07 step 11).
+pub(crate) fn build_egress_clients(
     app_config: &AppConfig,
     registry: &ProviderRegistry,
 ) -> Result<std::collections::HashMap<String, std::sync::Arc<ProxyClient>>> {

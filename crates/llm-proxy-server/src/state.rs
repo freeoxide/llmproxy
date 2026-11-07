@@ -78,6 +78,17 @@ impl EngineSlot {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = Some(built);
     }
+
+    fn replace(
+        &self,
+        engine: Arc<Engine>,
+    ) -> Option<Result<Arc<Engine>, llm_proxy_engine::EngineError>> {
+        let mut guard = self
+            .built
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.replace(Ok(engine))
+    }
 }
 
 impl std::fmt::Debug for AppState {
@@ -234,9 +245,15 @@ impl AppState {
         &self.app_config
     }
 
-    /// Access the provider registry.
-    pub fn providers(&self) -> &ProviderRegistry {
-        &self.providers
+    /// The live provider registry: the current engine's after a hot reload
+    /// swapped it (plan 07 step 11), the startup registry before the first
+    /// build. An owned `Arc`, because the answer can change between calls.
+    #[must_use]
+    pub fn providers(&self) -> Arc<ProviderRegistry> {
+        match self.engine.get() {
+            Some(Ok(engine)) => engine.provider_registry(),
+            _ => Arc::clone(&self.providers),
+        }
     }
 
     /// The request engine: the shared lifecycle (admission, routing,
@@ -266,15 +283,38 @@ impl AppState {
     }
 
     /// Builds a fresh engine from this state's current parts. Used for the
-    /// lazy first build and by the hot-reload path (plan 07 step 11), which
-    /// then swaps the slot; requests holding the previous engine finish on
-    /// it because they hold an `Arc` clone.
+    /// lazy first build; the hot-reload path (plan 07 step 11) builds from
+    /// explicit parts and then swaps the slot, so requests holding the
+    /// previous engine finish on it because they hold an `Arc` clone.
     pub(crate) fn build_engine(&self) -> Result<Arc<Engine>, llm_proxy_engine::EngineError> {
+        let egress = (*self.egress_clients).clone();
+        for provider in self.providers.iter() {
+            if provider.egress.is_some() && !egress.contains_key(&provider.name) {
+                tracing::warn!(
+                    provider = %provider.name,
+                    "provider has [provider.egress] configured but no egress client was wired; \
+                     its upstream traffic is leaving directly, not through the configured proxy"
+                );
+            }
+        }
+        self.build_engine_from_parts(&self.providers, egress)
+    }
+
+    /// Builds an engine over an explicit registry and egress map — the
+    /// hot-reload path (plan 07 step 11): the new engine is built and
+    /// validated before anything live is touched. Admission (per-key
+    /// policies and concurrency caps) is rebuilt against the new registry,
+    /// since caps live on providers.
+    pub fn build_engine_from_parts(
+        &self,
+        providers: &Arc<ProviderRegistry>,
+        egress: HashMap<String, Arc<ProxyClient>>,
+    ) -> Result<Arc<Engine>, llm_proxy_engine::EngineError> {
         let config = llm_proxy_engine::ConfigSource::load(&*self.config_source)
             .unwrap_or_else(|_| Arc::clone(&self.app_config));
         let mut builder = EngineBuilder::from_parts(
             Arc::clone(&self.config_source) as Arc<dyn llm_proxy_engine::ConfigSource>,
-            Arc::clone(&self.providers),
+            Arc::clone(providers),
             Arc::clone(&self.provider_adapters),
             Arc::clone(&self.proxy_client),
         )
@@ -283,10 +323,10 @@ impl AppState {
         .event_bus(Arc::clone(&self.event_bus))
         .counter(self.token_counter.clone());
         // The one admission step (plan 05): per-key policies from
-        // [auth.clients] and caps from [provider.concurrency]. With
-        // neither configured the engine keeps its allow-all default.
-        let admission =
-            llm_proxy_engine::PolicyAdmission::from_config(&config.auth, &self.providers);
+        // [auth.clients] and caps from [provider.concurrency] — read off the
+        // registry this engine routes through. With neither configured the
+        // engine keeps its allow-all default.
+        let admission = llm_proxy_engine::PolicyAdmission::from_config(&config.auth, providers);
         if !admission.is_noop() {
             builder = builder.admission(Arc::new(admission));
         }
@@ -298,20 +338,18 @@ impl AppState {
                 config.server.cache.max_entries,
             )));
         }
-        let egress = (*self.egress_clients).clone();
-        for provider in self.providers.iter() {
-            if provider.egress.is_some() && !egress.contains_key(&provider.name) {
-                tracing::warn!(
-                    provider = %provider.name,
-                    "provider has [provider.egress] configured but no egress client was wired; \
-                     its upstream traffic is leaving directly, not through the configured proxy"
-                );
-            }
-        }
         if !egress.is_empty() {
             builder = builder.egress_clients(egress);
         }
         builder.build().map(Arc::new)
+    }
+
+    /// Swaps in a freshly built engine (plan 07 step 11): new requests use
+    /// it; in-flight requests keep running on the engine they already hold.
+    /// Returns the previous engine, if one had been built.
+    #[must_use]
+    pub fn swap_engine(&self, engine: Arc<Engine>) -> Option<Arc<Engine>> {
+        self.engine.replace(engine).and_then(|result| result.ok())
     }
 
     /// Access the provider model catalog service.

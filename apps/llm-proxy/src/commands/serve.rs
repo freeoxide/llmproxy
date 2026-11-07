@@ -77,6 +77,18 @@ pub async fn cmd_serve(
         ),
         None => None,
     };
+    // Hot reload (plan 07 step 11): the SIGHUP listener needs the state
+    // before the router takes it.
+    let reload_state = state.clone();
+    let hot_reload_enabled = state.app_config().server.hot_reload;
+    if hot_reload_enabled {
+        info!(
+            "hot reload enabled: SIGHUP (or `llm-proxy reload`) re-reads the provider files; \
+             [server]/[auth]/[storage] changes are refused with a restart-required error"
+        );
+    }
+    spawn_reload_listener(reload_state, path.clone(), hot_reload_enabled);
+
     let app = build_router(state);
 
     let listener = bind_listener(bind_addr).await?.tap_io(|tcp_stream| {
@@ -181,6 +193,54 @@ fn spawn_shutdown_listener() -> watch::Receiver<bool> {
         started.send_replace(true);
     });
     shutdown
+}
+
+/// Listens for SIGHUP and reloads the provider and pool files (plan 07 step
+/// 11). Without `server.hot_reload = true` the signal is acknowledged and
+/// ignored, so an operator poking the daemon changes nothing silently.
+#[cfg(unix)]
+fn spawn_reload_listener(state: llm_proxy_server::AppState, config_path: PathBuf, enabled: bool) {
+    tokio::spawn(async move {
+        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(hangup) => hangup,
+            Err(error) => {
+                tracing::warn!(%error, "cannot listen for SIGHUP; hot reload unavailable");
+                return;
+            }
+        };
+        while hangup.recv().await.is_some() {
+            if !enabled {
+                tracing::info!(
+                    "SIGHUP ignored: server.hot_reload = false; restart the server to apply \
+                     config changes"
+                );
+                continue;
+            }
+            match crate::reload::reload_registry(&state, &config_path) {
+                Ok(report) => {
+                    if report.is_empty() {
+                        info!("reload: nothing changed");
+                    } else {
+                        info!("{report}");
+                    }
+                }
+                Err(error) => tracing::error!(
+                    %error,
+                    "reload refused; the running configuration stands"
+                ),
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_listener(
+    _state: llm_proxy_server::AppState,
+    _config_path: PathBuf,
+    _enabled: bool,
+) {
+    // SIGHUP does not exist on this platform; `llm-proxy reload` says so too.
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {

@@ -1,0 +1,493 @@
+//! Hot reload (plan 07 step 11, backlog 23): re-read the provider and pool
+//! files and swap them in, one provider at a time, without dropping
+//! in-flight requests — and refuse, whole and up front, any change that
+//! needs a restart.
+//!
+//! What reload may change: the provider and pool files under `providers/`.
+//! What it must refuse: anything under `[server]`, `[auth]` or `[storage]`
+//! — those are wired into listeners, middleware and the ledger, and
+//! applying half of them would be worse than refusing. The refusal names
+//! the exact fields and changes nothing.
+//!
+//! Mechanics: the new registry is loaded through the same gates startup
+//! runs, a fresh engine is built over it (validated before anything live is
+//! touched), and only then is the engine slot swapped. Requests already
+//! running hold their own `Arc<Engine>` clone and finish on it — on any
+//! provider, changed or not.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use llm_proxy_adapters::ProviderAdapterRegistry;
+use llm_proxy_server::AppState;
+use secrecy::ExposeSecret;
+
+use crate::state::load_registry_with_checks;
+
+/// What one reload did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadReport {
+    /// Providers that appeared in the new registry.
+    pub added: Vec<String>,
+    /// Providers that disappeared.
+    pub removed: Vec<String>,
+    /// Providers present in both but changed (by rendered comparison).
+    pub changed: Vec<String>,
+    /// Pools added / removed / changed, reported the same way.
+    pub pools_changed: Vec<String>,
+}
+
+impl ReloadReport {
+    /// Whether anything changed at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.changed.is_empty()
+            && self.pools_changed.is_empty()
+    }
+}
+
+impl std::fmt::Display for ReloadReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "reload applied: {} added, {} removed, {} changed, {} pool changes",
+            self.added.len(),
+            self.removed.len(),
+            self.changed.len(),
+            self.pools_changed.len()
+        )?;
+        for name in self.added.iter().chain(&self.removed).chain(&self.changed) {
+            write!(f, "\n  provider {name}")?;
+        }
+        for name in &self.pools_changed {
+            write!(f, "\n  pool {name}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Reloads the provider and pool files beside `config_path` into `state`.
+///
+/// Refuses — changing nothing — when the new config differs anywhere
+/// outside the provider files (stable `restart-required:` prefix naming the
+/// fields), when a provider file fails any startup gate, or when the
+/// registry cannot be loaded. On success, later requests route through the
+/// new registry; in-flight requests finish on the engine they already hold.
+///
+/// # Errors
+///
+/// `anyhow` with a `restart-required:` prefix for refused changes, or the
+/// underlying loader error for broken provider files.
+pub fn reload_registry(state: &AppState, config_path: &Path) -> Result<ReloadReport> {
+    let mut next = llm_proxy_core::load_app_config(config_path)
+        .with_context(|| format!("re-reading {}", config_path.display()))?;
+    // The CLI layer outranks the file (the stated precedence): a --port the
+    // server was started with stays in force, so the diff must not see it.
+    next.server.bind = state.app_config().server.bind;
+
+    let restart = llm_proxy_core::restart_required_changes(state.app_config(), &next);
+    if !restart.is_empty() {
+        bail!(
+            "restart-required: {} changed ({}); the reload was refused and nothing was \
+             applied. Restart the server to apply these fields.",
+            restart.len(),
+            restart.join(", ")
+        );
+    }
+
+    // The same gates startup runs; a broken provider file refuses the whole
+    // reload rather than half-applying.
+    let adapter_registry = ProviderAdapterRegistry::builtin();
+    let registry = load_registry_with_checks(&next, config_path, &adapter_registry)
+        .context("re-loading providers (reload refused; nothing was applied)")?;
+
+    let current = state.providers();
+    let report = diff_registries(&current, &registry);
+
+    // Egress clients are per-provider; rebuild them from the new registry.
+    let egress = crate::state::build_egress_clients(&next, &registry)?;
+
+    // Build and validate the replacement engine before touching anything
+    // live; the swap itself is one pointer change.
+    let engine = state
+        .build_engine_from_parts(&std::sync::Arc::new(registry), egress)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "building the reloaded engine (reload refused; nothing was applied): {error}"
+            )
+        })?;
+    let _previous = state.swap_engine(engine);
+    Ok(report)
+}
+
+/// Names what differs between two registries, provider by provider and pool
+/// by pool. Provider comparison is by rendered config (secrets redacted by
+/// their `Debug`-independent serde skips, so a rotated key counts as a
+/// change without being printed).
+fn diff_registries(
+    current: &llm_proxy_core::ProviderRegistry,
+    next: &llm_proxy_core::ProviderRegistry,
+) -> ReloadReport {
+    let mut report = ReloadReport::default();
+    let names = |registry: &llm_proxy_core::ProviderRegistry| -> BTreeSet<String> {
+        registry.iter().map(|p| p.name.clone()).collect()
+    };
+    let (current_names, next_names) = (names(current), names(next));
+    for name in next_names.difference(&current_names) {
+        report.added.push(name.clone());
+    }
+    for name in current_names.difference(&next_names) {
+        report.removed.push(name.clone());
+    }
+    for name in current_names.intersection(&next_names) {
+        let rendered_changed = match (
+            current.get(name).and_then(|p| serde_json::to_value(p).ok()),
+            next.get(name).and_then(|p| serde_json::to_value(p).ok()),
+        ) {
+            (Some(a), Some(b)) => a != b,
+            _ => true,
+        };
+        // Secrets are skip_serializing, so a pure key rotation needs its own
+        // comparison — counted as a change, never printed.
+        let secret_changed = match (current.get(name), next.get(name)) {
+            (Some(a), Some(b)) => {
+                a.api_key.expose_secret() != b.api_key.expose_secret()
+                    || a.api_keys.as_ref().map(|keys| {
+                        keys.iter()
+                            .map(|k| k.expose_secret().to_owned())
+                            .collect::<Vec<_>>()
+                    }) != b.api_keys.as_ref().map(|keys| {
+                        keys.iter()
+                            .map(|k| k.expose_secret().to_owned())
+                            .collect::<Vec<_>>()
+                    })
+            }
+            _ => true,
+        };
+        if rendered_changed || secret_changed {
+            report.changed.push(name.clone());
+        }
+    }
+    let pool_names = |registry: &llm_proxy_core::ProviderRegistry| -> BTreeSet<String> {
+        registry.pools().map(|p| p.name.clone()).collect()
+    };
+    let (current_pools, next_pools) = (pool_names(current), pool_names(next));
+    for name in current_pools.symmetric_difference(&next_pools) {
+        report.pools_changed.push(name.clone());
+    }
+    for name in current_pools.intersection(&next_pools) {
+        let changed = match (
+            current
+                .pool(name)
+                .and_then(|p| serde_json::to_value(p).ok()),
+            next.pool(name).and_then(|p| serde_json::to_value(p).ok()),
+        ) {
+            (Some(a), Some(b)) => a != b,
+            _ => true,
+        };
+        if changed {
+            report.pools_changed.push(name.clone());
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::http::StatusCode;
+    use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
+    use llm_proxy_engine::{ClientDialect, EngineRequest, InboundRequest};
+    use llm_proxy_protocol::core::{
+        CoreContent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
+    };
+
+    fn write_provider(dir: &Path, name: &str, endpoint: &str, marker_port: u16) {
+        std::fs::create_dir_all(dir.join("providers")).expect("providers dir");
+        std::fs::write(
+            dir.join(format!("providers/{name}.toml")),
+            format!(
+                r#"[provider]
+name = "{name}"
+api_key = "key-{name}"
+auth_style = "x-api-key"
+[provider.adapters.messages]
+protocol = "anthropic_messages"
+endpoint = "{endpoint}"
+[provider.routes]
+messages = "messages"
+
+[provider.model_aliases]
+"m" = "{marker_port}"
+"#
+            ),
+        )
+        .expect("provider file");
+    }
+
+    fn write_config(dir: &Path, extra: &str) -> PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"[server]
+bind = "127.0.0.1:3477"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = true
+server_name = "reload-test"
+{extra}"#
+            ),
+        )
+        .expect("config file");
+        path
+    }
+
+    async fn spawn_echo_upstream(delay: Duration) -> (String, std::net::SocketAddr) {
+        let app = Router::new().route(
+            "/{*path}",
+            axum::routing::post(move || async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"upstream says hi"}],"model":"m","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":2}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                tracing::trace!(%error, "reload-test upstream stopped");
+            }
+        });
+        (format!("http://{addr}/v1/messages"), addr)
+    }
+
+    fn engine_request(provider: &str) -> EngineRequest {
+        EngineRequest::new(
+            provider,
+            llm_proxy_core::ProviderRouteKind::Messages,
+            ClientDialect::Anthropic,
+            CoreRequest {
+                model: ModelRef {
+                    requested: "m".to_owned(),
+                    upstream: None,
+                },
+                messages: vec![CoreMessage {
+                    role: CoreRole::User,
+                    content: vec![CoreContent::Text {
+                        text: "hi".to_owned(),
+                        cache: None,
+                    }],
+                }],
+                system: Vec::new(),
+                tools: Vec::new(),
+                tool_choice: None,
+                sampling: SamplingOptions::default(),
+                stream: false,
+                metadata: Default::default(),
+                provider_hints: Default::default(),
+            },
+            InboundRequest {
+                auth: None,
+                headers: HashMap::new(),
+                wire: ClientWireRequest::new(
+                    ClientWireFormat::AnthropicMessages,
+                    serde_json::json!({}),
+                ),
+            },
+        )
+        .with_request_id("req-reload-test")
+        .with_body_hash("hash")
+    }
+
+    fn state_for(dir: &Path) -> llm_proxy_server::AppState {
+        crate::state::load_toml_state(
+            &dir.join("config.toml"),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .expect("state builds")
+    }
+
+    /// The plan's Done-when: a reload that changes one provider leaves
+    /// in-flight requests on other providers running — and the changed
+    /// provider serves its new upstream afterwards.
+    #[tokio::test]
+    async fn a_provider_swap_leaves_in_flight_requests_on_other_providers_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // slow upstream for provider "slow", fast for "quick".
+        let (slow_endpoint, _slow_addr) = spawn_echo_upstream(Duration::from_millis(800)).await;
+        let (quick_endpoint, _quick_addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "slow", &slow_endpoint, 1);
+        write_provider(dir.path(), "quick", &quick_endpoint, 2);
+        let _config = write_config(dir.path(), "");
+
+        let state = state_for(dir.path());
+        let engine = state.engine().expect("engine builds");
+
+        // Fire a request at the slow provider; it will still be in flight
+        // when the reload lands.
+        let in_flight = {
+            let engine = std::sync::Arc::clone(&engine);
+            tokio::spawn(async move {
+                engine
+                    .execute(engine_request("slow"))
+                    .await
+                    .expect("the in-flight request on the untouched provider completes")
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Change ONLY the quick provider: point it at a new upstream.
+        let (new_quick_endpoint, _new_addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "quick", &new_quick_endpoint, 3);
+        let report =
+            reload_registry(&state, &dir.path().join("config.toml")).expect("reload applies");
+        assert_eq!(
+            report.changed,
+            vec!["quick".to_owned()],
+            "exactly the changed provider is reported: {report}"
+        );
+
+        // The in-flight request on the untouched provider finishes fine.
+        let done = tokio::time::timeout(Duration::from_secs(10), in_flight)
+            .await
+            .expect("in-flight join")
+            .expect("in-flight task");
+        assert_eq!(done.core.usage.input_tokens, 3);
+
+        // And a fresh request reaches the reloaded provider's new upstream.
+        let fresh = state.engine().expect("post-reload engine");
+        let response = fresh
+            .execute(engine_request("quick"))
+            .await
+            .expect("the reloaded provider serves");
+        assert_eq!(response.core.usage.input_tokens, 3);
+    }
+
+    /// Restart-required refusal: a `[server]` change refuses the reload and
+    /// applies nothing — the changed provider file is NOT picked up.
+    #[tokio::test]
+    async fn a_server_change_refuses_the_reload_and_applies_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        let _initial = write_config(dir.path(), "");
+
+        let state = state_for(dir.path());
+        let engine_before = state.engine().expect("engine builds");
+        let registry_before = state.providers();
+
+        // Touch the provider AND the server section: the refusal must win,
+        // and the provider change must not half-apply.
+        write_provider(dir.path(), "prov", &endpoint, 9);
+        write_config(dir.path(), "\nrequest_timeout = \"120s\"\n");
+        // (rewrite with the same base but a new timeout)
+        let path = {
+            let p = dir.path().join("config.toml");
+            std::fs::write(
+                &p,
+                r#"[server]
+bind = "127.0.0.1:3477"
+request_timeout = "120s"
+log_level = "info"
+hot_reload = true
+server_name = "reload-test"
+"#,
+            )
+            .expect("config rewrite");
+            p
+        };
+
+        let error =
+            reload_registry(&state, &path).expect_err("a server change must refuse the reload");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restart-required:"),
+            "the refusal carries the stable prefix operators grep for: {message}"
+        );
+        assert!(
+            message.contains("server.request_timeout"),
+            "the refusal names the exact field: {message}"
+        );
+        // Nothing was applied: the same engine serves, the same registry.
+        let engine_after = state.engine().expect("engine");
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "the engine was not swapped by a refused reload"
+        );
+        let registry_after = state.providers();
+        assert!(
+            Arc::ptr_eq(&registry_before, &registry_after),
+            "the provider set was not changed by a refused reload"
+        );
+    }
+
+    /// A broken provider file refuses the whole reload rather than
+    /// half-applying.
+    #[tokio::test]
+    async fn a_broken_provider_file_refuses_the_whole_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "good", &endpoint, 1);
+        write_provider(dir.path(), "also-good", &endpoint, 2);
+        let path = write_config(dir.path(), "");
+        let state = state_for(dir.path());
+        let engine_before = state.engine().expect("engine builds");
+
+        // Corrupt one provider file.
+        std::fs::write(dir.path().join("providers/good.toml"), "not toml {{{").expect("corrupt");
+        let error = reload_registry(&state, &path).expect_err("a broken file refuses the reload");
+        assert!(
+            format!("{error:#}").contains("nothing was applied"),
+            "the error says nothing was applied: {error:#}"
+        );
+        let engine_after = state.engine().expect("engine");
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "the engine was not swapped by a refused reload"
+        );
+    }
+
+    /// Adding and removing providers round-trips through the report.
+    #[tokio::test]
+    async fn adding_and_removing_providers_is_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "keep", &endpoint, 1);
+        write_provider(dir.path(), "drop-me", &endpoint, 2);
+        let path = write_config(dir.path(), "");
+        let state = state_for(dir.path());
+        state.engine().expect("engine builds");
+
+        std::fs::remove_file(dir.path().join("providers/drop-me.toml")).expect("remove");
+        write_provider(dir.path(), "fresh", &endpoint, 3);
+        let report = reload_registry(&state, &path).expect("reload applies");
+        assert_eq!(report.removed, vec!["drop-me".to_owned()]);
+        assert_eq!(report.added, vec!["fresh".to_owned()]);
+        assert!(
+            report.changed.is_empty(),
+            "untouched providers are untouched: {report}"
+        );
+        // The live set reflects it.
+        let live = state.providers();
+        assert!(live.get("fresh").is_some());
+        assert!(live.get("drop-me").is_none());
+    }
+}

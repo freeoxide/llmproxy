@@ -210,3 +210,15 @@ mod doctor_parsing {
         assert_eq!(config.as_deref(), Some(std::path::Path::new("x.toml")));
     }
 }
+
+#[cfg(test)]
+mod reload_parsing {
+    use clap::Parser;
+    use llm_proxy_app::cli::{Cli, Commands};
+
+    #[test]
+    fn reload_parses_as_a_flagless_command() {
+        let cli = Cli::try_parse_from(["llm-proxy", "reload"]).expect("reload parses");
+        assert!(matches!(cli.command, Commands::Reload));
+    }
+}

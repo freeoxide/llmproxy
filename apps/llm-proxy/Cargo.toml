@@ -30,6 +30,7 @@ llm-proxy-server = { workspace = true, features = ["admin"] }
 opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-json", "reqwest-blocking-client", "metrics"] }
+secrecy = { workspace = true }
 llm-proxy-core = { workspace = true }
 llm-proxy-adapters = { workspace = true }
 llm-proxy-transport = { workspace = true }
@@ -60,5 +61,4 @@ vergen-gix = { workspace = true }
 insta = { version = "1.42", features = ["yaml", "filters"] }
 axum = { workspace = true }
 llm-proxy-protocol = { workspace = true }
-secrecy = { workspace = true }
 tempfile = "3"

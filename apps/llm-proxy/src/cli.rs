@@ -38,6 +38,9 @@ pub enum Commands {
     },
     /// Stop a running server.
     Stop,
+    /// Signal a running server to re-read its provider files (hot reload;
+    /// needs server.hot_reload = true, unix only).
+    Reload,
     /// Check if the server is running.
     Status,
     /// Create a default config file.
