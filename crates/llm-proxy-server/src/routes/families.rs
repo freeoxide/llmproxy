@@ -48,7 +48,7 @@ use llm_proxy_adapters::ProviderError;
 use llm_proxy_adapters::request::{AuthHeaders, ProxyRequest};
 use llm_proxy_core::ProviderRouteKind;
 use llm_proxy_engine::EngineError;
-use llm_proxy_protocol::core::{ModelRef, Usage, UsageProvenance};
+use llm_proxy_protocol::core::{ModelRef, Usage};
 use llm_proxy_storage::{EventBus, ProxyEvent, RequestReceived, ResponseCompleted};
 use llm_proxy_transport::ProxyClient;
 use llm_proxy_transport::client::UpstreamResponse;
@@ -163,6 +163,7 @@ struct FamilyContext<'a> {
     caller: String,
     provider: &'a str,
     family: &'static str,
+    kind: ProviderRouteKind,
     requested_model: String,
     body_hash: String,
     start: Instant,
@@ -193,10 +194,22 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
         caller: meta.caller.as_str().to_owned(),
         provider,
         family: family_name(spec.kind),
+        kind: spec.kind,
         requested_model: String::new(),
         body_hash: format!("{:x}", Sha256::digest(&body)),
         start: Instant::now(),
     };
+
+    // Prepare the egress body first, then write the request row before
+    // any refusal can occur — the chat lifecycle and the MCP gateway
+    // emit theirs before admitting, so a refused family call leaves an
+    // attributed pair of rows (caller, provider, route kind) instead of
+    // an unattributable failure row alone.
+    let registry = state.providers();
+    let (requested_model, outbound_body, outbound_content_type) =
+        prepare_body(spec, &body, headers, &registry, provider);
+    ctx.requested_model = requested_model;
+    emit_family_request(state.event_bus(), &ctx);
 
     if !resource.is_empty() && !is_plain_resource_path(resource) {
         return family_error(
@@ -210,10 +223,6 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
     }
 
     // Resolve the route through the same registry the chat pipeline uses.
-    let registry = state.providers();
-    let (requested_model, outbound_body, outbound_content_type) =
-        prepare_body(spec, &body, headers, &registry, provider);
-    ctx.requested_model = requested_model;
     let target = match registry.resolve_provider_route(provider, spec.kind, &ctx.requested_model) {
         Ok(target) => target,
         Err(error) => {
@@ -239,7 +248,10 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
     };
 
     // Admission: the same reserve/settle step the chat pipeline runs. A
-    // refusal never reaches the upstream.
+    // refusal never reaches the upstream. The reservation itself carries
+    // no token estimate (families have no chat-style estimator); the
+    // settlement in `account` charges the provider-reported usage, so
+    // per-key TPM windows and priced budgets count family traffic.
     let engine = match state.engine() {
         Ok(engine) => engine,
         Err(error) => {
@@ -263,8 +275,6 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
         Err(error) => return family_error(state.event_bus(), &ctx, &RouteError::from(error)),
     };
 
-    emit_family_request(state.event_bus(), &ctx);
-
     // Forward on the provider's own transport (its `[provider.egress]`
     // client when it has one) and account.
     let outbound = Outbound {
@@ -281,7 +291,7 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
         admission.as_ref(),
         &ticket,
         &ctx,
-        target.provider_name.clone(),
+        &target,
         upstream.map_err(|error| upstream_refusal(&error, !resource.is_empty(), passthrough)),
     )
     .await
@@ -388,17 +398,32 @@ async fn account(
     admission: &dyn llm_proxy_engine::Admission,
     ticket: &llm_proxy_engine::AdmissionTicket,
     ctx: &FamilyContext<'_>,
-    member: String,
+    target: &llm_proxy_core::ProviderAdapterTargetConfig,
     upstream: Result<UpstreamResponse, RouteError>,
 ) -> Response {
     match upstream {
         Ok(answer) => {
+            // The families that report request-scoped token usage do so
+            // in their JSON answers; it drives settlement (per-key TPM
+            // windows and, where the model is priced, USD budgets) and
+            // the ledger row. Everything else reports usage in its own
+            // units (rows, seconds, images) and stays synthetic zero
+            // rather than a fabricated number.
+            let usage = family_usage(ctx.kind, &answer.body);
+            let cost = usage.as_ref().and_then(|usage| {
+                llm_proxy_engine::lifecycle::billed_cost(
+                    usage,
+                    state
+                        .providers()
+                        .pricing_for(&target.provider_name, &target.upstream_model),
+                )
+            });
             admission.settle(
                 ticket,
                 &llm_proxy_engine::AdmissionOutcome {
                     succeeded: true,
-                    usage: None,
-                    cost: None,
+                    usage: usage.as_ref(),
+                    cost: cost.as_ref(),
                 },
             );
             state
@@ -406,21 +431,14 @@ async fn account(
                 .emit(&ProxyEvent::ResponseCompleted(ResponseCompleted {
                     request_id: ctx.request_id.clone(),
                     timestamp: OffsetDateTime::now_utc(),
-                    provider: member,
+                    provider: target.provider_name.clone(),
                     upstream_message_id: None,
                     model: ModelRef {
                         requested: ctx.requested_model.clone(),
                         upstream: None,
                     },
-                    // These families report usage in their own units (rows,
-                    // seconds, images); the row records the call with
-                    // explicitly-synthetic-zero token usage rather than a
-                    // fabricated number.
-                    usage: Usage {
-                        provenance: UsageProvenance::SyntheticZero,
-                        ..Usage::default()
-                    },
-                    cost: None,
+                    usage: usage.unwrap_or_else(Usage::synthetic_zero),
+                    cost,
                     stop_reason: llm_proxy_protocol::core::StopReason::EndTurn,
                     latency_ms: elapsed_ms(ctx.start),
                     credential_id: None,
@@ -440,6 +458,115 @@ async fn account(
             family_error(state.event_bus(), ctx, &refusal)
         }
     }
+}
+
+/// The provider-reported token usage in one family answer, for the
+/// families whose documented APIs report request-scoped tokens in their
+/// JSON responses: embeddings and image generations (the OpenAI
+/// `usage.prompt_tokens` / `usage.total_tokens` and
+/// `usage.input_tokens` / `usage.output_tokens` shapes), and rerank —
+/// the flat `usage` variants plus Cohere's Rerank v2 envelope, which has
+/// no top-level `usage` and reports under `meta.tokens`, falling back to
+/// `meta.billed_units`. Files and batch answers carry aggregate
+/// lifecycle usage, not this call's, and audio answers are not JSON —
+/// both stay [`UsageProvenance::SyntheticZero`]. The answer is
+/// deserialized into a struct naming only the usage fields, so a large
+/// vector payload is skipped, never materialized.
+fn family_usage(kind: ProviderRouteKind, body: &[u8]) -> Option<Usage> {
+    if !matches!(
+        kind,
+        ProviderRouteKind::Embeddings
+            | ProviderRouteKind::Rerank
+            | ProviderRouteKind::ImagesGenerations
+    ) {
+        return None;
+    }
+    let answer: FamilyAnswer = serde_json::from_slice(body).ok()?;
+    if let Some(usage) = answer.usage.as_ref().and_then(flat_usage_pair) {
+        return Some(Usage::provider_reported(usage.0, usage.1));
+    }
+    // Cohere's rerank envelope: usage under meta.tokens, falling back to
+    // meta.billed_units when meta.tokens is absent or carries no input.
+    if kind == ProviderRouteKind::Rerank {
+        let meta = answer.meta.as_ref()?;
+        let counts = meta
+            .tokens
+            .as_ref()
+            .filter(|tokens| tokens.input_tokens.is_some())
+            .or(meta.billed_units.as_ref())?;
+        let input = counts.input_tokens?;
+        return Some(Usage::provider_reported(
+            count_i32(input),
+            count_i32(counts.output_tokens.unwrap_or(0)),
+        ));
+    }
+    None
+}
+
+/// The input/output pair of a top-level `usage` object, when it carries
+/// any token count at all.
+fn flat_usage_pair(usage: &FlatUsage) -> Option<(i32, i32)> {
+    let input = usage
+        .prompt_tokens
+        .or(usage.input_tokens)
+        .or(usage.billed_tokens)?;
+    let output = usage
+        .output_tokens
+        .or(usage.completion_tokens)
+        .or_else(|| usage.total_tokens.map(|total| total.saturating_sub(input)))
+        .unwrap_or(0);
+    Some((count_i32(input), count_i32(output)))
+}
+
+fn count_i32(count: u64) -> i32 {
+    i32::try_from(count).unwrap_or(i32::MAX)
+}
+
+/// A family answer, reduced to the fields the proxy reads: deserializing
+/// into this shape skips everything else (embedding vectors, ranked
+/// documents, image payloads) without allocating values for it.
+#[derive(serde::Deserialize)]
+struct FamilyAnswer {
+    #[serde(default)]
+    usage: Option<FlatUsage>,
+    #[serde(default)]
+    meta: Option<CohereMeta>,
+}
+
+/// A top-level `usage` object: the OpenAI embeddings/images fields plus
+/// the flat variants rerank servers send.
+#[derive(serde::Deserialize)]
+struct FlatUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    total_tokens: Option<u64>,
+    #[serde(default)]
+    billed_tokens: Option<u64>,
+}
+
+/// Cohere's per-response metadata envelope (Rerank v2).
+#[derive(serde::Deserialize)]
+struct CohereMeta {
+    #[serde(default)]
+    tokens: Option<TokenCounts>,
+    #[serde(default)]
+    billed_units: Option<TokenCounts>,
+}
+
+/// An `{input_tokens, output_tokens}` counts object.
+#[derive(serde::Deserialize)]
+struct TokenCounts {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 /// Rewrites the family body for egress: JSON families get their `model`
@@ -559,6 +686,7 @@ fn family_name(kind: ProviderRouteKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm_proxy_protocol::core::UsageProvenance;
 
     #[test]
     fn the_resource_goes_between_the_endpoint_and_its_query() {
@@ -596,5 +724,91 @@ mod tests {
         ] {
             assert!(!is_plain_resource_path(refused), "{refused:?}");
         }
+    }
+
+    #[test]
+    fn the_documented_usage_shapes_become_provider_reported_usage() {
+        // OpenAI embeddings: prompt_tokens + total_tokens.
+        let openai = family_usage(
+            ProviderRouteKind::Embeddings,
+            br#"{"data":[],"usage":{"prompt_tokens":5,"total_tokens":5}}"#,
+        )
+        .expect("usage parsed");
+        assert_eq!(
+            (openai.input_tokens, openai.output_tokens),
+            (5, 0),
+            "total == prompt, so output is zero"
+        );
+        assert_eq!(openai.provenance, UsageProvenance::ProviderReported);
+
+        // Cohere Rerank v2: no top-level usage; meta.tokens preferred.
+        let cohere = family_usage(
+            ProviderRouteKind::Rerank,
+            br#"{"results":[],"id":"9f75d94c","meta":{
+                "api_version":{"version":"2"},
+                "billed_units":{"input_tokens":7},
+                "tokens":{"input_tokens":7,"output_tokens":3}}}"#,
+        )
+        .expect("usage parsed");
+        assert_eq!(
+            (cohere.input_tokens, cohere.output_tokens),
+            (7, 3),
+            "meta.tokens wins over billed_units"
+        );
+        assert_eq!(cohere.provenance, UsageProvenance::ProviderReported);
+
+        // Cohere's documented example body reports only billed_units.
+        let billed_only = family_usage(
+            ProviderRouteKind::Rerank,
+            br#"{"results":[],"meta":{"api_version":{"version":"2"},
+                "billed_units":{"input_tokens":192}}}"#,
+        )
+        .expect("usage parsed");
+        assert_eq!(
+            (billed_only.input_tokens, billed_only.output_tokens),
+            (192, 0)
+        );
+
+        // Flat rerank variants and image generations' shape.
+        let billed = family_usage(
+            ProviderRouteKind::Rerank,
+            br#"{"results":[],"usage":{"billed_tokens":9}}"#,
+        )
+        .expect("usage parsed");
+        assert_eq!((billed.input_tokens, billed.output_tokens), (9, 0));
+        let images = family_usage(
+            ProviderRouteKind::ImagesGenerations,
+            br#"{"data":[],"usage":{"input_tokens":11,"output_tokens":423,"total_tokens":434}}"#,
+        )
+        .expect("usage parsed");
+        assert_eq!((images.input_tokens, images.output_tokens), (11, 423));
+    }
+
+    #[test]
+    fn families_without_request_scoped_usage_stay_synthetic_zero() {
+        // A files/batches answer carries lifecycle aggregates, not this
+        // call's tokens; audio answers are not JSON. Neither is priced or
+        // charged into TPM windows from numbers that are not this call's.
+        let batch_list = br#"{"data":[{"usage":{"total_tokens":1234}}]}"#;
+        assert!(family_usage(ProviderRouteKind::Files, batch_list).is_none());
+        assert!(family_usage(ProviderRouteKind::Batches, batch_list).is_none());
+        assert!(
+            family_usage(
+                ProviderRouteKind::AudioSpeech,
+                b"RIFF\x24\x00\x00\x00WAVEfmt "
+            )
+            .is_none()
+        );
+        // A JSON answer from a token-reporting family without a usage
+        // object (an unpriced self-hosted server) is not fabricated.
+        assert!(family_usage(ProviderRouteKind::Embeddings, br#"{"data":[]}"#).is_none());
+        // A rerank meta with no token counts anywhere reports nothing.
+        assert!(
+            family_usage(
+                ProviderRouteKind::Rerank,
+                br#"{"results":[],"meta":{"api_version":{"version":"2"},"warnings":[]}}"#
+            )
+            .is_none()
+        );
     }
 }

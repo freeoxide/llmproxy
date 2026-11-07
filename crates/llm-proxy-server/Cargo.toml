@@ -52,6 +52,7 @@ time = { workspace = true }
 secrecy = { workspace = true }
 
 [dev-dependencies]
+argon2 = { workspace = true, features = ["rand_core"] }
 tower = { workspace = true, features = ["util"] }
 llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }
 tempfile = "3"

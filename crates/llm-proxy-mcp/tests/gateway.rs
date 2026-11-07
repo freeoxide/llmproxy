@@ -311,6 +311,11 @@ async fn an_admission_refusal_refuses_the_tool_call_and_settles_a_refund() {
         message.contains("limit"),
         "the admission refusal reaches the client, got {message}"
     );
+    assert_eq!(
+        body["error"]["code"].as_i64(),
+        Some(-32603),
+        "a refusal to run a known method is an internal error, not an unknown method (-32601)"
+    );
     // No upstream call was made: the headers log stays empty of tool calls.
     let headers = fixture.upstream_headers.lock().await;
     assert!(
@@ -411,6 +416,11 @@ async fn an_unknown_tool_is_rejected_without_an_upstream_call() {
             .as_str()
             .is_some_and(|message| message.contains("unknown tool")),
         "got {body}"
+    );
+    assert_eq!(
+        body["error"]["code"].as_i64(),
+        Some(-32602),
+        "an unknown tool is the client's invalid params, not a server error: {body}"
     );
     assert!(fixture.admission.reserves.lock().await.is_empty());
 }

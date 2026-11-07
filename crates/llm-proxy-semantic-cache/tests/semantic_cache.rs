@@ -257,6 +257,63 @@ async fn buckets_are_bounded() {
     );
 }
 
+/// The bound is per caller, not per bucket: one caller spreading requests
+/// over many model strings cannot exceed max_entries in total
+/// (docs/data-class-policy.md: "at most max_entries per caller").
+#[tokio::test]
+async fn one_callers_total_across_models_is_bounded() {
+    let cache = SemanticCache::new(
+        config(0.99, Duration::from_secs(600), 2),
+        Box::new(NgramEmbedder::new()),
+    );
+    let prompt = "the same prompt under three different models";
+    for model in ["model-a", "model-b", "model-c"] {
+        let request = core_request(prompt);
+        let key = CacheKey {
+            caller: "key",
+            provider: "p",
+            route_kind: ProviderRouteKind::Messages,
+            model,
+            body_hash: "hash",
+            streaming: false,
+            request: &request,
+        };
+        cache
+            .store(
+                &key,
+                &CacheEntry {
+                    response: response(prompt),
+                    events: Vec::new(),
+                },
+            )
+            .await;
+    }
+    // The caller holds at most two of the three; the oldest (model-a) is
+    // the one evicted, wherever it sits.
+    async fn lookup_in(cache: &SemanticCache, prompt: &str, model: &str) -> Option<CacheEntry> {
+        let request = core_request(prompt);
+        let key = CacheKey {
+            caller: "key",
+            provider: "p",
+            route_kind: ProviderRouteKind::Messages,
+            model,
+            body_hash: "hash",
+            streaming: false,
+            request: &request,
+        };
+        cache.lookup(&key).await.expect("lookup")
+    }
+    assert!(
+        lookup_in(&cache, prompt, "model-a").await.is_none(),
+        "the caller's oldest entry was evicted by the per-caller cap"
+    );
+    assert!(
+        lookup_in(&cache, prompt, "model-b").await.is_some()
+            && lookup_in(&cache, prompt, "model-c").await.is_some(),
+        "the newest entries across the caller's buckets survive"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Through a real engine against a loopback upstream.
 

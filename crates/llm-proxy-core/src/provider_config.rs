@@ -3213,6 +3213,15 @@ pub fn validate_passthrough_auth_combination(
 
 fn validate_auth_config(auth: &AuthConfig, bind: SocketAddr) -> Result<(), CoreError> {
     let clients_empty = auth.clients.is_empty();
+    // A managed key store ([auth.admin].key_store, plan 09 step 2) can be
+    // a deployment's only source of client keys: the daemon merges its
+    // live keys into the verifiers at startup, so client-keys mode with
+    // an empty [auth.clients] section is valid when one is configured.
+    let has_managed_key_store = |auth: &AuthConfig| {
+        auth.admin
+            .as_ref()
+            .is_some_and(|admin| admin.key_store.is_some())
+    };
     match auth.mode {
         AuthMode::None if !clients_empty => {
             return Err(CoreError::ConfigValidation {
@@ -3222,10 +3231,11 @@ fn validate_auth_config(auth: &AuthConfig, bind: SocketAddr) -> Result<(), CoreE
                 source: None,
             });
         }
-        AuthMode::ClientKeys if clients_empty => {
+        AuthMode::ClientKeys if clients_empty && !has_managed_key_store(auth) => {
             return Err(CoreError::ConfigValidation {
-                message: "auth.mode = \"client-keys\" requires at least one entry \
-                          under [auth.clients]"
+                message: "auth.mode = \"client-keys\" requires at least one key under \
+                          [auth.clients] or a managed key store \
+                          ([auth.admin].key_store)"
                     .to_owned(),
                 source: None,
             });
@@ -4445,10 +4455,41 @@ mode = "client-keys"
         let error = load_app_config(dir.path().join("config.toml"))
             .expect_err("client-keys mode needs at least one key");
         assert!(
-            error
-                .to_string()
-                .contains("requires at least one entry under [auth.clients]"),
+            error.to_string().contains("requires at least one key"),
             "got: {error}"
+        );
+    }
+
+    #[test]
+    fn auth_client_keys_with_only_a_managed_key_store_is_accepted() {
+        // A deployment may keep every client key in the admin key store;
+        // the daemon merges the store's live keys into the verifiers at
+        // startup, so an empty [auth.clients] must not fail validation.
+        let dir = config_dir_with_auth(
+            "0.0.0.0:3456",
+            r#"
+[auth]
+mode = "client-keys"
+
+[auth.admin]
+token = "admin-tok"
+key_store = "managed-keys.db"
+
+[storage]
+path = "usage.db"
+"#,
+        );
+        let config = load_app_config(dir.path().join("config.toml")).expect(
+            "managed keys satisfy the \
+                                                                    at-least-one-key rule",
+        );
+        assert!(config.auth.clients.is_empty());
+        assert!(
+            config
+                .auth
+                .admin
+                .and_then(|admin| admin.key_store)
+                .is_some()
         );
     }
 

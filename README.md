@@ -23,9 +23,12 @@ crates/llm-proxy-sdk           facade crate (published as llm-proxy-sdk)
 crates/llm-proxy-store-redis       [replica] shared limits/budgets in Redis
 crates/llm-proxy-store-postgres    [replica] shared limits/budgets in Postgres
 crates/llm-proxy-admin             admin surface: keys, usage, config, UI, MCP tools
-crates/llm-proxy-guardrails        guards with modes and fail policies
 crates/llm-proxy-semantic-cache    [server.semantic_cache]
 crates/llm-proxy-mcp               MCP gateway ([mcp], own tokens)
+# No daemon feature: embedders wire guards through
+# EngineBuilder::guard (llm-proxy-guardrails never becomes a daemon
+# dependency).
+crates/llm-proxy-guardrails        guards with modes and fail policies
 ~~~
 
 A bare `cargo build` compiles none of them (they sit outside

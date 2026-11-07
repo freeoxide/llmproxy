@@ -20,6 +20,34 @@ pub(crate) const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 /// JSON-RPC error codes.
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_REQUEST: i64 = -32600;
+const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
+
+/// A tools dispatch failure: whose fault it is picks the JSON-RPC error
+/// code, so a client mistake is never answered as a server error.
+enum ToolFailure {
+    /// The client's request was invalid (a missing or unknown tool name):
+    /// `-32602` Invalid params.
+    InvalidParams(String),
+    /// The server failed to run a known method (an admission refusal, an
+    /// upstream outage): `-32603` Internal error.
+    Server(String),
+}
+
+impl ToolFailure {
+    fn code(&self) -> i64 {
+        match self {
+            Self::InvalidParams(_) => INVALID_PARAMS,
+            Self::Server(_) => INTERNAL_ERROR,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::InvalidParams(message) | Self::Server(message) => message,
+        }
+    }
+}
 
 /// One configured upstream MCP server.
 #[derive(Debug)]
@@ -148,17 +176,22 @@ pub(crate) async fn gateway_endpoint(
             Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
         )
             .into_response(),
-        Err(message) => error_for_id(StatusCode::OK, &id, METHOD_NOT_FOUND, &message),
+        // A tools/list or tools/call failure is not an unknown method
+        // (-32601, kept for `other` above): client mistakes answer
+        // -32602, server-side failures -32603.
+        Err(failure) => error_for_id(StatusCode::OK, &id, failure.code(), failure.message()),
     }
 }
 
 /// Aggregates `tools/list` across every configured upstream, namespacing
 /// tool names as `<server>__<tool>` so two upstreams exposing the same
 /// name never collide.
-async fn list_tools(gateway: &McpGateway) -> Result<Value, String> {
+async fn list_tools(gateway: &McpGateway) -> Result<Value, ToolFailure> {
     let mut tools: Vec<Value> = Vec::new();
     for upstream in gateway.upstreams() {
-        let listed = upstream_request(gateway, upstream, "tools/list", &json!({}), None).await?;
+        let listed = upstream_request(gateway, upstream, "tools/list", &json!({}), None)
+            .await
+            .map_err(ToolFailure::Server)?;
         let upstream_tools = listed
             .get("tools")
             .and_then(Value::as_array)
@@ -176,14 +209,18 @@ async fn list_tools(gateway: &McpGateway) -> Result<Value, String> {
 
 /// Dispatches one namespaced tool call to its upstream, wrapped in the
 /// shared admission and accounting.
-async fn call_tool(gateway: &McpGateway, token_id: &str, params: &Value) -> Result<Value, String> {
+async fn call_tool(
+    gateway: &McpGateway,
+    token_id: &str,
+    params: &Value,
+) -> Result<Value, ToolFailure> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
-        .ok_or_else(|| "tools/call needs a tool name".to_owned())?;
+        .ok_or_else(|| ToolFailure::InvalidParams("tools/call needs a tool name".to_owned()))?;
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
     let Some((upstream, tool)) = gateway.resolve_tool(name) else {
-        return Err(format!("unknown tool: {name}"));
+        return Err(ToolFailure::InvalidParams(format!("unknown tool: {name}")));
     };
     let call = ToolCall {
         caller: token_id,
@@ -214,7 +251,7 @@ async fn call_tool(gateway: &McpGateway, token_id: &str, params: &Value) -> Resu
                 error.status_code().max(400),
                 start.elapsed().as_millis().min(u64::MAX as u128) as u64,
             );
-            return Err(message);
+            return Err(ToolFailure::Server(message));
         }
     };
 
@@ -248,7 +285,7 @@ async fn call_tool(gateway: &McpGateway, token_id: &str, params: &Value) -> Resu
                 StatusCode::BAD_GATEWAY.as_u16(),
                 start.elapsed().as_millis().min(u64::MAX as u128) as u64,
             );
-            Err(message)
+            Err(ToolFailure::Server(message))
         }
     }
 }

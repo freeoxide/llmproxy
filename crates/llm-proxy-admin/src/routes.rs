@@ -94,34 +94,100 @@ async fn create_key(
             )
                 .into_response()
         }
-        Err(error) => admin_error(error),
+        Err(error) => action_error(error),
     }
+}
+
+/// An admin action failure with the HTTP status the client earned: the
+/// operator's own input mistake is a 4xx, a broken surface or store is a
+/// `500`. The MCP tools map 4xx to JSON-RPC `-32602` and the rest to
+/// `-32603`.
+pub(crate) struct AdminActionError {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+}
+
+impl AdminActionError {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+
+    /// Renders the JSON error body the REST routes answer with.
+    pub(crate) fn into_response(self) -> Response {
+        let kind = if self.status.is_client_error() {
+            "invalid_request_error"
+        } else {
+            "internal_error"
+        };
+        (
+            self.status,
+            axum::Json(json!({
+                "error": { "type": kind, "message": self.message },
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn action_error(error: AdminActionError) -> Response {
+    error.into_response()
 }
 
 pub(crate) fn create_key_json(
     surface: &AdminSurface,
     policy: &KeyPolicyInput,
-) -> Result<IssuedKey, String> {
+) -> Result<IssuedKey, AdminActionError> {
     surface
         .keys_ref()
-        .ok_or_else(|| "no key store was attached to this surface".to_owned())?
+        .ok_or_else(|| AdminActionError::internal("no key store was attached to this surface"))?
         .create(policy)
-        .map_err(|error| format!("issuing the key failed: {error}"))
+        .map_err(|error| {
+            let status = match &error {
+                crate::keys::ManagedKeyError::InvalidPolicy(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            AdminActionError {
+                status,
+                message: format!("issuing the key failed: {error}"),
+            }
+        })
 }
 
 async fn revoke_key(State(state): State<AdminState>, Path(key_id): Path<String>) -> Response {
     match revoke_key_json(&state.surface, &key_id) {
         Ok(()) => (StatusCode::OK, axum::Json(json!({ "revoked": key_id }))).into_response(),
-        Err(error) => admin_error(error),
+        Err(error) => action_error(error),
     }
 }
 
-pub(crate) fn revoke_key_json(surface: &AdminSurface, key_id: &str) -> Result<(), String> {
-    surface
+pub(crate) fn revoke_key_json(
+    surface: &AdminSurface,
+    key_id: &str,
+) -> Result<(), AdminActionError> {
+    let store = surface
         .keys_ref()
-        .ok_or_else(|| "no key store was attached to this surface".to_owned())?
-        .revoke(key_id)
-        .map_err(|error| format!("revoking the key failed: {error}"))
+        .ok_or_else(|| AdminActionError::internal("no key store was attached to this surface"))?;
+    store.revoke(key_id).map_err(|error| {
+        let status = match &error {
+            crate::keys::ManagedKeyError::UnknownKey(_) => StatusCode::NOT_FOUND,
+            crate::keys::ManagedKeyError::AlreadyRevoked(_) => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        AdminActionError {
+            status,
+            message: format!("revoking the key failed: {error}"),
+        }
+    })
 }
 
 async fn get_config(State(state): State<AdminState>) -> Response {
@@ -141,33 +207,38 @@ pub(crate) async fn usage_summary_json(
     surface: &AdminSurface,
     window: &str,
     group_by: &str,
-) -> Result<Value, String> {
+) -> Result<Value, AdminActionError> {
     use llm_proxy_storage::{GroupBy, now_unix_millis};
-    let reader = surface
-        .usage_ref()
-        .ok_or_else(|| "no usage views were attached to this surface".to_owned())?;
+    let reader = surface.usage_ref().ok_or_else(|| {
+        AdminActionError::internal("no usage views were attached to this surface")
+    })?;
     let parsed = humantime::parse_duration(window).map_err(|parse_error| {
-        format!("window must be a duration like \"24h\", got {window:?} ({parse_error})")
+        AdminActionError::invalid(format!(
+            "window must be a duration like \"24h\", got {window:?} ({parse_error})"
+        ))
     })?;
     if parsed.is_zero() {
-        return Err("window must be a positive duration".to_owned());
+        return Err(AdminActionError::invalid(
+            "window must be a positive duration",
+        ));
     }
     let group = GroupBy::parse(group_by).ok_or_else(|| {
-        format!("group_by must be one of provider, model, caller; got {group_by:?}")
+        AdminActionError::invalid(format!(
+            "group_by must be one of provider, model, caller; got {group_by:?}"
+        ))
     })?;
     let until_ms = now_unix_millis();
     let since_ms = until_ms.saturating_sub(i64::try_from(parsed.as_millis()).unwrap_or(i64::MAX));
-    let groups = reader
-        .summary(since_ms, group)
-        .await
-        .map_err(|error| format!("the usage ledger query failed: {error}"))?;
+    let groups = reader.summary(since_ms, group).await.map_err(|error| {
+        AdminActionError::internal(format!("the usage ledger query failed: {error}"))
+    })?;
     serde_json::to_value(json!({
         "since_ms": since_ms,
         "until_ms": until_ms,
         "group_by": group.as_str(),
         "groups": groups,
     }))
-    .map_err(|error| format!("serializing the summary: {error}"))
+    .map_err(|error| AdminActionError::internal(format!("serializing the summary: {error}")))
 }
 
 #[derive(serde::Deserialize)]
@@ -188,7 +259,7 @@ async fn usage_summary(
     .await
     {
         Ok(summary) => (StatusCode::OK, axum::Json(summary)).into_response(),
-        Err(error) => admin_error(error),
+        Err(error) => action_error(error),
     }
 }
 

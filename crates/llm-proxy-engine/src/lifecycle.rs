@@ -351,7 +351,7 @@ fn settle(
 /// The cost of provider-reported usage at the member's pricing, when both
 /// exist: what the provider bills, which is what budgets charge (plan 05
 /// step 6). Synthetic or unknown usage is never priced.
-fn billed_cost(usage: &Usage, pricing: Option<&ModelPricing>) -> Option<Cost> {
+pub fn billed_cost(usage: &Usage, pricing: Option<&ModelPricing>) -> Option<Cost> {
     if usage.provenance != UsageProvenance::ProviderReported {
         return None;
     }

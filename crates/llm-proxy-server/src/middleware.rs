@@ -263,6 +263,17 @@ fn split_prefixed_token(token: &str) -> Option<(&str, &str)> {
     (!key_id.is_empty() && !secret.is_empty()).then_some((key_id, secret))
 }
 
+/// Whether a managed key store is configured (`[auth.admin].key_store`):
+/// it can be a deployment's only key source, so client-keys mode may
+/// start with no verifiers loaded and fail closed per request until the
+/// admin listener issues one.
+fn has_key_store(config: &AuthConfig) -> bool {
+    config
+        .admin
+        .as_ref()
+        .is_some_and(|admin| admin.key_store.is_some())
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -340,12 +351,16 @@ impl ClientAuth {
     ///
     /// Returns [`ClientAuthError`] on contradictory mode/client combinations,
     /// reserved or empty key ids, or an unparseable verifier string.
+    /// Client-keys mode may start with no verifiers at all when a managed
+    /// key store is configured: with none loaded yet every proxy request
+    /// fails closed until one is issued, which the admin listener (behind
+    /// its own token) can always do.
     pub fn from_config(config: &AuthConfig) -> Result<Self, ClientAuthError> {
         match config.mode {
             AuthMode::None if !config.clients.is_empty() => {
                 return Err(ClientAuthError::ModeNoneWithClients);
             }
-            AuthMode::ClientKeys if config.clients.is_empty() => {
+            AuthMode::ClientKeys if config.clients.is_empty() && !has_key_store(config) => {
                 return Err(ClientAuthError::ClientKeysWithoutClients);
             }
             AuthMode::None | AuthMode::ClientKeys => {}
@@ -489,7 +504,12 @@ impl ClientAuth {
     /// Order: the digest cache (no argon2), then — for a `<key-id>.<secret>`
     /// token — the one verifier that id names (one argon2 run, none when
     /// the id is unknown), else the legacy scan of every verifier.
-    pub(crate) async fn authenticate(&self, token: &str) -> Option<String> {
+    ///
+    /// This is the check the managed-key flow must satisfy: a store's
+    /// `client_specs()` verifiers have to accept the tokens that store
+    /// issues (the secret after the first `.`), which is what
+    /// `llm-proxy-admin` tests against.
+    pub async fn authenticate(&self, token: &str) -> Option<String> {
         if !self.enforced || self.verifiers.is_empty() {
             return None;
         }
@@ -692,6 +712,29 @@ mod tests {
             ClientAuth::from_config(&keys_without_clients),
             Err(ClientAuthError::ClientKeysWithoutClients)
         ));
+    }
+
+    /// A managed-key store can be a deployment's only key source: with
+    /// one configured, client-keys mode must start even with no keys
+    /// loaded yet (a fresh store, or the last key revoked) and fail
+    /// closed per request — otherwise the daemon could never bootstrap
+    /// its first key through the admin listener.
+    #[tokio::test]
+    async fn client_keys_with_a_key_store_starts_empty_and_fails_closed() {
+        let config = llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients: HashMap::new(),
+            admin: Some(llm_proxy_core::AdminAuthConfig {
+                token: SecretString::from("admin-tok".to_owned()),
+                key_store: Some(std::path::PathBuf::from("managed-keys.db")),
+            }),
+        };
+        let auth = ClientAuth::from_config(&config).expect("boots with an empty store");
+        assert!(auth.is_enforced(), "the mode is still enforced");
+        assert!(
+            auth.authenticate("anything.secret").await.is_none(),
+            "every request fails closed until a key is issued"
+        );
     }
 
     #[test]

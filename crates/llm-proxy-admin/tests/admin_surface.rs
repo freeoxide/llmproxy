@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use llm_proxy_admin::{AdminSurface, ManagedKeys};
+use llm_proxy_admin::{AdminSurface, KeyPolicyInput, ManagedKeys};
 use tower::ServiceExt;
 
 const ADMIN_TOKEN: &str = "admin-secret";
@@ -142,6 +142,83 @@ async fn a_key_lives_a_full_lifecycle_through_http() {
     assert!(
         listed["keys"][0]["revoked_at"].is_string(),
         "the record carries the revocation"
+    );
+}
+
+/// An issued token must authenticate through the daemon's own
+/// `ClientAuth` built from `client_specs()` — the exact path a restart
+/// takes. `create()` used to hash the whole `<key-id>.<secret>` token
+/// while `ClientAuth` verifies only the part after the first `.`, so
+/// every issued key was a 401.
+#[tokio::test]
+async fn an_issued_token_authenticates_through_client_auth() {
+    use llm_proxy_core::{AuthConfig, AuthMode};
+    use secrecy::ExposeSecret;
+
+    let keys = Arc::new(ManagedKeys::in_memory().expect("key store"));
+    let issued = keys
+        .create(&KeyPolicyInput {
+            rpm: Some(60),
+            ..KeyPolicyInput::default()
+        })
+        .expect("issued");
+    let mut auth = AuthConfig {
+        mode: AuthMode::ClientKeys,
+        ..AuthConfig::default()
+    };
+    for (id, spec) in keys.client_specs().expect("specs") {
+        auth.clients.insert(id, spec);
+    }
+    let client_auth = llm_proxy_server::ClientAuth::from_config(&auth).expect("client auth");
+
+    assert_eq!(
+        client_auth
+            .authenticate(issued.token.expose_secret())
+            .await
+            .as_deref(),
+        Some(issued.key_id.as_str()),
+        "the once-shown token authenticates as its key id"
+    );
+    assert!(
+        client_auth
+            .authenticate(&format!("{}.not-the-secret", issued.key_id))
+            .await
+            .is_none(),
+        "a wrong secret is refused"
+    );
+    assert!(
+        client_auth
+            .authenticate("unknown-key.anything")
+            .await
+            .is_none(),
+        "an unknown key id is refused"
+    );
+}
+
+/// A `usd_per_day` typo used to be stored unvalidated and silently became
+/// a 0 USD/day budget after the next restart. Creation must answer 400
+/// and store nothing.
+#[tokio::test]
+async fn a_malformed_usd_per_day_answers_400_and_stores_nothing() {
+    let app = surface();
+    let refused = app
+        .clone()
+        .oneshot(post("/keys", Some(r#"{"usd_per_day": "five"}"#.to_owned())))
+        .await
+        .expect("response");
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body = json_body(refused).await;
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("usd_per_day"),
+        "the refusal names the field: {message}"
+    );
+    let listed = json_body(app.oneshot(get("/keys")).await.expect("response")).await;
+    assert!(
+        listed["keys"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty),
+        "no key was stored for the refused policy"
     );
 }
 
@@ -344,6 +421,54 @@ async fn mcp_create_key_tool_issues_a_working_token() {
     let payload: serde_json::Value = serde_json::from_str(text).expect("tool payload is JSON");
     let token = payload["token"].as_str().expect("one-time token");
     assert!(token.contains('.'), "the tool returns the prefixed token");
+}
+
+/// Tool failures carry the JSON-RPC code of their blame, never "method
+/// not found": a client mistake (a malformed budget) answers -32602
+/// invalid params, a server-side failure (no key store attached to the
+/// surface) answers -32603 internal error.
+#[tokio::test]
+async fn mcp_tool_failures_map_client_and_server_blame() {
+    let app = surface();
+    let invalid = app
+        .oneshot(mcp_post(
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"create_key","arguments":{"usd_per_day":"five"}}}"#.to_owned(),
+            Some("tools/call"),
+            Some("create_key"),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(invalid.status(), StatusCode::OK);
+    let body = json_body(invalid).await;
+    assert_eq!(
+        body["error"]["code"].as_i64(),
+        Some(-32602),
+        "a client mistake is invalid params, got {body}"
+    );
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("usd_per_day"),
+        "the refusal names the field: {message}"
+    );
+
+    // A surface with no key store attached cannot run the tool at all:
+    // the server's failure, not the client's.
+    let bare = AdminSurface::new(ADMIN_TOKEN).router();
+    let server_failure = bare
+        .oneshot(mcp_post(
+            r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"create_key","arguments":{}}}"#.to_owned(),
+            Some("tools/call"),
+            Some("create_key"),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(server_failure.status(), StatusCode::OK);
+    let body = json_body(server_failure).await;
+    assert_eq!(
+        body["error"]["code"].as_i64(),
+        Some(-32603),
+        "a store failure is an internal error, got {body}"
+    );
 }
 
 fn mcp_post(body: String, header_method: Option<&str>, header_name: Option<&str>) -> Request<Body> {

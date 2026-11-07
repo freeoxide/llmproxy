@@ -85,4 +85,6 @@ insta = { version = "1.42", features = ["yaml", "filters"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 llm-proxy-protocol = { workspace = true }
+secrecy = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tempfile = "3"

@@ -33,6 +33,12 @@ pub enum ManagedKeyError {
     /// A key is already revoked.
     #[error("key {0} is already revoked")]
     AlreadyRevoked(String),
+    /// The policy pinned on the key is invalid (a `usd_per_day` that is
+    /// not a fixed-point decimal); creation refuses it, and startup
+    /// refuses a stored one, rather than issuing a silent 0 USD/day
+    /// budget.
+    #[error("invalid key policy: {0}")]
+    InvalidPolicy(String),
 }
 
 /// What the operator may pin on a key at creation (the plan 05 policy
@@ -138,12 +144,26 @@ impl ManagedKeys {
     ///
     /// # Errors
     ///
-    /// [`ManagedKeyError::Hash`] when the verifier cannot be produced.
+    /// [`ManagedKeyError::Hash`] when the verifier cannot be produced,
+    /// [`ManagedKeyError::InvalidPolicy`] when `usd_per_day` is not a
+    /// fixed-point decimal — the value is parsed once, here, so a typo
+    /// cannot become a key with a silent 0 USD/day budget.
     pub fn create(&self, policy: &KeyPolicyInput) -> Result<IssuedKey, ManagedKeyError> {
+        if let Some(usd) = policy.usd_per_day.as_deref()
+            && usd.parse::<rust_decimal::Decimal>().is_err()
+        {
+            return Err(ManagedKeyError::InvalidPolicy(format!(
+                "usd_per_day must be a fixed-point decimal like \"5.00\", got {usd:?}"
+            )));
+        }
         let key_id = format!("k{}", hex(&random_bytes(6)?));
         let secret = hex(&random_bytes(32)?);
         let token = format!("{key_id}.{secret}");
-        let phc = hash_token(&token)?;
+        // The verifier covers only the secret — the part after the first
+        // `.` — because that is what `ClientAuth` verifies for a prefixed
+        // token: it looks the key id up and runs argon2 on the remainder.
+        // Hashing the whole token here made every issued key a 401.
+        let phc = hash_token(&secret)?;
         let created = OffsetDateTime::now_utc();
         let conn = self
             .conn
@@ -270,7 +290,7 @@ impl ManagedKeys {
             let policy: KeyPolicyInput = serde_json::from_str(&policy).map_err(|error| {
                 ManagedKeyError::Hash(format!("stored policy is corrupt: {error}"))
             })?;
-            specs.push((id, policy.into_spec(SecretString::from(phc))));
+            specs.push((id, policy.into_spec(SecretString::from(phc))?));
         }
         Ok(specs)
     }
@@ -279,17 +299,27 @@ impl ManagedKeys {
 impl KeyPolicyInput {
     /// Converts the wire policy to the engine's client-key spec.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Never in practice: `usd_per_day` strings were parsed once at
-    /// creation; a stored garbage value surfaces as `rust_decimal`'s
-    /// error instead.
-    pub fn into_spec(self, verifier: SecretString) -> ClientKeySpec {
-        let budget = self.usd_per_day.map(|usd| KeyBudgetConfig {
-            usd_per_day: usd.parse().unwrap_or_default(),
-            unestimatable: UnestimatableCostPolicy::Reject,
-            assumed_max_output_tokens: 4096,
-        });
+    /// [`ManagedKeyError::InvalidPolicy`] when `usd_per_day` does not
+    /// parse as a fixed-point decimal. Creation validates it, so a stored
+    /// value that fails here means the store was changed outside the API —
+    /// surfacing the error refuses the key loudly instead of issuing a
+    /// 0 USD/day budget that would block every request.
+    pub fn into_spec(self, verifier: SecretString) -> Result<ClientKeySpec, ManagedKeyError> {
+        let budget = match self.usd_per_day.as_deref() {
+            Some(usd) => Some(KeyBudgetConfig {
+                usd_per_day: usd.parse().map_err(|error| {
+                    ManagedKeyError::InvalidPolicy(format!(
+                        "usd_per_day must be a fixed-point decimal like \"5.00\", \
+                         got {usd:?} ({error})"
+                    ))
+                })?,
+                unestimatable: UnestimatableCostPolicy::Reject,
+                assumed_max_output_tokens: 4096,
+            }),
+            None => None,
+        };
         let restricted = budget.is_some()
             || self.rpm.is_some()
             || self.tpm.is_some()
@@ -297,7 +327,7 @@ impl KeyPolicyInput {
             || !self.allow_models.is_empty()
             || !self.allow_providers.is_empty();
         if restricted {
-            ClientKeySpec::Policy {
+            Ok(ClientKeySpec::Policy {
                 verifier,
                 allow_models: self.allow_models,
                 allow_providers: self.allow_providers,
@@ -307,9 +337,9 @@ impl KeyPolicyInput {
                     rpd: self.rpd,
                 }),
                 budget,
-            }
+            })
         } else {
-            ClientKeySpec::Verifier(verifier)
+            Ok(ClientKeySpec::Verifier(verifier))
         }
     }
 }
@@ -446,9 +476,33 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_usd_per_day_is_refused_at_creation_and_never_stored() {
+        // `unwrap_or_default()` used to turn "five" into a 0 USD/day
+        // budget: after a restart the key refused every request with no
+        // error anywhere. Creation must reject the typo outright.
+        let store = ManagedKeys::in_memory().expect("store");
+        let result = store.create(&KeyPolicyInput {
+            usd_per_day: Some("five".to_owned()),
+            ..KeyPolicyInput::default()
+        });
+        match result {
+            Err(ManagedKeyError::InvalidPolicy(message)) => {
+                assert!(message.contains("usd_per_day"), "got {message}");
+            }
+            other => panic!("a malformed budget must be refused, got {other:?}"),
+        }
+        assert!(
+            store.list().expect("listed").is_empty(),
+            "nothing was stored for the refused policy"
+        );
+    }
+
+    #[test]
     fn an_issued_token_verifies_with_one_argon2_run() {
-        // The store only persists the verifier; the issued token must
-        // verify against it exactly as ClientAuth would.
+        // The store only persists the verifier. `ClientAuth` splits a
+        // prefixed token at the first `.` and verifies only the secret
+        // part against that key id's PHC — so the stored verifier must
+        // cover the secret, never the whole token.
         let store = ManagedKeys::in_memory().expect("store");
         let issued = store.create(&KeyPolicyInput::default()).expect("issued");
         let conn = store
@@ -462,12 +516,24 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("stored verifier");
+        let secret = issued
+            .token
+            .expose_secret()
+            .split_once('.')
+            .map(|(_, secret)| secret)
+            .expect("tokens are key-id-prefixed");
         use argon2::PasswordVerifier;
         assert!(
             Argon2::default()
-                .verify_password(issued.token.expose_secret().as_bytes(), phc.as_str())
+                .verify_password(secret.as_bytes(), phc.as_str())
                 .is_ok(),
-            "the once-shown token verifies against the stored verifier"
+            "the once-shown token's secret verifies against the stored verifier"
+        );
+        assert!(
+            Argon2::default()
+                .verify_password(issued.token.expose_secret().as_bytes(), phc.as_str())
+                .is_err(),
+            "the whole token is not what the verifier covers"
         );
     }
 

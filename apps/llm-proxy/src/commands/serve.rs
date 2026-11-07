@@ -340,12 +340,9 @@ async fn bind_admin_listener(
     let router = {
         use llm_proxy_admin::AdminSurface;
         use secrecy::ExposeSecret;
-        let admin = state
-            .app_config()
-            .auth
-            .admin
-            .as_ref()
-            .expect("admin posture implies [auth.admin]");
+        let Some(admin) = state.app_config().auth.admin.as_ref() else {
+            bail!("admin posture enabled but [auth.admin] is not configured");
+        };
         let mut surface = AdminSurface::new(admin.token.expose_secret());
         if let Some(keys) = crate::state::managed_key_store_for_serve(state.app_config()) {
             surface = surface.keys(keys);

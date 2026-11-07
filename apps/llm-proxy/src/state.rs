@@ -108,24 +108,44 @@ pub async fn load_toml_state_from_config(
 
     // Managed keys (plan 09 step 2): when [auth.admin.key_store] is set
     // (and the admin-ui feature is compiled in), the store's live keys
-    // authenticate alongside the [auth.clients] file keys. File keys win
-    // on id collisions, so the store can never shadow an operator key.
+    // join the file's [auth.clients] — in the AuthConfig every consumer
+    // reads, not just the authenticator. ClientAuth verifies them, the
+    // engine's PolicyAdmission enforces the policies pinned on them
+    // (windows, budgets, allowlists) and the replica admissions carry
+    // them too. File keys win on id collisions, so the store can never
+    // shadow an operator key. Under auth.mode = "none" the merge is
+    // skipped instead of failing startup: no client auth is enforced in
+    // that mode, so the keys would be dead weight, and merging them would
+    // trip ClientAuth's mode-none-with-clients refusal on every restart.
     #[cfg(feature = "admin-ui")]
-    let auth_config = {
-        let mut merged = app_config.auth.clone();
-        if let Some(store) = managed_key_store(&app_config)? {
-            for (id, spec) in store
-                .client_specs()
-                .with_context(|| "reading managed keys from [auth.admin.key_store]")?
-            {
-                merged.clients.entry(id).or_insert(spec);
+    let app_config = {
+        let mut config = app_config;
+        if config.auth.mode != llm_proxy_core::AuthMode::None {
+            if let Some(store) = managed_key_store(&config)? {
+                for (id, spec) in store
+                    .client_specs()
+                    .with_context(|| "reading managed keys from [auth.admin.key_store]")?
+                {
+                    config.auth.clients.entry(id).or_insert(spec);
+                }
             }
+        } else if config
+            .auth
+            .admin
+            .as_ref()
+            .is_some_and(|admin| admin.key_store.is_some())
+        {
+            tracing::warn!(
+                "auth.mode is \"none\": managed keys from [auth.admin.key_store] are \
+                 not enforced; set auth.mode = \"client-keys\" to use them"
+            );
         }
-        merged
+        config
     };
-    #[cfg(not(feature = "admin-ui"))]
-    let auth_config = app_config.auth.clone();
-    let client_auth = llm_proxy_server::ClientAuth::from_config(&auth_config)
+    // A corrupt verifier must still refuse startup (AppState's own build
+    // fails closed with a log instead, which is right for the library and
+    // wrong for a daemon).
+    llm_proxy_server::ClientAuth::from_config(&app_config.auth)
         .with_context(|| "building client auth from [auth] config")?;
 
     let egress_clients = build_egress_clients(&app_config, &registry)?;
@@ -158,7 +178,6 @@ pub async fn load_toml_state_from_config(
         build_info(),
         Some(cache_dir),
     )
-    .with_client_auth(std::sync::Arc::new(client_auth))
     .with_egress_clients(egress_clients)
     .with_event_bus(event_bus);
     crate::replica::apply_replica(&app_config, &registry, base).await
@@ -1142,13 +1161,24 @@ enabled = true
         }
     }
 
+    /// A `[replica]` section must never start single-node silently. The
+    /// exact outcome depends on the build's features, so each cfg branch
+    /// asserts its own.
     #[tokio::test]
-    async fn replica_config_without_the_feature_refuses_to_start() {
+    async fn replica_config_refuses_or_connects_by_feature() {
+        // Point at a port that is guaranteed to have no Redis: bind an
+        // ephemeral listener and free it. A fixed port (6379) would make
+        // this test depend on the developer's machine running a local
+        // Redis or not.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            r#"
+            format!(
+                r#"
 [server]
 bind = "127.0.0.1:3457"
 request_timeout = "300s"
@@ -1157,8 +1187,9 @@ server_name = "replica-refusal"
 
 [replica]
 backend = "redis"
-url = "redis://127.0.0.1:6379"
-"#,
+url = "redis://127.0.0.1:{port}"
+"#
+            ),
         )
         .unwrap();
         let result = load_toml_state(
@@ -1167,18 +1198,320 @@ url = "redis://127.0.0.1:6379"
             None,
         )
         .await;
-        // With the store-redis feature this build actually connects (and
-        // fails on the absent server); without it, the refusal must name
-        // the feature rather than silently running single-node.
+        #[cfg(feature = "store-redis")]
         match result {
             Err(error) => {
                 let message = format!("{error:#}");
                 assert!(
-                    message.contains("replica") || message.contains("connecting"),
-                    "the failure must name the replica wiring, got: {message}"
+                    message.contains("replica") && message.contains("connecting"),
+                    "the connect failure must name the replica wiring, got: {message}"
                 );
             }
             Ok(_) => panic!("[replica] must never start single-node silently"),
         }
+        #[cfg(not(feature = "store-redis"))]
+        match result {
+            Err(error) => {
+                let message = format!("{error:#}");
+                assert!(
+                    message.contains("replica") && message.contains("store-redis"),
+                    "the refusal must name the missing feature, got: {message}"
+                );
+            }
+            Ok(_) => panic!("[replica] must never start single-node silently"),
+        }
+    }
+
+    /// A config with `[auth.admin].key_store` for the managed-key
+    /// startup tests. `policy` seeds one key with that policy; `None`
+    /// leaves the store empty.
+    #[cfg(feature = "admin-ui")]
+    fn config_with_key_store(
+        mode: &str,
+        policy: Option<&llm_proxy_admin::KeyPolicyInput>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Option<secrecy::SecretString>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("managed-keys.db");
+        let token = policy.map(|policy| {
+            llm_proxy_admin::ManagedKeys::open(&store_path)
+                .expect("key store")
+                .create(policy)
+                .expect("one live key")
+                .token
+        });
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3460"
+request_timeout = "300s"
+log_level = "info"
+server_name = "managed-keys-startup"
+
+[auth]
+mode = "{mode}"
+
+[auth.admin]
+token = "admin-tok"
+key_store = "{}"
+
+[storage]
+path = "{}"
+"#,
+                store_path.display(),
+                dir.path().join("usage.db").display()
+            ),
+        )
+        .unwrap();
+        (dir, path, token)
+    }
+
+    #[cfg(feature = "admin-ui")]
+    fn config_with_seeded_key_store(
+        mode: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, secrecy::SecretString) {
+        let (dir, path, token) = config_with_key_store(mode, Some(&Default::default()));
+        (dir, path, token.expect("seeded key"))
+    }
+
+    /// auth.mode = "none" plus a key store with live keys must not break
+    /// the next restart: the merge is skipped (no client auth is enforced
+    /// in that mode) instead of tripping ClientAuth's
+    /// mode-none-with-clients refusal.
+    #[tokio::test]
+    #[cfg(feature = "admin-ui")]
+    async fn auth_mode_none_with_a_key_store_still_starts() {
+        let (_dir, path, _token) = config_with_seeded_key_store("none");
+        load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("mode none never merges managed keys, so startup succeeds");
+    }
+
+    /// client-keys mode with an empty [auth.clients] and a seeded key
+    /// store must start and actually enforce the managed key: anonymous
+    /// requests get 401, the issued token does not.
+    #[tokio::test]
+    #[cfg(feature = "admin-ui")]
+    async fn client_keys_mode_runs_on_managed_keys_alone() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header};
+        use secrecy::ExposeSecret;
+        use tower::ServiceExt as _;
+
+        let (_dir, path, token) = config_with_seeded_key_store("client-keys");
+        let state = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("the merged managed key satisfies the at-least-one-key rule");
+        let app = llm_proxy_server::build_router(state);
+
+        let anonymous = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/providers/mock/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("served");
+        assert_eq!(
+            anonymous.status(),
+            StatusCode::UNAUTHORIZED,
+            "client auth is enforced by the merged managed key"
+        );
+
+        let authenticated = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/providers/mock/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", token.expose_secret()),
+                    )
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("served");
+        assert_ne!(
+            authenticated.status(),
+            StatusCode::UNAUTHORIZED,
+            "the issued managed token authenticates after the restart-shaped startup"
+        );
+    }
+
+    /// Client-keys mode over an empty key store (a fresh deployment
+    /// before its first key, or the last key revoked) must still boot —
+    /// the admin listener can then issue the first key — and fail closed
+    /// on every proxy request until one exists. Startup used to die at
+    /// ClientAuth's empty-clients refusal, so such a deployment could
+    /// never be bootstrapped.
+    #[tokio::test]
+    #[cfg(feature = "admin-ui")]
+    async fn client_keys_mode_boots_on_an_empty_key_store_and_fails_closed() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header};
+        use tower::ServiceExt as _;
+
+        let (_dir, path, token) = config_with_key_store("client-keys", None);
+        assert!(token.is_none(), "no key was seeded");
+        let state = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("an empty key store boots in client-keys mode");
+        let app = llm_proxy_server::build_router(state);
+        let refused = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/providers/mock/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("served");
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNAUTHORIZED,
+            "with no keys loaded every request fails closed"
+        );
+    }
+
+    /// The policy pinned on a managed key must be enforced, not just
+    /// stored and listed back: a key issued with a TPM cap is throttled
+    /// by the engine's admission, while an unpolicied managed key on the
+    /// same daemon is served. The daemon merges the store's keys into
+    /// the AuthConfig every consumer reads — ClientAuth authenticates
+    /// them and PolicyAdmission enforces their policies.
+    #[tokio::test]
+    #[cfg(feature = "admin-ui")]
+    async fn a_managed_keys_tpm_policy_is_enforced() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header};
+        use secrecy::ExposeSecret;
+        use tower::ServiceExt as _;
+
+        // A loopback upstream answering an Anthropic messages body.
+        let upstream = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"id":"msg_h","type":"message","role":"assistant",
+                        "content":[{"type":"text","text":"upstream answer"}],
+                        "model":"claude-sonnet-4-6","stop_reason":"end_turn",
+                        "stop_sequence":null,
+                        "usage":{"input_tokens":10,"output_tokens":4}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, upstream).await {
+                tracing::trace!(%error, "fake upstream stopped");
+            }
+        });
+
+        let (dir, path, capped) = config_with_key_store(
+            "client-keys",
+            Some(&llm_proxy_admin::KeyPolicyInput {
+                tpm: Some(8),
+                ..llm_proxy_admin::KeyPolicyInput::default()
+            }),
+        );
+        // A second, unpolicied key on the same store: the control.
+        let plain = llm_proxy_admin::ManagedKeys::open(dir.path().join("managed-keys.db"))
+            .expect("key store")
+            .create(&llm_proxy_admin::KeyPolicyInput::default())
+            .expect("plain key")
+            .token;
+        std::fs::create_dir_all(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/loopy.toml"),
+            format!(
+                r#"[provider]
+name = "loopy"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.msgs]
+protocol = "anthropic_messages"
+endpoint = "http://{addr}/v1/messages"
+[provider.routes]
+messages = "msgs"
+"#
+            ),
+        )
+        .unwrap();
+        let state = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("daemon starts");
+        let app = llm_proxy_server::build_router(state);
+
+        let post = |token: &secrecy::SecretString| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/providers/loopy/v1/messages")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_secret()),
+                )
+                .body(Body::from(
+                    r#"{"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"please explain rust ownership and borrowing in a few sentences"}]}"#,
+                ))
+                .expect("request");
+            app.clone().oneshot(request)
+        };
+
+        let throttled = post(&capped.expect("capped key")).await.expect("served");
+        assert_eq!(
+            throttled.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the capped key's input estimate alone exceeds its tpm of 8"
+        );
+
+        let served = post(&plain).await.expect("served");
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "the unpolicied managed key on the same daemon is served"
+        );
+        let bytes = axum::body::to_bytes(served.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("upstream answer"),
+            "the control call reached the upstream"
+        );
     }
 }

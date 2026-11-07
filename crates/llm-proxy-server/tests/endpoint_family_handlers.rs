@@ -23,8 +23,8 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::{
-    AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry,
-    ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
+    AppConfig, AuthMode, AuthStyle, ClientKeySpec, KeyWindowLimits, ProviderAdapterConfig,
+    ProviderConfig, ProviderRegistry, ProviderRouteKind, ProviderRoutesConfig, ServerConfig,
 };
 use llm_proxy_server::{AppState, BuildInfo, build_router};
 use llm_proxy_storage::{ProxyEvent, RecordingBus};
@@ -287,6 +287,18 @@ fn app_over(config: ProviderConfig) -> (Router, Arc<RecordingBus>) {
     (app, bus)
 }
 
+/// A PHC verifier for `secret`, as `[auth.clients]` stores them (the
+/// same one-argon2-run shape `ManagedKeys::create` produces).
+fn phc_of(secret: &str) -> secrecy::SecretString {
+    use argon2::PasswordHasher as _;
+    secrecy::SecretString::from(
+        argon2::Argon2::default()
+            .hash_password(secret.as_bytes())
+            .expect("phc")
+            .to_string(),
+    )
+}
+
 async fn fixture() -> (Router, Capture, Arc<RecordingBus>) {
     let (endpoint, captured) = spawn_upstream().await;
     let (app, bus) = app_over(provider_config(&endpoint));
@@ -376,10 +388,106 @@ async fn embeddings_routes_through_with_the_model_alias_and_credential() {
         .expect("request row");
     assert_eq!(request_row.route_kind, "embeddings");
     assert_eq!(request_row.model.requested, "embed-small");
-    assert!(
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            ProxyEvent::ResponseCompleted(row) => Some(row),
+            _ => None,
+        })
+        .expect("completed row");
+    // The upstream answered usage {prompt_tokens: 5, total_tokens: 5};
+    // the row must carry it as provider-reported, not synthetic zero —
+    // settlement and the ledger count family traffic through it.
+    assert_eq!(completed.usage.input_tokens, 5);
+    assert_eq!(
+        completed.usage.provenance,
+        llm_proxy_protocol::core::UsageProvenance::ProviderReported,
+        "the family's reported tokens reach the ledger row"
+    );
+}
+
+/// The admission half of the family usage fix: a tpm-limited key must be
+/// throttled by the usage its family calls report. The fake upstream
+/// answers `usage {prompt_tokens: 5, total_tokens: 5}`; with tpm = 8 the
+/// third call inside the minute is refused before any upstream call.
+#[tokio::test]
+async fn a_tpm_limited_key_is_throttled_by_reported_family_usage() {
+    let (endpoint, _captured) = spawn_upstream().await;
+    let mut config = base_config();
+    config.auth.mode = AuthMode::ClientKeys;
+    config.auth.clients.insert(
+        "klimited".to_owned(),
+        ClientKeySpec::Policy {
+            verifier: phc_of("fam-secret"),
+            allow_models: vec![],
+            allow_providers: vec![],
+            limits: Some(KeyWindowLimits {
+                rpm: None,
+                tpm: Some(8),
+                rpd: None,
+            }),
+            budget: None,
+        },
+    );
+    let registry =
+        ProviderRegistry::from_providers(vec![provider_config(&endpoint)]).expect("registry");
+    let bus = Arc::new(RecordingBus::new());
+    // The token window resets on the calendar minute; a wall clock could
+    // roll the minute over between the first and third call and admit the
+    // third spuriously. A fixed clock keeps the whole sequence inside one
+    // window. The admission step is still the production
+    // PolicyAdmission::from_config over this config's key policies.
+    let admission = llm_proxy_engine::PolicyAdmission::from_config(&config.auth, &registry)
+        .with_clock(|| {
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed instant")
+        });
+    let app =
+        build_router(state(config, registry, Arc::clone(&bus)).with_admission(Arc::new(admission)));
+
+    for (call, expected) in [
+        (1, StatusCode::OK),
+        (2, StatusCode::OK),
+        (3, StatusCode::TOO_MANY_REQUESTS),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/providers/fake/v1/embeddings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer klimited.fam-secret")
+                    .body(Body::from(
+                        br#"{"model":"embed-small","input":"hi"}"#.to_vec(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("served");
+        assert_eq!(
+            response.status(),
+            expected,
+            "call {call}: 5 tokens per call against a tpm of 8 throttles the third"
+        );
+    }
+    // The throttled call never reached the upstream but is still
+    // accounted as an attributed refusal pair.
+    let events = bus.snapshot();
+    assert_eq!(
         events
             .iter()
-            .any(|event| matches!(event, ProxyEvent::ResponseCompleted(_)))
+            .filter(|event| matches!(event, ProxyEvent::ResponseFailed(_)))
+            .count(),
+        1,
+        "the throttled call wrote a failure row"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProxyEvent::RequestReceived(_)))
+            .count(),
+        3,
+        "every call, refused or not, wrote its request row"
     );
 }
 
@@ -612,11 +720,28 @@ async fn resource_paths_that_could_leave_the_family_are_refused() {
         captured.lock().await.is_empty(),
         "nothing outside the family endpoint reached the upstream"
     );
+    // Each refusal writes an attributed pair: a RequestReceived naming
+    // the caller, provider and route kind, then the failure row.
+    let events = bus.snapshot();
+    let requests = events
+        .iter()
+        .filter(|event| matches!(event, ProxyEvent::RequestReceived(_)))
+        .count();
+    let failures = events
+        .iter()
+        .filter(|event| matches!(event, ProxyEvent::ResponseFailed(_)))
+        .count();
+    assert_eq!(requests, 4, "every refused call leaves a request row");
+    assert_eq!(failures, 4, "every refused call leaves a failure row");
+    assert_eq!(events.len(), 8, "nothing else: {events:?}");
     assert!(
-        bus.snapshot()
-            .iter()
-            .all(|event| matches!(event, ProxyEvent::ResponseFailed(_))),
-        "each refusal writes a failure row and nothing else"
+        events.iter().all(|event| match event {
+            ProxyEvent::RequestReceived(row) => {
+                row.provider == "fake" && (row.route_kind == "files" || row.route_kind == "batches")
+            }
+            _ => true,
+        }),
+        "the request rows carry the caller's provider and route kind"
     );
 }
 
@@ -857,9 +982,18 @@ async fn an_unconfigured_family_is_refused_with_its_route_named() {
         "the refusal names the missing route: {message}"
     );
     assert!(captured.lock().await.is_empty(), "no upstream call");
-    // The refusal is accounted.
-    assert!(
-        matches!(bus.snapshot().first(), Some(ProxyEvent::ResponseFailed(_))),
-        "unconfigured-family refusals write a failure row"
-    );
+    // The refusal is accounted and attributable: the request row comes
+    // first (caller, provider, route kind), then the failure row.
+    let events = bus.snapshot();
+    match (events.first(), events.get(1)) {
+        (Some(ProxyEvent::RequestReceived(request)), Some(ProxyEvent::ResponseFailed(_))) => {
+            assert_eq!(request.route_kind, "embeddings");
+            assert_eq!(request.provider, "fake");
+            assert_eq!(request.model.requested, "embed-small");
+        }
+        other => panic!(
+            "an unconfigured-family refusal writes an attributed request \
+             row then a failure row, got {other:?}"
+        ),
+    }
 }

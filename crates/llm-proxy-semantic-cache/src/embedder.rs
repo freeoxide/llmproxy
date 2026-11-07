@@ -34,9 +34,18 @@ pub trait Embedder: Send + Sync + std::fmt::Debug {
 /// prompt shares few. Not a model embedding: semantic paraphrases that
 /// share no wording will not match, and the threshold says how close is
 /// close enough.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct NgramEmbedder {
     dimension: usize,
+}
+
+impl Default for NgramEmbedder {
+    // Manual on purpose: a derived Default would leave `dimension` at 0
+    // and `bucket_of` would divide by zero on the first embed. Default
+    // must mean the same embedder as `new()`.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The default vector width.
@@ -166,5 +175,21 @@ mod tests {
             .expect("embed");
         assert_eq!(first, second);
         assert_eq!(first.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_default_embedder_embeds_exactly_like_new() {
+        // `NgramEmbedder::default()` used to carry dimension 0 and panic
+        // on its first modulo; it must behave identically to `::new()`.
+        let text = "what is the capital of france".to_owned();
+        let from_default = NgramEmbedder::default()
+            .embed(std::slice::from_ref(&text))
+            .await
+            .expect("default embeds");
+        let from_new = NgramEmbedder::new()
+            .embed(&[text])
+            .await
+            .expect("new embeds");
+        assert_eq!(from_default, from_new);
     }
 }

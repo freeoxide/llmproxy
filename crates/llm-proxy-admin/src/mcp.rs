@@ -14,7 +14,10 @@
 //! or echoed; the `MCP-Protocol-Version`, `Mcp-Method` and (for
 //! `tools/call`) `Mcp-Name` headers are required and validated against
 //! the body, with a `-32020` `HeaderMismatch` on disagreement; an unknown
-//! method is `404` with `-32601`. `initialize` is answered for
+//! method is `404` with `-32601`; a tool failure answers the JSON-RPC
+//! code of its blame — `-32602` for client mistakes (unknown tool,
+//! invalid arguments), `-32603` for server-side failures (store or
+//! ledger). `initialize` is answered for
 //! older-era clients, per the revision's backward-compatibility note.
 
 use axum::Json;
@@ -34,6 +37,34 @@ pub const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
 const METHOD_NOT_FOUND: i64 = -32601;
 const HEADER_MISMATCH: i64 = -32020;
 const INVALID_REQUEST: i64 = -32600;
+const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
+
+/// A tool failure: whose fault it is picks the JSON-RPC error code, so a
+/// client mistake is never answered as a server error.
+enum ToolFailure {
+    /// The client's input was invalid (unknown tool, malformed
+    /// arguments): `-32602` Invalid params.
+    InvalidParams(String),
+    /// The server failed to run a known tool (a store or ledger
+    /// failure): `-32603` Internal error.
+    Server(String),
+}
+
+impl ToolFailure {
+    fn code(&self) -> i64 {
+        match self {
+            Self::InvalidParams(_) => INVALID_PARAMS,
+            Self::Server(_) => INTERNAL_ERROR,
+        }
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::InvalidParams(message) | Self::Server(message) => message,
+        }
+    }
+}
 
 pub(crate) async fn endpoint(
     State(state): State<AdminState>,
@@ -138,7 +169,10 @@ pub(crate) async fn endpoint(
             Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
         )
             .into_response(),
-        Err(message) => error_for_id(StatusCode::OK, &id, METHOD_NOT_FOUND, &message),
+        // A tool failure is not an unknown method (-32601, kept for
+        // `other` above): client mistakes answer -32602, server-side
+        // failures -32603.
+        Err(failure) => error_for_id(StatusCode::OK, &id, failure.code(), failure.message()),
     }
 }
 
@@ -275,16 +309,25 @@ fn tool(name: &str, description: &str, input_schema: &Value) -> Value {
 }
 
 /// Dispatches one tool call to the same handlers the REST routes use.
-async fn call_tool(surface: &AdminSurface, name: &str, arguments: &Value) -> Result<Value, String> {
+/// Client mistakes answer `-32602`, server-side failures `-32603` — the
+/// status the REST route would set decides which.
+async fn call_tool(
+    surface: &AdminSurface,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, ToolFailure> {
     let payload = match name {
         "list_keys" => {
-            let keys = crate::routes::list_keys_json(surface)?;
+            let keys = crate::routes::list_keys_json(surface).map_err(ToolFailure::Server)?;
             json!({ "keys": keys })
         }
         "create_key" => {
-            let policy: crate::KeyPolicyInput = serde_json::from_value(arguments.clone())
-                .map_err(|error| format!("invalid key policy: {error}"))?;
-            let issued = crate::routes::create_key_json(surface, &policy)?;
+            let policy: crate::KeyPolicyInput =
+                serde_json::from_value(arguments.clone()).map_err(|error| {
+                    ToolFailure::InvalidParams(format!("invalid key policy: {error}"))
+                })?;
+            let issued =
+                crate::routes::create_key_json(surface, &policy).map_err(from_action_error)?;
             json!({
                 "key_id": issued.key_id,
                 "token": issued.token.expose_secret(),
@@ -296,33 +339,43 @@ async fn call_tool(surface: &AdminSurface, name: &str, arguments: &Value) -> Res
             let key_id = arguments
                 .get("key_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| "revoke_key needs key_id".to_owned())?;
-            crate::routes::revoke_key_json(surface, key_id)?;
+                .ok_or_else(|| ToolFailure::InvalidParams("revoke_key needs key_id".to_owned()))?;
+            crate::routes::revoke_key_json(surface, key_id).map_err(from_action_error)?;
             json!({ "revoked": key_id })
         }
-        "get_config" => crate::config_view::sanitize_config(
-            surface
-                .config_ref()
-                .ok_or_else(|| "no config was attached to this surface".to_owned())?,
-        ),
-        "usage_summary" => {
-            crate::routes::usage_summary_json(
-                surface,
-                arguments
-                    .get("window")
-                    .and_then(Value::as_str)
-                    .unwrap_or("24h"),
-                arguments
-                    .get("group_by")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider"),
-            )
-            .await?
+        "get_config" => {
+            crate::config_view::sanitize_config(surface.config_ref().ok_or_else(|| {
+                ToolFailure::Server("no config was attached to this surface".to_owned())
+            })?)
         }
-        other => return Err(format!("unknown tool: {other}")),
+        "usage_summary" => crate::routes::usage_summary_json(
+            surface,
+            arguments
+                .get("window")
+                .and_then(Value::as_str)
+                .unwrap_or("24h"),
+            arguments
+                .get("group_by")
+                .and_then(Value::as_str)
+                .unwrap_or("provider"),
+        )
+        .await
+        .map_err(from_action_error)?,
+        other => return Err(ToolFailure::InvalidParams(format!("unknown tool: {other}"))),
     };
     Ok(json!({
         "content": [ { "type": "text", "text": payload.to_string() } ],
         "isError": false,
     }))
+}
+
+/// A REST action error becomes the JSON-RPC failure of the same blame:
+/// the 4xx the client earned is invalid params, anything else is the
+/// server's failure.
+fn from_action_error(error: crate::routes::AdminActionError) -> ToolFailure {
+    if error.status.is_client_error() {
+        ToolFailure::InvalidParams(error.message)
+    } else {
+        ToolFailure::Server(error.message)
+    }
 }

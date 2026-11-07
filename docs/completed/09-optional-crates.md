@@ -50,16 +50,19 @@ unless real use says otherwise.
   (`AdmissionBackend`), the cooldown view behind `Cooldowns` (now
   wall-clock), so the replica stores implement engine seams instead of
   their own copy of the rules. Redis: every counter move is one atomic
-  `INCR`, refusals roll back, unsettled leases expire on a TTL; tested
-  over the real RESP wire against an in-repo minimal server (no Redis
-  binary exists here) — two instances over one store enforce one budget
-  between them, concurrently, and a refund on one releases budget for
-  the other. Postgres: one transaction per admission (windows, caps and
-  the lease commit together or not at all), deadpool-managed pool, a
-  purge timer; its identical done-when tests are `#[ignore]`d behind
-  `LLM_PROXY_TEST_POSTGRES` because this environment has no Postgres
-  server. `[replica]` wires either store into the daemon and refuses to
-  start when the section names a backend whose feature is off.
+  `INCR`, refusals roll back, unsettled leases expire on a TTL; two
+  instances over one store enforce one budget between them,
+  concurrently, and a refund on one releases budget for the other.
+  Postgres: one transaction per admission (windows, caps and the lease
+  commit together or not at all), deadpool-managed pool, a purge timer;
+  the same done-when holds. Both suites also ran against the real
+  servers (see the live-server verification paragraph below) and are
+  `#[ignore]`d behind their env vars. Only Redis has an in-repo loopback
+  fake, so the default test run exercises Redis; the Postgres store's
+  tests all need `LLM_PROXY_TEST_POSTGRES` and never run by default.
+  `[replica]` wires either store into the daemon
+  and refuses to start when the section names a backend whose feature is
+  off.
 - `llm-proxy-admin` (steps 2-3, backlog 35) serves on the dedicated
   admin listener behind `[auth.admin]`: managed client keys (issue, list,
   revoke; argon2id verifiers, the token shown once, merged into
