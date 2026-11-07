@@ -27,6 +27,10 @@ endpoint = "https://opencode.ai/zen/v1/models/{model}:generateContent"
 [provider.routes]
 chat_completions = "chat"
 messages = "anthropic"
+# Client dialects (plan 08): the Responses and Gemini-native routes resolve
+# through these entries; the Ollama /api routes use chat_completions above.
+responses = "responses"
+generate_content = "gemini"
 
 # [provider.model_aliases]
 # "short-name" = "upstream-model-id"

@@ -17,8 +17,9 @@ catalogs, and transport.
 |---|---:|---:|
 | OpenAI Chat Completions | yes | yes |
 | Anthropic Messages | yes | yes |
-| OpenAI Responses | no | yes |
-| Gemini GenerateContent | no | yes |
+| OpenAI Responses | yes | yes |
+| Gemini GenerateContent | yes | yes |
+| Ollama (`/api/chat`, `/api/generate`, `/api/tags`) | yes | no |
 
 The client routes are:
 
@@ -26,11 +27,20 @@ The client routes are:
 POST /providers/{provider}/v1/chat/completions
 POST /providers/{provider}/v1/messages
 POST /providers/{provider}/v1/messages/count_tokens
+POST /providers/{provider}/v1/responses
+POST /providers/{provider}/v1beta/models/{model}:generateContent
+POST /providers/{provider}/v1beta/models/{model}:streamGenerateContent?alt=sse
+POST /providers/{provider}/api/chat
+POST /providers/{provider}/api/generate
 GET  /providers/{provider}/v1/models
+GET  /providers/{provider}/api/tags
 ```
 
-Responses and Gemini are currently upstream adapter choices. They do not imply
-that `/v1/responses` or Gemini-native client routes are registered.
+The Responses and Gemini-native routes resolve through the provider's
+`routes.responses` and `routes.generate_content` adapter entries; the Ollama
+routes resolve through `routes.chat_completions`. Ollama is a client dialect
+only — there is no Ollama upstream adapter; the same admission, routing and
+accounting pipeline serves every dialect.
 
 ## Boundaries
 

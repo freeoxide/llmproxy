@@ -9,7 +9,6 @@ Each plan is one stage of work, with its scope, steps and finish line.
 
 | # | Plan | Status | Depends on |
 |---|---|---|---|
-| 08 | [Client dialects](plans/08-client-dialects.md) | Not started | 03 |
 | 09 | [Optional crates](plans/09-optional-crates.md) | Not started | 05; the semantic cache also needs 06 |
 | 10 | [Language bindings](plans/10-bindings.md) | Not started | 03, with a stable API |
 | 11 | [Research corrections](plans/11-research-corrections.md) | Not started | None |
@@ -61,6 +60,7 @@ Plan headers point to the [research audit](research/audit-2026-11-05/REPORT.md):
 
 ## Completed
 
+- [08. Client dialects](completed/08-client-dialects.md)
 - [07. Hardening and operations](completed/07-hardening-and-operations.md)
 - [06. Cache and dedup](completed/06-cache-and-dedup.md)
 - [05. Admission and budgets](completed/05-admission-and-budgets.md)
