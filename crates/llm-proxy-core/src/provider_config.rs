@@ -72,7 +72,7 @@ impl AppConfig {
 }
 
 /// Log output format for the tracing subscriber.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     /// Human-readable plain-text logs (default).
@@ -93,6 +93,25 @@ impl LogFormat {
             .to_ascii_lowercase()
             .as_str()
         {
+            "json" => Self::Json,
+            _ => Self::Plain,
+        }
+    }
+
+    /// The format subscriber init should use (BUG-25): a set, non-empty
+    /// `RUST_LOG_FORMAT` wins over the configured `server.log_format`, as
+    /// documented; unset or empty falls back to the configured value. A set
+    /// but unrecognized value wins as [`LogFormat::Plain`], matching
+    /// [`LogFormat::from_env`].
+    ///
+    /// The env value is a parameter (not read here) so precedence is
+    /// testable without touching the process environment.
+    #[must_use]
+    pub fn effective(env: Option<&str>, configured: Self) -> Self {
+        let Some(value) = env.map(str::trim).filter(|value| !value.is_empty()) else {
+            return configured;
+        };
+        match value.to_ascii_lowercase().as_str() {
             "json" => Self::Json,
             _ => Self::Plain,
         }
@@ -119,8 +138,9 @@ pub struct ServerConfig {
     /// Log level: `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`.
     pub log_level: String,
     /// Log output format for the tracing subscriber: `"plain"` (default) or
-    /// `"json"`. The effective format is read from `RUST_LOG_FORMAT` at
-    /// subscriber init (see [`LogFormat::from_env`]); this field documents intent.
+    /// `"json"`. The startup path honours this value
+    /// (see [`LogFormat::effective`]); a set `RUST_LOG_FORMAT` env var wins
+    /// over it.
     #[serde(default)]
     pub log_format: LogFormat,
     /// Reserved hot-reload flag. Configuration loading rejects `true`.
@@ -3179,6 +3199,22 @@ chat_completions = "chat"
                 "the error must say what a pointer is: {error}"
             );
         }
+    }
+
+    #[test]
+    fn log_format_precedence_env_wins_then_config_then_default() {
+        use LogFormat::{Json, Plain};
+        // BUG-25: the config value is honoured when the env var is unset.
+        assert_eq!(LogFormat::effective(None, Json), Json);
+        assert_eq!(LogFormat::effective(Some(""), Json), Json, "empty is unset");
+        assert_eq!(LogFormat::effective(Some("   "), Plain), Plain);
+        // A set env var wins over whatever the config says.
+        assert_eq!(LogFormat::effective(Some("json"), Plain), Json);
+        assert_eq!(LogFormat::effective(Some("JSON"), Plain), Json);
+        assert_eq!(LogFormat::effective(Some("plain"), Json), Plain);
+        // Set but unrecognized: the env still decides, as Plain — matching
+        // from_env, so a typo never silently resurrects the config value.
+        assert_eq!(LogFormat::effective(Some("yaml"), Json), Plain);
     }
 
     #[test]

@@ -214,3 +214,118 @@ path = "{storage}"
         assert_eq!(server.wait_for_exit().code(), Some(1));
     }
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod log_format_startup {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    /// BUG-25 regression, at the binary: `server.log_format = "json"` in the
+    /// config must shape the daemon's own startup logs, and `RUST_LOG_FORMAT`
+    /// must still win over it.
+    fn first_log_line(log_format_setting: &str, env_format: Option<&str>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                r#"[server]
+bind = "{addr}"
+request_timeout = "60s"
+shutdown_timeout = "1s"
+log_level = "info"
+log_format = "{log_format_setting}"
+hot_reload = false
+server_name = "log-format-test"
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_llm-proxy"));
+        command
+            .args(["serve", "--config"])
+            .arg(dir.path().join("config.toml"))
+            .env("HOME", dir.path())
+            .env_remove("RUST_LOG_FORMAT")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Some(value) = env_format {
+            command.env("RUST_LOG_FORMAT", value);
+        }
+        let mut child = command.spawn().unwrap();
+
+        // The first subscriber line appears once the server is up.
+        let started = std::time::Instant::now();
+        let line = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "server never logged anything"
+            );
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("server exited early: {status:?}");
+            }
+            if tcp_stream_probe(addr) {
+                break read_first_line(&mut child);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if let Err(error) = child.kill() {
+            eprintln!("failed to stop the log-format test server: {error}");
+        }
+        if let Err(error) = child.wait() {
+            eprintln!("failed to reap the log-format test server: {error}");
+        }
+        line
+    }
+
+    fn tcp_stream_probe(addr: std::net::SocketAddr) -> bool {
+        std::net::TcpStream::connect(addr).is_ok()
+    }
+
+    fn read_first_line(child: &mut std::process::Child) -> String {
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a log line arrives");
+        line
+    }
+
+    fn looks_like_json(line: &str) -> bool {
+        let trimmed = line.trim();
+        trimmed.starts_with('{') && trimmed.ends_with('}')
+    }
+
+    #[test]
+    fn config_json_format_shapes_the_startup_logs() {
+        let line = first_log_line("json", None);
+        assert!(
+            looks_like_json(&line),
+            "server.log_format = \"json\" must produce JSON logs, got: {line}"
+        );
+    }
+
+    #[test]
+    fn rust_log_format_wins_over_the_configured_format() {
+        let line = first_log_line("json", Some("plain"));
+        assert!(
+            !looks_like_json(&line),
+            "RUST_LOG_FORMAT=plain must override server.log_format = \"json\", got: {line}"
+        );
+    }
+
+    #[test]
+    fn the_default_remains_plain() {
+        let line = first_log_line("plain", None);
+        assert!(
+            !looks_like_json(&line),
+            "plain must stay plain, got: {line}"
+        );
+    }
+}

@@ -16,6 +16,10 @@ use tracing::info;
 
 use crate::paths::providers_dir_for;
 
+/// Test helper: load config from `path` then build the state. The serve path
+/// loads the config itself (before tracing init, BUG-25) and calls
+/// [`load_toml_state_from_config`].
+#[cfg(test)]
 pub(crate) fn load_toml_state(
     path: &Path,
     adapter_registry: ProviderAdapterRegistry,
@@ -30,6 +34,17 @@ pub(crate) fn load_toml_state(
         app_config.server.bind = bind;
     }
 
+    load_toml_state_from_config(app_config, path, adapter_registry)
+}
+
+/// Build the serving state from an already-loaded config: the path the serve
+/// command takes, so it can initialize the tracing subscriber from the
+/// config's `server.log_format` before anything logs through it (BUG-25).
+pub fn load_toml_state_from_config(
+    app_config: AppConfig,
+    path: &Path,
+    adapter_registry: ProviderAdapterRegistry,
+) -> Result<AppState> {
     // Phase-shaped upstream timeouts (backlog 8, BUG-14): the configured
     // phases replace the fixed connect/headers/idle constants.
     let proxy_client = ProxyClient::try_with_timeouts(&app_config.server.upstream_timeouts)
@@ -265,10 +280,21 @@ pub fn build_info() -> BuildInfo {
     }
 }
 
+/// The log format subscriber init should use (BUG-25): a set
+/// `RUST_LOG_FORMAT` wins over the configured `server.log_format`, as
+/// documented; unset falls back to the configured value.
+pub fn startup_log_format(config: &AppConfig) -> LogFormat {
+    LogFormat::effective(
+        std::env::var("RUST_LOG_FORMAT").ok().as_deref(),
+        config.server.log_format,
+    )
+}
+
 /// Initialize the tracing subscriber.
 ///
-/// Reads `RUST_LOG` (falling back to `"info"`) and the output format from
-/// `RUST_LOG_FORMAT` via [`LogFormat::from_env`].
+/// Reads `RUST_LOG` (falling back to `"info"`); the format comes from the
+/// caller, which resolves `server.log_format` against `RUST_LOG_FORMAT`
+/// (see [`startup_log_format`]).
 pub fn init_tracing(log_format: &LogFormat) {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;

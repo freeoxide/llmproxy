@@ -13,7 +13,21 @@ use tracing::info;
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{config_dir, resolve_config};
 use crate::pid::{is_process_running, read_pid, remove_pid, write_pid, write_pid_value};
-use crate::state::{init_tracing, load_toml_state};
+use crate::state::init_tracing;
+
+/// Applies the `--port` CLI override to the loaded config (step 10's stated
+/// precedence: CLI over config).
+fn apply_port_override(
+    mut app_config: llm_proxy_core::AppConfig,
+    port_override: Option<u16>,
+) -> llm_proxy_core::AppConfig {
+    if let Some(port) = port_override {
+        let mut bind = app_config.server.bind;
+        bind.set_port(port);
+        app_config.server.bind = bind;
+    }
+    app_config
+}
 
 /// Run the `serve` command.
 ///
@@ -24,21 +38,28 @@ pub async fn cmd_serve(
     background: bool,
     daemonize: bool,
 ) -> Result<()> {
-    init_tracing(&LogFormat::from_env());
+    let path = resolve_config(config_path.as_deref());
+    validate_toml_extension(&path)?;
 
     if background && !daemonize {
-        let path = resolve_config(config_path.as_deref());
-        validate_toml_extension(&path)?;
+        // The parent only logs spawn failures; the daemon child runs this
+        // same command with `--daemonize` and initializes tracing itself
+        // from the resolved config below.
+        init_tracing(&LogFormat::from_env());
         return spawn_daemon(config_path.as_deref(), port_override);
     }
 
-    let path = resolve_config(config_path.as_deref());
-
-    validate_toml_extension(&path)?;
+    // BUG-25: the config loads before the subscriber is built, so
+    // `server.log_format` is honoured; a set `RUST_LOG_FORMAT` still wins
+    // (see `startup_log_format`).
+    let app_config = llm_proxy_core::load_app_config(&path)
+        .with_context(|| format!("loading TOML config from {}", path.display()))?;
+    let app_config = apply_port_override(app_config, port_override);
+    init_tracing(&crate::state::startup_log_format(&app_config));
 
     let adapter_registry = ProviderAdapterRegistry::builtin();
 
-    let state = load_toml_state(&path, adapter_registry, port_override)?;
+    let state = crate::state::load_toml_state_from_config(app_config, &path, adapter_registry)?;
 
     let admin = bind_admin_listener(&state).await?;
 
