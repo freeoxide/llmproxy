@@ -65,9 +65,16 @@ pub fn router(state: AppState) -> Router {
 
     // Shared admission middleware; the body limit and timeout layer on top
     // are per endpoint family (conflict 16), so each family composes its own.
+    // The host/origin gate runs after the request id is injected and before
+    // client auth: under anonymous auth it is the DNS-rebinding defense
+    // (backlog 11), and under client keys it passes everything through.
     let admission = |family: &'static str| {
         ServiceBuilder::new()
             .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
+            .layer(from_fn_with_state(
+                state.clone(),
+                crate::host_guard::enforce_host_origin,
+            ))
             .layer(from_fn_with_state(state.clone(), require_client_auth))
             .layer(from_fn_with_state(
                 Arc::clone(&event_bus),

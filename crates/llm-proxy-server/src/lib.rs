@@ -4,6 +4,8 @@
 
 #![deny(missing_docs)]
 
+/// Host/Origin validation under anonymous auth (DNS-rebinding defense).
+pub mod host_guard;
 /// Middleware components (auth, rate limiter, request ID, IP extraction).
 pub mod middleware;
 /// Route handlers and router composition.
