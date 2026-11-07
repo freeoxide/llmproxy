@@ -60,5 +60,6 @@ vergen-gix = { workspace = true }
 [dev-dependencies]
 insta = { version = "1.42", features = ["yaml", "filters"] }
 axum = { workspace = true }
+tokio = { workspace = true }
 llm-proxy-protocol = { workspace = true }
 tempfile = "3"

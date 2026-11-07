@@ -329,3 +329,176 @@ server_name = "log-format-test"
         );
     }
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod hot_reload_signal {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Plan 07 step 11, end to end against the real binary: SIGHUP re-reads
+    /// the provider files, and a request after the signal reaches the
+    /// provider's new upstream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sighup_swaps_a_changed_providers_upstream() {
+        // The blocking HTTP posts below run on this thread; the fake
+        // upstreams need the runtime's other workers to answer, hence the
+        // multi-thread flavor.
+        let before_addr = spawn_upstream("before-reload").await;
+        let after_addr = spawn_upstream("after-reload").await;
+        let marker = "after-reload";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bind = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("probe bind")
+            .local_addr()
+            .expect("probe addr");
+        write_live_provider(dir.path(), &before_addr.to_string());
+        write_e2e_config(dir.path(), bind);
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_llm-proxy"))
+            .args(["serve", "--config"])
+            .arg(dir.path().join("config.toml"))
+            .env("HOME", dir.path())
+            .env("NO_PROXY", "127.0.0.1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("server starts");
+
+        let post = |body: &str| -> String {
+            let mut stream = TcpStream::connect(bind).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("read timeout");
+            let request = format!(
+                "POST /providers/live/v1/messages HTTP/1.1\r\nHost: {bind}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {length}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                length = body.len(),
+            );
+            stream.write_all(request.as_bytes()).expect("write");
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).expect("read");
+            reply
+        };
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#;
+
+        // Wait for the server to accept, then check the pre-reload upstream.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "server never started accepting");
+            if let Some(status) = child.try_wait().expect("child state") {
+                panic!("server exited early: {status:?}");
+            }
+            if TcpStream::connect(bind).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let reply = post(body);
+        assert!(reply.contains("200"), "pre-reload request: {reply:.200}");
+        assert!(
+            reply.contains("before-reload"),
+            "pre-reload marker: {reply:.200}"
+        );
+
+        // Point the provider at the other upstream and signal SIGHUP.
+        write_live_provider(dir.path(), &after_addr.to_string());
+        let status = Command::new("kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(status.success(), "SIGHUP sent");
+
+        // The swap lands shortly; the next requests see the new upstream.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let reply = post(body);
+            if reply.contains(marker) {
+                assert!(
+                    reply.contains("200"),
+                    "post-reload request served by the new upstream: {reply:.200}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the reloaded provider never answered from its new upstream"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        if let Err(error) = child.kill().and_then(|()| child.wait().map(drop)) {
+            eprintln!("failed to stop the reload-e2e server: {error}");
+        }
+    }
+
+    fn write_live_provider(dir: &std::path::Path, endpoint: &str) {
+        std::fs::create_dir_all(dir.join("providers")).expect("providers dir");
+        std::fs::write(
+            dir.join("providers/live.toml"),
+            format!(
+                r#"[provider]
+name = "live"
+api_key = "k"
+auth_style = "x-api-key"
+[provider.adapters.messages]
+protocol = "anthropic_messages"
+endpoint = "http://{endpoint}/v1/messages"
+[provider.routes]
+messages = "messages"
+"#
+            ),
+        )
+        .expect("provider file");
+    }
+
+    fn write_e2e_config(dir: &std::path::Path, bind: std::net::SocketAddr) {
+        std::fs::write(
+            dir.join("config.toml"),
+            format!(
+                r#"[server]
+bind = "{bind}"
+request_timeout = "60s"
+shutdown_timeout = "1s"
+log_level = "warn"
+hot_reload = true
+server_name = "reload-e2e"
+[auth]
+mode = "none"
+"#
+            ),
+        )
+        .expect("config");
+    }
+
+    async fn spawn_upstream(marker: &'static str) -> std::net::SocketAddr {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/{*path}",
+            post(move || async move {
+                let body = format!(
+                    r#"{{"id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"{marker}"}}],"model":"m","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":2,"output_tokens":1}}}}"#
+                );
+                (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("reload-e2e upstream stopped: {error}");
+            }
+        });
+        addr
+    }
+}
