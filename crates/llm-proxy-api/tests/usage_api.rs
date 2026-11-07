@@ -23,7 +23,7 @@ mod tests {
         t0: OffsetDateTime,
     }
 
-    fn received_event(
+    pub(super) fn received_event(
         id: &str,
         caller: &str,
         provider: &str,
@@ -47,7 +47,7 @@ mod tests {
         })
     }
 
-    fn completed_event(
+    pub(super) fn completed_event(
         id: &str,
         provider: &str,
         model: &str,
@@ -99,7 +99,7 @@ mod tests {
         event
     }
 
-    fn failed_event(id: &str, provider: Option<&str>, ts: OffsetDateTime) -> ProxyEvent {
+    pub(super) fn failed_event(id: &str, provider: Option<&str>, ts: OffsetDateTime) -> ProxyEvent {
         ProxyEvent::ResponseFailed(ResponseFailed {
             request_id: id.to_owned(),
             timestamp: ts,
@@ -185,7 +185,7 @@ mod tests {
         }
     }
 
-    fn app_for(path: &std::path::Path) -> axum::Router {
+    pub(super) fn app_for(path: &std::path::Path) -> axum::Router {
         llm_proxy_api::UsageApi::new(path.to_owned(), ADMIN_TOKEN).router()
     }
 
@@ -871,5 +871,113 @@ mod metrics_route {
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod in_flight_visibility {
+    use super::tests::{ADMIN_TOKEN, app_for, completed_event, failed_event, received_event};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use llm_proxy_storage::{EventBus, RetentionPolicy, SqliteEventBus};
+    use serde_json::Value;
+    use std::time::Duration;
+    use time::OffsetDateTime;
+    use tower::ServiceExt;
+
+    /// Backlog 27: /usage/requests already returns rows written at
+    /// RequestReceived; now each row says which state it is in, and
+    /// in-flight rows carry elapsed time measured at query time.
+    #[tokio::test]
+    async fn request_rows_report_state_and_in_flight_elapsed_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(
+            &path,
+            RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                prune_every: Duration::from_secs(3600),
+            },
+        )
+        .expect("open ledger");
+        let t0 = OffsetDateTime::now_utc();
+        let second = Duration::from_secs(1);
+
+        // A request whose received row exists and never completed: in flight.
+        bus.emit(&received_event(
+            "live-1", "laptop", "prov-a", "claude-3", t0,
+        ));
+        // One that completed.
+        bus.emit(&received_event(
+            "done-1",
+            "laptop",
+            "prov-a",
+            "claude-3",
+            t0 + second,
+        ));
+        bus.emit(&completed_event(
+            "done-1",
+            "prov-a",
+            "claude-3",
+            t0 + 2 * second,
+            "0.5",
+        ));
+        // One that failed.
+        bus.emit(&received_event(
+            "sad-1",
+            "laptop",
+            "prov-a",
+            "claude-3",
+            t0 + 3 * second,
+        ));
+        bus.emit(&failed_event("sad-1", Some("prov-a"), t0 + 4 * second));
+        let closer = std::sync::Arc::new(bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close joined");
+
+        let app = app_for(&path);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/usage/requests")
+                    .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("body is JSON");
+
+        let find = |id: &str| {
+            body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["request_id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing from rows: {body}"))
+                .clone()
+        };
+        let live = find("live-1");
+        assert_eq!(live["state"], "in_flight", "row: {live}");
+        let elapsed = live["elapsed_ms"].as_i64().expect("elapsed is present");
+        assert!(
+            elapsed >= 0,
+            "elapsed time is measured at query time: {live}"
+        );
+        let done = find("done-1");
+        assert_eq!(done["state"], "completed", "row: {done}");
+        assert!(
+            done["elapsed_ms"].is_null(),
+            "settled rows carry latency_ms, not elapsed: {done}"
+        );
+        let sad = find("sad-1");
+        assert_eq!(sad["state"], "failed", "row: {sad}");
+        assert!(sad["elapsed_ms"].is_null(), "row: {sad}");
     }
 }

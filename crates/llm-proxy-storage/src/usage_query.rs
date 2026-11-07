@@ -173,6 +173,15 @@ pub struct RequestRow {
     pub body_hash: Option<String>,
     /// Whether the response came from the response cache.
     pub cache_hit: Option<bool>,
+    /// Lifecycle state derived from the row (plan 07 step 8, backlog 27):
+    /// `in_flight` while no completion is recorded (a row the ledger wrote
+    /// at `RequestReceived` whose request is still running), `failed` when an
+    /// error_kind is set, `completed` otherwise.
+    pub state: String,
+    /// For `in_flight` rows: milliseconds since the request was received,
+    /// measured at query time. `None` for settled rows (`latency_ms` is the
+    /// settled fact there).
+    pub elapsed_ms: Option<i64>,
 }
 
 /// One page of request rows plus the cursor for the next page.
@@ -445,6 +454,10 @@ fn map_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RequestRow, i64
         reasoning: cost_reasoning.unwrap_or_else(|| "0".to_owned()),
         total,
     });
+    // Lifecycle state (plan 07 step 8): computed in SQL from the same row so
+    // the state and the timestamps it rests on cannot drift apart. Elapsed
+    // time for in-flight rows is measured at query time (?1).
+    let state: String = row.get(29)?;
     let row_out = RequestRow {
         request_id: row.get(0)?,
         received_at_ms: row.get(1)?,
@@ -465,6 +478,8 @@ fn map_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RequestRow, i64
         latency_ms: row.get(25)?,
         body_hash: row.get(26)?,
         cache_hit: row.get::<_, Option<i64>>(27)?.map(|flag| flag != 0),
+        state,
+        elapsed_ms: row.get(30)?,
     };
     let ts: Option<i64> = row.get(28)?;
     Ok((row_out, ts.unwrap_or(i64::MIN)))
@@ -472,6 +487,9 @@ fn map_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RequestRow, i64
 
 fn requests_sync(path: &Path, filter: &RequestFilter) -> Result<RequestsPage, UsageQueryError> {
     let conn = UsageReader::open(path)?;
+    // In-flight elapsed time is measured once per query, at query time (an
+    // integer literal, so it cannot perturb the bound-parameter order).
+    let now_ms = now_unix_millis();
     let mut clauses: Vec<&'static str> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
     if let Some(since) = filter.since_ms {
@@ -506,7 +524,11 @@ fn requests_sync(path: &Path, filter: &RequestFilter) -> Result<RequestsPage, Us
          output_tokens, reasoning_tokens, cache_read_tokens, cache_creation_tokens, \
          usage_provenance, cost_input, cost_output, cost_cache_creation, cost_cache_read, \
          cost_reasoning, cost_total, stop_reason, error_kind, http_status, latency_ms, \
-         body_hash, cache_hit, COALESCE(received_at, completed_at) AS ts \
+         body_hash, cache_hit, COALESCE(received_at, completed_at) AS ts, \
+         CASE WHEN completed_at IS NULL THEN 'in_flight' \
+              WHEN error_kind IS NOT NULL THEN 'failed' \
+              ELSE 'completed' END AS state, \
+         CASE WHEN completed_at IS NULL THEN {now_ms} - received_at ELSE NULL END AS elapsed_ms \
          FROM requests {where_sql} \
          ORDER BY ts DESC, request_id DESC \
          LIMIT ?"
