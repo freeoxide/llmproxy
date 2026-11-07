@@ -46,8 +46,9 @@
 //! ```
 //!
 //! Cargo features: `server` (the axum binding, default), `sqlite` (the
-//! persistent ledger, default), `admin` (the read-only usage API). With all
-//! defaults off you get the engine, adapters and transport only.
+//! persistent ledger, default), `admin` (the read-only usage API),
+//! `semantic-cache` (the optional semantic cache, plan 09 step 5). With
+//! all defaults off you get the engine, adapters and transport only.
 
 #![deny(missing_docs)]
 
