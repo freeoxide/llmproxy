@@ -32,6 +32,9 @@ store-postgres = ["dep:llm-proxy-store-postgres"]
 admin-ui = ["dep:llm-proxy-admin"]
 # The semantic response cache (plan 09 step 5).
 semantic-cache = ["llm-proxy-server/semantic-cache"]
+# The MCP gateway (plan 09 step 6): `[mcp]` starts it on its own
+# listener with its own tokens.
+mcp-gateway = ["dep:llm-proxy-mcp"]
 
 [dependencies]
 llm-proxy-server = { workspace = true, features = ["admin"] }
@@ -51,6 +54,7 @@ llm-proxy-storage = { workspace = true, features = ["sqlite"] }
 llm-proxy-store-redis = { workspace = true, optional = true }
 llm-proxy-store-postgres = { workspace = true, optional = true }
 llm-proxy-admin = { workspace = true, optional = true }
+llm-proxy-mcp = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -2496,6 +2496,7 @@ dependencies = [
  "llm-proxy-admin",
  "llm-proxy-core",
  "llm-proxy-engine",
+ "llm-proxy-mcp",
  "llm-proxy-protocol",
  "llm-proxy-server",
  "llm-proxy-storage",
@@ -2581,6 +2582,29 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "llm-proxy-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "llm-proxy-adapters",
+ "llm-proxy-core",
+ "llm-proxy-engine",
+ "llm-proxy-protocol",
+ "llm-proxy-storage",
+ "llm-proxy-transport",
+ "secrecy",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

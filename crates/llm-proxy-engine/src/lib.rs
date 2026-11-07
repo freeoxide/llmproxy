@@ -299,6 +299,14 @@ impl Engine {
         &self.inner.usage
     }
 
+    /// The admission step this engine reserves through, shared with
+    /// sidecar surfaces (the MCP gateway, plan 09 step 6) so one budget
+    /// bounds every surface.
+    #[must_use]
+    pub fn shared_admission(&self) -> Arc<dyn Admission> {
+        Arc::clone(&self.inner.admission)
+    }
+
     /// The configuration snapshot source.
     #[must_use]
     pub fn config_source(&self) -> &Arc<dyn ConfigSource> {

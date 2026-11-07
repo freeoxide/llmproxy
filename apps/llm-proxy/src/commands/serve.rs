@@ -17,6 +17,14 @@ use crate::paths::{config_dir, resolve_config};
 use crate::pid::{is_process_running, read_pid, remove_pid, write_pid, write_pid_value};
 use crate::state::init_tracing;
 
+/// The `--background` path: the parent only logs spawn failures; the
+/// daemon child runs this same command with `--daemonize` and initializes
+/// tracing itself from the resolved config.
+fn spawn_in_background(config_path: Option<&Path>, port_override: Option<u16>) -> Result<()> {
+    init_tracing(&LogFormat::from_env());
+    spawn_daemon(config_path, port_override)
+}
+
 /// Applies the `--port` CLI override to the loaded config (step 10's stated
 /// precedence: CLI over config).
 fn apply_port_override(
@@ -44,11 +52,7 @@ pub async fn cmd_serve(
     validate_toml_extension(&path)?;
 
     if background && !daemonize {
-        // The parent only logs spawn failures; the daemon child runs this
-        // same command with `--daemonize` and initializes tracing itself
-        // from the resolved config below.
-        init_tracing(&LogFormat::from_env());
-        return spawn_daemon(config_path.as_deref(), port_override);
+        return spawn_in_background(config_path.as_deref(), port_override);
     }
 
     // BUG-25: the config loads before the subscriber is built, so
@@ -65,6 +69,7 @@ pub async fn cmd_serve(
         crate::state::load_toml_state_from_config(app_config, &path, adapter_registry).await?;
 
     let admin = bind_admin_listener(&state).await?;
+    let mcp = bind_mcp_gateway(&state).await?;
 
     claim_pid_file()?;
 
@@ -124,13 +129,23 @@ pub async fn cmd_serve(
                 .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()))
                 .await
             {
-                tracing::error!(%error, "admin usage listener failed");
+                tracing::error!(%error, "admin surface listener failed");
+            }
+        }
+    };
+    let mcp_serve = async {
+        if let Some((listener, router)) = mcp {
+            if let Err(error) = axum::serve(listener, router.into_make_service())
+                .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()))
+                .await
+            {
+                tracing::error!(%error, "MCP gateway listener failed");
             }
         }
     };
 
     let servers = async {
-        let (main, ()) = tokio::join!(serve.into_future(), admin_serve);
+        let (main, (), ()) = tokio::join!(serve.into_future(), admin_serve, mcp_serve);
         main
     };
     let Some(result) = drain_within_deadline(
@@ -346,6 +361,53 @@ async fn bind_admin_listener(
         "admin usage API listening (read-only, behind the admin token)"
     );
     Ok(Some((listener, router)))
+}
+
+/// The MCP gateway listener (plan 09 step 6): `[mcp]` is its own surface
+/// with its own tokens, sharing the engine's admission and the ledger.
+#[cfg(feature = "mcp-gateway")]
+async fn bind_mcp_gateway(
+    state: &llm_proxy_server::AppState,
+) -> Result<Option<(TcpListener, axum::Router)>> {
+    use std::sync::Arc;
+    let Some(config) = state.app_config().mcp.clone() else {
+        return Ok(None);
+    };
+    if config.tokens.is_empty() {
+        bail!("[mcp] is configured with no tokens: the gateway would refuse everyone");
+    }
+    let admission = state
+        .engine()
+        .map(|engine| engine.shared_admission())
+        .map_err(|error| anyhow::anyhow!("building the engine for the MCP gateway: {error}"))?;
+    let gateway = llm_proxy_mcp::McpGateway::new(
+        config.clone(),
+        admission,
+        Arc::clone(state.event_bus()),
+        Arc::new(llm_proxy_transport::ProxyClient::new()),
+    );
+    let addr = gateway.bind();
+    let router = gateway.router();
+    let listener = bind_listener(addr).await?;
+    info!(
+        addr = %addr,
+        upstreams = config.upstreams.len(),
+        "MCP gateway listening (own tokens, shared admission and ledger)"
+    );
+    Ok(Some((listener, router)))
+}
+
+#[cfg(not(feature = "mcp-gateway"))]
+async fn bind_mcp_gateway(
+    state: &llm_proxy_server::AppState,
+) -> Result<Option<(TcpListener, axum::Router)>> {
+    if state.app_config().mcp.is_some() {
+        bail!(
+            "[mcp] is configured but this build lacks the mcp-gateway feature; \
+             rebuild with --features mcp-gateway"
+        );
+    }
+    Ok(None)
 }
 
 async fn bind_listener(bind_addr: std::net::SocketAddr) -> Result<TcpListener> {
