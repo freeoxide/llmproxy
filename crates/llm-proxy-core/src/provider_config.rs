@@ -149,6 +149,7 @@ pub struct ServerConfig {
     /// `[server]`, `[auth]`, `[storage]` — are refused with a
     /// restart-required error instead of being half-applied. Default `false`:
     /// without it, reload signals are ignored.
+    #[serde(default)]
     pub hot_reload: bool,
     /// Per-client requests allowed per minute. `0` disables rate limiting.
     #[serde(default = "default_rate_limit_rpm")]
@@ -2674,13 +2675,17 @@ pub fn bare_v1_target_problems(
 /// Names every change between two config snapshots that hot reload cannot
 /// apply and therefore refuses (plan 07 step 11, backlog 23): any `[server]`
 /// field (compared as rendered values, so the message can name the field),
-/// the auth mode, the set of client key ids, the admin token, and the
-/// storage ledger. Provider and pool files are reloadable and are not
-/// compared here. Empty result: the reload may proceed.
+/// the auth mode, the whole `[auth.clients]` map (key ids as a set, and —
+/// under an unchanged id — the verifier and policy too, named
+/// `auth.clients.<id>`), the admin token, and the storage ledger. Provider
+/// and pool files are reloadable and are not compared here. Empty result:
+/// the reload may proceed.
 ///
-/// Secrets are compared by equality and never rendered; the client key
-/// *ids* are compared as a set (verifiers change by replacing a key under
-/// the same id — which keeps attribution intact and needs no restart).
+/// Secrets are compared by equality and never rendered. A verifier rotated
+/// under an existing key id or an edited policy is restart-required as
+/// well: the auth middleware and the engine's admission are not rebuilt by
+/// a reload, so applying the rest of the file while they keep the old key
+/// material would silently keep authenticating a revoked token.
 #[must_use]
 pub fn restart_required_changes(current: &AppConfig, next: &AppConfig) -> Vec<String> {
     let mut changes = Vec::new();
@@ -2710,6 +2715,17 @@ pub fn restart_required_changes(current: &AppConfig, next: &AppConfig) -> Vec<St
     }
     if key_set(current) != key_set(next) {
         changes.push("auth.clients".to_owned());
+    } else {
+        for id in key_set(current) {
+            let (Some(current_spec), Some(next_spec)) =
+                (current.auth.clients.get(id), next.auth.clients.get(id))
+            else {
+                continue;
+            };
+            if !client_spec_matches(current_spec, next_spec) {
+                changes.push(format!("auth.clients.{id}"));
+            }
+        }
     }
     let token_of = |config: &AppConfig| {
         config
@@ -2727,6 +2743,66 @@ pub fn restart_required_changes(current: &AppConfig, next: &AppConfig) -> Vec<St
         _ => changes.push("storage".to_owned()),
     }
     changes
+}
+
+/// Whether two specs for the same key id are the same key material and the
+/// same policy. Verifiers compare by secret equality (never rendered); a
+/// bare string and a table carrying only defaults are the same key, since
+/// the defaults are what the bare spelling means.
+fn client_spec_matches(current: &ClientKeySpec, next: &ClientKeySpec) -> bool {
+    if current.verifier().expose_secret() != next.verifier().expose_secret() {
+        return false;
+    }
+    let policy_is_empty = |models: &[String],
+                           providers: &[String],
+                           limits: &Option<KeyWindowLimits>,
+                           budget: &Option<KeyBudgetConfig>| {
+        models.is_empty() && providers.is_empty() && limits.is_none() && budget.is_none()
+    };
+    match (current, next) {
+        (ClientKeySpec::Verifier(_), ClientKeySpec::Verifier(_)) => true,
+        (
+            ClientKeySpec::Policy {
+                allow_models,
+                allow_providers,
+                limits,
+                budget,
+                ..
+            },
+            ClientKeySpec::Policy {
+                allow_models: next_models,
+                allow_providers: next_providers,
+                limits: next_limits,
+                budget: next_budget,
+                ..
+            },
+        ) => {
+            allow_models == next_models
+                && allow_providers == next_providers
+                && limits == next_limits
+                && budget == next_budget
+        }
+        (
+            ClientKeySpec::Verifier(_),
+            ClientKeySpec::Policy {
+                allow_models,
+                allow_providers,
+                limits,
+                budget,
+                ..
+            },
+        )
+        | (
+            ClientKeySpec::Policy {
+                allow_models,
+                allow_providers,
+                limits,
+                budget,
+                ..
+            },
+            ClientKeySpec::Verifier(_),
+        ) => policy_is_empty(allow_models, allow_providers, limits, budget),
+    }
 }
 
 /// Validates one pool definition in isolation: non-empty name and members,
@@ -3787,6 +3863,106 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
             restart_required_changes(&current, &next),
             vec!["server.hot_reload".to_owned()]
         );
+    }
+
+    /// Audit finding 1: the reload used to exempt same-id client changes,
+    /// so a rotated verifier kept authenticating the old token until
+    /// restart while the operator believed the reload applied.
+    #[test]
+    fn same_id_verifier_rotation_is_restart_required() {
+        let current = base_config();
+        let mut next = current.clone();
+        let Some(ClientKeySpec::Verifier(phc)) = next.auth.clients.get("laptop") else {
+            panic!("base config keys laptop with a bare verifier");
+        };
+        let rotated = phc.expose_secret().to_owned() + "other-hash";
+        next.auth.clients.insert(
+            "laptop".to_owned(),
+            ClientKeySpec::Verifier(SecretString::from(rotated)),
+        );
+        assert_eq!(
+            restart_required_changes(&current, &next),
+            vec!["auth.clients.laptop".to_owned()],
+            "a rotated verifier under an existing key id must be refused, naming the key"
+        );
+    }
+
+    #[test]
+    fn same_id_policy_change_is_restart_required() {
+        let current = base_config();
+        let verifier = current
+            .auth
+            .clients
+            .get("laptop")
+            .map(|spec| match spec {
+                ClientKeySpec::Verifier(phc) => SecretString::from(phc.expose_secret()),
+                ClientKeySpec::Policy { verifier, .. } => SecretString::clone(verifier),
+            })
+            .expect("laptop is keyed");
+        let mut next = current.clone();
+        next.auth.clients.insert(
+            "laptop".to_owned(),
+            ClientKeySpec::Policy {
+                verifier,
+                allow_models: vec!["claude-*".to_owned()],
+                allow_providers: Vec::new(),
+                limits: None,
+                budget: None,
+            },
+        );
+        assert_eq!(
+            restart_required_changes(&current, &next),
+            vec!["auth.clients.laptop".to_owned()],
+            "a tightened allowlist under an existing key id must be refused, naming the key"
+        );
+    }
+
+    /// The bare-string and table spellings of the same key (verifier equal,
+    /// policy all defaults) are one unchanged key, so restating the config
+    /// in the other spelling does not demand a restart.
+    #[test]
+    fn same_verifier_with_only_default_policy_fields_is_not_a_change() {
+        let current = base_config();
+        let Some(ClientKeySpec::Verifier(phc)) = current.auth.clients.get("laptop") else {
+            panic!("base config keys laptop with a bare verifier");
+        };
+        let mut next = current.clone();
+        next.auth.clients.insert(
+            "laptop".to_owned(),
+            ClientKeySpec::Policy {
+                verifier: SecretString::from(phc.expose_secret()),
+                allow_models: Vec::new(),
+                allow_providers: Vec::new(),
+                limits: None,
+                budget: None,
+            },
+        );
+        assert!(
+            restart_required_changes(&current, &next).is_empty(),
+            "the table spelling with only defaults is the same key as the bare string"
+        );
+    }
+
+    #[test]
+    fn load_app_config_defaults_hot_reload_to_false_when_omitted() {
+        // The doc promises "Default `false`"; the field must parse as
+        // defaulted, not fail, when the key is absent.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+server_name = "test"
+"#,
+        )
+        .unwrap();
+
+        let config = load_app_config(&path).expect("a config omitting hot_reload parses");
+        assert!(!config.server.hot_reload);
     }
 
     #[test]

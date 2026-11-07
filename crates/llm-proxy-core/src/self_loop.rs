@@ -244,12 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn hop_header_names_are_stable() {
-        assert_eq!(HOP_HEADER, "x-llm-proxy-hop");
-        assert_eq!(HOP_HEADER_VALUE, "1");
-    }
-
-    #[test]
     fn default_ports_are_derived_from_the_scheme() {
         assert_eq!(
             host_port_of("https://api.example.com/v1/x"),

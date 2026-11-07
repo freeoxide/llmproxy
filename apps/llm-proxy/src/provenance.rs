@@ -68,10 +68,8 @@ fn table_value<'t>(table: &'t toml::Table, path: &[&str]) -> Option<&'t toml::Va
 /// Names the first `${VAR}` reference in a raw string value, if any.
 fn env_var_of(value: &toml::Value) -> Option<String> {
     let text = value.as_str()?;
-    let start = text.find("${")?;
-    let after = &text[(start + 2)..];
-    let end = after.find('}')?;
-    let name = &after[..end];
+    let (_, after_marker) = text.split_once("${")?;
+    let (name, _) = after_marker.split_once('}')?;
     (!name.is_empty()).then(|| name.to_owned())
 }
 
@@ -111,6 +109,7 @@ pub fn provenance_report(
 ) -> Vec<SettingProvenance> {
     let table = raw_toml.parse::<toml::Table>().unwrap_or_default();
     let mut rows = server_rows(&table, &config.server, env);
+    rows.extend(metrics_rows(&table, &config.server));
     rows.extend(feature_rows(&table, &config.server));
     rows.extend(auth_and_storage_rows(&table, config));
     if env.rust_log_format.is_some() {
@@ -205,7 +204,63 @@ fn server_rows(
             server.admin_on_main_listener.to_string(),
             source_of(table, &["server", "admin_on_main_listener"]),
         ),
+        line(
+            "server.endpoint_families",
+            render_endpoint_families(server),
+            source_of(table, &["server", "endpoint_families"]),
+        ),
     ]
+}
+
+/// The `[server.metrics]` export rows.
+fn metrics_rows(
+    table: &toml::Table,
+    server: &llm_proxy_core::ServerConfig,
+) -> Vec<SettingProvenance> {
+    vec![
+        line(
+            "server.metrics.otlp.endpoint",
+            server.metrics.otlp.as_ref().map_or_else(
+                || "disabled".to_owned(),
+                |otlp| {
+                    llm_proxy_core::provider_config::endpoint_without_query(&otlp.endpoint)
+                        .to_owned()
+                },
+            ),
+            source_of(table, &["server", "metrics", "otlp", "endpoint"]),
+        ),
+        line(
+            "server.metrics.otlp.interval",
+            server
+                .metrics
+                .otlp
+                .as_ref()
+                .map_or_else(|| "disabled".to_owned(), |otlp| humantime(otlp.interval)),
+            source_of(table, &["server", "metrics", "otlp", "interval"]),
+        ),
+    ]
+}
+
+/// `[server.endpoint_families]` rendered one family per entry, sorted by
+/// family name so the row is stable across runs.
+fn render_endpoint_families(server: &llm_proxy_core::ServerConfig) -> String {
+    if server.endpoint_families.is_empty() {
+        return "none".to_owned();
+    }
+    let mut families: Vec<(&String, &llm_proxy_core::EndpointFamilyConfig)> =
+        server.endpoint_families.iter().collect();
+    families.sort_by(|a, b| a.0.cmp(b.0));
+    families
+        .into_iter()
+        .map(|(name, family)| {
+            format!(
+                "{name}: max_body_bytes={}, request_timeout={}",
+                family.max_body_bytes,
+                humantime(family.request_timeout)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Timeout-phase and feature-flag rows.
@@ -253,20 +308,74 @@ fn feature_rows(
             source_of(table, &["server", "preflight", "mode"]),
         ),
         line(
+            "server.preflight.margin_tokens",
+            server.preflight.margin_tokens.to_string(),
+            source_of(table, &["server", "preflight", "margin_tokens"]),
+        ),
+        line(
             "server.cache.enabled",
             server.cache.enabled.to_string(),
             source_of(table, &["server", "cache", "enabled"]),
+        ),
+        line(
+            "server.cache.ttl",
+            humantime(server.cache.ttl),
+            source_of(table, &["server", "cache", "ttl"]),
+        ),
+        line(
+            "server.cache.max_entries",
+            server.cache.max_entries.to_string(),
+            source_of(table, &["server", "cache", "max_entries"]),
         ),
         line(
             "server.idempotency.enabled",
             server.idempotency.enabled.to_string(),
             source_of(table, &["server", "idempotency", "enabled"]),
         ),
+        line(
+            "server.idempotency.ttl",
+            humantime(server.idempotency.ttl),
+            source_of(table, &["server", "idempotency", "ttl"]),
+        ),
+        line(
+            "server.idempotency.max_entries",
+            server.idempotency.max_entries.to_string(),
+            source_of(table, &["server", "idempotency", "max_entries"]),
+        ),
+        line(
+            "server.bare_v1.models",
+            render_bare_v1_models(server),
+            source_of(table, &["server", "bare_v1", "models"]),
+        ),
+        line(
+            "server.bare_v1.default_target",
+            server
+                .bare_v1
+                .default_target
+                .clone()
+                .unwrap_or_else(|| "none".to_owned()),
+            source_of(table, &["server", "bare_v1", "default_target"]),
+        ),
     ]
 }
 
-/// The `[auth]` mode/key count and the `[storage]` ledger presence. Values
-/// only — no secret is ever rendered (verifiers, tokens, keys).
+/// `[server.bare_v1].models` rendered as sorted `model -> target` pairs.
+fn render_bare_v1_models(server: &llm_proxy_core::ServerConfig) -> String {
+    if server.bare_v1.models.is_empty() {
+        return "none".to_owned();
+    }
+    let mut mappings: Vec<(&String, &String)> = server.bare_v1.models.iter().collect();
+    mappings.sort_by(|a, b| a.0.cmp(b.0));
+    mappings
+        .into_iter()
+        .map(|(model, target)| format!("{model} -> {target}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `[auth]` mode/key count, the admin surface's presence, and the
+/// `[storage]` ledger settings. Values only — no secret is ever rendered
+/// (verifiers, tokens, keys).
 fn auth_and_storage_rows(table: &toml::Table, config: &AppConfig) -> Vec<SettingProvenance> {
     vec![
         line(
@@ -284,12 +393,48 @@ fn auth_and_storage_rows(table: &toml::Table, config: &AppConfig) -> Vec<Setting
             source_of(table, &["auth", "clients"]),
         ),
         line(
+            "auth.admin",
+            if config.auth.admin.is_some() {
+                "configured"
+            } else {
+                "absent"
+            }
+            .to_owned(),
+            source_of(table, &["auth", "admin"]),
+        ),
+        line(
             "storage.path",
             config.storage.as_ref().map_or_else(
                 || "(no ledger: nothing persisted)".to_owned(),
                 |storage| storage.path.display().to_string(),
             ),
             source_of(table, &["storage", "path"]),
+        ),
+        line(
+            "storage.max_age",
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_age)
+                .map_or_else(|| "forever".to_owned(), humantime),
+            source_of(table, &["storage", "max_age"]),
+        ),
+        line(
+            "storage.max_rows",
+            config
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.max_rows)
+                .map_or_else(|| "unlimited".to_owned(), |rows| rows.to_string()),
+            source_of(table, &["storage", "max_rows"]),
+        ),
+        line(
+            "storage.prune_interval",
+            config.storage.as_ref().map_or_else(
+                || "(no ledger)".to_owned(),
+                |storage| humantime(storage.prune_interval),
+            ),
+            source_of(table, &["storage", "prune_interval"]),
         ),
     ]
 }
@@ -408,6 +553,11 @@ server_name = "t"
 mode = "client-keys"
 [auth.clients]
 laptop = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
+[auth.admin]
+token = "admin-token-value"
+
+[storage]
+path = "usage.db"
 "#;
         let config = config_from(raw);
         let rows = provenance_report(raw, &config, &RuntimeEnvOverrides::default());
@@ -420,7 +570,146 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$c2FsdA$aGFzaA"
             !rendered.contains("argon2id") && !rendered.contains("aGFzaA"),
             "verifiers must never be printed: {rendered}"
         );
+        assert!(
+            !rendered.contains("admin-token-value"),
+            "the admin token must never be printed: {rendered}"
+        );
         let keys = find(&rows, "auth.client_keys");
         assert_eq!(keys.value, "1", "the key count is the reportable fact");
+        let admin = find(&rows, "auth.admin");
+        assert_eq!(admin.value, "configured", "presence is the reportable fact");
+    }
+
+    /// Audit finding 3: the report used to print a curated subset. Every
+    /// documented operator-facing setting must appear with its resolved value
+    /// and its layer.
+    #[test]
+    fn every_documented_setting_has_a_row_with_its_resolved_value() {
+        let raw = r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+
+[server.preflight]
+mode = "enforce"
+margin_tokens = 128
+
+[server.cache]
+enabled = true
+ttl = "5m"
+max_entries = 250
+
+[server.idempotency]
+enabled = true
+ttl = "12h"
+max_entries = 50
+
+[server.metrics.otlp]
+endpoint = "http://127.0.0.1:4318/v1/metrics"
+interval = "30s"
+
+[server.bare_v1]
+enabled = true
+[server.bare_v1.models]
+"claude-sonnet-4-6" = "anthropic"
+"gpt-4o" = "openai"
+
+[server.endpoint_families.messages]
+max_body_bytes = 2048
+request_timeout = "60s"
+
+[storage]
+path = "usage.db"
+max_age = "30d"
+max_rows = 1000
+prune_interval = "2h"
+"#;
+        let config = config_from(raw);
+        let rows = provenance_report(raw, &config, &RuntimeEnvOverrides::default());
+
+        let cases = [
+            ("server.preflight.margin_tokens", "128"),
+            ("server.cache.ttl", "300s"),
+            ("server.cache.max_entries", "250"),
+            ("server.idempotency.ttl", "43200s"),
+            ("server.idempotency.max_entries", "50"),
+            (
+                "server.metrics.otlp.endpoint",
+                "http://127.0.0.1:4318/v1/metrics",
+            ),
+            ("server.metrics.otlp.interval", "30s"),
+            (
+                "server.bare_v1.models",
+                "claude-sonnet-4-6 -> anthropic, gpt-4o -> openai",
+            ),
+            (
+                "server.endpoint_families",
+                "messages: max_body_bytes=2048, request_timeout=60s",
+            ),
+            ("storage.max_age", "2592000s"),
+            ("storage.max_rows", "1000"),
+            ("storage.prune_interval", "7200s"),
+        ];
+        for (setting, value) in cases {
+            let row = find(&rows, setting);
+            assert_eq!(
+                row.value, value,
+                "{setting} carries its resolved value [{:?}]",
+                row.source
+            );
+            assert_eq!(
+                row.source,
+                Provenance::Config,
+                "{setting} is set in the file"
+            );
+        }
+    }
+
+    /// The same rows exist when nothing is set, attributing the documented
+    /// defaults instead of silently disappearing.
+    #[test]
+    fn unset_new_settings_still_have_rows_attributed_to_defaults() {
+        let raw = r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#;
+        let config = config_from(raw);
+        let rows = provenance_report(raw, &config, &RuntimeEnvOverrides::default());
+        for setting in [
+            "server.preflight.margin_tokens",
+            "server.cache.ttl",
+            "server.cache.max_entries",
+            "server.idempotency.ttl",
+            "server.idempotency.max_entries",
+            "server.metrics.otlp.endpoint",
+            "server.metrics.otlp.interval",
+            "server.bare_v1.models",
+            "server.bare_v1.default_target",
+            "server.endpoint_families",
+            "auth.admin",
+            "storage.max_age",
+            "storage.max_rows",
+            "storage.prune_interval",
+        ] {
+            let row = find(&rows, setting);
+            assert_eq!(
+                row.source,
+                Provenance::Default,
+                "{setting} must be attributed to the default layer, got {:?}",
+                row.source
+            );
+        }
+        assert_eq!(find(&rows, "auth.admin").value, "absent");
+        assert_eq!(
+            find(&rows, "server.metrics.otlp.endpoint").value,
+            "disabled"
+        );
+        assert_eq!(find(&rows, "storage.max_age").value, "forever");
+        assert_eq!(find(&rows, "storage.max_rows").value, "unlimited");
     }
 }

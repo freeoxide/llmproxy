@@ -360,12 +360,18 @@ fn classify_probe_error(
 }
 
 /// The model a probe should name: an alias target first (it is guaranteed to
-/// exist upstream), then a priced model, then a protocol default.
+/// exist upstream), then a priced model, then a protocol default. Both map
+/// picks are by sorted key: HashMap iteration order would send repeated runs
+/// at different models and make a "wrong model id" FAIL flaky.
 fn probe_model(provider: &ProviderConfig, protocol: &str) -> String {
-    if let Some(target) = provider.model_aliases.values().next() {
+    if let Some((_, target)) = provider
+        .model_aliases
+        .iter()
+        .min_by_key(|(alias, _)| *alias)
+    {
         return target.clone();
     }
-    if let Some(model) = provider.pricing.keys().next() {
+    if let Some(model) = provider.pricing.keys().min_by_key(|model| model.as_str()) {
         return model.as_str().to_owned();
     }
     if protocol == "anthropic_messages" {
@@ -562,5 +568,64 @@ server_name = "doctor-test"
                 ),
             }
         }
+    }
+
+    /// Audit finding 7: several aliases used to make the probed model depend
+    /// on HashMap iteration order, so a "wrong model id" FAIL was flaky.
+    /// The probe must name the same model on every run: the target of the
+    /// lexicographically first alias.
+    #[test]
+    fn probe_model_picks_the_first_alias_by_name_not_hash_order() {
+        let provider = toml::from_str::<llm_proxy_core::ProviderFile>(
+            r#"[provider]
+name = "probe-determinism"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+[provider.routes]
+chat_completions = "chat"
+[provider.model_aliases]
+"zz-alias" = "z-upstream-model"
+"aa-alias" = "a-upstream-model"
+"mm-alias" = "m-upstream-model"
+"#,
+        )
+        .expect("provider parses")
+        .provider;
+
+        assert_eq!(
+            probe_model(&provider, "openai_chat_completions"),
+            "a-upstream-model",
+            "the probe names the first alias by name, whatever the HashMap order"
+        );
+    }
+
+    #[test]
+    fn probe_model_falls_back_to_the_first_priced_model_deterministically() {
+        let provider = toml::from_str::<llm_proxy_core::ProviderFile>(
+            r#"[provider]
+name = "priced-probe"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "https://example.com/v1/chat/completions"
+[provider.routes]
+chat_completions = "chat"
+[provider.pricing]
+"zz-model" = { input = "0.001", output = "0.002" }
+"aa-model" = { input = "0.001", output = "0.002" }
+"#,
+        )
+        .expect("provider parses")
+        .provider;
+
+        assert_eq!(
+            probe_model(&provider, "openai_chat_completions"),
+            "aa-model",
+            "without aliases the probe names the first priced model by name"
+        );
     }
 }

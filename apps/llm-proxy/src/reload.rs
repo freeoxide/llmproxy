@@ -77,16 +77,29 @@ impl std::fmt::Display for ReloadReport {
 /// registry cannot be loaded. On success, later requests route through the
 /// new registry; in-flight requests finish on the engine they already hold.
 ///
+/// `port_override` is the `--port` the server was started with, if any: the
+/// CLI layer outranks the file, so the same override is applied to the
+/// re-read bind. Nothing else about `server.bind` is masked — a file edit of
+/// the bind reaches the diff and is refused as the restart-required change
+/// it is.
+///
 /// # Errors
 ///
 /// `anyhow` with a `restart-required:` prefix for refused changes, or the
 /// underlying loader error for broken provider files.
-pub fn reload_registry(state: &AppState, config_path: &Path) -> Result<ReloadReport> {
+pub async fn reload_registry(
+    state: &AppState,
+    config_path: &Path,
+    port_override: Option<u16>,
+) -> Result<ReloadReport> {
     let mut next = llm_proxy_core::load_app_config(config_path)
         .with_context(|| format!("re-reading {}", config_path.display()))?;
     // The CLI layer outranks the file (the stated precedence): a --port the
-    // server was started with stays in force, so the diff must not see it.
-    next.server.bind = state.app_config().server.bind;
+    // server was started with stays in force. Applied to the re-read bind it
+    // also means the file's own port cannot mask a host change.
+    if let Some(port) = port_override {
+        next.server.bind.set_port(port);
+    }
 
     let restart = llm_proxy_core::restart_required_changes(state.app_config(), &next);
     if !restart.is_empty() {
@@ -99,16 +112,31 @@ pub fn reload_registry(state: &AppState, config_path: &Path) -> Result<ReloadRep
     }
 
     // The same gates startup runs; a broken provider file refuses the whole
-    // reload rather than half-applying.
+    // reload rather than half-applying. The gates read the provider files
+    // and resolve DNS (the self-loop check), which blocks — so they run off
+    // the async runtime, the way doctor already runs its checks.
     let adapter_registry = ProviderAdapterRegistry::builtin();
-    let registry = load_registry_with_checks(&next, config_path, &adapter_registry)
-        .context("re-loading providers (reload refused; nothing was applied)")?;
+    let check_config = next.clone();
+    let check_path = config_path.to_path_buf();
+    let registry = tokio::task::spawn_blocking(move || {
+        load_registry_with_checks(&check_config, &check_path, &adapter_registry)
+            .context("re-loading providers (reload refused; nothing was applied)")
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("the reload's config gates task failed: {error}"))??;
 
     let current = state.providers();
     let report = diff_registries(&current, &registry);
 
     // Egress clients are per-provider; rebuild them from the new registry.
     let egress = crate::state::build_egress_clients(&next, &registry)?;
+
+    // Advance the config snapshot before building the engine, so the new
+    // engine is built from it. The diff above has already proven the
+    // app-level sections are unchanged, so this keeps the snapshot in
+    // lockstep with the last good reload instead of serving startup values
+    // forever while the engine swaps around it.
+    let _previous_config = state.config_source().swap(std::sync::Arc::new(next));
 
     // Build and validate the replacement engine before touching anything
     // live; the swap itself is one pointer change.
@@ -357,8 +385,9 @@ server_name = "reload-test"
         // Change ONLY the quick provider: point it at a new upstream.
         let (new_quick_endpoint, _new_addr) = spawn_echo_upstream(Duration::ZERO).await;
         write_provider(dir.path(), "quick", &new_quick_endpoint, 3);
-        let report =
-            reload_registry(&state, &dir.path().join("config.toml")).expect("reload applies");
+        let report = reload_registry(&state, &dir.path().join("config.toml"), None)
+            .await
+            .expect("reload applies");
         assert_eq!(
             report.changed,
             vec!["quick".to_owned()],
@@ -415,8 +444,9 @@ server_name = "reload-test"
             p
         };
 
-        let error =
-            reload_registry(&state, &path).expect_err("a server change must refuse the reload");
+        let error = reload_registry(&state, &path, None)
+            .await
+            .expect_err("a server change must refuse the reload");
         let message = format!("{error:#}");
         assert!(
             message.starts_with("restart-required:"),
@@ -453,7 +483,9 @@ server_name = "reload-test"
 
         // Corrupt one provider file.
         std::fs::write(dir.path().join("providers/good.toml"), "not toml {{{").expect("corrupt");
-        let error = reload_registry(&state, &path).expect_err("a broken file refuses the reload");
+        let error = reload_registry(&state, &path, None)
+            .await
+            .expect_err("a broken file refuses the reload");
         assert!(
             format!("{error:#}").contains("nothing was applied"),
             "the error says nothing was applied: {error:#}"
@@ -478,7 +510,9 @@ server_name = "reload-test"
 
         std::fs::remove_file(dir.path().join("providers/drop-me.toml")).expect("remove");
         write_provider(dir.path(), "fresh", &endpoint, 3);
-        let report = reload_registry(&state, &path).expect("reload applies");
+        let report = reload_registry(&state, &path, None)
+            .await
+            .expect("reload applies");
         assert_eq!(report.removed, vec!["drop-me".to_owned()]);
         assert_eq!(report.added, vec!["fresh".to_owned()]);
         assert!(
@@ -489,5 +523,186 @@ server_name = "reload-test"
         let live = state.providers();
         assert!(live.get("fresh").is_some());
         assert!(live.get("drop-me").is_none());
+    }
+
+    /// Audit finding 2: a file edit of `server.bind` used to be silently
+    /// masked before the restart-required diff, so the operator got a
+    /// successful reload while the server kept the old bind.
+    #[tokio::test]
+    async fn a_bind_edit_is_refused_as_restart_required_not_masked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        let _startup_config = write_config(dir.path(), "");
+
+        let state = state_for(dir.path());
+        let engine_before = state.engine().expect("engine builds");
+
+        // Move the port in the file; nothing else changes.
+        let moved = {
+            let p = dir.path().join("config.toml");
+            std::fs::write(
+                &p,
+                r#"[server]
+bind = "127.0.0.1:3478"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = true
+server_name = "reload-test"
+"#,
+            )
+            .expect("config rewrite");
+            p
+        };
+
+        let error = reload_registry(&state, &moved, None)
+            .await
+            .expect_err("a bind edit cannot be applied by a reload");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restart-required:"),
+            "the refusal carries the stable prefix operators grep for: {message}"
+        );
+        assert!(
+            message.contains("server.bind"),
+            "the refusal names the bind, which was previously masked: {message}"
+        );
+        let engine_after = state.engine().expect("engine");
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "the engine was not swapped by a refused reload"
+        );
+    }
+
+    /// The CLI port override outranks the file on reload too: the server
+    /// keeps its `--port`, and the file's own port value does not turn every
+    /// reload into a spurious `server.bind` refusal.
+    #[tokio::test]
+    async fn a_cli_port_override_masks_only_the_port_across_reloads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        let path = write_config(dir.path(), "");
+
+        let state = crate::state::load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            Some(3999),
+        )
+        .expect("state builds with the CLI port");
+        state.engine().expect("engine builds");
+
+        // Change the provider only; the file still says port 3477 while the
+        // server runs on the overridden 3999.
+        write_provider(dir.path(), "prov", &endpoint, 7);
+        let report = reload_registry(&state, &path, Some(3999))
+            .await
+            .expect("the CLI port stays in force; the reload applies");
+        assert_eq!(
+            report.changed,
+            vec!["prov".to_owned()],
+            "exactly the provider change is applied: {report}"
+        );
+    }
+
+    /// Audit finding 1: a verifier rotated under an existing key id used to
+    /// pass the diff unapplied — the old (possibly leaked) token kept
+    /// working until restart. It must be refused, naming the key.
+    #[tokio::test]
+    async fn a_same_id_verifier_rotation_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        let path = {
+            let p = dir.path().join("config.toml");
+            std::fs::write(
+                &p,
+                r#"[server]
+bind = "127.0.0.1:3477"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = true
+server_name = "reload-test"
+
+[auth]
+mode = "client-keys"
+[auth.clients]
+laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$bi0KNLfLnc1qQxSai7uQDVMEMeSRpD/+rFoYCc/kku8"
+"#,
+            )
+            .expect("config file");
+            p
+        };
+
+        let state = state_for(dir.path());
+        let engine_before = state.engine().expect("engine builds");
+
+        // Rotate the verifier under the same key id, touching nothing else.
+        std::fs::write(
+            &path,
+            r#"[server]
+bind = "127.0.0.1:3477"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = true
+server_name = "reload-test"
+
+[auth]
+mode = "client-keys"
+[auth.clients]
+laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mjyfLxyGLpTMhPn5VmRQMb0fw"
+"#,
+        )
+        .expect("config rewrite");
+
+        let error = reload_registry(&state, &path, None)
+            .await
+            .expect_err("a same-id verifier change cannot be applied by a reload");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restart-required:"),
+            "the refusal carries the stable prefix operators grep for: {message}"
+        );
+        assert!(
+            message.contains("auth.clients.laptop"),
+            "the refusal names the rotated key: {message}"
+        );
+        let engine_after = state.engine().expect("engine");
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "the engine was not swapped by a refused reload"
+        );
+    }
+
+    /// A successful reload advances the config snapshot the engine reads, so
+    /// the engine is never left serving startup values while the registry
+    /// swaps around it.
+    #[tokio::test]
+    async fn a_successful_reload_advances_the_config_snapshot() {
+        use llm_proxy_engine::ConfigSource;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        let path = write_config(dir.path(), "");
+        let state = state_for(dir.path());
+        state.engine().expect("engine builds");
+        let snapshot_before = state.config_source().load().expect("startup snapshot");
+
+        write_provider(dir.path(), "prov", &endpoint, 4);
+        reload_registry(&state, &path, None)
+            .await
+            .expect("reload applies");
+        let snapshot_after = state.config_source().load().expect("post-reload snapshot");
+
+        assert!(
+            !Arc::ptr_eq(&snapshot_before, &snapshot_after),
+            "the engine's config snapshot advanced with the reload"
+        );
+        assert_eq!(
+            serde_json::to_value(&*snapshot_before).ok(),
+            serde_json::to_value(&*snapshot_after).ok(),
+            "the app-level sections are unchanged; only the snapshot identity moved"
+        );
     }
 }

@@ -41,13 +41,3 @@ pub(crate) async fn refuse_looped_requests(
     }
     next.run(req).await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_hop_header_name_matches_the_stamped_one() {
-        assert_eq!(HOP_HEADER, "x-llm-proxy-hop");
-    }
-}

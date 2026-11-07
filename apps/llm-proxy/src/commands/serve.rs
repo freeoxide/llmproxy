@@ -87,7 +87,12 @@ pub async fn cmd_serve(
              [server]/[auth]/[storage] changes are refused with a restart-required error"
         );
     }
-    spawn_reload_listener(reload_state, path.clone(), hot_reload_enabled);
+    spawn_reload_listener(
+        reload_state,
+        path.clone(),
+        hot_reload_enabled,
+        port_override,
+    );
 
     let app = build_router(state);
 
@@ -198,8 +203,15 @@ fn spawn_shutdown_listener() -> watch::Receiver<bool> {
 /// Listens for SIGHUP and reloads the provider and pool files (plan 07 step
 /// 11). Without `server.hot_reload = true` the signal is acknowledged and
 /// ignored, so an operator poking the daemon changes nothing silently.
+/// `port_override` is the `--port` the server was started with, reapplied to
+/// every re-read config so the CLI layer keeps outranking the file.
 #[cfg(unix)]
-fn spawn_reload_listener(state: llm_proxy_server::AppState, config_path: PathBuf, enabled: bool) {
+fn spawn_reload_listener(
+    state: llm_proxy_server::AppState,
+    config_path: PathBuf,
+    enabled: bool,
+    port_override: Option<u16>,
+) {
     tokio::spawn(async move {
         let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         {
@@ -217,7 +229,7 @@ fn spawn_reload_listener(state: llm_proxy_server::AppState, config_path: PathBuf
                 );
                 continue;
             }
-            match crate::reload::reload_registry(&state, &config_path) {
+            match crate::reload::reload_registry(&state, &config_path, port_override).await {
                 Ok(report) => {
                     if report.is_empty() {
                         info!("reload: nothing changed");
@@ -239,6 +251,7 @@ fn spawn_reload_listener(
     _state: llm_proxy_server::AppState,
     _config_path: PathBuf,
     _enabled: bool,
+    _port_override: Option<u16>,
 ) {
     // SIGHUP does not exist on this platform; `llm-proxy reload` says so too.
 }

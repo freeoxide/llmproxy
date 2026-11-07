@@ -94,12 +94,13 @@ async fn handle_models_inner(
     })?;
     // A pool name lists the union of its members' catalogs; a provider name
     // lists its own (plan 04 step 4: clients use the same URL shape either
-    // way).
+    // way). One captured registry snapshot answers both lookups, so a reload
+    // landing between them cannot split the view.
     let live_providers = state.providers();
     let member_names: Vec<String> = match live_providers.pool(provider_name) {
         Some(pool) => pool.members.clone(),
         None => {
-            if state.providers().get(provider_name).is_none() {
+            if live_providers.get(provider_name).is_none() {
                 let err = RouteError::UnknownProvider(provider_name.to_owned());
                 core_pipeline::emit_response_failed(
                     &event_bus,
