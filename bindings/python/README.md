@@ -1,0 +1,72 @@
+# llm-proxy (Python)
+
+Python bindings for the llm-proxy engine: translation between wire dialects,
+request execution through the full pipeline, streaming events with
+cancellation, and configuration from code. The extension wraps the shared
+bridge crate (`crates/llm-proxy-bridge`) and adds no logic of its own.
+
+## Install
+
+Prebuilt wheels install with no Rust toolchain:
+
+```
+pip install llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl
+```
+
+Wheels for macOS and Windows are built by CI runners with those toolchains;
+the abi3 wheel supports CPython 3.9+.
+
+## Use
+
+```python
+from llm_proxy import Proxy, ProxyError
+
+proxy = Proxy({
+    "providers": [
+        {
+            "name": "acme",
+            "api_key": "sk-...",
+            "auth_style": "bearer",
+            "adapters": {
+                "messages": {
+                    "protocol": "anthropic_messages",
+                    "endpoint": "https://api.example.com/v1/messages",
+                }
+            },
+            "routes": {"messages": "messages"},
+            "model_aliases": {"claude-sonnet-4-5": "claude-sonnet-4-5-20250929"},
+        }
+    ],
+    "record_usage": True,
+})
+
+reply = proxy.execute("acme", "anthropic_messages", request_body)
+
+for event in proxy.execute_stream("acme", "anthropic_messages", stream_body):
+    ...  # event dicts; break or drop to cancel upstream
+
+translated = proxy.translate_request(body, "anthropic_messages", "openai_chat_completions")
+```
+
+Dialect names: `anthropic_messages`, `openai_chat_completions`,
+`openai_responses`, `gemini_generate_content`, `ollama_chat`,
+`ollama_generate`. Provider protocols: `anthropic_messages`,
+`openai_chat_completions`, `openai_responses`, `gemini_generate_content`.
+
+`execute` blocks and releases the GIL while waiting. Failures raise
+`ProxyError` with `kind`, `status`, `message`, `retry_after_seconds` and
+`should_retry`.
+
+## Build and test
+
+```
+python -m venv .venv && .venv/bin/pip install maturin pytest
+.venv/bin/maturin build --release -o dist
+python -m venv .venv-test && .venv-test/bin/pip install dist/*.whl pytest
+.venv-test/bin/python -m pytest tests -q
+```
+
+The test suite replays the plan-02 contract fixtures from
+`bindings/shared/cases.json` and compares against the snapshots the Rust
+bridge test generates: the same fixtures must give the same results in Rust
+and Python.
