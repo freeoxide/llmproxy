@@ -164,6 +164,15 @@ async fn handle_models_inner(
                     llm_proxy_core::ProviderRouteKind::Messages => "messages",
                     llm_proxy_core::ProviderRouteKind::Responses => "responses",
                     llm_proxy_core::ProviderRouteKind::GenerateContent => "generate_content",
+                    llm_proxy_core::ProviderRouteKind::Embeddings => "embeddings",
+                    llm_proxy_core::ProviderRouteKind::Rerank => "rerank",
+                    llm_proxy_core::ProviderRouteKind::AudioTranscriptions => {
+                        "audio_transcriptions"
+                    }
+                    llm_proxy_core::ProviderRouteKind::AudioSpeech => "audio_speech",
+                    llm_proxy_core::ProviderRouteKind::ImagesGenerations => "images_generations",
+                    llm_proxy_core::ProviderRouteKind::Files => "files",
+                    llm_proxy_core::ProviderRouteKind::Batches => "batches",
                 })
                 .collect(),
             context_length: entry.context_length,

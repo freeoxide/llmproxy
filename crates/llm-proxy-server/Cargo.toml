@@ -17,6 +17,9 @@ admin = ["dep:llm-proxy-api", "llm-proxy-storage/sqlite"]
 # The semantic response cache (plan 09 step 5): wires
 # [server.semantic_cache] into the engine.
 semantic-cache = ["dep:llm-proxy-semantic-cache"]
+# Non-chat endpoint families (plan 09 step 7): embeddings, rerank, audio,
+# images, files and batch routes.
+endpoint-families = []
 
 [lints]
 workspace = true

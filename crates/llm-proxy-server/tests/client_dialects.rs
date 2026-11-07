@@ -331,6 +331,13 @@ mod tests {
                     .then_some(adapter_name.to_owned()),
                 generate_content: (route == ProviderRouteKind::GenerateContent)
                     .then_some(adapter_name.to_owned()),
+                embeddings: None,
+                rerank: None,
+                audio_transcriptions: None,
+                audio_speech: None,
+                images_generations: None,
+                files: None,
+                batches: None,
             },
             model_aliases: HashMap::new(),
             discovery: None,

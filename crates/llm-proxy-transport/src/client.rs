@@ -159,14 +159,26 @@ impl ProxyClient {
         req: &ProxyRequest,
         accept_event_stream: bool,
     ) -> reqwest::RequestBuilder {
-        let mut builder = self
-            .http
-            .post(&req.url)
-            .header("Content-Type", "application/json")
-            // Self-loop marker (backlog 32): any llm-proxy that receives a
-            // request already carrying it is forwarding to itself and
-            // answers 508 instead of looping.
-            .header(llm_proxy_core::HOP_HEADER, llm_proxy_core::HOP_HEADER_VALUE);
+        // The JSON default applies only when the caller did not pick a
+        // content type: family handlers (plan 09 step 7) forward audio
+        // and file bodies with the client's own multipart or binary type.
+        let caller_content_type = req
+            .extra_headers
+            .get("content-type")
+            .or_else(|| req.forwarded_headers.get("content-type"));
+        // The JSON default applies only when the caller did not pick a
+        // content type: family handlers (plan 09 step 7) forward audio
+        // and file bodies with the client's own multipart or binary type.
+        let builder = self.http.post(&req.url);
+        // Self-loop marker (backlog 32): any llm-proxy that receives a
+        // request already carrying it is forwarding to itself and
+        // answers 508 instead of looping.
+        let builder = builder.header(llm_proxy_core::HOP_HEADER, llm_proxy_core::HOP_HEADER_VALUE);
+        let builder = match caller_content_type {
+            Some(content_type) => builder.header("Content-Type", content_type),
+            None => builder.header("Content-Type", "application/json"),
+        };
+        let mut builder = builder;
         if accept_event_stream {
             builder = builder.header("Accept", "text/event-stream");
         }

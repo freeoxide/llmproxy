@@ -1492,6 +1492,21 @@ pub enum ProviderRouteKind {
     /// `/v1beta/models/{model}:generateContent|:streamGenerateContent`
     /// endpoint (plan 08 step 2).
     GenerateContent,
+    /// `/v1/embeddings` (plan 09 step 7): a family-specific handler, not
+    /// the chat core.
+    Embeddings,
+    /// `/v1/rerank` (plan 09 step 7).
+    Rerank,
+    /// `/v1/audio/transcriptions` (plan 09 step 7); multipart body.
+    AudioTranscriptions,
+    /// `/v1/audio/speech` (plan 09 step 7); binary response.
+    AudioSpeech,
+    /// `/v1/images/generations` (plan 09 step 7).
+    ImagesGenerations,
+    /// `/v1/files` and `/v1/files/{id}[/content]` (plan 09 step 7).
+    Files,
+    /// `/v1/batches` and `/v1/batches/{id}` (plan 09 step 7).
+    Batches,
 }
 
 /// Maps [`ProviderRouteKind`] to adapter names within a provider.
@@ -1521,6 +1536,28 @@ pub struct ProviderRoutesConfig {
     /// Route kind: adapter name for the `generate_content` endpoint.
     #[serde(default)]
     pub generate_content: Option<String>,
+    /// Route kind: adapter name for the `embeddings` family (plan 09
+    /// step 7; requires the server's `endpoint-families` feature).
+    #[serde(default)]
+    pub embeddings: Option<String>,
+    /// Route kind: adapter name for the `rerank` family.
+    #[serde(default)]
+    pub rerank: Option<String>,
+    /// Route kind: adapter name for the `audio_transcriptions` family.
+    #[serde(default)]
+    pub audio_transcriptions: Option<String>,
+    /// Route kind: adapter name for the `audio_speech` family.
+    #[serde(default)]
+    pub audio_speech: Option<String>,
+    /// Route kind: adapter name for the `images_generations` family.
+    #[serde(default)]
+    pub images_generations: Option<String>,
+    /// Route kind: adapter name for the `files` family.
+    #[serde(default)]
+    pub files: Option<String>,
+    /// Route kind: adapter name for the `batches` family.
+    #[serde(default)]
+    pub batches: Option<String>,
 }
 
 impl ProviderRoutesConfig {
@@ -1531,6 +1568,13 @@ impl ProviderRoutesConfig {
             ProviderRouteKind::Messages => self.messages.as_deref(),
             ProviderRouteKind::Responses => self.responses.as_deref(),
             ProviderRouteKind::GenerateContent => self.generate_content.as_deref(),
+            ProviderRouteKind::Embeddings => self.embeddings.as_deref(),
+            ProviderRouteKind::Rerank => self.rerank.as_deref(),
+            ProviderRouteKind::AudioTranscriptions => self.audio_transcriptions.as_deref(),
+            ProviderRouteKind::AudioSpeech => self.audio_speech.as_deref(),
+            ProviderRouteKind::ImagesGenerations => self.images_generations.as_deref(),
+            ProviderRouteKind::Files => self.files.as_deref(),
+            ProviderRouteKind::Batches => self.batches.as_deref(),
         }
     }
 }

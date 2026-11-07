@@ -456,6 +456,13 @@ impl ProviderRegistry {
                 ProviderRouteKind::Messages => "messages",
                 ProviderRouteKind::Responses => "responses",
                 ProviderRouteKind::GenerateContent => "generate_content",
+                ProviderRouteKind::Embeddings => "embeddings",
+                ProviderRouteKind::Rerank => "rerank",
+                ProviderRouteKind::AudioTranscriptions => "audio_transcriptions",
+                ProviderRouteKind::AudioSpeech => "audio_speech",
+                ProviderRouteKind::ImagesGenerations => "images_generations",
+                ProviderRouteKind::Files => "files",
+                ProviderRouteKind::Batches => "batches",
             };
             ProviderRouteResolutionError::UnsupportedRoute {
                 provider: provider.name.clone(),

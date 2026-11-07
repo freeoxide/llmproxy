@@ -24,6 +24,8 @@ use secrecy::ExposeSecret;
 mod chat;
 mod core_pipeline;
 mod error_response;
+#[cfg(feature = "endpoint-families")]
+mod families;
 mod gemini_generate;
 mod health;
 mod messages;
@@ -33,6 +35,12 @@ mod responses;
 mod token_count;
 
 use chat::{handle_bare_chat_completions, handle_chat_completions};
+#[cfg(feature = "endpoint-families")]
+use families::{
+    FAMILY_AUDIO_SPEECH, FAMILY_AUDIO_TRANSCRIPTIONS, FAMILY_BATCHES, FAMILY_EMBEDDINGS,
+    FAMILY_FILES, FAMILY_IMAGES_GENERATIONS, FAMILY_RERANK, FamilySpec, handle_json_family,
+    handle_raw_family, handle_subpath_family,
+};
 use gemini_generate::handle_generate_content;
 use health::{health, ready, version};
 use llm_proxy_core::{family_max_body_bytes, family_request_timeout};
@@ -51,6 +59,12 @@ pub(crate) const FAMILY_MODELS: &str = "models";
 pub(crate) const FAMILY_RESPONSES: &str = "responses";
 pub(crate) const FAMILY_GENERATE_CONTENT: &str = "generate_content";
 pub(crate) const FAMILY_OLLAMA: &str = "ollama";
+
+/// Wraps one family's fixed wiring for its handlers.
+#[cfg(feature = "endpoint-families")]
+fn family(spec: FamilySpec) -> axum::Extension<FamilySpec> {
+    axum::Extension(spec)
+}
 
 const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 
@@ -105,6 +119,10 @@ pub fn router(state: AppState) -> Router {
 /// The provider-scoped API surface: every client dialect's route, each under
 /// its endpoint family's admission chain, plus the opt-in bare `/v1/*` routes
 /// (plan 04 step 11).
+#[expect(
+    clippy::too_many_lines,
+    reason = "a route table with one block per endpoint family; the family loops below replaced a longer unrolled list"
+)]
 fn provider_api_router(state: &AppState) -> Router<AppState> {
     let id_gen = Arc::clone(&state.request_id_gen);
     let event_bus = Arc::clone(&state.event_bus);
@@ -187,6 +205,83 @@ fn provider_api_router(state: &AppState) -> Router<AppState> {
         .merge(generate_content)
         .merge(ollama)
         .merge(ollama_tags);
+
+    // Non-chat families (plan 09 step 7), each behind its own admission
+    // chain: its body limit and timeout from
+    // [server.endpoint_families], the same loop/host/auth gates, and a
+    // family-specific handler. (path, route kind, json body, family name)
+    #[cfg(feature = "endpoint-families")]
+    for (path, kind, json, family_name) in [
+        (
+            "/providers/{provider}/v1/embeddings",
+            llm_proxy_core::ProviderRouteKind::Embeddings,
+            true,
+            FAMILY_EMBEDDINGS,
+        ),
+        (
+            "/providers/{provider}/v1/rerank",
+            llm_proxy_core::ProviderRouteKind::Rerank,
+            true,
+            FAMILY_RERANK,
+        ),
+        (
+            "/providers/{provider}/v1/images/generations",
+            llm_proxy_core::ProviderRouteKind::ImagesGenerations,
+            true,
+            FAMILY_IMAGES_GENERATIONS,
+        ),
+        (
+            "/providers/{provider}/v1/batches",
+            llm_proxy_core::ProviderRouteKind::Batches,
+            true,
+            FAMILY_BATCHES,
+        ),
+        (
+            "/providers/{provider}/v1/batches/{*tail}",
+            llm_proxy_core::ProviderRouteKind::Batches,
+            true,
+            FAMILY_BATCHES,
+        ),
+        (
+            "/providers/{provider}/v1/audio/transcriptions",
+            llm_proxy_core::ProviderRouteKind::AudioTranscriptions,
+            false,
+            FAMILY_AUDIO_TRANSCRIPTIONS,
+        ),
+        (
+            "/providers/{provider}/v1/audio/speech",
+            llm_proxy_core::ProviderRouteKind::AudioSpeech,
+            false,
+            FAMILY_AUDIO_SPEECH,
+        ),
+        (
+            "/providers/{provider}/v1/files",
+            llm_proxy_core::ProviderRouteKind::Files,
+            false,
+            FAMILY_FILES,
+        ),
+        (
+            "/providers/{provider}/v1/files/{*tail}",
+            llm_proxy_core::ProviderRouteKind::Files,
+            false,
+            FAMILY_FILES,
+        ),
+    ] {
+        let subpath = path.contains("{*tail}");
+        let handler = if subpath {
+            post(handle_subpath_family)
+        } else if json {
+            post(handle_json_family)
+        } else {
+            post(handle_raw_family)
+        };
+        api = api.merge(
+            Router::new()
+                .route(path, handler)
+                .route_layer(family(FamilySpec { kind, json }))
+                .layer(admission(family_name)),
+        );
+    }
 
     // Bare `/v1/*` is off by default (plan 04 step 11): with it off, those
     // paths fall through to the 404 fallback; enabled, the model name
