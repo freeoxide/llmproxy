@@ -198,11 +198,14 @@ path = "{storage}"
 
         let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
         let mut client = TcpStream::connect(server.addr).unwrap();
+        // The host guard under anonymous auth refuses a Host that does not
+        // name this listener, so the request must spell its address.
         write!(
             client,
-            "POST /providers/upstream/v1/chat/completions HTTP/1.1\r\nHost: t\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
+            "POST /providers/upstream/v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\n\
+             Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n{body}",
+            addr = server.addr,
+            length = body.len(),
         )
         .unwrap();
         let _held_open = accept_within_limit(&upstream);

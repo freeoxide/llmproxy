@@ -425,7 +425,7 @@ mod tests {
                     "openai-chat".to_owned(),
                     ProviderAdapterConfig {
                         protocol: "openai_chat".to_owned(),
-                        endpoint: "http://0.0.0.0:1/unreachable".to_owned(),
+                        endpoint: "http://127.0.0.1:1/unreachable".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
                         forward_inbound_headers: None,
                         lossy: false,

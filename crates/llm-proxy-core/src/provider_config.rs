@@ -1593,6 +1593,25 @@ pub enum ConfigValidationError {
         /// The endpoint URL that has an invalid scheme.
         endpoint: String,
     },
+    /// An endpoint would carry this provider's credentials in cleartext to an
+    /// off-machine host (backlog 25): an `http://` adapter or discovery URL
+    /// whose host is neither a loopback address nor `localhost`. Loopback is
+    /// exempt; a hostname that merely resolves to loopback is not, because
+    /// validation runs offline and a name is exactly what a mistake or an
+    /// attacker can repoint.
+    #[error(
+        "provider \"{provider}\": adapter \"{adapter}\" endpoint \"{endpoint}\" would send the upstream credential in cleartext to the off-machine host \"{host}\"; use https:// (or a loopback host such as 127.0.0.1 behind a local tunnel)"
+    )]
+    CleartextCredentials {
+        /// Provider name.
+        provider: String,
+        /// Adapter name (`"discovery"` for the discovery endpoint).
+        adapter: String,
+        /// The cleartext endpoint URL.
+        endpoint: String,
+        /// The off-machine host the endpoint names.
+        host: String,
+    },
     /// The `[provider.egress]` proxy URL is not usable as a forward proxy.
     #[error(
         "provider \"{provider}\": [provider.egress] proxy URL is invalid ({reason}): \"{proxy}\""
@@ -2021,6 +2040,7 @@ fn validate_adapters(
                 endpoint: adapter_cfg.endpoint.clone(),
             });
         }
+        validate_cleartext_endpoint(name, adapter_name, &adapter_cfg.endpoint)?;
         if let Some(known) = known_protocols
             && !known.contains(&adapter_cfg.protocol.as_str())
         {
@@ -2093,6 +2113,7 @@ fn validate_discovery(provider: &ProviderConfig, name: &str) -> Result<(), Confi
             endpoint: discovery.endpoint.clone(),
         });
     }
+    validate_cleartext_endpoint(name, "discovery", &discovery.endpoint)?;
     validate_headers(&discovery.headers, name, "discovery")?;
     for (limit, value) in [
         ("max_pages", discovery.max_pages),
@@ -2206,6 +2227,63 @@ const FORBIDDEN_HEADERS: &[&str] = &[
 fn has_valid_http_scheme(endpoint: &str) -> bool {
     let scheme_region = scheme_region(endpoint);
     scheme_region.eq_ignore_ascii_case("http") || scheme_region.eq_ignore_ascii_case("https")
+}
+
+/// The host of an endpoint URL's authority, brackets stripped from IPv6
+/// literals. userinfo (`user:pass@`) is dropped. `None` when there is no host.
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let after_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split_once(']')?.0
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether an endpoint URL's host is machine-local by spelling alone: a
+/// loopback IP literal (any `127.0.0.0/8` or `::1` form) or `localhost`.
+/// A hostname that merely resolves to loopback does not count — validation
+/// runs without DNS, and a resolvable name is re-pointable by whoever
+/// controls it.
+fn host_is_machine_local(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Refuses an `http://` endpoint to an off-machine host (backlog 25): the
+/// upstream credential — the provider key, or the client's own token on a
+/// `passthrough_auth` provider — would cross the network in cleartext.
+fn validate_cleartext_endpoint(
+    provider: &str,
+    adapter: &str,
+    endpoint: &str,
+) -> Result<(), ConfigValidationError> {
+    if !scheme_region(endpoint.trim()).eq_ignore_ascii_case("http") {
+        return Ok(());
+    }
+    if let Some(host) = endpoint_host(endpoint.trim())
+        && !host_is_machine_local(host)
+    {
+        return Err(ConfigValidationError::CleartextCredentials {
+            provider: provider.to_owned(),
+            adapter: adapter.to_owned(),
+            endpoint: endpoint.to_owned(),
+            host: host.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn scheme_region(endpoint: &str) -> &str {
@@ -2994,6 +3072,86 @@ chat_completions = "chat"
         .provider;
         provider.name = name.to_owned();
         provider
+    }
+
+    #[test]
+    fn cleartext_endpoints_to_off_machine_hosts_are_refused() {
+        let mut provider = make_minimal_provider("leaky");
+        let Some(adapter) = provider.adapters.get_mut("chat") else {
+            panic!("minimal provider has a chat adapter");
+        };
+        adapter.endpoint = "http://api.example.com/v1/chat/completions".to_owned();
+        let error = validate_provider_config(&provider, None)
+            .expect_err("a cleartext endpoint to a remote host must be refused");
+        assert!(
+            matches!(error, ConfigValidationError::CleartextCredentials { .. }),
+            "got: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("leaky") && message.contains("api.example.com"),
+            "the error must name the provider and the host: {message}"
+        );
+        assert!(
+            message.contains("https"),
+            "the error must name the fix: {message}"
+        );
+    }
+
+    #[test]
+    fn cleartext_endpoints_to_machine_local_hosts_are_exempt() {
+        for endpoint in [
+            "http://127.0.0.1:8080/v1/chat/completions",
+            "http://127.8.8.8:8080/v1/chat/completions",
+            "http://localhost:8080/v1/chat/completions",
+            "http://[::1]:8080/v1/chat/completions",
+            // A LAN address is off-machine even though it is "internal".
+            // Covered by the refusal test; https to the same host is fine.
+            "https://192.168.1.4/v1/chat/completions",
+        ] {
+            let mut provider = make_minimal_provider("local");
+            let Some(adapter) = provider.adapters.get_mut("chat") else {
+                panic!("minimal provider has a chat adapter");
+            };
+            adapter.endpoint = endpoint.to_owned();
+            validate_provider_config(&provider, None)
+                .unwrap_or_else(|error| panic!("{endpoint} must validate: {error}"));
+        }
+    }
+
+    #[test]
+    fn cleartext_discovery_endpoints_to_remote_hosts_are_refused() {
+        let mut provider = make_minimal_provider("leaky-discovery");
+        provider.discovery = Some(
+            toml::from_str(
+                r#"kind = "openai_compatible_models"
+            endpoint = "http://models.example.com/v1/models"
+            "#,
+            )
+            .expect("discovery parses"),
+        );
+        let error = validate_provider_config(&provider, None)
+            .expect_err("a cleartext discovery endpoint to a remote host must be refused");
+        assert!(
+            error.to_string().contains("discovery"),
+            "the error must name where the cleartext endpoint lives: {error}"
+        );
+    }
+
+    #[test]
+    fn a_local_tunnel_hostname_is_not_machine_local_by_spelling() {
+        // A name that resolves to loopback (SSH tunnels, split-horizon DNS)
+        // is still refused: validation runs without DNS, and a resolvable
+        // name is re-pointable. Operators tunneling must spell the address.
+        let mut provider = make_minimal_provider("tunneled");
+        let Some(adapter) = provider.adapters.get_mut("chat") else {
+            panic!("minimal provider has a chat adapter");
+        };
+        adapter.endpoint = "http://box.internal:8080/v1/chat/completions".to_owned();
+        assert!(
+            validate_provider_config(&provider, None).is_err(),
+            "a hostname is off-machine until it is localhost or an IP literal"
+        );
     }
 
     #[test]

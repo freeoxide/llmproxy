@@ -198,6 +198,52 @@ mod tests {
     }
 
     #[test]
+    fn cmd_validate_rejects_cleartext_credentials_to_a_remote_host() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/leaky.toml"),
+            r#"[provider]
+name = "leaky"
+api_key = "k"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "http://api.example.com/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let err = result.expect_err("cleartext credentials to a remote host are invalid");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("leaky") && message.contains("api.example.com"),
+            "the validate error names the provider and the host: {message}"
+        );
+        assert!(
+            message.contains("cleartext"),
+            "the validate error says what is wrong: {message}"
+        );
+    }
+
+    #[test]
     fn cmd_validate_rejects_a_bare_v1_target_naming_no_provider_or_pool() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
