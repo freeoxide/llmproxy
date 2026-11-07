@@ -17,6 +17,23 @@ use crate::paths::{config_dir, resolve_config};
 use crate::pid::{is_process_running, read_pid, remove_pid, write_pid, write_pid_value};
 use crate::state::init_tracing;
 
+/// Loads the TOML config and builds the serving state: the config loads
+/// before the subscriber is built so `server.log_format` is honoured
+/// (BUG-25, with `RUST_LOG_FORMAT` still winning), then the state —
+/// providers, auth, ledger, replica stores — comes up from it.
+async fn load_serve_state(
+    path: &Path,
+    port_override: Option<u16>,
+) -> Result<llm_proxy_server::AppState> {
+    let app_config = llm_proxy_core::load_app_config(path)
+        .with_context(|| format!("loading TOML config from {}", path.display()))?;
+    let app_config = apply_port_override(app_config, port_override);
+    init_tracing(&crate::state::startup_log_format(&app_config));
+
+    let adapter_registry = ProviderAdapterRegistry::builtin();
+    crate::state::load_toml_state_from_config(app_config, path, adapter_registry).await
+}
+
 /// The `--background` path: the parent only logs spawn failures; the
 /// daemon child runs this same command with `--daemonize` and initializes
 /// tracing itself from the resolved config.
