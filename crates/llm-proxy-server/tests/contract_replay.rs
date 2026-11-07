@@ -1400,4 +1400,182 @@ mod tests {
             48
         );
     }
+
+    /// Real Codex CLI 0.167.0 traffic (`codex exec`, see the fixture
+    /// README): the first request of a session — developer system prompt,
+    /// skills and permissions messages, `environment_context`, and the
+    /// tool list with the `namespace` and `web_search` shapes. It must
+    /// reach a same-format Responses upstream byte-identical apart from
+    /// the model alias.
+    #[tokio::test]
+    async fn codex_captured_first_request_replays_through_the_responses_route() {
+        let upstream = spawn_responses_upstream().await;
+        let state = base_state(responses_provider(&upstream));
+        let app = build_router(state);
+
+        let body = captured_fixture("codex/first-request.json");
+        let builder = apply_captured_headers(
+            Request::builder()
+                .method("POST")
+                .uri("/providers/fixture-provider/v1/responses"),
+            "codex/headers.json",
+        );
+        let resp = app
+            .oneshot(builder.body(Body::from(body.to_string())).expect("body"))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (headers, upstream_body) = captured(&upstream).await;
+        let mut expected = body.clone();
+        expected["model"] = Value::String("gpt-5.1-codex-2030-09-17".to_owned());
+        assert_eq!(
+            upstream_body, expected,
+            "the captured first request must reach upstream with only the model rewritten"
+        );
+        // The real 0.167.0 first-turn shape survives: system prompt and
+        // skills ride as developer messages, the turn carries medium
+        // effort, and the session is stored with encrypted reasoning.
+        assert_eq!(upstream_body["input"][0]["role"], "developer");
+        assert!(upstream_body["input"][2]["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .starts_with("<environment_context>"));
+        assert_eq!(upstream_body["reasoning"]["effort"], "medium");
+        assert_eq!(upstream_body["reasoning"]["summary"], "auto");
+        assert_eq!(upstream_body["store"], false);
+        assert_eq!(upstream_body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(upstream_body["client_metadata"], body["client_metadata"]);
+        // The namespace and web_search tool shapes ride untouched.
+        let tool_types: Vec<&str> = upstream_body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["type"].as_str().expect("tool type"))
+            .collect();
+        assert!(tool_types.contains(&"namespace"), "tools: {tool_types:?}");
+        assert!(tool_types.contains(&"web_search"), "tools: {tool_types:?}");
+        // None of the real Codex client headers reach the upstream.
+        for forbidden in [
+            "originator",
+            "session-id",
+            "thread-id",
+            "x-client-request-id",
+            "x-codex-beta-features",
+            "x-codex-turn-metadata",
+            "x-codex-window-id",
+            "user-agent",
+        ] {
+            assert!(
+                !headers.contains_key(forbidden),
+                "{forbidden} from the captured Codex header set must never be forwarded"
+            );
+        }
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer operator-key")
+        );
+    }
+
+    /// The second request of the captured session: the assistant turn is
+    /// replayed as a `reasoning` item with `encrypted_content`, an
+    /// `exec_command` function call and its real captured output, on top
+    /// of the first-turn shape.
+    #[tokio::test]
+    async fn codex_captured_session_replays_through_the_responses_route() {
+        let upstream = spawn_responses_upstream().await;
+        let state = base_state(responses_provider(&upstream));
+        let app = build_router(state);
+
+        let body = captured_fixture("codex/session-request.json");
+        let builder = apply_captured_headers(
+            Request::builder()
+                .method("POST")
+                .uri("/providers/fixture-provider/v1/responses"),
+            "codex/headers.json",
+        );
+        let resp = app
+            .oneshot(builder.body(Body::from(body.to_string())).expect("body"))
+            .await
+            .expect("request served");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let (headers, upstream_body) = captured(&upstream).await;
+        let mut expected = body.clone();
+        expected["model"] = Value::String("gpt-5.1-codex-2030-09-17".to_owned());
+        assert_eq!(
+            upstream_body, expected,
+            "the captured tool-turn request must reach upstream with only the model rewritten"
+        );
+        // The replayed assistant turn rides untouched: reasoning with its
+        // opaque encrypted payload, the exec_command call and its output
+        // correlate by call_id exactly as the CLI sent them.
+        let input = upstream_body["input"].as_array().expect("input array");
+        assert_eq!(input[4]["type"], "reasoning");
+        assert_eq!(
+            input[4]["encrypted_content"],
+            "gAAAAABcapture_turn1_encrypted_reasoning_placeholder"
+        );
+        assert_eq!(input[5]["type"], "function_call");
+        assert_eq!(input[5]["name"], "exec_command");
+        assert_eq!(input[5]["call_id"], "call_capture_turn1");
+        assert_eq!(input[5]["arguments"], "{\"cmd\":\"ls -la\"}");
+        assert_eq!(input[6]["type"], "function_call_output");
+        assert_eq!(input[6]["call_id"], "call_capture_turn1");
+        // The capture's session bookkeeping survives verbatim.
+        assert_eq!(
+            upstream_body["prompt_cache_key"],
+            "01c0ffee-0000-4000-8000-0000000000c1"
+        );
+        assert_eq!(upstream_body["client_metadata"], body["client_metadata"]);
+        // Client telemetry and credentials never reach the upstream.
+        for forbidden in [
+            "originator",
+            "session-id",
+            "thread-id",
+            "x-client-request-id",
+            "x-codex-beta-features",
+            "x-codex-turn-metadata",
+            "x-codex-window-id",
+            "user-agent",
+        ] {
+            assert!(
+                !headers.contains_key(forbidden),
+                "{forbidden} from the captured Codex header set must never be forwarded"
+            );
+        }
+        for (_, value) in headers.iter() {
+            let text = value.to_str().unwrap_or_default();
+            assert!(
+                !text.contains("codex-capture-placeholder-key-not-real"),
+                "the captured Codex credential must never leak upstream: {text}"
+            );
+        }
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer operator-key")
+        );
+
+        // The response side: the upstream's Responses SSE comes back to
+        // the Codex client with the exact usage numbers.
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("read body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        let completed = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str::<Value>(data).expect("valid json"))
+            .find(|value| value["type"] == "response.completed")
+            .expect("terminal event");
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 120);
+        assert_eq!(
+            completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            0
+        );
+        assert_eq!(
+            completed["response"]["usage"]["output_tokens_details"]["reasoning_tokens"],
+            48
+        );
+    }
 }

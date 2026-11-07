@@ -93,15 +93,23 @@ pipeline code.
   run for every dialect against a loopback fake upstream in
   `crates/llm-proxy-server/tests/client_dialects.rs` (19 tests), including
   the Codex tool-call ordering assertion and the wire-exact usage fields.
-  The Codex session fixture replays through the Responses route in the
-  plan-02 contract harness (`tests/contract_replay.rs`): the request
-  reaching the fake Responses upstream equals the fixture byte-for-byte
-  apart from the model alias, none of the Codex client headers forward,
-  and the SSE response returns with exact usage. The fixture is
-  synthesized from the Responses API reference and the Codex CLI's
-  documented client behavior — the CLI is not installed in this
-  environment and no upstream API keys exist, so a live capture remains
-  open (see the fixture README for provenance). All three dialects decode,
+  Captured Codex traffic replays through the Responses route in the
+  plan-02 contract harness (`tests/contract_replay.rs`): the real Codex
+  CLI 0.167.0 was installed from the `@openai/codex` npm package and run
+  against a loopback capture upstream (fake credential, canned replies —
+  one reply drove a real `exec_command` tool turn the CLI executed in its
+  read-only sandbox), and both requests of that session
+  (`fixtures/contract/captured/codex/`) must reach the fake Responses
+  upstream byte-for-byte apart from the model alias, with none of the
+  Codex client headers (`originator`, `session-id`, `thread-id`,
+  `x-client-request-id`, `x-codex-*`, user agent) forwarded and the SSE
+  response returning with exact usage. The capture documents the real
+  0.167.0 wire shape — `developer`-role system-prompt/skills/permissions
+  messages, `environment_context`, replayed `reasoning` with
+  `encrypted_content`, a real `function_call`/`function_call_output` pair,
+  `namespace` and `web_search` tool shapes, `client_metadata` — which the
+  synthesized `codex/` fixture (kept for extra documented field sets)
+  only approximated. All three dialects decode,
   run through the engine and re-encode from the SDK with no
   `llm-proxy-server` item (`crates/llm-proxy-sdk/tests/dialects_without_server.rs`,
   passing under `--no-default-features`, where the server crate is not
