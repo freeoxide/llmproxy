@@ -9,4 +9,5 @@ pub mod paths;
 pub mod permissions;
 pub mod pid;
 pub mod platform;
+pub mod provenance;
 pub mod state;

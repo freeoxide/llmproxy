@@ -38,6 +38,25 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     );
     println!("  server_name:     {}", app_config.server.server_name);
 
+    // Config provenance (backlog 34): every resolved setting with the layer
+    // it came from, so "why is my flag ignored?" is answerable from output.
+    // The raw file text (pre-interpolation) is what attributes the env
+    // layer; the parsed config supplies the resolved values.
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("re-reading config from {}", path.display()))?;
+    let env = crate::provenance::RuntimeEnvOverrides {
+        rust_log_format: std::env::var("RUST_LOG_FORMAT").ok(),
+    };
+    let report = crate::provenance::provenance_report(&raw, &app_config, &env);
+    println!();
+    println!(
+        "=== Resolved settings ({}) ===",
+        crate::provenance::PRECEDENCE
+    );
+    for row in &report {
+        println!("  {} = {}  [{}]", row.setting, row.value, row.source);
+    }
+
     let providers_dir = providers_dir_for(&path);
     // Every gate startup runs (protocols, self-loop, bare /v1 targets, the
     // auth/passthrough combination) runs here too, on the same shared path.
