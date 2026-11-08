@@ -36,6 +36,18 @@ Run-verified under wine 10.0 with the official node-v20.19.2 win-x64
 
     wine <node.exe> test/bindings.test.js   # 13/13 with llm-proxy.win32-x64-gnu.node
 
+An msvc binary (`llm-proxy.win32-x64-msvc.node`) is produced by cargo-xwin
+cross-compilation (the msvc CRT and Windows-SDK libraries are fetched from
+Microsoft; no node import library is needed, because on msvc the napi
+symbols resolve dynamically from the host `node.exe` at load):
+
+    RUSTC_WRAPPER= cargo xwin build --release --target x86_64-pc-windows-msvc
+    # llm_proxy_node.dll -> llm-proxy.win32-x64-msvc.node
+
+Run-verified the same way: 13/13 with only the msvc binary present, 13/13
+with both Windows binaries present, and 13/13 through the `index.js` gnu
+fallback.
+
 A macOS binary (`llm-proxy.darwin-universal.node`) is produced by zig
 cross-compilation — `RUSTC_WRAPPER= cargo zigbuild --release --target
 universal2-apple-darwin`, then the resulting `libllm_proxy_node.dylib` is
