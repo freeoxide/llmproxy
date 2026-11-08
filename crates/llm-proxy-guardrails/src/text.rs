@@ -73,7 +73,11 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Option<String>>,
 {
-    if let Some(redacted) = mask(std::mem::take(text)).await {
+    // The rule receives the text by value (it may rebuild it), but a `None`
+    // answer means "leave this block alone" — the original must survive,
+    // not be emptied by the hand-off.
+    let offered = text.clone();
+    if let Some(redacted) = mask(offered).await {
         *text = redacted;
     }
 }

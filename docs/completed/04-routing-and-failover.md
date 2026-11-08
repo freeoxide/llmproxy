@@ -53,3 +53,55 @@ Add pools, retries and failover on top of the routing decision in the
 - A stream that fails before commit fails over, and one that fails after commit ends
   with an in-band error and a failed ledger row.
 - With bare `/v1/*` left off, those routes return 404.
+
+## Done
+
+- `llm_proxy_engine::classification` is the one transient/terminal sort,
+  with `Retry-After` parsing for both header spellings and Go-style
+  durations; the ladder consumes it through `next_wait` for backoff and
+  cooldown decisions.
+- Pools live in `[pool.*]` config and serve `/providers/{pool}/v1/...`:
+  config validation rejects a duplicate member, an empty member list and a
+  pool name colliding with a provider (`validate_pool_config_against`,
+  `provider_registry.rs`), and every attempt of a pool's ladder writes its
+  own `AttemptCompleted` row — `pool_survives_a_429…`, `…a_5xx_then_a_
+  connect_error…` and `a_direct_provider_route_never_fails_over…`
+  (`crates/llm-proxy-engine/tests/pools_and_failover.rs`) pin the done-when
+  lines, over HTTP in `crates/llm-proxy-server/tests/routing_pools.rs`.
+- One ladder deadline spans all attempts (`ladder_deadline`, the tighter of
+  the route's `total_timeout` and `server.upstream_timeouts.total`;
+  `the_ladder_deadline_spans_all_attempts`), with per-member attempts,
+  backoff, and passive cooldowns on the `Cooldowns` trait — a 429 with a
+  reset time cools the member until it (`upstream_429_with_retry_after`)
+  and the optional synthetic probe clears it on recovery
+  (`the_health_probe_clears_a_members_cooldown_when_it_recovers`).
+- Credential pools rotate `api_keys` with failure feedback: a rejected key
+  stays out of rotation while it cools and the used key id lands on the
+  attempt and usage rows (`a_rejected_key_stays_out_of_rotation…`,
+  `a_rejected_key_cools_the_key_not_the_member`).
+- Pre-output failover is the hold budget: the buffer phase holds the
+  response for the configured window (committing an empty head when it
+  expires in silence, heartbeats covering the gap), fails over before the
+  first byte, and after commit every failure is in-band with a terminal
+  event and a failed row (`a_stream_that_fails_before_commit_fails_over`,
+  `a_stream_that_fails_after_commit_ends_with_an_in_band_error…`,
+  `the_hold_budget_commits_a_silent_stream_and_covers_the_gap`).
+- Connect/first-byte/idle/total timeouts come from
+  `server.upstream_timeouts` (per-family overrides in
+  `server.endpoint_families`), validated at config load
+  (`validate_upstream_timeouts`).
+- Sticky pools pin a session (the `x-claude-code-session-id` header) to the
+  member that served it, reordering the next ladder; the pin never applies
+  to a direct route or a non-sticky pool, and the refuse policy holds the
+  session on its pinned member even mid-cooldown
+  (`sticky_affinity_pins_a_session_to_the_member_that_served_it`,
+  `a_direct_route_does_not_pin_the_session`,
+  `refuse_policy_holds_when_the_pinned_member_is_already_cooling`). A
+  provider switch strips provider-bound state (`strip_provider_bound_state`).
+- Bare `/v1/*` is off by default and 404s while off
+  (`bare_v1_routes_return_404_when_left_off`); enabled it resolves a model
+  to a provider or pool and runs the same failover
+  (`bare_v1_resolves_a_model_to_a_provider_when_enabled`, `…_to_a_pool…`).
+- Retry exhaustion answers with the status policy's `x-should-retry: false`
+  plus a computed `Retry-After` (`llm_proxy_engine::error_policy`, asserted
+  on the HTTP surface in `routing_pools.rs`).

@@ -422,7 +422,10 @@ pub fn expand_url_template(
     };
 
     let configured_model = &target.upstream_model;
-    let has_models_prefix = template[..model_pos].ends_with("models/");
+    // `model_pos` came from `find`, so the prefix always exists; the
+    // checked forms keep the slicing rule's letter.
+    let prefix = template.get(..model_pos).unwrap_or(template);
+    let has_models_prefix = prefix.ends_with("models/");
     let model = configured_model
         .strip_prefix("models/")
         .filter(|_| has_models_prefix)
@@ -443,9 +446,11 @@ pub fn expand_url_template(
         )));
     }
     let mut result = String::with_capacity(template.len() + model.len());
-    result.push_str(&template[..model_pos]);
+    result.push_str(prefix);
     result.push_str(model);
-    result.push_str(&template[model_pos + "{model}".len()..]);
+    if let Some(tail) = template.get(model_pos + "{model}".len()..) {
+        result.push_str(tail);
+    }
     Ok(result)
 }
 
@@ -570,6 +575,8 @@ pub(crate) fn truncate_str_safe(s: &str, max_len: usize) -> &str {
         while !s.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
-        &s[..end]
+        // `end` is boundary-adjusted below the length, so the head always
+        // exists; the checked form keeps the slicing rule's letter.
+        s.get(..end).unwrap_or(s)
     }
 }

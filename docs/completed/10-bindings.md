@@ -53,7 +53,7 @@ the engine and add no logic of their own, so they start once its API has stopped
   pure-Python layer (`llm_proxy/__init__.py`) unpacks the error tuple into a
   `ProxyError` with attributes and documents the surface. Two wheels are
   built here: `llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl`
-  (installed into a fresh venv whose `pip install` runs no Rust; 13 pytest
+  (installed into a fresh venv whose `pip install` runs no Rust; 14 pytest
   tests pass against the installed wheel) and
   `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation),
   which is run-verified with the embeddable Windows CPython 3.13.5 under
@@ -93,7 +93,9 @@ the engine and add no logic of their own, so they start once its API has stopped
   on msvc the napi symbols resolve dynamically from the host node.exe at
   load, so no node import library is needed) and run-verified the same way:
   13/13 with only the msvc binary present, 13/13 with both Windows binaries
-  present, 13/13 through the gnu fallback. The macOS binary is a
+  present, 13/13 through the gnu fallback (the suite held 13 tests when
+  these Windows runs were made; it has since grown to 14). The macOS
+  binary is a
   darwin-universal build produced by zig cross-compilation (`cargo zigbuild
   --target universal2-apple-darwin`): structurally verified as a fat
   `x86_64 + arm64` Mach-O whose undefined `napi_*` symbols resolve from the
@@ -114,7 +116,8 @@ the engine and add no logic of their own, so they start once its API has stopped
   stamps with a marker). The Python and Node suites replay the same cases
   against their own fake upstreams and compare to the same snapshots: the
   same fixtures give the same results through Rust, Python and Node
-  (13 tests in each of the three languages). Streaming and cancellation are
+  (14 tests through Python and Node; the Rust bridge drives the same cases
+  inside 3 aggregate tests). Streaming and cancellation are
   exercised in all three: events flow incrementally, `cancel()` stops
   delivery, the `ClientCancelled` usage row lands, and the proxy stays
   usable.

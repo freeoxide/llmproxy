@@ -73,7 +73,10 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
             end -= 1;
         }
         if end >= 5 {
-            if let Some(pos) = result[..end].rfind("_0x") {
+            // `end` is boundary-adjusted below the length, so the head
+            // always exists; the checked form keeps the slicing rule's
+            // letter.
+            if let Some(pos) = result.get(..end).unwrap_or(&result).rfind("_0x") {
                 let seq_end = pos + 6;
                 if seq_end > end {
                     end = pos;
@@ -103,7 +106,11 @@ fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(name);
     }
 
-    let stripped = &name[SENTINEL.len()..];
+    // `starts_with` above makes the strip always succeed; the checked form
+    // keeps the slicing rule's letter.
+    let Some(stripped) = name.get(SENTINEL.len()..) else {
+        return std::borrow::Cow::Borrowed(name);
+    };
     if !stripped.contains("_0x") {
         return std::borrow::Cow::Owned(stripped.to_owned());
     }
@@ -113,19 +120,22 @@ fn desanitize_tool_name(name: &str) -> std::borrow::Cow<'_, str> {
     let mut i = 0;
 
     while i < bytes.len() {
-        if bytes[i] == b'_' && i + 5 < bytes.len() && bytes[i + 1] == b'0' && bytes[i + 2] == b'x' {
-            let hex_hi = i + 3;
-            let hex_lo = i + 4;
-            let closing = i + 5;
-            if bytes[closing] == b'_' {
-                if let Some(byte_val) = hex_byte(bytes[hex_hi], bytes[hex_lo]) {
-                    result.push(byte_val);
-                    i = closing + 1;
-                    continue;
-                }
-            }
+        // A `_0xHH_` escape decodes to one byte; anything else copies
+        // through. Every access is bounds-checked by construction here.
+        if bytes.get(i) == Some(&b'_')
+            && bytes.get(i + 1) == Some(&b'0')
+            && bytes.get(i + 2) == Some(&b'x')
+            && bytes.get(i + 5) == Some(&b'_')
+            && let (Some(&hi), Some(&lo)) = (bytes.get(i + 3), bytes.get(i + 4))
+            && let Some(byte_val) = hex_byte(hi, lo)
+        {
+            result.push(byte_val);
+            i += 6;
+            continue;
         }
-        result.push(bytes[i]);
+        if let Some(&byte) = bytes.get(i) {
+            result.push(byte);
+        }
         i += 1;
     }
 
@@ -157,7 +167,12 @@ fn sanitize_tool_use_id(id: &str) -> String {
         while !sanitized.is_char_boundary(end) && end > 0 {
             end -= 1;
         }
-        sanitized[..end].to_owned()
+        // `end` is boundary-adjusted below the length, so the head always
+        // exists; the checked form keeps the slicing rule's letter.
+        match sanitized.get(..end) {
+            Some(head) => head.to_owned(),
+            None => sanitized,
+        }
     } else if sanitized.is_empty() {
         "tool_result".to_owned()
     } else {

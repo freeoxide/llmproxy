@@ -337,7 +337,8 @@ impl AppState {
     /// hot-reload path (plan 07 step 11): the new engine is built and
     /// validated before anything live is touched. Admission (per-key
     /// policies and concurrency caps) is rebuilt against the new registry,
-    /// since caps live on providers.
+    /// since caps live on providers. The config snapshot is the one this
+    /// state's source currently serves.
     pub fn build_engine_from_parts(
         &self,
         providers: &Arc<ProviderRegistry>,
@@ -345,6 +346,19 @@ impl AppState {
     ) -> Result<Arc<Engine>, llm_proxy_engine::EngineError> {
         let config = llm_proxy_engine::ConfigSource::load(&*self.config_source)
             .unwrap_or_else(|_| Arc::clone(&self.app_config));
+        self.build_engine_from_parts_with_config(providers, egress, &config)
+    }
+
+    /// [`Self::build_engine_from_parts`] over an explicit config snapshot:
+    /// the hot-reload path builds its candidate engine from the proposed
+    /// file before anything live — including the shared config source the
+    /// serving engine reads — is touched.
+    pub fn build_engine_from_parts_with_config(
+        &self,
+        providers: &Arc<ProviderRegistry>,
+        egress: HashMap<String, Arc<ProxyClient>>,
+        config: &llm_proxy_core::AppConfig,
+    ) -> Result<Arc<Engine>, llm_proxy_engine::EngineError> {
         let mut builder = EngineBuilder::from_parts(
             Arc::clone(&self.config_source) as Arc<dyn llm_proxy_engine::ConfigSource>,
             Arc::clone(providers),

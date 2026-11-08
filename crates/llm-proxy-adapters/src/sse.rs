@@ -65,8 +65,8 @@ impl SseFramer {
             if self.buffer.starts_with(BOM) {
                 self.buffer.drain(..BOM.len());
             }
-            let still_prefix = (1..BOM.len())
-                .any(|n| self.buffer.len() == n && BOM.starts_with(&self.buffer[..n]));
+            let still_prefix =
+                (1..BOM.len()).any(|n| self.buffer.len() == n && BOM.starts_with(&self.buffer));
             if !still_prefix {
                 self.bom_checked = true;
             }
@@ -108,7 +108,12 @@ impl SseFramer {
         let Some(last_nl) = self.buffer.iter().rposition(|&b| b == b'\n') else {
             return Ok(());
         };
-        let complete = self.buffer[..last_nl + 1].to_vec();
+        // `last_nl` came from `rposition`, so the head up to and including
+        // the newline always exists; the checked form keeps the slicing
+        // rule's letter.
+        let Some(complete) = self.buffer.get(..last_nl + 1).map(<[u8]>::to_vec) else {
+            return Ok(());
+        };
         self.buffer.drain(..last_nl + 1);
         let text = str::from_utf8(&complete).map_err(ProviderError::from)?;
         for line in text.lines() {
@@ -126,12 +131,15 @@ impl SseFramer {
         let mut frames = Vec::new();
 
         while let Some(nl_pos) = self.buffer.iter().position(|&b| b == b'\n') {
-            let trimmed_end = match self.buffer[..nl_pos].iter().rposition(|&b| b != b'\r') {
+            // `nl_pos` came from `position`, so the head always exists; the
+            // checked forms keep the slicing rule's letter.
+            let head = self.buffer.get(..nl_pos).unwrap_or(&[]);
+            let trimmed_end = match head.iter().rposition(|&b| b != b'\r') {
                 Some(pos) => pos + 1,
                 None => 0,
             };
 
-            let line = str::from_utf8(&self.buffer[..trimmed_end])
+            let line = str::from_utf8(head.get(..trimmed_end).unwrap_or(&[]))
                 .map_err(ProviderError::from)?
                 .to_owned();
 
@@ -155,8 +163,10 @@ impl SseFramer {
         }
 
         if let Some(colon_pos) = line.find(':') {
-            let field = &line[..colon_pos];
-            let value = &line[colon_pos + 1..];
+            // A found ':' is always a boundary; the checked forms keep the
+            // slicing rule's letter.
+            let field = line.get(..colon_pos).unwrap_or(line);
+            let value = line.get(colon_pos + 1..).unwrap_or("");
             let value = value.strip_prefix(' ').unwrap_or(value);
 
             match field {

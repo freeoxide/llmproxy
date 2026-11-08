@@ -131,22 +131,19 @@ pub async fn reload_registry(
     // Egress clients are per-provider; rebuild them from the new registry.
     let egress = crate::state::build_egress_clients(&next, &registry)?;
 
-    // Advance the config snapshot before building the engine, so the new
-    // engine is built from it. The diff above has already proven the
-    // app-level sections are unchanged, so this keeps the snapshot in
-    // lockstep with the last good reload instead of serving startup values
-    // forever while the engine swaps around it.
-    let _previous_config = state.config_source().swap(std::sync::Arc::new(next));
-
-    // Build and validate the replacement engine before touching anything
-    // live; the swap itself is one pointer change.
+    // Build and validate the replacement engine from the proposed config
+    // before touching anything live — including the config snapshot the
+    // serving engine reads, so a refused build really applies nothing. The
+    // snapshot and engine slot then advance together.
+    let next_config = std::sync::Arc::new(next);
     let engine = state
-        .build_engine_from_parts(&std::sync::Arc::new(registry), egress)
+        .build_engine_from_parts_with_config(&std::sync::Arc::new(registry), egress, &next_config)
         .map_err(|error| {
             anyhow::anyhow!(
                 "building the reloaded engine (reload refused; nothing was applied): {error}"
             )
         })?;
+    let _previous_config = state.config_source().swap(next_config);
     let _previous = state.swap_engine(engine);
     Ok(report)
 }
@@ -234,7 +231,7 @@ mod tests {
     use axum::Router;
     use axum::http::StatusCode;
     use llm_proxy_adapters::client_wire::{ClientWireFormat, ClientWireRequest};
-    use llm_proxy_engine::{ClientDialect, EngineRequest, InboundRequest};
+    use llm_proxy_engine::{ClientDialect, ConfigSource, EngineRequest, InboundRequest};
     use llm_proxy_protocol::core::{
         CoreContent, CoreMessage, CoreRequest, CoreRole, ModelRef, SamplingOptions,
     };
@@ -468,6 +465,17 @@ server_name = "reload-test"
             Arc::ptr_eq(&registry_before, &registry_after),
             "the provider set was not changed by a refused reload"
         );
+        // Nothing was applied to the config snapshot the serving engine
+        // reads, either.
+        let snapshot_before = state
+            .config_source()
+            .load()
+            .expect("the serving snapshot loads");
+        assert_eq!(
+            snapshot_before.server.request_timeout,
+            Duration::from_secs(300),
+            "the snapshot still serves the startup config, not the refused file"
+        );
     }
 
     /// A broken provider file refuses the whole reload rather than
@@ -495,6 +503,48 @@ server_name = "reload-test"
         assert!(
             Arc::ptr_eq(&engine_before, &engine_after),
             "the engine was not swapped by a refused reload"
+        );
+    }
+
+    /// A replacement engine that cannot be built must leave the serving
+    /// config snapshot untouched too: the snapshot is shared with the live
+    /// engine, so advancing it before the build would make a "refused"
+    /// reload change what the serving engine reads.
+    #[cfg(feature = "semantic-cache")]
+    #[tokio::test]
+    async fn a_refused_engine_build_leaves_the_serving_config_snapshot_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        write_config(dir.path(), "");
+        let state = state_for(dir.path()).await;
+        state.engine().expect("engine builds");
+        let snapshot_before = state
+            .config_source()
+            .load()
+            .expect("the serving snapshot loads");
+
+        // A proposed config the engine build refuses (both cache opt-ins):
+        // the reload path builds from exactly this kind of proposal before
+        // anything live advances.
+        let mut proposal = (*snapshot_before).clone();
+        proposal.server.cache.enabled = true;
+        proposal.server.semantic_cache.enabled = true;
+        let error = state
+            .build_engine_from_parts_with_config(&state.providers(), HashMap::new(), &proposal)
+            .expect_err("the conflicting proposal must refuse the build");
+        assert!(
+            error.to_string().contains("mutually exclusive"),
+            "got {error}"
+        );
+
+        let snapshot_after = state
+            .config_source()
+            .load()
+            .expect("the serving snapshot loads");
+        assert!(
+            Arc::ptr_eq(&snapshot_before, &snapshot_after),
+            "a refused build must not advance the serving config snapshot"
         );
     }
 

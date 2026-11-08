@@ -75,6 +75,65 @@ fn core_response(text: &str) -> CoreResponse {
     }
 }
 
+/// A non-matching rule must leave every text block exactly as it was: the
+/// mask walk hands each text to the rule and a "no match" answer means
+/// "leave this block alone", never "empty it".
+#[tokio::test]
+async fn a_non_matching_rule_leaves_request_and_response_texts_intact() {
+    // Response-scoped mask: the request is out of scope entirely, and the
+    // response's clean block must survive alongside the masked one.
+    let rule = PatternRule::new(
+        r"sk-[a-z0-9]{8,}",
+        llm_proxy_guardrails::RuleAction::Mask {
+            placeholder: "[REDACTED]".to_owned(),
+        },
+        llm_proxy_guardrails::RuleScope::Responses,
+        "response-only masking",
+    )
+    .expect("rule");
+    let guard = Arc::new(Guardrail::masking(Arc::new(rule), FailPolicy::Closed));
+
+    let mut request = core_request(false, "rotate sk-clientsecret77 now");
+    guard
+        .transform_request(&mut request)
+        .await
+        .expect("transform");
+    assert_eq!(
+        request.messages[0].content[0],
+        CoreContent::Text {
+            text: "rotate sk-clientsecret77 now".to_owned(),
+            cache: None,
+        },
+        "a response-scoped rule must not touch the request at all"
+    );
+
+    let mut response = core_response("clean text next to sk-upstreamsecret99");
+    response.content.insert(
+        0,
+        CoreContent::Text {
+            text: "entirely clean".to_owned(),
+            cache: None,
+        },
+    );
+    guard
+        .transform_response(&mut response)
+        .await
+        .expect("transform");
+    match (response.content.first(), response.content.get(1)) {
+        (
+            Some(CoreContent::Text {
+                text: untouched, ..
+            }),
+            Some(CoreContent::Text { text: masked, .. }),
+        ) => {
+            assert_eq!(untouched, "entirely clean", "no match means no change");
+            assert!(!masked.contains("sk-upstreamsecret99"), "got {masked}");
+            assert!(masked.contains("[REDACTED]"), "got {masked}");
+        }
+        other => panic!("two text blocks expected, got {other:?}"),
+    }
+}
+
 /// A rule whose checker always fails, to observe the fail policy.
 #[derive(Debug)]
 struct FailingRule;
@@ -363,6 +422,41 @@ async fn the_engine_masks_both_directions_against_a_live_upstream() {
     assert!(
         upstream_text.contains("[REDACTED]"),
         "the placeholder reached the upstream"
+    );
+    match response.core.content.first() {
+        Some(CoreContent::Text { text, .. }) => {
+            assert!(!text.contains("sk-upstreamsecret99"), "got {text}");
+            assert!(text.contains("[REDACTED]"), "got {text}");
+        }
+        other => panic!("text block expected, got {other:?}"),
+    }
+}
+
+/// The pattern appears only in the model's output: the request is clean
+/// (so nothing forces a core re-encode) and the same-format passthrough is
+/// eligible — it must still be suppressed, or the client would receive the
+/// raw upstream bytes with the secret while the cache and ledger hold the
+/// masked core.
+#[tokio::test]
+async fn a_response_only_masking_reaches_the_same_format_client_masked() {
+    let rule = PatternRule::mask(r"sk-[a-z0-9]{8,}", "[REDACTED]").expect("rule");
+    let guard = Arc::new(Guardrail::masking(Arc::new(rule), FailPolicy::Closed));
+    let (engine, _endpoint, _captured) = engine_with(guard).await;
+
+    let response = engine
+        .execute(engine_request(core_request(
+            false,
+            "a perfectly clean prompt",
+        )))
+        .await
+        .expect("request served");
+    assert!(
+        response.raw_body.is_none(),
+        "the same-format raw passthrough must not carry the unmasked upstream bytes, got {:?}",
+        response
+            .raw_body
+            .as_deref()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     );
     match response.core.content.first() {
         Some(CoreContent::Text { text, .. }) => {

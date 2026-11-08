@@ -1315,9 +1315,13 @@ async fn run_ladder_once(
             // Slot 11.5 (plan 09 step 4): the guards' response rewrites —
             // the masked form is what the client receives, what the cache
             // stores and what usage rows describe.
+            let content_before_guards =
+                (!inner.guards.is_empty()).then(|| core_resp.content.clone());
             for guard in &inner.guards {
                 guard.transform_response(&mut core_resp).await?;
             }
+            let guards_rewrote_response =
+                content_before_guards.is_some_and(|before| before != core_resp.content);
 
             let latency = req.start.elapsed();
             core_resp.cost = cost.clone();
@@ -1387,8 +1391,14 @@ async fn run_ladder_once(
 
             // Same-format passthrough: the upstream response body reaches the
             // client verbatim; the decode above only read usage and the stop
-            // reason for the ledger, it did not rewrite the body.
-            let raw_body = if wire.same_format_as(&attempt.target.protocol) {
+            // reason for the ledger, it did not rewrite the body. Unless a
+            // guard rewrote the response: the raw upstream bytes would then
+            // carry the un-redacted text past the masked core — to the
+            // client and, through the idempotency claim, to retries — so the
+            // client is served the re-encoded masked form instead.
+            let raw_body = if guards_rewrote_response {
+                None
+            } else if wire.same_format_as(&attempt.target.protocol) {
                 Some(response_bytes)
             } else {
                 None
