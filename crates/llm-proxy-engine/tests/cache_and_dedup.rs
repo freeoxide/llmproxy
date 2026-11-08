@@ -913,6 +913,118 @@ fn delayed_400_upstream(calls: Arc<AtomicUsize>, delay: Duration) -> Router {
     )
 }
 
+/// An admission step that records the usage each settlement was charged
+/// with, so a test can assert what reached the budget counters.
+#[derive(Debug, Default)]
+struct UsageRecordingAdmission {
+    settled_usage: std::sync::Mutex<Vec<Option<u64>>>,
+}
+
+#[async_trait::async_trait]
+impl Admission for UsageRecordingAdmission {
+    async fn reserve(&self, _claim: &AdmissionClaim<'_>) -> Result<AdmissionTicket, EngineError> {
+        Ok(AdmissionTicket::default())
+    }
+
+    fn settle(&self, _ticket: &AdmissionTicket, outcome: &AdmissionOutcome<'_>) {
+        self.settled_usage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(outcome.usage.map(total_usage_tokens));
+    }
+}
+
+fn total_usage_tokens(usage: &llm_proxy_protocol::core::Usage) -> u64 {
+    [
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_creation_input_tokens.unwrap_or(0),
+        usage.cache_read_input_tokens.unwrap_or(0),
+        usage.reasoning_tokens.unwrap_or(0),
+    ]
+    .into_iter()
+    .map(|count| u64::try_from(count).unwrap_or(0))
+    .sum()
+}
+
+#[tokio::test]
+async fn a_pre_commit_failure_charges_the_usage_its_prefix_already_reported() {
+    // The buffered prefix reported provider usage before the stream failed
+    // before committing: settlement must charge those tokens — the provider
+    // billed them — exactly like the committed-head capture does on a
+    // post-commit failure.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&counted);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // One chunk: a usage delta, then a leading in-band error —
+                // the whole prefix decodes before the failure is visible.
+                let chunks = vec![bytes::Bytes::from_static(
+                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"input_tokens\":7,\"output_tokens\":5}}\n\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"dying before the first byte\"}}\n\n",
+                )];
+                let body_stream =
+                    futures::stream::iter(chunks).map(Ok::<_, std::convert::Infallible>);
+                (
+                    StatusCode::OK,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    Body::from_stream(body_stream),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let endpoint = spawn_upstream(app).await;
+    let bus = Arc::new(RecordingBus::new());
+    let admission = Arc::new(UsageRecordingAdmission::default());
+    let engine = engine_with(
+        vec![provider(endpoint)],
+        test_config(),
+        bus,
+        Some(Arc::clone(&admission) as Arc<dyn Admission>),
+        None,
+    );
+
+    let failed = engine
+        .execute_stream(engine_request(true, "billed prefix", "caller-a", None))
+        .await;
+    assert!(failed.is_err(), "the stream never commits: {failed:?}");
+
+    let settled = async {
+        loop {
+            if !admission
+                .settled_usage
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), settled)
+        .await
+        .expect("the failed stream settles its reservation");
+    let recorded = admission
+        .settled_usage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(
+        recorded,
+        vec![Some(12)],
+        "settlement must charge the prefix's reported usage (7 in + 5 out), got {recorded:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 async fn collect_stream(stream: EngineStream) -> Vec<CoreEvent> {
     let mut all = stream.head;
     let mut tail = stream.tail;
@@ -982,6 +1094,94 @@ async fn a_failed_streaming_first_attempt_releases_its_key() {
         calls.load(Ordering::SeqCst),
         2,
         "the keyed retry must execute upstream again, not replay the failed stream"
+    );
+}
+
+#[tokio::test]
+async fn a_stream_joiner_completes_its_idempotency_claim_from_the_shared_outcome() {
+    // A joiner holds its own claimed Idempotency-Key while it shares the
+    // leader's stream (a different key: the leader's own is in flight and
+    // would 409). When the leader ends cleanly, the joiner's key must store
+    // that shared outcome, so a matching retry replays it instead of
+    // re-executing — the same rule the non-streaming follower already
+    // follows.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/{*path}",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&counted);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                let chunks = vec![
+                    bytes::Bytes::from_static(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_j\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-6\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"shared\"}}\n\n",
+                    ),
+                    bytes::Bytes::from_static(
+                        b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ),
+                ];
+                let body_stream =
+                    futures::stream::iter(chunks).map(Ok::<_, std::convert::Infallible>);
+                (
+                    StatusCode::OK,
+                    [(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    )],
+                    Body::from_stream(body_stream),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let endpoint = spawn_upstream(app).await;
+    let bus = Arc::new(RecordingBus::new());
+    let engine = build_idempotent_engine(endpoint, bus);
+
+    let leader = engine.execute_stream(engine_request(
+        true,
+        "joiner idem",
+        "caller-a",
+        Some("leader-key"),
+    ));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let joiner = engine.execute_stream(
+        engine_request(true, "joiner idem", "caller-a", Some("joiner-key"))
+            .with_request_id("req-joiner"),
+    );
+    let (leader, joiner) = futures::future::join(leader, joiner).await;
+    let leader_events = collect_stream(leader.expect("leader streams")).await;
+    let joiner_events = collect_stream(joiner.expect("joiner joins the shared stream")).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        joiner_events
+            .iter()
+            .any(|event| matches!(event, CoreEvent::MessageStop { .. })),
+        "the joiner's replay reaches the terminal: {joiner_events:?}"
+    );
+    assert_eq!(leader_events, joiner_events);
+
+    let replay = engine
+        .execute_stream(
+            engine_request(true, "joiner idem", "caller-a", Some("joiner-key"))
+                .with_request_id("req-retry"),
+        )
+        .await
+        .expect("a retry under the joiner's key must not conflict");
+    let replay_events = collect_stream(replay).await;
+    assert_eq!(
+        joiner_events, replay_events,
+        "the retry replays the shared outcome the joiner stored"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the retry replayed from the joiner's claim; no second upstream call"
     );
 }
 

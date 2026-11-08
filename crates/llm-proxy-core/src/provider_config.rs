@@ -2833,6 +2833,15 @@ pub fn load_app_config(path: impl AsRef<Path>) -> Result<AppConfig, CoreError> {
             });
         }
     }
+    if cfg.server.cache.enabled && cfg.server.semantic_cache.enabled {
+        return Err(CoreError::ConfigValidation {
+            message: "server.cache and server.semantic_cache are mutually exclusive \
+                      opt-ins; enabling both would silently replace the exact-match \
+                      cache with the semantic one — enable one"
+                .to_owned(),
+            source: None,
+        });
+    }
     if cfg.server.idempotency.enabled && cfg.server.idempotency.ttl.is_zero() {
         return Err(CoreError::ConfigValidation {
             message: "server.idempotency.ttl must be greater than 0s when \
@@ -5614,6 +5623,29 @@ threshold = 0.9"#,
         assert!(config.server.semantic_cache.enabled);
         assert_eq!(config.server.semantic_cache.ttl, Duration::from_secs(300));
         assert_eq!(config.server.semantic_cache.max_entries, 64);
+    }
+
+    #[test]
+    fn enabling_both_cache_optins_is_refused() {
+        // The engine holds one cache: enabling both opt-ins would silently
+        // replace the exact-match cache with the semantic one. The pair is
+        // a config error, not a precedence rule.
+        let (_dir, path) = write_app_config(
+            r#"
+[server.cache]
+enabled = true
+ttl = "30s"
+max_entries = 8
+
+[server.semantic_cache]
+enabled = true"#,
+        );
+        let error =
+            load_app_config(&path).expect_err("both cache opt-ins must be refused at load time");
+        assert!(
+            error.to_string().contains("mutually exclusive"),
+            "the refusal must name the conflict, got: {error}"
+        );
     }
 
     #[test]

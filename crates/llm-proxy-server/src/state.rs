@@ -374,18 +374,25 @@ impl AppState {
         }
         // The opt-in response cache (plan 06): off by default, so with
         // no [server.cache] the engine keeps its store-nothing default.
+        // The two cache opt-ins are mutually exclusive: a builder holds one
+        // cache, so enabling both would silently replace the exact-match
+        // cache with the semantic one. Config loading refuses the pair; this
+        // refuses it for programmatic configs too.
         if config.server.cache.enabled {
             builder = builder.cache(Arc::new(llm_proxy_engine::MemoryCache::new(
                 config.server.cache.ttl,
                 config.server.cache.max_entries,
             )));
         }
-        // The opt-in semantic cache (plan 09 step 5): off by default, and
-        // only when the optional crate is compiled in. The exact-match
-        // cache above stays the behavior for [server.cache]; the two
-        // features are distinct opt-ins.
         #[cfg(feature = "semantic-cache")]
         if config.server.semantic_cache.enabled {
+            if config.server.cache.enabled {
+                return Err(llm_proxy_engine::EngineError::Internal(
+                    "[server.cache] and [server.semantic_cache] are mutually exclusive \
+                     opt-ins; enable one"
+                        .to_owned(),
+                ));
+            }
             let semantic = Arc::new(llm_proxy_semantic_cache::SemanticCache::new(
                 config.server.semantic_cache.clone(),
                 Box::new(llm_proxy_semantic_cache::NgramEmbedder::new()),

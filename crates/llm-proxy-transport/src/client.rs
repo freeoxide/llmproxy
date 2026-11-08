@@ -524,7 +524,11 @@ pub(crate) async fn read_error_body_bounded(resp: reqwest::Response, cap: usize)
                     break;
                 }
                 let take = bytes.len().min(remaining);
-                buf.extend_from_slice(&bytes[..take]);
+                // `take` never exceeds the chunk's length; the checked form
+                // just keeps the cap honest without a panicking slice.
+                if let Some(chunk) = bytes.get(..take) {
+                    buf.extend_from_slice(chunk);
+                }
                 if buf.len() >= cap {
                     break;
                 }

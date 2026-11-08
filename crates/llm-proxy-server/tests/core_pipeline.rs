@@ -2988,6 +2988,36 @@ mod tests {
         assert_eq!(rows.iter().filter(|hit| **hit).count(), 1);
     }
 
+    #[cfg(feature = "semantic-cache")]
+    #[tokio::test]
+    async fn enabling_both_cache_optins_refuses_to_build_an_engine() {
+        // The engine holds one cache: both opt-ins together would silently
+        // replace the exact-match cache with the semantic one. Programmatic
+        // configs are refused at the engine build, mirroring the load-time
+        // refusal in llm-proxy-core.
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_provider_edited(
+            &mock_url,
+            "anthropic_messages",
+            "messages",
+            "claude-sonnet-4-6",
+            HashMap::new(),
+            |config| {
+                config.server.cache = llm_proxy_core::ResponseCacheConfig {
+                    enabled: true,
+                    ttl: Duration::from_secs(60),
+                    max_entries: 16,
+                };
+                config.server.semantic_cache.enabled = true;
+            },
+        );
+        let error = state.engine().expect_err("both cache opt-ins must refuse");
+        assert!(
+            error.to_string().contains("mutually exclusive"),
+            "the refusal must name the conflict, got: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn idempotency_key_opt_in_replays_for_a_matching_retry() {
         let mock_url = spawn_mock_anthropic_non_stream().await;

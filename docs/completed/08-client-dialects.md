@@ -91,7 +91,7 @@ pipeline code.
 - **Done-when verification.** The shared dialect scenarios — streaming
   text, tool calls, exact usage, upstream errors, same-format passthrough —
   run for every dialect against a loopback fake upstream in
-  `crates/llm-proxy-server/tests/client_dialects.rs` (19 tests), including
+  `crates/llm-proxy-server/tests/client_dialects.rs` (21 tests), including
   the Codex tool-call ordering assertion and the wire-exact usage fields.
   Captured Codex traffic replays through the Responses route in the
   plan-02 contract harness (`tests/contract_replay.rs`): the real Codex

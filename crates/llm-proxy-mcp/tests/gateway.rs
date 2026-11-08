@@ -424,3 +424,112 @@ async fn an_unknown_tool_is_rejected_without_an_upstream_call() {
     );
     assert!(fixture.admission.reserves.lock().await.is_empty());
 }
+
+/// A fake upstream whose `tools/call` parks until released, so a test can
+/// drop a call mid-flight — exactly where a client disconnect lands.
+async fn spawn_hanging_upstream(release: Arc<tokio::sync::watch::Receiver<bool>>) -> String {
+    let app = Router::new().route(
+        "/mcp",
+        axum::routing::post(move |body: String| {
+            let mut release = release.as_ref().clone();
+            async move {
+                let message: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                if message["method"].as_str() != Some("tools/call") {
+                    return (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&serde_json::json!({
+                            "jsonrpc": "2.0", "id": message["id"],
+                            "error": { "code": -32601, "message": "unknown method" }
+                        }))
+                        .unwrap_or_default(),
+                    )
+                        .into_response();
+                }
+                while !*release.borrow() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": message["id"],
+                        "result": { "content": [], "isError": false }
+                    }))
+                    .unwrap_or_default(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hanging upstream");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "hanging upstream stopped");
+        }
+    });
+    format!("http://{addr}/mcp")
+}
+
+#[tokio::test]
+async fn a_tool_call_dropped_mid_upstream_still_settles_its_reservation() {
+    // A client disconnect mid tools/call drops the handler future between
+    // reserve and settle; the reservation must be released as failed, or
+    // its in-flight slot is held forever (the same rule the chat pipeline
+    // enforces with UnsettledLeaseGuard).
+    let release = Arc::new(tokio::sync::watch::Sender::new(false));
+    let upstream_url = spawn_hanging_upstream(Arc::new(release.subscribe())).await;
+    let admission = Arc::new(RecordingAdmission::default());
+    let gateway = McpGateway::new(
+        gateway_config(upstream_url, 3979),
+        Arc::clone(&admission) as Arc<dyn Admission>,
+        Arc::new(RecordingBus::new()) as Arc<dyn EventBus>,
+        Arc::new(ProxyClient::new()),
+    );
+    let app = gateway.router();
+
+    let call_app = app.clone();
+    let call = tokio::spawn(async move {
+        post(
+            &call_app,
+            Some("gateway-token"),
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call",
+            "params":{"name":"docs__echo","arguments":{"text":"hi"}}}"#,
+        )
+        .await
+    });
+    let reserved = async {
+        loop {
+            if !admission.reserves.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), reserved)
+        .await
+        .expect("the call reserved before parking upstream");
+
+    call.abort();
+    let settled = async {
+        loop {
+            if !admission.settles.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), settled)
+        .await
+        .expect("the dropped call must settle its reservation (drop backstop)");
+    assert_eq!(
+        admission.settles.lock().await.as_slice(),
+        &[false],
+        "the backstop settles the dropped call as failed"
+    );
+}

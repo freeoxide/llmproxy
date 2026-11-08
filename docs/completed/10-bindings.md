@@ -75,13 +75,13 @@ the engine and add no logic of their own, so they start once its API has stopped
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
   pre-commit stream failures); `index.js` turns them into thrown
   `ProxyError`s and an async-iterable `Stream` whose `cancel()` settles as
-  `ClientCancelled`. 13 `node --test` tests pass; `npm install` of the
+  `ClientCancelled`. 14 `node --test` tests pass; `npm install` of the
   packed tarball (`npm pack` → `freeoxide-llm-proxy-0.1.0.tgz`) loads the
   prebuilt `llm-proxy.linux-x64-gnu.node` with no Rust toolchain. A
   Windows x64 binary (`llm-proxy.win32-x64-gnu.node`) is produced by
   mingw-w64 cross-compilation — the napi import library generated from the
   official `node.exe` exports (objdump export table → dlltool) — and
-  run-verified: the full 13-test contract suite passes under wine 10.0 with
+  run-verified: the full 14-test contract suite passes under wine 10.0 with
   the official node-v20.19.2 win-x64 `node.exe`, and `index.js` gained a
   fallback that loads the gnu binary when the generated loader's msvc-first
   path finds no msvc binary (official node.exe is MSVC-built). The npm name

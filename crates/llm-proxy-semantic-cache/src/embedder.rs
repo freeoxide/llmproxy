@@ -98,8 +98,13 @@ fn embed_one(text: &str, dimension: usize) -> Embedding {
     let mut vector = vec![0.0_f32; dimension];
     let mut norm = 0.0_f32;
     for (bucket, count) in counts {
-        vector[bucket] = count;
-        norm += count * count;
+        // `bucket` is `hash % dimension`, so the slot always exists; the
+        // checked form keeps the norm consistent with the vector should
+        // that invariant ever break, instead of panicking.
+        if let Some(component) = vector.get_mut(bucket) {
+            *component = count;
+            norm += count * count;
+        }
     }
     let norm = norm.sqrt();
     if norm > f32::EPSILON {

@@ -1575,7 +1575,16 @@ async fn execute_stream_attempt(
                     // records the row only when no leader stays.
                     return Err(error);
                 }
-                return Ok(joined_stream(Arc::clone(&inner), &req, share));
+                // The joiner's own idempotency claim completes with the
+                // shared outcome once the leader's stream ends cleanly —
+                // mirroring the non-streaming follower — so a matching retry
+                // replays instead of re-executing (a failed leader releases
+                // it: failures are not stored).
+                let claim = match idempotency {
+                    IdempotencyStep::Claimed(claim) => Some(claim),
+                    IdempotencyStep::Ignored | IdempotencyStep::Replay(_) => None,
+                };
+                return Ok(joined_stream(Arc::clone(&inner), &req, share, claim));
             }
             StreamAcquire::Lead(lead) => stream_lead = Some(lead),
         }
@@ -1982,6 +1991,7 @@ fn build_core_event_stream(
                 last_error: None,
                 lead,
                 idempotency,
+                last_usage: None,
             };
             let order = stream.ladder.order.clone();
             let io = StreamIo {
@@ -2328,6 +2338,10 @@ struct StreamLadder {
     /// The idempotency claim (plan 06 step 3): completed with the collected
     /// events on a clean end.
     idempotency: Option<IdempotencyClaim>,
+    /// The last provider-reported usage a failed pre-commit prefix carried:
+    /// what settlement charges when every attempt fails and the task stops
+    /// (the provider billed those tokens; settlement must not drop them).
+    last_usage: Option<Usage>,
 }
 
 /// How a committed or abandoned stream attempt ended, for the single-flight
@@ -2432,6 +2446,27 @@ fn leading_stream_error(pending: &[CoreEvent]) -> Option<EngineError> {
         })
 }
 
+/// The last provider-reported usage in a buffered pre-commit prefix: what a
+/// pre-commit failure must still charge at settlement — the provider billed
+/// those tokens even though nothing was committed to the client (the same
+/// capture the committed head gets at the commit boundary).
+fn prefix_usage(pending: &[CoreEvent]) -> Option<Usage> {
+    pending.iter().rev().find_map(|event| match event {
+        CoreEvent::UsageDelta { usage } => Some(usage.clone()),
+        _ => None,
+    })
+}
+
+/// Stashes a failing prefix's reported usage on the ladder, so the failure
+/// funnel's settles (and `stop_with`, when every attempt fails) charge what
+/// the provider billed. A later attempt's report supersedes an earlier
+/// one's; a report-less attempt never erases one that had it.
+fn stash_prefix_usage(stream_ladder: &mut StreamLadder, pending: &[CoreEvent]) {
+    if let Some(usage) = prefix_usage(pending) {
+        stream_ladder.last_usage = Some(usage);
+    }
+}
+
 /// Signals a terminal pre-commit failure to the caller (which writes the
 /// request's failure row); when the caller is already gone, records the
 /// cancellation here.
@@ -2461,7 +2496,8 @@ async fn stop_with(
     };
     inner.metrics.record_failure();
     signal_pre_stream_error(inner, stream, final_error.clone());
-    settle(inner, &stream.ticket, false, None, None);
+    let usage = stream.last_usage.take();
+    settle(inner, &stream.ticket, false, usage.as_ref(), None);
     // Joiners receive the same failure — a pre-commit failure reaches them
     // as their own first-byte error; the idempotency claim drops with the
     // task, releasing the key (failures are not stored).
@@ -2560,6 +2596,8 @@ async fn buffer_pre_commit(
                 Some(Ok(bytes)) => {
                     if decode_chunk(&mut ctx, &bytes, &mut pending).is_err() {
                         // Framing/decode garbage: the ladder classifies it.
+                        // The frames decoded before the garbage still billed.
+                        stash_prefix_usage(stream_ladder, &pending);
                         let error = EngineError::ProviderDecode(
                             "provider decode error before the first event".to_owned(),
                         );
@@ -2569,12 +2607,14 @@ async fn buffer_pre_commit(
                         continue;
                     }
                     if let Some(error) = leading_stream_error(&pending) {
+                        stash_prefix_usage(stream_ladder, &pending);
                         return failure_or_retry(inner, stream_ladder, member, &error, attempt_start, attempt_in_member).await;
                     }
                     return PreCommit::Committed(Box::new(CommittedStream { ctx, stream, head: pending }));
                 }
                 Some(Err(e)) => {
                     let error = map_provider_error(&e, ctx.passthrough_auth);
+                    stash_prefix_usage(stream_ladder, &pending);
                     return failure_or_retry(inner, stream_ladder, member, &error, attempt_start, attempt_in_member).await;
                 }
                 None => {
@@ -2621,7 +2661,10 @@ async fn failure_or_retry(
 /// record it (row, cooldowns, feedback) and decide the next move. Returns
 /// `true` when the ladder continues with another attempt (the caller breaks
 /// the buffer loop and retries), `false` when the task must return — the
-/// terminal and exhausted cases signal the caller and settle here.
+/// terminal and exhausted cases signal the caller and settle here. The
+/// settles charge the prefix usage the caller stashed on the ladder (a
+/// retried attempt may report its own; the last reported one is what
+/// settlement charges).
 async fn pre_commit_failure(
     inner: &Arc<EngineInner>,
     stream: &mut StreamLadder,
@@ -2640,7 +2683,13 @@ async fn pre_commit_failure(
             let final_error = error.clone();
             inner.metrics.record_failure();
             signal_pre_stream_error(inner, stream, final_error.clone());
-            settle(inner, &stream.ticket, false, None, None);
+            settle(
+                inner,
+                &stream.ticket,
+                false,
+                stream.last_usage.as_ref(),
+                None,
+            );
             stream.finish_stream(StreamEnd::Failed(final_error));
             false
         }
@@ -2650,7 +2699,13 @@ async fn pre_commit_failure(
                 let final_error = exhausted(inner, &ladder.plan, ladder.seq, error.clone()).await;
                 inner.metrics.record_failure();
                 signal_pre_stream_error(inner, stream, final_error.clone());
-                settle(inner, &stream.ticket, false, None, None);
+                settle(
+                    inner,
+                    &stream.ticket,
+                    false,
+                    stream.last_usage.as_ref(),
+                    None,
+                );
                 stream.finish_stream(StreamEnd::Failed(final_error));
                 false
             } else {
@@ -2945,6 +3000,11 @@ struct StreamReplay {
     /// row records the failure, not a completed hit.
     failure: Option<(&'static str, String)>,
     recorded: bool,
+    /// A joining request's idempotency claim: completed with the leader's
+    /// collected events when the shared stream ends cleanly, released by
+    /// drop otherwise (failures are not stored). An idempotent replay of
+    /// stored events never carries one — its key already holds the outcome.
+    idempotency: Option<IdempotencyClaim>,
 }
 
 enum ReplayPhase {
@@ -3091,6 +3151,19 @@ async fn replay_next(mut state: StreamReplay) -> Option<(CoreEvent, StreamReplay
                 ),
             });
         }
+        // The leader ran to a clean terminal: the joiner's idempotency claim
+        // stores the very events this replay hands its caller, so a matching
+        // retry replays them (a failed leader leaves the claim to drop,
+        // releasing the key — failures are not stored). The leader has
+        // published its outcome by now, so its own claim already completed.
+        if outcome.is_ok()
+            && let Some(claim) = state.idempotency.take()
+        {
+            claim.complete(StoredOutcome {
+                response: None,
+                events: events.clone(),
+            });
+        }
         let (usage, stop_reason) = replay_lifecycle_of(&events);
         state.usage = usage;
         state.stop_reason = stop_reason;
@@ -3126,11 +3199,14 @@ fn replay_failure_of(events: &[CoreEvent]) -> Option<(&'static str, String)> {
 }
 
 /// A joiner's view of a shared streaming request (plan 06 step 2): the
-/// leader's collected events, replayed in order once it finishes.
+/// leader's collected events, replayed in order once it finishes. The
+/// joiner's idempotency claim, when it holds one, completes with the
+/// leader's collected events on a clean end.
 fn joined_stream(
     inner: Arc<EngineInner>,
     req: &EngineRequest,
     share: Arc<StreamShare>,
+    idempotency: Option<IdempotencyClaim>,
 ) -> EngineStream {
     EngineStream {
         head: Vec::new(),
@@ -3146,6 +3222,7 @@ fn joined_stream(
                 stop_reason: None,
                 failure: None,
                 recorded: false,
+                idempotency,
             },
             replay_next,
         )
@@ -3174,6 +3251,7 @@ fn replay_events_stream(
                 stop_reason,
                 failure: None,
                 recorded: false,
+                idempotency: None,
             },
             replay_next,
         )

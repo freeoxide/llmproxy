@@ -254,6 +254,14 @@ async fn call_tool(
             return Err(ToolFailure::Server(message));
         }
     };
+    // The reservation lives inside this handler future: a drop while the
+    // upstream call runs (client disconnect mid tools/call) must release
+    // the lease. Both arms below settle explicitly, so the guard disarms
+    // right before them — the same backstop the chat pipeline's family
+    // routes use.
+    let mut settle_guard = ticket.as_ref().map(|ticket| {
+        llm_proxy_engine::UnsettledLeaseGuard::new(Arc::clone(&gateway.admission), ticket)
+    });
 
     let upstream_params = json!({ "name": tool, "arguments": arguments });
     let outcome = upstream_request(
@@ -264,6 +272,9 @@ async fn call_tool(
         Some(&tool),
     )
     .await;
+    if let Some(guard) = settle_guard.as_mut() {
+        guard.disarm();
+    }
     match outcome {
         Ok(result) => {
             accounting::settle(gateway.admission.as_ref(), &ticket, true);
