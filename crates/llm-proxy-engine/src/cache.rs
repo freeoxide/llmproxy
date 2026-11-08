@@ -342,7 +342,11 @@ pub(crate) struct StreamShare {
 }
 
 impl StreamShare {
-    /// Append one event the leader forwarded (its tap point).
+    /// Append one event the leader forwarded (its tap point). Every event is
+    /// recorded — not just those before the commit boundary — because a
+    /// joiner arriving mid-stream replays `collected()` from the beginning
+    /// and must see the complete event list, so the recording cannot stop
+    /// or be pruned once the leader has forwarded a byte to its own client.
     pub(crate) fn record(&self, event: &CoreEvent) {
         self.events
             .lock()
