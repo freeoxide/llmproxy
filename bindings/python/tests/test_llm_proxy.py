@@ -14,6 +14,7 @@ Run against an installed wheel:
 import http.server
 import json
 import pathlib
+import queue
 import threading
 import time
 
@@ -259,6 +260,75 @@ def test_cancellation_stops_delivery_and_settles_client_cancelled(shared=load_sh
         next(iter(stream))
 
     deadline = time.monotonic() + settle_timeout
+    while time.monotonic() < deadline:
+        rows = proxy.usage_events()
+        if any(
+            row.get("kind") == "response_failed"
+            and row.get("error_kind") == "ClientCancelled"
+            for row in rows
+        ):
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("the ClientCancelled row must land after cancel: %r" % proxy.usage_events())
+
+    followup = proxy.execute(
+        scenario["followup_provider"],
+        scenario["dialect"],
+        {"model": "claude-sonnet-4-5", "max_tokens": 64,
+         "messages": [{"role": "user", "content": "again"}]},
+    )
+    assert "id" in followup
+
+
+def test_cancel_from_another_thread_unblocks_a_blocked_next(shared=load_shared()):
+    """The README documents GIL-releasing waits, so a reader thread can be
+    blocked in next() while the main thread cancels: cancel must not raise
+    'Already borrowed', the blocked reader must be released, and the request
+    must settle as ClientCancelled."""
+    scenario = shared["cancellation"]
+    # One SSE event, then nothing for an hour: the reader parks on a stalled
+    # upstream.
+    sse = CannedUpstream(
+        shared["upstream_responses"][scenario["upstream_response"]], 3_600_000
+    )
+    json_upstream = CannedUpstream(shared["upstream_responses"]["anthropic_json"])
+
+    proxy = make_proxy(
+        shared,
+        [
+            provider_for(shared, scenario["stream_provider"], sse.base_url),
+            provider_for(shared, scenario["followup_provider"], json_upstream.base_url),
+        ],
+        record_usage=True,
+    )
+    stream = proxy.execute_stream(
+        scenario["stream_provider"], scenario["dialect"], scenario["request"]
+    )
+
+    events = queue.Queue()
+
+    def read_until_end():
+        for event in stream:
+            events.put(event)
+        events.put(None)
+
+    reader = threading.Thread(target=read_until_end, daemon=True)
+    reader.start()
+
+    first = events.get(timeout=3)
+    assert "MessageStart" in first
+    with pytest.raises(queue.Empty):
+        # the reader is parked on the stalled upstream
+        events.get(timeout=0.3)
+
+    stream.cancel()
+    assert stream.cancelled, "the getter is readable while next() is blocked"
+    assert events.get(timeout=5) is None, "cancel unblocks the parked reader"
+    reader.join(timeout=5)
+    assert not reader.is_alive()
+
+    deadline = time.monotonic() + scenario.get("settle_timeout_secs", 5)
     while time.monotonic() < deadline:
         rows = proxy.usage_events()
         if any(

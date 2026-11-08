@@ -9,13 +9,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use llm_proxy_bridge::{Bridge, BridgeError, EventStream as BridgeStream, ExecuteOptions};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde_json::Value;
-use tokio::sync::Mutex;
 
 /// The structured failure payload the JS layer unpacks into a `ProxyError`.
 #[napi(object)]
@@ -167,10 +165,7 @@ impl Proxy {
                 });
                 Error::new(Status::GenericFailure, info.to_string())
             })?;
-        Ok(Stream {
-            inner: Mutex::new(stream),
-            cancelled: AtomicBool::new(false),
-        })
+        Ok(Stream { inner: stream })
     }
 
     /// Translate a request between wire dialects, no I/O.
@@ -231,13 +226,14 @@ impl Proxy {
 
 /// A streaming response. `next()` resolves with the next event object, or
 /// `null` once the stream has ended or been cancelled; `cancel()` stops
-/// delivery and settles the request as `ClientCancelled`.
+/// delivery and settles the request as `ClientCancelled` — including while a
+/// `next()` call is still pending, so a watchdog timer can cancel a stream
+/// mid-iteration.
 #[napi]
 pub struct Stream {
-    /// The bridge stream this handle drains.
-    inner: Mutex<BridgeStream>,
-    /// Whether cancel() was called (mirrors the bridge state for the getter).
-    cancelled: AtomicBool,
+    /// The bridge stream this handle drains; its methods take `&self`, so
+    /// cancel never waits on a pending next.
+    inner: BridgeStream,
 }
 
 #[napi]
@@ -245,22 +241,19 @@ impl Stream {
     /// The next event, or null when the stream has ended or been cancelled.
     #[napi]
     pub async fn next(&self) -> Result<Option<Value>> {
-        let mut inner = self.inner.lock().await;
-        Ok(inner.next().await)
+        Ok(self.inner.next().await)
     }
 
     /// Cancel the stream: stop delivering events and settle the request as
     /// `ClientCancelled`.
     #[napi]
-    pub async fn cancel(&self) -> Result<()> {
-        self.cancelled.store(true, Ordering::SeqCst);
-        self.inner.lock().await.cancel();
-        Ok(())
+    pub fn cancel(&self) {
+        self.inner.cancel();
     }
 
     /// Whether this stream has been cancelled.
     #[napi(getter)]
     pub fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.inner.is_cancelled()
     }
 }

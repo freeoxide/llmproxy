@@ -245,6 +245,11 @@ fn parse_options(options: Option<&Bound<'_, PyAny>>) -> PyResult<ExecuteOptions>
 
 /// A streaming response: iterate for event dicts; `cancel()` stops
 /// delivery and settles the request as `ClientCancelled`.
+///
+/// Every method goes through the bridge's shared-state synchronization, so
+/// `cancel()` and the `cancelled` getter work from any thread while another
+/// thread is blocked in `__next__` — no exclusive borrow is held across the
+/// wait.
 #[pyclass]
 struct Stream {
     /// The bridge stream this iterator drains.
@@ -259,8 +264,8 @@ impl Stream {
     }
 
     /// Blocks until the next event is available; releases the GIL while
-    /// waiting.
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+    /// waiting, so other threads can call `cancel()` meanwhile.
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let event = py.detach(|| self.inner.next_blocking());
         match event {
             Some(event) => value_to_py(py, &event).map(Some),
@@ -269,8 +274,9 @@ impl Stream {
     }
 
     /// Cancel the stream: stop delivering events and settle the request as
-    /// `ClientCancelled`.
-    fn cancel(&mut self) {
+    /// `ClientCancelled`. Safe to call from any thread, including while
+    /// another thread is blocked in `__next__`.
+    fn cancel(&self) {
         self.inner.cancel();
     }
 

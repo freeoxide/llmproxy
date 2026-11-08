@@ -8,6 +8,7 @@ Usage (from this machine): wine <py313>/python.exe Z:\\tmp\\pywine\\driver.py
 import http.server
 import json
 import pathlib
+import queue
 import sys
 import threading
 import time
@@ -182,6 +183,54 @@ def main():
                           {"model": "claude-sonnet-4-5", "max_tokens": 64,
                            "messages": [{"role": "user", "content": "again"}]})
     check("proxy stays usable after cancellation", "id" in reply)
+
+    # The watchdog shape: while a reader thread is blocked in next() on a
+    # stalled upstream (one SSE event, then nothing for an hour), cancel()
+    # from this thread must not raise 'Already borrowed', must release the
+    # reader, and the request must settle as ClientCancelled.
+    stalled = CannedUpstream(shared["upstream_responses"][scenario["upstream_response"]], 3_600_000)
+    proxy = Proxy({
+        "providers": [
+            provider_for(scenario["stream_provider"], stalled.base_url),
+            provider_for(scenario["followup_provider"], followup.base_url),
+        ],
+        "record_usage": True,
+    })
+    stream = proxy.execute_stream(scenario["stream_provider"], scenario["dialect"],
+                                  scenario["request"])
+    events = queue.Queue()
+
+    def read_until_end():
+        for event in stream:
+            events.put(event)
+        events.put(None)
+
+    reader = threading.Thread(target=read_until_end, daemon=True)
+    reader.start()
+    first = events.get(timeout=3)
+    check("stalled stream delivers its first event", "MessageStart" in first)
+    try:
+        events.get(timeout=0.3)
+        parked = False
+    except queue.Empty:
+        parked = True
+    check("reader is parked before cancel", parked)
+    stream.cancel()
+    check("cancelled getter readable while reader blocked", stream.cancelled)
+    ended = events.get(timeout=5)
+    check("cancel unblocks the parked reader", ended is None)
+    reader.join(timeout=5)
+    check("reader thread exits after cancel", not reader.is_alive())
+
+    deadline = time.monotonic() + scenario.get("settle_timeout_secs", 5)
+    settled = False
+    while time.monotonic() < deadline:
+        if any(row.get("kind") == "response_failed" and row.get("error_kind") == "ClientCancelled"
+               for row in proxy.usage_events()):
+            settled = True
+            break
+        time.sleep(0.05)
+    check("ClientCancelled row settles after the watchdog cancel", settled)
 
     print("python", sys.version)
     if failures:

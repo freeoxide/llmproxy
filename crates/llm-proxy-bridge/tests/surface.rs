@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use futures::StreamExt;
-use llm_proxy_bridge::{Bridge, ExecuteOptions};
+use llm_proxy_bridge::{Bridge, EventStream, ExecuteOptions};
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -489,6 +489,45 @@ async fn spawn_slow_sse_upstream() -> String {
     format!("http://{addr}")
 }
 
+/// Serves one SSE event, then holds the connection open for an hour before
+/// the second: a consumer past the first event is parked on a stalled
+/// upstream, the shape a watchdog `cancel()` has to break.
+async fn spawn_stalling_sse_upstream() -> String {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            let first = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_s10\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\n".to_owned();
+            let second =
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_owned();
+            let stream = futures::stream::once(async move {
+                Ok::<axum::body::Bytes, std::convert::Infallible>(axum::body::Bytes::from(
+                    first,
+                ))
+            })
+            .chain(futures::stream::once(async move {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(axum::body::Bytes::from(second))
+            }));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Body::from_stream(stream),
+            )
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::trace!(%error, "stalling upstream stopped");
+        }
+    });
+    format!("http://{addr}")
+}
+
 fn streaming_bridge(base_url: &str) -> Bridge {
     let config = json!({
         "record_usage": true,
@@ -521,7 +560,7 @@ fn stream_body() -> Value {
 async fn streaming_events_flow_and_cancellation_settles_client_cancelled() {
     let bridge = streaming_bridge(&spawn_slow_sse_upstream().await);
 
-    let mut stream = bridge
+    let stream = bridge
         .execute_stream(
             "streamco",
             "anthropic_messages",
@@ -597,7 +636,7 @@ async fn a_cancelled_bridge_stays_usable() {
     });
     let bridge = Bridge::from_json(&config).expect("bridge builds");
 
-    let mut stream = bridge
+    let stream = bridge
         .execute_stream(
             "streamco",
             "anthropic_messages",
@@ -671,7 +710,7 @@ async fn usage_events_record_the_request_lifecycle_only_when_opted_in() {
 async fn next_blocking_yields_the_same_events_off_runtime() {
     let bridge = streaming_bridge(&spawn_slow_sse_upstream().await);
 
-    let mut stream = bridge
+    let stream = bridge
         .execute_stream(
             "streamco",
             "anthropic_messages",
@@ -709,4 +748,135 @@ async fn next_blocking_yields_the_same_events_off_runtime() {
             .any(|event| event.get("MessageStop").is_some()),
         "the terminal event reaches the blocking reader"
     );
+}
+
+/// Polls the recorded usage rows until the request this stream served is
+/// settled as a client cancellation.
+async fn assert_settles_client_cancelled(bridge: &Bridge) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let cancelled = bridge.usage_events().iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("response_failed")
+                && event.get("error_kind").and_then(Value::as_str) == Some("ClientCancelled")
+        });
+        if cancelled {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ClientCancelled row must land after cancel, got: {:?}",
+            bridge.usage_events()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The watchdog pattern the bindings expose: a consumer parked in `next()`
+/// on a stalled upstream must be unblocked by a concurrent `cancel()` —
+/// which needs no exclusive access — with the request settling as
+/// `ClientCancelled`, not at the request timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_unblocks_a_pending_next_and_settles_client_cancelled() {
+    let bridge = streaming_bridge(&spawn_stalling_sse_upstream().await);
+    let stream = Arc::new(
+        bridge
+            .execute_stream(
+                "streamco",
+                "anthropic_messages",
+                &stream_body(),
+                &ExecuteOptions::default(),
+            )
+            .await
+            .expect("stream starts"),
+    );
+
+    let first = Arc::clone(&stream)
+        .next()
+        .await
+        .expect("first event arrives");
+    assert!(first.get("MessageStart").is_some(), "got: {first}");
+
+    let waiter = Arc::clone(&stream);
+    let pending = tokio::spawn(async move { waiter.next().await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !pending.is_finished(),
+        "next() is parked on the stalled upstream"
+    );
+
+    stream.cancel();
+    let resolved = tokio::time::timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("cancel unblocks the pending next")
+        .expect("the pending next joins");
+    assert!(
+        resolved.is_none(),
+        "a cancelled stream delivers no more events"
+    );
+    assert!(stream.is_cancelled());
+
+    assert_settles_client_cancelled(&bridge).await;
+}
+
+/// Drains a stream with `next_blocking` on the calling thread, forwarding
+/// each event to `tx`; `None` marks the observed end.
+fn forward_blocking(stream: &EventStream, tx: &std::sync::mpsc::Sender<Option<Value>>) {
+    loop {
+        let event = stream.next_blocking();
+        let ended = event.is_none();
+        if tx.send(event).is_err() || ended {
+            return;
+        }
+    }
+}
+
+/// The Python shape of the same pattern: a plain thread blocked in
+/// `next_blocking()` on a stalled upstream is released by `cancel()` from
+/// another thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_unblocks_a_blocked_next_blocking_reader_thread() {
+    let bridge = streaming_bridge(&spawn_stalling_sse_upstream().await);
+    let stream = Arc::new(
+        bridge
+            .execute_stream(
+                "streamco",
+                "anthropic_messages",
+                &stream_body(),
+                &ExecuteOptions::default(),
+            )
+            .await
+            .expect("stream starts"),
+    );
+
+    // The reader thread blocks in next_blocking like a Python interpreter
+    // thread, forwarding events (None marks the observed end).
+    let (tx, rx) = std::sync::mpsc::channel::<Option<Value>>();
+    let reader = {
+        let stream = Arc::clone(&stream);
+        std::thread::spawn(move || forward_blocking(&stream, &tx))
+    };
+
+    let first = rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first event reaches the reader")
+        .expect("first event present");
+    assert!(first.get("MessageStart").is_some(), "got: {first}");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the reader is parked on the stalled upstream"
+    );
+
+    stream.cancel();
+    let resolved = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("cancel unblocks the blocked reader");
+    assert!(
+        resolved.is_none(),
+        "a cancelled stream delivers no more events"
+    );
+    reader
+        .join()
+        .expect("the reader thread exits cleanly after cancel");
+
+    assert_settles_client_cancelled(&bridge).await;
 }

@@ -58,14 +58,18 @@ the engine and add no logic of their own, so they start once its API has stopped
   `llm_proxy-0.1.0-cp39-abi3-win_amd64.whl` (mingw-w64 cross-compilation),
   which is run-verified with the embeddable Windows CPython 3.13.5 under
   wine 10.0: every shared-contract case, the error shape, streaming,
-  cancellation and the `ClientCancelled` settlement pass
-  (`bindings/python/tests/windows_driver.py`). The macOS wheel is a
+  cancellation (including a watchdog `cancel()` releasing a reader thread
+  blocked in `next()` on a stalled upstream) and the `ClientCancelled`
+  settlement pass (`bindings/python/tests/windows_driver.py`). The macOS
+  wheel is a
   universal2 build produced by zig cross-compilation (`maturin build
   --zig --target universal2-apple-darwin`; zig supplies the macOS libc
   stubs, `llvm-lipo` merges the slices): structurally verified as a fat
   `x86_64 + arm64` Mach-O whose undefined `Py_*` symbols resolve from the
-  host interpreter and which links only system libraries — a run on macOS
-  hardware remains for CI.
+  host interpreter and which links only system libraries. On-macOS
+  verification runs in CI: the `bindings-macos` job builds the universal2
+  wheel on a macOS runner, pip-installs it into a fresh venv (no Rust
+  toolchain) and runs the pytest suite against the install.
 - **Node package (step 3).** `bindings/node`: napi-rs + `@napi-rs/cli`
   (`napi build --platform --release`). The native module returns structured
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
@@ -93,7 +97,10 @@ the engine and add no logic of their own, so they start once its API has stopped
   darwin-universal build produced by zig cross-compilation (`cargo zigbuild
   --target universal2-apple-darwin`): structurally verified as a fat
   `x86_64 + arm64` Mach-O whose undefined `napi_*` symbols resolve from the
-  host node at load — a run on macOS hardware remains for CI.
+  host node at load. On-macOS verification runs in CI: the `bindings-macos`
+  job builds the universal binary on a macOS runner, runs the contract
+  suite against it, and installs the packed npm tarball into a scratch
+  project (no Rust toolchain) as a load smoke test.
 - **Shared tests (step 4).** `bindings/shared/cases.json` holds the shared
   cases: the plan-02 contract fixtures (Claude Code, the Anthropic SDK, the
   OpenAI SDK, Codex — captured and synthesized; provenance in the fixture

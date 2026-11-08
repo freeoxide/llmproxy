@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -56,6 +57,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 /// The channel feeding a stream's consumer; a handful of events buffered so
 /// the upstream pipeline keeps moving while a slow consumer processes one.
@@ -531,8 +533,16 @@ impl Bridge {
         let request = engine_request(provider, decoded, options, body);
         let stream: EngineStream = self.engine.execute_stream(request).await?;
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
-        self.runtime.spawn(pump_events(stream, tx));
-        Ok(EventStream { rx: Some(rx) })
+        let cancel = Arc::new(StreamCancel::default());
+        self.runtime
+            .spawn(pump_events(stream, tx, Arc::clone(&cancel)));
+        Ok(EventStream {
+            consumer: tokio::sync::Mutex::new(ConsumerEnd {
+                rx,
+                wake: cancel.wake.subscribe(),
+            }),
+            cancel,
+        })
     }
 
     /// Translate a request between wire dialects with no I/O: the client
@@ -612,7 +622,16 @@ impl Bridge {
         };
         sink.snapshot()
             .into_iter()
-            .filter_map(|event| serde_json::to_value(event).ok())
+            .filter_map(|event| match serde_json::to_value(&event) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "usage event could not be serialized for the binding surface"
+                    );
+                    None
+                }
+            })
             .collect()
     }
 
@@ -725,76 +744,181 @@ fn embedded_server_config() -> ServerConfig {
     }
 }
 
-/// Forwards the engine's events into the consumer channel. When the
-/// consumer goes away (cancel or drop) the engine stream is dropped here,
-/// which is what records the `ClientCancelled` settlement.
-async fn pump_events(stream: EngineStream, tx: mpsc::Sender<Value>) {
+/// Forwards the engine's events into the consumer channel until the stream
+/// ends, the consumer goes away (its receiver drops) or the consumer
+/// cancels. Returning drops the engine stream here, which is what records
+/// the `ClientCancelled` settlement on the cancel and drop paths.
+async fn pump_events(stream: EngineStream, tx: mpsc::Sender<Value>, cancel: Arc<StreamCancel>) {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let mut wake = cancel.wake.subscribe();
     let EngineStream { head, tail } = stream;
     let mut tail = tail;
     for event in head {
-        if !send_event(&tx, &event).await {
+        if !send_event(&cancel, &mut wake, &tx, &event).await {
             return;
         }
     }
-    while let Some(event) = tail.next().await {
-        if !send_event(&tx, &event).await {
+    loop {
+        if cancel.is_cancelled() {
             return;
+        }
+        tokio::select! {
+            biased;
+            changed = wake.changed() => {
+                // The sender cannot drop while this task holds its Arc.
+                if changed.is_err() || cancel.is_cancelled() {
+                    return;
+                }
+            }
+            event = tail.next() => match event {
+                Some(event) => {
+                    if !send_event(&cancel, &mut wake, &tx, &event).await {
+                        return;
+                    }
+                }
+                None => return,
+            },
         }
     }
 }
 
-async fn send_event(tx: &mpsc::Sender<Value>, event: &CoreEvent) -> bool {
-    match serde_json::to_value(event) {
-        Ok(value) => tx.send(value).await.is_ok(),
+async fn send_event(
+    cancel: &StreamCancel,
+    wake: &mut watch::Receiver<bool>,
+    tx: &mpsc::Sender<Value>,
+    event: &CoreEvent,
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    let value = match serde_json::to_value(event) {
+        Ok(value) => value,
         Err(error) => {
             tracing::warn!(%error, "core event could not be serialized for the binding stream");
-            true
+            return true;
         }
+    };
+    tokio::select! {
+        biased;
+        changed = wake.changed() => changed.is_ok() && !cancel.is_cancelled(),
+        sent = tx.send(value) => sent.is_ok(),
     }
+}
+
+/// Cancellation state shared between an [`EventStream`] and the pump task
+/// feeding it. The flag is the decision; the `watch` channel is the wakeup,
+/// and it is level-triggered (a cancel that lands between a flag check and
+/// the `changed()` registration still fires) so a cancel can never be lost
+/// to a race.
+#[derive(Debug, Default)]
+struct StreamCancel {
+    cancelled: AtomicBool,
+    wake: watch::Sender<bool>,
+}
+
+impl StreamCancel {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// The consumer side of a stream's channel, plus its private wakeup feed.
+/// Guarded by one mutex so sequential `next` callers cannot interleave
+/// reads; `cancel` never takes this lock.
+struct ConsumerEnd {
+    rx: mpsc::Receiver<Value>,
+    wake: watch::Receiver<bool>,
 }
 
 /// A streaming response as an iterator of JSON events. Dropping it, or
-/// calling [`EventStream::cancel`], cancels the upstream request; the
-/// engine then settles it as `ClientCancelled`.
+/// calling [`EventStream::cancel`], cancels the upstream request; the engine
+/// then settles it as `ClientCancelled`.
+///
+/// Every method takes `&self`, so a cancel from any thread (a watchdog, a
+/// Python thread) works while another thread is blocked in
+/// [`EventStream::next`] or [`EventStream::next_blocking`].
 pub struct EventStream {
-    rx: Option<mpsc::Receiver<Value>>,
+    consumer: tokio::sync::Mutex<ConsumerEnd>,
+    cancel: Arc<StreamCancel>,
 }
 
 impl std::fmt::Debug for EventStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EventStream")
-            .field("cancelled", &self.rx.is_none())
+            .field("cancelled", &self.cancel.is_cancelled())
             .finish()
     }
 }
 
 impl EventStream {
     /// The next event, or `None` once the stream has ended or been
-    /// cancelled.
-    pub async fn next(&mut self) -> Option<Value> {
-        self.rx.as_mut()?.recv().await
+    /// cancelled. A concurrent [`EventStream::cancel`] unblocks a pending
+    /// call; sequential callers are serialized.
+    pub async fn next(&self) -> Option<Value> {
+        let mut consumer = self.consumer.lock().await;
+        let ConsumerEnd { rx, wake } = &mut *consumer;
+        loop {
+            if self.cancel.is_cancelled() {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                changed = wake.changed() => {
+                    // The sender cannot drop while this stream holds it.
+                    if changed.is_err() {
+                        return None;
+                    }
+                }
+                event = rx.recv() => {
+                    return match event {
+                        // An event that raced with a cancel is not delivered.
+                        Some(event) if !self.cancel.is_cancelled() => Some(event),
+                        _ => None,
+                    };
+                }
+            }
+        }
     }
 
     /// The blocking form of [`EventStream::next`], for language runtimes
     /// without an event loop. Must be called from a thread that is not a
-    /// tokio worker.
+    /// tokio worker. A concurrent [`EventStream::cancel`] unblocks a pending
+    /// call: cancelling stops the pump task, which closes the channel.
     ///
     /// # Panics
     ///
     /// Panics if called from within a tokio runtime worker thread.
-    pub fn next_blocking(&mut self) -> Option<Value> {
-        self.rx.as_mut()?.blocking_recv()
+    pub fn next_blocking(&self) -> Option<Value> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let mut consumer = self.consumer.blocking_lock();
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        match consumer.rx.blocking_recv() {
+            // An event that raced with a cancel is not delivered.
+            Some(event) if !self.cancel.is_cancelled() => Some(event),
+            _ => None,
+        }
     }
 
     /// Cancel the stream: stop delivering events and settle the request as
-    /// `ClientCancelled`. Idempotent.
-    pub fn cancel(&mut self) {
-        self.rx = None;
+    /// `ClientCancelled`. Idempotent, and safe to call while another thread
+    /// is blocked waiting for an event.
+    pub fn cancel(&self) {
+        self.cancel.cancelled.store(true, Ordering::Release);
+        // Infallible (a `watch` send needs no receiver) and level-triggered,
+        // so both the pump and any pending consumer observe the cancel even
+        // if they have not registered a waiter yet.
+        self.cancel.wake.send_replace(true);
     }
 
     /// Whether this stream has been cancelled (not merely ended).
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.rx.is_none()
+        self.cancel.is_cancelled()
     }
 }

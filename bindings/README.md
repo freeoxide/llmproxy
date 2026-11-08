@@ -18,5 +18,5 @@ with the official Windows node.exe and embeddable CPython (the full Node
 contract suite and the Python driver both pass; see the package READMEs);
 the Node package also carries an msvc binary (cargo-xwin), verified the same
 way. macOS artifacts are produced by zig cross-compilation (universal2 for
-both packages) and verified structurally; a run on macOS hardware remains
-for CI.
+both packages) and verified structurally; on-macOS install and contract
+runs happen in CI (the `bindings-macos` job).

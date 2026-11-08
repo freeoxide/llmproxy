@@ -165,7 +165,7 @@ fn error_value(error: &BridgeError) -> Value {
     })
 }
 
-async fn drain(stream: &mut EventStream) -> Vec<Value> {
+async fn drain(stream: &EventStream) -> Vec<Value> {
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event);
@@ -217,7 +217,7 @@ async fn run_case(shared: &Value, case: &Value) -> Value {
             .execute_stream(provider_name, dialect, &body, &options)
             .await
         {
-            Ok(mut stream) => Ok(drain(&mut stream).await),
+            Ok(stream) => Ok(drain(&stream).await),
             Err(error) => Err(error),
         }
     } else {
@@ -420,7 +420,7 @@ async fn cancellation_settles_client_cancelled_and_the_bridge_stays_usable() {
         .and_then(Value::as_str)
         .expect("dialect");
 
-    let mut stream = bridge
+    let stream = bridge
         .execute_stream(
             stream_provider,
             dialect,

@@ -64,7 +64,9 @@ class CannedUpstream {
           res.write(events[index]);
           index += 1;
           if (this.gapMs) {
-            setTimeout(sendNext, this.gapMs);
+            // unref'd so a multi-minute stall (a watchdog-cancel test) does
+            // not keep the test process alive after the suite finishes.
+            setTimeout(sendNext, this.gapMs).unref();
           } else {
             sendNext();
           }
@@ -309,6 +311,81 @@ test('cancellation stops delivery and settles ClientCancelled', async () => {
       }
       if (Date.now() > deadline) {
         assert.fail(`the ClientCancelled row must land after cancel: ${JSON.stringify(rows)}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    const followup = await proxy.execute(scenario.followup_provider, scenario.dialect, {
+      model: 'claude-sonnet-4-5',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'again' }],
+    });
+    assert.ok('id' in followup);
+  } finally {
+    sse.stop();
+    jsonUpstream.stop();
+  }
+});
+
+// The watchdog shape: while a next() call is parked on a stalled upstream
+// (one SSE event, then nothing for an hour), cancel() must return promptly,
+// unblock the pending next() with null and settle ClientCancelled — not
+// wait out the 300 s request timeout.
+test('cancel unblocks a pending next on a stalled upstream', async () => {
+  const scenario = shared.cancellation;
+  const sse = await startUpstream(
+    shared.upstream_responses[scenario.upstream_response],
+    3_600_000
+  );
+  const jsonUpstream = await startUpstream(shared.upstream_responses.anthropic_json);
+  try {
+    const proxy = new Proxy({
+      record_usage: true,
+      providers: [
+        providerFor(scenario.stream_provider, sse.baseUrl),
+        providerFor(scenario.followup_provider, jsonUpstream.baseUrl),
+      ],
+    });
+
+    const stream = await proxy.executeStream(
+      scenario.stream_provider,
+      scenario.dialect,
+      scenario.request
+    );
+    const iterator = stream[Symbol.asyncIterator]();
+    const first = await iterator.next();
+    assert.ok(!first.done);
+    assert.ok('MessageStart' in first.value);
+
+    // Park a next() on the stalled upstream, then cancel from a watchdog
+    // timer, exactly as a consumer with a timeout would.
+    const pending = stream.next();
+    const cancelDeadline = Date.now() + 5_000;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    await stream.cancel();
+    assert.ok(Date.now() < cancelDeadline, 'cancel() returns while next() is pending');
+    assert.ok(stream.cancelled);
+
+    const settled = await Promise.race([
+      pending.then((event) => ({ event })),
+      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 5_000)),
+    ]);
+    assert.ok(!settled.timeout, 'the pending next() resolves after cancel');
+    assert.equal(settled.event, null, 'the cancelled stream delivers no more events');
+
+    const deadline = Date.now() + (scenario.settle_timeout_secs || 5) * 1000;
+    for (;;) {
+      const rows = proxy.usageEvents();
+      const cancelled = rows.some(
+        (row) => row.kind === 'response_failed' && row.error_kind === 'ClientCancelled'
+      );
+      if (cancelled) {
+        break;
+      }
+      if (Date.now() > deadline) {
+        assert.fail(
+          `the ClientCancelled row must land after cancel: ${JSON.stringify(rows)}`
+        );
       }
       await new Promise((resolve) => setTimeout(resolve, 50));
     }

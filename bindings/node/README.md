@@ -55,7 +55,10 @@ copied under its loader name (zig supplies the macOS libc stubs; `llvm-lipo`
 as `lipo` merges the x86_64 and arm64 slices). Statically verified: a fat
 `x86_64 + arm64` Mach-O whose undefined `napi_*` symbols resolve from the
 host node at load (`-undefined dynamic_lookup`) and which links only system
-libraries. A run on macOS hardware remains for CI.
+libraries. macOS runs happen in CI: the `bindings-macos` job builds the
+universal binary on a macOS runner, runs the full contract suite against it
+and installs the packed tarball into a scratch project with no Rust
+toolchain.
 
 ## Use
 

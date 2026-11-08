@@ -27,8 +27,10 @@ every shared-contract case, the error shape, streaming, cancellation and the
 ClientCancelled settlement pass (see `tests/windows_driver.py`). The macOS
 wheel's extension is a fat `x86_64 + arm64` Mach-O whose undefined `Py_*`
 symbols resolve from the host interpreter and which links only system
-libraries (`libSystem`, `libiconv`, `libcharset`); a run on macOS hardware
-remains for CI. The abi3 wheels support CPython 3.9+.
+libraries (`libSystem`, `libiconv`, `libcharset`). macOS runs happen in CI:
+the `bindings-macos` job builds the universal2 wheel on a macOS runner,
+pip-installs it into a fresh venv (no Rust toolchain) and runs the full
+pytest suite against the install. The abi3 wheels support CPython 3.9+.
 
 ## Use
 
