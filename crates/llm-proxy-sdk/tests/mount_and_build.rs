@@ -7,11 +7,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "server")]
 use axum::Router;
+#[cfg(feature = "server")]
 use axum::body::Body;
+#[cfg(feature = "server")]
 use axum::http::{Request, StatusCode};
+#[cfg(feature = "server")]
 use axum::routing::get;
 use llm_proxy_sdk::prelude::*;
+#[cfg(feature = "server")]
 use tower::ServiceExt;
 
 fn app_config() -> core::AppConfig {
@@ -45,6 +50,7 @@ fn app_config() -> core::AppConfig {
     }
 }
 
+#[cfg(feature = "server")]
 fn state() -> AppState {
     let registry = core::ProviderRegistry::from_providers(vec![]).expect("empty registry");
     AppState::new(
@@ -61,6 +67,7 @@ fn state() -> AppState {
     )
 }
 
+#[cfg(feature = "server")]
 #[tokio::test]
 async fn an_axum_app_mounts_the_proxy_router_next_to_its_own_routes() {
     // A host application with its own routes merges the proxy router in.

@@ -29,6 +29,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features
 
+      # The SDK's documented server-less embedding configuration
+      # (`--no-default-features`): its test targets must compile there too.
+      - name: SDK without default features
+        run: cargo test -p llm-proxy-sdk --no-default-features --locked
+
       - name: Locked build
         run: cargo build --locked
 

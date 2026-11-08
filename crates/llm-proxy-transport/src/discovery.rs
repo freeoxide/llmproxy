@@ -113,6 +113,11 @@ impl DiscoveryClient {
         self.send_once(self.http.get(url), max_bytes).await
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the retry loop below runs at least once and every `continue` stores the \
+                  error, so `last_error` is always Some at the tail expression"
+    )]
     async fn fetch_page(
         &self,
         provider: &ProviderConfig,

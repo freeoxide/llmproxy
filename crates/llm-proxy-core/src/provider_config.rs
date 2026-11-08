@@ -2216,6 +2216,11 @@ fn validate_name(name: &str) -> Result<(), ConfigValidationError> {
         return Err(ConfigValidationError::EmptyProviderName);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the pattern is a compile-time-constant regex literal; a failure is a \
+                  programming error caught the moment this static is first used"
+    )]
     static PROVIDER_NAME_SLUG: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"^[a-z0-9_-]{1,64}$").expect("valid provider name slug regex")
     });

@@ -654,6 +654,54 @@ mod tests {
         format!("http://{addr}/v1/messages")
     }
 
+    async fn spawn_mock_anthropic_reset_before_terminal_stream() -> String {
+        use futures::StreamExt;
+
+        // A stream that starts delivering content, then dies on a transport
+        // error before any terminal event: the post-commit failure path with
+        // no decoder terminal behind it.
+        let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            let events: Vec<Result<Event, std::io::Error>> = vec![
+                Ok(Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_cut2","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#)),
+                Ok(Event::default()
+                    .event("content_block_start")
+                    .data(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#)),
+                Ok(Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#)),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "upstream connection reset before terminal",
+                )),
+            ];
+            // Yield before the error so the server flushes the frames above
+            // first; without this the whole body sits in the write buffer
+            // and the abort loses it all.
+            let stream = futures::stream::iter(events).then(|item| async move {
+                if item.is_err() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                item
+            });
+            let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.into_response(),
+            )
+        }),
+    );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{addr}/v1/messages")
+    }
+
     async fn spawn_mock_with_request_tracker(response_body: Vec<u8>) -> (String, Arc<AtomicBool>) {
         let received = Arc::new(AtomicBool::new(false));
         let received_clone = Arc::clone(&received);
@@ -2508,6 +2556,38 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
             "a transport error after the terminal must be recorded as a failure: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_commit_failure_emits_exactly_one_error_event() {
+        // A transport error after the stream committed already crosses to
+        // the client in-band; the missing-terminal backstop must not append
+        // a second (truncation) error event on top of it.
+        let mock_url = spawn_mock_anthropic_reset_before_terminal_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", true);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            text.contains("partial"),
+            "content before the failure must have been delivered: {text}"
+        );
+        assert_eq!(
+            text.matches("event: error").count(),
+            1,
+            "exactly one terminal error event must cross, got: {text}"
+        );
+        assert!(
+            text.contains("event: message_stop"),
+            "the synthetic terminal must still close the stream: {text}"
         );
     }
 

@@ -184,6 +184,122 @@ async fn rate_windows_are_shared_across_instances() {
     }
 }
 
+fn claim_with_tokens<'a>(
+    caller: &'a str,
+    input: u64,
+    max_output: Option<u64>,
+) -> AdmissionClaim<'a> {
+    AdmissionClaim {
+        caller,
+        provider: "p",
+        member: "p",
+        model: "m",
+        requested_model: "m",
+        body_hash: "h",
+        estimated_input_tokens: input,
+        max_output_tokens: max_output,
+    }
+}
+
+#[tokio::test]
+async fn a_tpm_refusal_rolls_back_the_request_counts_it_already_committed() {
+    // "A refusal leaves no counter behind" (the backend's contract): the
+    // tpm check refuses after the rpm and rpd increments committed, so a
+    // budget-busting token demand must not also consume a request slot —
+    // or every refused request would inflate rpm and rpd until the client
+    // sees spurious 429s.
+    let server = TestRedis::start();
+    let store = RedisStore::connect(&server.url(), "test")
+        .await
+        .expect("connect");
+    let keys = HashMap::from([(
+        "key".to_owned(),
+        KeyPolicy {
+            limits: KeyWindowLimits {
+                rpm: Some(2),
+                tpm: Some(100),
+                rpd: Some(1_000),
+            },
+            ..KeyPolicy::default()
+        },
+    )]);
+    let admission = replica_admission(keys, pricing(), HashMap::new(), store);
+
+    match admission
+        .reserve(&claim_with_tokens("key", 500, Some(500)))
+        .await
+    {
+        Err(llm_proxy_engine::EngineError::RateLimited { message, .. }) => {
+            assert!(message.contains("tpm"), "got {message}");
+        }
+        other => panic!("the oversized token demand must refuse on tpm, got {other:?}"),
+    }
+    admission
+        .reserve(&claim_with_tokens("key", 10, None))
+        .await
+        .expect("the refusal must not have counted as an admitted request (1/2 rpm)");
+    admission
+        .reserve(&claim_with_tokens("key", 10, None))
+        .await
+        .expect("the second counted request still fits (2/2 rpm)");
+    match admission.reserve(&claim_with_tokens("key", 10, None)).await {
+        Err(llm_proxy_engine::EngineError::RateLimited { message, .. }) => {
+            assert!(message.contains("rpm"), "got {message}");
+        }
+        other => panic!("only the two admitted requests may count against rpm, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_budget_refusal_rolls_back_the_window_counts_it_already_committed() {
+    // Same contract one check later: a budget-exhausted request refuses
+    // after rpm, rpd and the tpm reservation committed, and none of them
+    // may stay — budget-exhausted callers must not also burn their rate
+    // windows or hold token reservations for the rest of the minute.
+    let server = TestRedis::start();
+    let store = RedisStore::connect(&server.url(), "test")
+        .await
+        .expect("connect");
+    let keys = HashMap::from([(
+        "key".to_owned(),
+        KeyPolicy {
+            limits: KeyWindowLimits {
+                rpm: Some(1),
+                tpm: Some(10_000),
+                rpd: None,
+            },
+            budget: Some(KeyBudgetConfig {
+                usd_per_day: "0.5".parse().expect("decimal"),
+                unestimatable: UnestimatableCostPolicy::Reject,
+                assumed_max_output_tokens: 100,
+            }),
+            ..KeyPolicy::default()
+        },
+    )]);
+    let admission = replica_admission(keys, pricing(), HashMap::new(), store);
+
+    // 500 in + 500 out at 0.001/0.001 per token estimates 1 USD against a
+    // 0.5 USD budget: the budget check refuses; a 10-token demand with the
+    // assumed 100-token output (0.11 USD) still fits it.
+    match admission
+        .reserve(&claim_with_tokens("key", 500, Some(500)))
+        .await
+    {
+        Err(llm_proxy_engine::EngineError::BudgetExhausted { .. }) => {}
+        other => panic!("the unaffordable demand must refuse on budget, got {other:?}"),
+    }
+    admission
+        .reserve(&claim_with_tokens("key", 10, None))
+        .await
+        .expect("the refusal must not have consumed the only rpm slot");
+    match admission.reserve(&claim_with_tokens("key", 10, None)).await {
+        Err(llm_proxy_engine::EngineError::RateLimited { message, .. }) => {
+            assert!(message.contains("rpm"), "got {message}");
+        }
+        other => panic!("the second affordable request must refuse on rpm alone, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn concurrency_caps_are_shared_and_released_by_settlement() {
     let server = TestRedis::start();

@@ -300,6 +300,54 @@ pub struct AdmissionTicket {
     pub caller: Option<String>,
 }
 
+/// Releases a reservation whose holder was dropped before settling: the
+/// drop backstop of [`Admission::reserve`]. A non-streaming request holds
+/// its ticket inside the handler future, so a client disconnect or a
+/// per-family timeout that drops that future mid-ladder would otherwise
+/// leave the lease unsettled forever — its in-flight slot held, its budget
+/// reservation kept. Hold this next to every reserve, and [`Self::disarm`]
+/// on each path that settles explicitly; the drop then settles as failed
+/// (no usage, no charge), exactly like the streaming supervisor does for a
+/// task that never completed.
+#[derive(Debug)]
+pub struct UnsettledLeaseGuard {
+    admission: Option<Arc<dyn Admission>>,
+    ticket: AdmissionTicket,
+}
+
+impl UnsettledLeaseGuard {
+    /// Arms the backstop for `ticket`. Keep the guard alive for as long as
+    /// the future that owns the reservation.
+    pub fn new(admission: Arc<dyn Admission>, ticket: &AdmissionTicket) -> Self {
+        Self {
+            admission: Some(admission),
+            ticket: ticket.clone(),
+        }
+    }
+
+    /// Cancels the backstop: an explicit settlement has run (or is about
+    /// to, with no await in between), so dropping the guard must not settle
+    /// a second time.
+    pub fn disarm(&mut self) {
+        self.admission = None;
+    }
+}
+
+impl Drop for UnsettledLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(admission) = self.admission.take() {
+            admission.settle(
+                &self.ticket,
+                &AdmissionOutcome {
+                    succeeded: false,
+                    usage: None,
+                    cost: None,
+                },
+            );
+        }
+    }
+}
+
 /// The outcome handed back at settlement.
 #[derive(Debug)]
 pub struct AdmissionOutcome<'a> {

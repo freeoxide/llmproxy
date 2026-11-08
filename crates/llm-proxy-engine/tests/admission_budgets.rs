@@ -447,6 +447,63 @@ async fn a_saturated_concurrency_cap_answers_503_and_frees_on_completion() {
         .expect("the slot freed at settlement");
 }
 
+#[tokio::test]
+async fn a_request_dropped_mid_ladder_releases_its_in_flight_slot() {
+    // A client disconnect (or the per-family timeout) drops the non-streaming
+    // handler future between reserve and settle. That drop must release the
+    // concurrency slot, or a cap of `n` leaked leases answers 503 forever.
+    let release = Arc::new(tokio::sync::watch::Sender::new(false));
+    let arrivals = Arc::new(AtomicUsize::new(0));
+    let endpoint = spawn_upstream(upstream_held_counting(
+        Arc::new(release.subscribe()),
+        Arc::clone(&arrivals),
+    ))
+    .await;
+    let registry = ProviderRegistry::from_providers(vec![provider(
+        endpoint,
+        Some(llm_proxy_core::ProviderConcurrencyConfig {
+            total: Some(1),
+            models: HashMap::new(),
+        }),
+    )])
+    .expect("registry");
+    let admission = Arc::new(PolicyAdmission::from_config(
+        &llm_proxy_core::AuthConfig::default(),
+        &registry,
+    ));
+    let engine = EngineBuilder::new(test_config())
+        .providers(Arc::new(registry))
+        .event_bus(Arc::new(RecordingBus::new()) as Arc<dyn EventBus>)
+        .admission(Arc::clone(&admission) as Arc<dyn Admission>)
+        .build()
+        .expect("engine");
+
+    // Park one request upstream — past reserve, holding the only slot.
+    let dropped = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .execute(engine_request("anonymous", "claude-sonnet-4-6"))
+                .await
+        }
+    });
+    await_arrivals(&arrivals, 1).await;
+    dropped.abort();
+    dropped.await.expect_err("the dropped task was aborted");
+    // Let the orphaned upstream handler finish; the slot it gated is gone
+    // with the dropped caller.
+    release.send_replace(true);
+
+    engine
+        .execute(distinct_engine_request(
+            "anonymous",
+            "claude-sonnet-4-6",
+            "after-drop",
+        ))
+        .await
+        .expect("the dropped request's slot must be released, not leaked");
+}
+
 /// A held upstream that counts arrivals before parking, so a test can wait
 /// until a request is genuinely in flight there (holding its slot).
 fn upstream_held_counting(

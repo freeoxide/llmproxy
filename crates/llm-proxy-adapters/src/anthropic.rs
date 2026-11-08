@@ -21,11 +21,21 @@ use crate::sse::SseFrame;
 const ANTHROPIC_DEFAULT_MAX_TOKENS: i32 = 4096;
 
 #[inline]
+#[expect(
+    clippy::expect_used,
+    reason = "every caller passes a json! {{...}} literal, which is always an object; the \
+              invariant is local to this module's call sites"
+)]
 fn json_object(val: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
     val.as_object_mut()
         .expect("json! macro with {{...}} always produces a JSON object")
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
+              error caught the moment this static is first used, not a runtime input"
+)]
 static INVALID_TOOL_USE_ID_CHAR: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex"));
 
@@ -42,6 +52,10 @@ fn sanitize_tool_name(name: &str) -> (String, bool) {
         } else {
             let mut buf = [0u8; 4];
             let encoded = ch.encode_utf8(&mut buf);
+            #[expect(
+                clippy::expect_used,
+                reason = "writing into a String cannot fail (no formatter errors on a String)"
+            )]
             for &byte in encoded.as_bytes() {
                 write!(result, "_0x{:02x}_", byte).expect("write! to String is infallible");
             }

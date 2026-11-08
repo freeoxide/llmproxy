@@ -37,7 +37,8 @@ use crate::error::{AuthOwner, EngineError, map_provider_error, sanitize_upstream
 use crate::headers::select_forwarded_headers;
 use crate::traits::{
     AdmissionOutcome, AdmissionTicket, CacheEntry, CacheKey, CredentialFeedback, CredentialPick,
-    CredentialQuery, GuardDecision, ResolvedTarget, RoutePlan, RouteQuery, UsageSink,
+    CredentialQuery, GuardDecision, ResolvedTarget, RoutePlan, RouteQuery, UnsettledLeaseGuard,
+    UsageSink,
 };
 use crate::types::{ClientDialect, EngineRequest, EngineResponse, EngineStream};
 use crate::{EngineInner, ProviderAdapterTarget};
@@ -1099,9 +1100,17 @@ async fn run_once_attempt(
             return Err(error);
         }
     };
+    // The reservation lives inside this future: a drop before settlement
+    // (client disconnect, per-family timeout mid-ladder) must release the
+    // lease, not hold its slot and budget forever. Disarmed on both paths
+    // below, which settle explicitly.
+    let mut settle_guard = UnsettledLeaseGuard::new(Arc::clone(&inner.admission), &ticket);
 
     match run_ladder_once(inner, req, plan, &ticket, &cache_key).await {
         Ok(response) => {
+            // run_ladder_once settled on success (slot 13) before
+            // returning; dropping here must not settle twice.
+            settle_guard.disarm();
             if let Some(lead) = lead {
                 lead.publish(Ok(response.clone()));
             }
@@ -1114,6 +1123,7 @@ async fn run_once_attempt(
             Ok(response)
         }
         Err(failure) => {
+            settle_guard.disarm();
             settle(
                 inner,
                 &ticket,
@@ -2835,10 +2845,13 @@ async fn stream_committed(
             ));
         }
     }
-    if !ctx.decoder.saw_terminal() {
+    if !ctx.decoder.saw_terminal() && failure.is_none() {
         // The upstream ended without a terminal event: keep valid client
         // framing (synthetic terminal below) but mark the failure in-band
-        // and in the ledger.
+        // and in the ledger. Only when no in-band failure was already
+        // emitted — a framing, decode or transport error already crossed to
+        // the client, and a second terminal error event would duplicate it
+        // (the synthetic MessageStop below still keeps the framing valid).
         let error = EngineError::ProviderDecode(TRUNCATED_STREAM_MESSAGE.to_owned());
         failure = Some(error.clone());
         inner.metrics.record_failure();

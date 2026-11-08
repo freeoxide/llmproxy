@@ -274,6 +274,12 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
         Ok(ticket) => ticket,
         Err(error) => return family_error(state.event_bus(), &ctx, &RouteError::from(error)),
     };
+    // The reservation lives inside this handler future: a drop while the
+    // upstream call runs (client disconnect, the family timeout) must
+    // release the lease. `account` settles in both arms without suspending,
+    // so the guard disarms right before it.
+    let mut settle_guard =
+        llm_proxy_engine::UnsettledLeaseGuard::new(Arc::clone(&admission), &ticket);
 
     // Forward on the provider's own transport (its `[provider.egress]`
     // client when it has one) and account.
@@ -286,6 +292,7 @@ async fn run_family(state: &AppState, meta: &RequestMeta, call: FamilyCall<'_>) 
     };
     let client = engine.transport().client_for(&target.provider_name);
     let upstream = forward(client, &target, api_key, outbound).await;
+    settle_guard.disarm();
     account(
         state,
         admission.as_ref(),

@@ -71,6 +71,11 @@ fn truncate_with_suffix(s: &str, max_len: usize, suffix: &str) -> String {
     llm_proxy_protocol::util::truncate_with_suffix(s, max_len, suffix)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "every pattern is a compile-time-constant regex literal; a failure is a programming \
+              error caught the moment this static is first used, not a runtime input"
+)]
 static REDACTION_PATTERNS: std::sync::LazyLock<Vec<regex::Regex>> =
     std::sync::LazyLock::new(|| {
         const C: &str = r"A-Za-z0-9_.\-/+=";

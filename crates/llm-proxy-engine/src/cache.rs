@@ -82,6 +82,35 @@ impl MemoryCache {
     fn expired(&self, stored_at: Instant) -> bool {
         stored_at.elapsed() >= self.ttl
     }
+
+    /// Drops expired entries and their order slots, and reclaims superseded
+    /// slots. Stored-at times are non-decreasing along the queue (a re-stored
+    /// identity re-enqueues at the back with a fresh clock), so every expired
+    /// entry sits at the front: without this sweep the queue would keep one
+    /// dead slot per expired identity and grow without bound under churn.
+    fn sweep_expired(&self, table: &mut CacheTable) {
+        while let Some((identity, generation)) = table.order.front().cloned() {
+            let current = table.entries.get(&identity).map(|(_, _, live)| *live);
+            match current {
+                Some(live) if live == generation => {
+                    let expired = table
+                        .entries
+                        .get(&identity)
+                        .is_some_and(|(_, stored_at, _)| self.expired(*stored_at));
+                    if !expired {
+                        break;
+                    }
+                    table.entries.remove(&identity);
+                    table.order.pop_front();
+                }
+                // A superseded slot: its identity was re-stored under a newer
+                // generation (or removed); the slot alone goes.
+                _ => {
+                    table.order.pop_front();
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -89,10 +118,13 @@ impl Cache for MemoryCache {
     async fn lookup(&self, key: &CacheKey<'_>) -> Result<Option<CacheEntry>, EngineError> {
         let identity = CacheIdentity::from_key(key);
         let mut table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sweep_expired(&mut table);
         match table.entries.get(&identity) {
             Some((entry, stored_at, _)) if !self.expired(*stored_at) => Ok(Some(entry.clone())),
+            // Unreachable after the sweep (every remaining entry is live);
+            // kept so an expired hit can never be served even if that
+            // invariant changes.
             Some(_) => {
-                // Expired: drop it so the capacity bound counts live entries.
                 table.entries.remove(&identity);
                 Ok(None)
             }
@@ -103,6 +135,7 @@ impl Cache for MemoryCache {
     async fn store(&self, key: &CacheKey<'_>, entry: &CacheEntry) {
         let identity = CacheIdentity::from_key(key);
         let mut table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.sweep_expired(&mut table);
         let generation = table.next_generation;
         table.next_generation += 1;
         table.entries.insert(
@@ -748,6 +781,81 @@ impl IdempotencyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use llm_proxy_protocol::core::{CoreRequest, CoreResponse};
+
+    fn plain_request() -> CoreRequest {
+        CoreRequest {
+            model: llm_proxy_protocol::core::ModelRef {
+                requested: "m".to_owned(),
+                upstream: None,
+            },
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: None,
+            sampling: Default::default(),
+            stream: false,
+            metadata: Default::default(),
+            provider_hints: Default::default(),
+        }
+    }
+
+    fn cache_key<'a>(body_hash: &'a str, request: &'a CoreRequest) -> CacheKey<'a> {
+        CacheKey {
+            caller: "caller-a",
+            provider: "prov",
+            route_kind: ProviderRouteKind::Messages,
+            model: "m",
+            body_hash,
+            streaming: false,
+            request,
+        }
+    }
+
+    fn empty_entry() -> CacheEntry {
+        CacheEntry {
+            response: CoreResponse {
+                id: None,
+                model: llm_proxy_protocol::core::ModelRef {
+                    requested: "m".to_owned(),
+                    upstream: None,
+                },
+                content: Vec::new(),
+                stop_reason: llm_proxy_protocol::core::StopReason::EndTurn,
+                stop_sequence: None,
+                usage: Default::default(),
+                provider_meta: serde_json::Map::new(),
+                cost: None,
+            },
+            events: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_entries_do_not_leave_dead_queue_slots_behind() {
+        // Distinct bodies churn the cache below its capacity bound and age
+        // past the TTL: the queue must be reclaimed with the entries, not
+        // accumulate one dead slot per expired identity (an unbounded leak
+        // in the long-running daemon).
+        let cache = MemoryCache::new(Duration::from_millis(30), 64);
+        let request = plain_request();
+        for i in 0..32 {
+            let body_hash = format!("hash-{i}");
+            cache
+                .store(&cache_key(&body_hash, &request), &empty_entry())
+                .await;
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        let hit = cache.lookup(&cache_key("hash-0", &request)).await;
+        assert!(matches!(hit, Ok(None)), "every stored entry is expired");
+        let table = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            table.order.len(),
+            table.entries.len(),
+            "every queue slot must map to a live entry after expiry churn"
+        );
+        assert_eq!(table.entries.len(), 0, "nothing live remains");
+    }
 
     fn matched(provider: &str, route_kind: ProviderRouteKind, body: &str) -> IdemMatch {
         IdemMatch {

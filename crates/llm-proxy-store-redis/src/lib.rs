@@ -166,6 +166,29 @@ fn store_error(error: &redis::RedisError) -> EngineError {
     EngineError::Internal(format!("admission store: {error}"))
 }
 
+/// Which committed increments a refused admission must still roll back.
+/// Every refusal first undoes its own check's increment inline; this
+/// releases the counters the checks *before* it committed, so a refusal
+/// leaves no counter behind.
+#[derive(Clone, Copy, Default)]
+struct CommittedWindows {
+    rpm: bool,
+    rpd: bool,
+    tpm: bool,
+    reserved_usd: bool,
+}
+
+impl CommittedWindows {
+    /// Everything `admit_windows` commits on success — what a concurrency
+    /// refusal after the window checks must roll back.
+    const ALL: Self = Self {
+        rpm: true,
+        rpd: true,
+        tpm: true,
+        reserved_usd: true,
+    };
+}
+
 /// The Redis-backed [`AdmissionBackend`]: windows, budgets, concurrency
 /// caps and leases held in the shared store.
 #[derive(Debug, Clone)]
@@ -330,6 +353,16 @@ impl RedisAdmissionBackend {
                         .decr(&key, 1)
                         .await
                         .map_err(|error| store_error(&error))?;
+                    // The rpm increment above was already committed.
+                    self.rollback_windows(
+                        conn,
+                        demand,
+                        CommittedWindows {
+                            rpm: true,
+                            ..CommittedWindows::default()
+                        },
+                    )
+                    .await;
                     return Err(rate_limited(
                         format!("rpd limit {rpd} reached for this key"),
                         until_next_day(demand.now),
@@ -352,6 +385,17 @@ impl RedisAdmissionBackend {
                         .decr(&key, demand.reserved_tokens as i64)
                         .await
                         .map_err(|error| store_error(&error))?;
+                    // The rpm and rpd increments above were already committed.
+                    self.rollback_windows(
+                        conn,
+                        demand,
+                        CommittedWindows {
+                            rpm: true,
+                            rpd: true,
+                            ..CommittedWindows::default()
+                        },
+                    )
+                    .await;
                     return Err(rate_limited(
                         format!("tpm limit {tpm} would be exceeded for this key"),
                         until_next_minute(demand.now),
@@ -393,6 +437,19 @@ impl RedisAdmissionBackend {
                     .decr(&resv, estimate)
                     .await
                     .map_err(|error| store_error(&error))?;
+                // The rpm, rpd and tpm increments from admit_windows were
+                // already committed on this connection.
+                self.rollback_windows(
+                    conn,
+                    demand,
+                    CommittedWindows {
+                        rpm: true,
+                        rpd: true,
+                        tpm: true,
+                        reserved_usd: false,
+                    },
+                )
+                .await;
                 return Err(EngineError::BudgetExhausted {
                     message: format!(
                         "daily budget of {} USD would be exceeded for this key (spent {}, \
@@ -433,7 +490,8 @@ impl RedisAdmissionBackend {
                     .decr(&key, 1)
                     .await
                     .map_err(|error| store_error(&error))?;
-                self.rollback_windows(conn, demand).await;
+                self.rollback_windows(conn, demand, CommittedWindows::ALL)
+                    .await;
                 let cap = demand.member_cap.unwrap_or(0);
                 return Err(EngineError::Overloaded {
                     message: format!(
@@ -466,7 +524,8 @@ impl RedisAdmissionBackend {
                         .await
                         .map_err(|error| store_error(&error))?;
                 }
-                self.rollback_windows(conn, demand).await;
+                self.rollback_windows(conn, demand, CommittedWindows::ALL)
+                    .await;
                 return Err(EngineError::Overloaded {
                     message: format!(
                         "model \"{}\" on \"{}\" is at its in-flight cap of {cap}",
@@ -479,16 +538,22 @@ impl RedisAdmissionBackend {
         Ok(())
     }
 
-    /// Undoes the window increments of a reservation that passed its
-    /// window checks but lost a concurrency slot.
-    async fn rollback_windows(&self, conn: &mut ConnectionManager, demand: &ReservationDemand<'_>) {
+    /// Undoes the committed increments of a refused reservation: the
+    /// checks before the refusing one (a concurrency slot, or a later
+    /// window/budget check) have already moved counters on this connection.
+    async fn rollback_windows(
+        &self,
+        conn: &mut ConnectionManager,
+        demand: &ReservationDemand<'_>,
+        parts: CommittedWindows,
+    ) {
         let caller = demand.caller;
         fn undo(result: Result<i64, redis::RedisError>) {
             if let Err(error) = result {
                 tracing::warn!(%error, "admission rollback failed");
             }
         }
-        if demand.rpm.is_some() {
+        if parts.rpm && demand.rpm.is_some() {
             let key = format!(
                 "{}:ad:rq:m:{caller}:{}",
                 self.store.prefix,
@@ -496,7 +561,7 @@ impl RedisAdmissionBackend {
             );
             undo(conn.decr(&key, 1).await);
         }
-        if demand.rpd.is_some() {
+        if parts.rpd && demand.rpd.is_some() {
             let key = format!(
                 "{}:ad:rq:d:{caller}:{}",
                 self.store.prefix,
@@ -504,11 +569,13 @@ impl RedisAdmissionBackend {
             );
             undo(conn.decr(&key, 1).await);
         }
-        if demand.tpm.is_some() && demand.reserved_tokens > 0 {
+        if parts.tpm && demand.tpm.is_some() && demand.reserved_tokens > 0 {
             let key = self.token_key(caller, unix_minute(demand.now));
             undo(conn.decr(&key, demand.reserved_tokens as i64).await);
         }
-        if let Some(estimate) = demand.estimate_usd {
+        if parts.reserved_usd
+            && let Some(estimate) = demand.estimate_usd
+        {
             let key = self.reserved_key(caller, &day_stamp(demand.now));
             undo(conn.decr(&key, estimate).await);
         }

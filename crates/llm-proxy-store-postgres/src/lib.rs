@@ -194,33 +194,83 @@ impl PostgresStore {
 
     /// Deletes window rows that can no longer be queried: minute rows
     /// older than two minutes, day rows older than one day, and leases
-    /// older than the lease TTL. Call on a timer.
+    /// older than the lease TTL. An expired lease held in-flight slots,
+    /// reserved tokens and reserved budget until its owner died; deleting
+    /// it without releasing those would leak them permanently (after `cap`
+    /// crashed leases a member sits at its in-flight cap forever), so the
+    /// purge releases exactly what [`PostgresAdmissionBackend::settle`]
+    /// would have — in one transaction, locking the lease rows so a
+    /// concurrent settle of the same lease cannot double-release. Call on
+    /// a timer.
     ///
     /// # Errors
     ///
-    /// [`PostgresStoreError::Query`] when the deletes fail.
+    /// [`PostgresStoreError::Query`] when the release or deletes fail.
     pub async fn purge_expired(&self) -> Result<u64, PostgresStoreError> {
         let minute_cut = unix_minute(OffsetDateTime::now_utc()) - 2;
         let today = OffsetDateTime::now_utc().date();
         let day_cut = pg_date(today.previous_day().unwrap_or(today));
         let lease_cut = OffsetDateTime::now_utc() - LEASE_TTL;
-        let client = self.connection().await?;
+        let mut client = self.connection().await?;
+        let tx = client.transaction().await?;
+        let expired = tx
+            .query(
+                "SELECT id FROM admission_leases WHERE created_at < $1 FOR UPDATE",
+                &[&lease_cut],
+            )
+            .await?;
+        let ids: Vec<uuid::Uuid> = expired.iter().map(|row| row.get(0)).collect();
+        if !ids.is_empty() {
+            tx.execute(
+                "UPDATE admission_minutes w \
+                 SET tokens = GREATEST(w.tokens - l.reserved_tokens, 0) \
+                 FROM admission_leases l \
+                 WHERE l.id = ANY($1) AND l.reserved_tokens > 0 \
+                 AND w.caller = l.caller AND w.minute = l.minute",
+                &[&ids],
+            )
+            .await?;
+            tx.execute(
+                "UPDATE admission_days d \
+                 SET reserved_usd = GREATEST(d.reserved_usd - l.reserved_usd, 0) \
+                 FROM admission_leases l \
+                 WHERE l.id = ANY($1) AND l.reserved_usd <> 0 \
+                 AND d.caller = l.caller AND d.day = l.day",
+                &[&ids],
+            )
+            .await?;
+            tx.execute(
+                "UPDATE admission_inflight_members m \
+                 SET count = GREATEST(m.count - 1, 0) \
+                 FROM admission_leases l \
+                 WHERE l.id = ANY($1) AND l.holds_member_slot AND m.member = l.member",
+                &[&ids],
+            )
+            .await?;
+            tx.execute(
+                "UPDATE admission_inflight_models g \
+                 SET count = GREATEST(g.count - 1, 0) \
+                 FROM admission_leases l \
+                 WHERE l.id = ANY($1) AND l.holds_model_slot \
+                 AND g.member = l.member AND g.model = l.model",
+                &[&ids],
+            )
+            .await?;
+        }
+        let rows = tx
+            .execute("DELETE FROM admission_leases WHERE id = ANY($1)", &[&ids])
+            .await?;
+        tx.commit().await?;
+        let total = rows;
         let rows = client
             .execute(
                 "DELETE FROM admission_minutes WHERE minute < $1",
                 &[&minute_cut],
             )
             .await?;
-        let total = rows;
-        let rows = client
-            .execute("DELETE FROM admission_days WHERE day < $1", &[&day_cut])
-            .await?;
         let total = total.saturating_add(rows);
         let rows = client
-            .execute(
-                "DELETE FROM admission_leases WHERE created_at < $1",
-                &[&lease_cut],
-            )
+            .execute("DELETE FROM admission_days WHERE day < $1", &[&day_cut])
             .await?;
         Ok(total.saturating_add(rows))
     }
