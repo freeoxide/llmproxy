@@ -88,16 +88,16 @@ impl ProviderStreamDecoder for OpenAiChatStreamDecoder {
             });
         }
 
-        if chunk.choices.is_empty() {
+        // `first` keeps the empty-choices handling and the head access in one
+        // checked form.
+        let Some(choice) = chunk.choices.first() else {
             if let Some(ref usage) = chunk.usage {
                 events.push(CoreEvent::UsageDelta {
                     usage: build_usage_from_openai(usage),
                 });
             }
             return Ok(events);
-        }
-
-        let choice = &chunk.choices[0];
+        };
 
         if let Some(reasoning) = choice
             .delta
@@ -726,8 +726,9 @@ fn encode_normalized_request(
         tools,
         tool_choice,
         stop: core.sampling.stop.as_ref().map(|v| {
-            if v.len() == 1 {
-                serde_json::Value::String(v[0].clone())
+            // A lone stop sequence is sent as a bare string per the API docs.
+            if let [only] = v.as_slice() {
+                serde_json::Value::String(only.clone())
             } else {
                 serde_json::Value::Array(
                     v.iter()
@@ -786,13 +787,11 @@ impl OpenAiChatAdapter {
         let resp: llm_proxy_protocol::openai::ChatCompletionResponse =
             serde_json::from_slice(bytes)?;
 
-        if resp.choices.is_empty() {
+        let Some(choice) = resp.choices.first() else {
             return Err(ProviderError::EmptyResponse(
                 "no choices in response".to_owned(),
             ));
-        }
-
-        let choice = &resp.choices[0];
+        };
         let msg = choice
             .message
             .as_ref()

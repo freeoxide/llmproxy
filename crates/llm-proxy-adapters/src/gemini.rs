@@ -66,16 +66,16 @@ impl ProviderStreamDecoder for GeminiStreamDecoder {
             });
         }
 
-        if chunk.candidates.is_empty() {
+        // `first` keeps the empty-candidates handling and the head access in
+        // one checked form.
+        let Some(candidate) = chunk.candidates.first() else {
             if let Some(ref usage) = chunk.usage_metadata {
                 events.push(CoreEvent::UsageDelta {
                     usage: build_gemini_usage(usage),
                 });
             }
             return Ok(events);
-        }
-
-        let candidate = &chunk.candidates[0];
+        };
 
         let parts: &[GeminiPart] = candidate
             .content
@@ -568,13 +568,11 @@ impl GeminiAdapter {
     ) -> Result<CoreResponse, ProviderError> {
         let resp: GeminiResponse = serde_json::from_slice(bytes)?;
 
-        if resp.candidates.is_empty() {
+        let Some(candidate) = resp.candidates.first() else {
             return Err(ProviderError::EmptyResponse(
                 "no candidates in response".to_owned(),
             ));
-        }
-
-        let candidate = &resp.candidates[0];
+        };
         let mut content = Vec::new();
         let mut tool_id_counter = 0usize;
 
