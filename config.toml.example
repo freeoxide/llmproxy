@@ -16,7 +16,8 @@ log_level = "info"
 # [storage] — are refused with a restart-required error naming the field,
 # instead of being half-applied. When false, reload signals are ignored.
 hot_reload = false
-# Requests per minute allowed per client IP. 0 disables rate limiting.
+# Requests per minute, keyed by the caller's client key id when
+# authenticated and by client IP otherwise. 0 disables rate limiting.
 # Direct loopback connections are exempt unless trust_forwarded_headers = true.
 rate_limit_rpm = 100
 # Use X-Forwarded-For / X-Real-IP for client identity. Enable only behind a
