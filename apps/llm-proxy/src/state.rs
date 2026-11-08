@@ -378,6 +378,14 @@ fn managed_key_fingerprint(
     fingerprint
 }
 
+/// A persistently invalid store would otherwise log the same ERROR once
+/// per refresh tick; the first failure and then one per minute is loud
+/// enough to act on.
+#[cfg(feature = "admin-ui")]
+fn should_log_invalid_refresh(consecutive: u32) -> bool {
+    consecutive <= 1 || consecutive % 60 == 0
+}
+
 /// Watches the managed-key store and, when the live key set changed,
 /// re-merges it over the file's `[auth]` and swaps both the client
 /// authenticator and the admission rules into the running state. A store
@@ -394,6 +402,7 @@ fn spawn_managed_key_refresh(
 ) {
     tokio::spawn(async move {
         let mut installed = managed_key_fingerprint(&initial);
+        let mut invalid_refreshes: u32 = 0;
         loop {
             tokio::time::sleep(MANAGED_KEY_REFRESH_INTERVAL).await;
             let specs = match store.client_specs() {
@@ -417,6 +426,14 @@ fn spawn_managed_key_refresh(
             }
             match llm_proxy_server::ClientAuth::from_config(&auth) {
                 Ok(client_auth) => {
+                    invalid_refreshes = 0;
+                    // Admission first: for the instant between the two
+                    // swaps a revoked token can still authenticate while
+                    // its id is already unknown to the new rules (which
+                    // treat unknown callers as unrestricted). The mirror
+                    // order instead lets a just-issued key bypass its
+                    // limits for that instant; failing open on revoke for
+                    // two adjacent statements is the cheaper instant.
                     swapping.replace(install(&auth));
                     state.swap_client_auth(std::sync::Arc::new(client_auth));
                     installed = seen;
@@ -426,11 +443,17 @@ fn spawn_managed_key_refresh(
                          refreshed without a restart"
                     );
                 }
-                Err(error) => tracing::error!(
-                    %error,
-                    "the refreshed managed key set is invalid; the previously \
-                     installed key set stands"
-                ),
+                Err(error) => {
+                    invalid_refreshes += 1;
+                    if should_log_invalid_refresh(invalid_refreshes) {
+                        tracing::error!(
+                            %error,
+                            consecutive = invalid_refreshes,
+                            "the refreshed managed key set is invalid; the previously \
+                             installed key set stands"
+                        );
+                    }
+                }
             }
         }
     });
@@ -719,6 +742,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "admin-ui")]
+    #[test]
+    fn invalid_refresh_logging_is_loud_first_then_once_a_minute() {
+        // The first failure shouts; the next minute of failures stays
+        // quiet, then one line per minute carries the count.
+        assert!(should_log_invalid_refresh(1));
+        assert!(!should_log_invalid_refresh(2));
+        assert!(!should_log_invalid_refresh(59));
+        assert!(should_log_invalid_refresh(60));
+        assert!(!should_log_invalid_refresh(61));
+        assert!(should_log_invalid_refresh(120));
+    }
 
     fn provider_config(raw: &str) -> ProviderConfig {
         toml::from_str::<llm_proxy_core::ProviderFile>(raw)
@@ -1945,7 +1981,9 @@ endpoint = "{endpoint}"
 
     /// Retry until the daemon has picked the key up. The 401 answers a
     /// not-yet-installed key (authentication never saw it) and consume
-    /// nothing; the first other answer is the call that counts.
+    /// nothing; a 429 proves the key installed but the call was refused,
+    /// so it also doesn't count — the first other answer is the call that
+    /// counts.
     async fn first_admitted(
         app: axum::Router,
         uri: &str,
@@ -1955,7 +1993,8 @@ endpoint = "{endpoint}"
         let deadline = std::time::Instant::now() + EFFECT_DEADLINE;
         loop {
             let response = post(app.clone(), uri, token, body).await;
-            if response.status() != StatusCode::UNAUTHORIZED {
+            let status = response.status();
+            if status != StatusCode::UNAUTHORIZED && status != StatusCode::TOO_MANY_REQUESTS {
                 return response;
             }
             assert!(
