@@ -23,6 +23,132 @@ pub struct BuildInfo {
     pub git_sha: &'static str,
 }
 
+/// The authenticator slot every request reads and the daemon can replace
+/// without a restart: managed keys issued or revoked at runtime swap the
+/// whole [`ClientAuth`] (verifiers and digest cache together, so a
+/// revoked token's cached digest dies with it) while requests already
+/// running finish on the authenticator they fetched.
+pub(crate) struct ClientAuthSlot {
+    current: std::sync::RwLock<Arc<ClientAuth>>,
+}
+
+impl ClientAuthSlot {
+    /// A slot serving `initial` until [`Self::replace`] swaps it.
+    pub(crate) fn new(initial: Arc<ClientAuth>) -> Self {
+        Self {
+            current: std::sync::RwLock::new(initial),
+        }
+    }
+
+    /// The authenticator serving right now.
+    pub(crate) fn current(&self) -> Arc<ClientAuth> {
+        let guard = self
+            .current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&guard)
+    }
+
+    /// Atomically replace the serving authenticator; every request from
+    /// now on authenticates against `next`. Returns the authenticator
+    /// that was serving until now.
+    pub(crate) fn replace(&self, next: Arc<ClientAuth>) -> Arc<ClientAuth> {
+        let mut guard = self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *guard, next)
+    }
+}
+
+impl std::fmt::Debug for ClientAuthSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientAuthSlot")
+            .field("current", &self.current())
+            .finish()
+    }
+}
+
+/// An [`llm_proxy_engine::Admission`] step whose rules can be replaced
+/// without rebuilding the engine: the engine holds one `Arc` to this
+/// wrapper for its whole life, and a swap replaces the inner step — same
+/// [`llm_proxy_engine::AdmissionBackend`] counters, fresh rules — so
+/// issuing or revoking a managed key at runtime changes what the running
+/// engine enforces without resetting anyone's windows or budgets.
+///
+/// The lock is never held across an `.await`: each method clones the
+/// inner `Arc` out and delegates to the clone.
+pub struct SwappingAdmission {
+    inner: std::sync::RwLock<Arc<dyn llm_proxy_engine::Admission>>,
+}
+
+impl SwappingAdmission {
+    /// A wrapper delegating to `inner` until [`Self::replace`] swaps it.
+    #[must_use]
+    pub fn new(inner: Arc<dyn llm_proxy_engine::Admission>) -> Self {
+        Self {
+            inner: std::sync::RwLock::new(inner),
+        }
+    }
+
+    fn current(&self) -> Arc<dyn llm_proxy_engine::Admission> {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&guard)
+    }
+
+    /// Atomically replace the enforced rules; requests already reserving
+    /// settle on the step they reserved through. Returns the step that
+    /// was enforcing until now.
+    pub fn replace(
+        &self,
+        next: Arc<dyn llm_proxy_engine::Admission>,
+    ) -> Arc<dyn llm_proxy_engine::Admission> {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::replace(&mut *guard, next)
+    }
+}
+
+impl std::fmt::Debug for SwappingAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwappingAdmission")
+            .field("inner", &self.current())
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+impl llm_proxy_engine::Admission for SwappingAdmission {
+    async fn reserve(
+        &self,
+        claim: &llm_proxy_engine::AdmissionClaim<'_>,
+    ) -> Result<llm_proxy_engine::AdmissionTicket, llm_proxy_engine::EngineError> {
+        self.current().reserve(claim).await
+    }
+
+    fn settle(
+        &self,
+        ticket: &llm_proxy_engine::AdmissionTicket,
+        outcome: &llm_proxy_engine::AdmissionOutcome<'_>,
+    ) {
+        self.current().settle(ticket, outcome);
+    }
+
+    async fn rekey(
+        &self,
+        ticket: &llm_proxy_engine::AdmissionTicket,
+        member: &str,
+        model: &str,
+    ) -> Result<(), llm_proxy_engine::EngineError> {
+        self.current().rekey(ticket, member, model).await
+    }
+}
+
 /// Application state shared with every handler.
 ///
 /// Cheap to clone (`Arc`-shared fields); the manual `Debug` impl never emits
@@ -42,7 +168,7 @@ pub struct AppState {
     pub(crate) request_id_gen: Arc<RequestIdGenerator>,
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
     pub(crate) event_bus: Arc<dyn EventBus>,
-    pub(crate) client_auth: Arc<ClientAuth>,
+    pub(crate) client_auth: Arc<ClientAuthSlot>,
     /// The configuration snapshots the engine reads per pipeline stage (plan
     /// 07 step 10): swapping the whole immutable snapshot is the one update
     /// path; nothing merges into a live one.
@@ -167,6 +293,7 @@ impl AppState {
                 Arc::new(ClientAuth::fail_closed())
             }
         };
+        let client_auth = Arc::new(ClientAuthSlot::new(client_auth));
         let app_config = Arc::new(app_config);
         let config_source = Arc::new(llm_proxy_engine::SwappingConfigSource::new(Arc::clone(
             &app_config,
@@ -195,8 +322,16 @@ impl AppState {
     /// Replace the client-auth state (builder-style).
     #[must_use]
     pub fn with_client_auth(mut self, client_auth: Arc<ClientAuth>) -> Self {
-        self.client_auth = client_auth;
+        self.client_auth = Arc::new(ClientAuthSlot::new(client_auth));
         self
+    }
+
+    /// Swap the authenticator the running server authenticates against
+    /// (managed keys issued or revoked at runtime); returns the
+    /// authenticator that was serving until now. Requests already
+    /// authenticated finish on their own answer.
+    pub fn swap_client_auth(&self, next: Arc<ClientAuth>) -> Arc<ClientAuth> {
+        self.client_auth.replace(next)
     }
 
     /// Replace the per-provider egress clients (builder-style).
@@ -930,10 +1065,102 @@ mod tests {
             make_build_info(),
         );
         assert!(
-            state.client_auth.is_enforced(),
+            state.client_auth.current().is_enforced(),
             "invalid auth config must fail closed, not open"
         );
-        assert_eq!(state.client_auth.client_count(), 0);
+        assert_eq!(state.client_auth.current().client_count(), 0);
+    }
+
+    #[derive(Clone)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBufferGuard<'a>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogBufferGuard(
+                self.0
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            )
+        }
+    }
+
+    struct LogBufferGuard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
+
+    impl std::io::Write for LogBufferGuard<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The logs AppState construction emits for an `[auth]` section,
+    /// edited before the build: the fail-closed ERROR a genuinely invalid
+    /// section earns, and no false one for a store-managed section.
+    fn captured_auth_build_logs(edit: impl FnOnce(&mut llm_proxy_core::AuthConfig)) -> String {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+        let mut cfg = make_app_config();
+        edit(&mut cfg.auth);
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(LogBuffer(Arc::clone(&buf)))
+            .with_ansi(false);
+        let subscriber = tracing_subscriber::registry().with(layer);
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let _state = AppState::new(
+                cfg,
+                make_provider_registry(),
+                ProviderAdapterRegistry::builtin(),
+                ProxyClient::new(),
+                make_build_info(),
+            );
+        }
+        String::from_utf8(buf.lock().expect("buffer lock not poisoned").clone())
+            .expect("captured bytes are UTF-8")
+    }
+
+    /// BUG 3: client-keys mode over an empty file client list is valid
+    /// when a managed key store backs it — building the state must not
+    /// log the fail-closed ERROR a genuinely invalid `[auth]` earns.
+    #[test]
+    fn a_store_backed_auth_builds_without_the_fail_closed_error_log() {
+        let logs = captured_auth_build_logs(|auth| {
+            auth.mode = llm_proxy_core::AuthMode::ClientKeys;
+            auth.admin = Some(llm_proxy_core::AdminAuthConfig {
+                token: secrecy::SecretString::from("admin-tok"),
+                key_store: Some("managed-keys.db".into()),
+            });
+        });
+        assert!(
+            !logs.contains("invalid [auth] config"),
+            "a store-managed deployment must not boot with a false auth ERROR, got: {logs}"
+        );
+    }
+
+    /// A genuinely invalid `[auth]` (unparseable verifier) still logs the
+    /// fail-closed ERROR — the fix must sharpen the diagnostic, not mute it.
+    #[test]
+    fn an_invalid_auth_config_still_logs_the_fail_closed_error() {
+        let logs = captured_auth_build_logs(|auth| {
+            auth.mode = llm_proxy_core::AuthMode::ClientKeys;
+            auth.clients.insert(
+                "laptop".to_owned(),
+                llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(
+                    "not-a-phc-string",
+                )),
+            );
+        });
+        assert!(
+            logs.contains("invalid [auth] config") && logs.contains("failing closed"),
+            "an invalid [auth] must still log the fail-closed ERROR, got: {logs}"
+        );
     }
 
     #[test]

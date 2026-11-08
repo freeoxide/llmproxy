@@ -37,6 +37,7 @@ llm-proxy-api = { workspace = true, optional = true }
 llm-proxy-semantic-cache = { workspace = true, optional = true }
 
 axum = { workspace = true, features = ["macros", "json"] }
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 tower = { workspace = true }
 tower-http = { version = "0.6", features = ["trace", "timeout", "catch-panic", "set-header", "cors"] }

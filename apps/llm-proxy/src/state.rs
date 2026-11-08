@@ -118,29 +118,17 @@ pub async fn load_toml_state_from_config(
     // that mode, so the keys would be dead weight, and merging them would
     // trip ClientAuth's mode-none-with-clients refusal on every restart.
     #[cfg(feature = "admin-ui")]
-    let app_config = {
-        let mut config = app_config;
-        if config.auth.mode != llm_proxy_core::AuthMode::None {
-            if let Some(store) = managed_key_store(&config)? {
-                for (id, spec) in store
-                    .client_specs()
-                    .with_context(|| "reading managed keys from [auth.admin.key_store]")?
-                {
-                    config.auth.clients.entry(id).or_insert(spec);
-                }
+    let managed = managed_key_source(&app_config)?;
+    #[cfg(feature = "admin-ui")]
+    let app_config = match &managed {
+        Some(source) => {
+            let mut config = app_config;
+            for (id, spec) in source.specs.iter().cloned() {
+                config.auth.clients.entry(id).or_insert(spec);
             }
-        } else if config
-            .auth
-            .admin
-            .as_ref()
-            .is_some_and(|admin| admin.key_store.is_some())
-        {
-            tracing::warn!(
-                "auth.mode is \"none\": managed keys from [auth.admin.key_store] are \
-                 not enforced; set auth.mode = \"client-keys\" to use them"
-            );
+            config
         }
-        config
+        None => app_config,
     };
     // A corrupt verifier must still refuse startup (AppState's own build
     // fails closed with a log instead, which is right for the library and
@@ -180,7 +168,234 @@ pub async fn load_toml_state_from_config(
     )
     .with_egress_clients(egress_clients)
     .with_event_bus(event_bus);
-    crate::replica::apply_replica(&app_config, &registry, base).await
+
+    // A daemon on a managed key store enforces through a swappable
+    // admission step and a swappable authenticator: the refresh loop
+    // (below) replaces both in place when the store's live key set
+    // changes, so a key issued or revoked at runtime is enforced by the
+    // running server without a restart — same rules shape as an
+    // equivalent file key, and the counters survive the swap.
+    #[cfg(feature = "admin-ui")]
+    let state = match managed {
+        Some(source) => {
+            let backend = std::sync::Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new())
+                as std::sync::Arc<dyn llm_proxy_engine::AdmissionBackend>;
+            let swapping = std::sync::Arc::new(llm_proxy_server::SwappingAdmission::new(
+                std::sync::Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
+                    &app_config.auth,
+                    &registry,
+                    std::sync::Arc::clone(&backend),
+                )),
+            ));
+            let base = base
+                .with_admission(std::sync::Arc::clone(&swapping)
+                    as std::sync::Arc<dyn llm_proxy_engine::Admission>);
+            let (state, replica_installer) = crate::replica::apply_replica(
+                &app_config,
+                &registry,
+                base,
+                Some(std::sync::Arc::clone(&swapping)),
+            )
+            .await?;
+            let installer: AdmissionInstaller = match replica_installer {
+                Some(replica) => replica,
+                None => single_node_admission_installer(state.clone(), backend),
+            };
+            spawn_managed_key_refresh(
+                state.clone(),
+                source.store,
+                source.file_auth,
+                source.specs,
+                swapping,
+                installer,
+            );
+            state
+        }
+        None => {
+            crate::replica::apply_replica(&app_config, &registry, base, None)
+                .await?
+                .0
+        }
+    };
+    #[cfg(not(feature = "admin-ui"))]
+    let state = crate::replica::apply_replica(&app_config, &registry, base, None)
+        .await?
+        .0;
+
+    Ok(state)
+}
+
+/// Rebuilds the single-node admission rules from a merged `[auth]` over
+/// the same in-process backend, so a refresh changes the rules without
+/// resetting anyone's windows or budgets.
+#[cfg(feature = "admin-ui")]
+fn single_node_admission_installer(
+    state: AppState,
+    backend: std::sync::Arc<dyn llm_proxy_engine::AdmissionBackend>,
+) -> AdmissionInstaller {
+    Box::new(move |auth| {
+        let providers = state.providers();
+        std::sync::Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
+            auth,
+            &providers,
+            std::sync::Arc::clone(&backend),
+        ))
+    })
+}
+
+/// Rebuilds the live admission rules from a merged `[auth]` (the file's
+/// clients plus the store's live keys): same counters, fresh rules — what
+/// the managed-key refresh swaps in.
+pub(crate) type AdmissionInstaller = Box<
+    dyn Fn(&llm_proxy_core::AuthConfig) -> std::sync::Arc<dyn llm_proxy_engine::Admission>
+        + Send
+        + Sync,
+>;
+
+/// The managed-key store a daemon runs on, opened once: the store handle,
+/// the file's `[auth]` before any merge (the base every refresh re-merges
+/// into, so a revoked key leaves the merged set instead of lingering
+/// forever), and the live specs as read at startup.
+#[cfg(feature = "admin-ui")]
+struct ManagedKeySource {
+    store: std::sync::Arc<llm_proxy_admin::ManagedKeys>,
+    file_auth: llm_proxy_core::AuthConfig,
+    specs: Vec<(String, llm_proxy_core::ClientKeySpec)>,
+}
+
+/// Opens the managed-key source for the serving state: `None` when no
+/// store is configured or `auth.mode = "none"` (with the same warning
+/// startup always emitted for that combination).
+///
+/// # Errors
+///
+/// `anyhow` when the store cannot be opened or read.
+#[cfg(feature = "admin-ui")]
+fn managed_key_source(config: &AppConfig) -> Result<Option<ManagedKeySource>> {
+    if config.auth.mode == llm_proxy_core::AuthMode::None {
+        if config
+            .auth
+            .admin
+            .as_ref()
+            .is_some_and(|admin| admin.key_store.is_some())
+        {
+            tracing::warn!(
+                "auth.mode is \"none\": managed keys from [auth.admin.key_store] are \
+                 not enforced; set auth.mode = \"client-keys\" to use them"
+            );
+        }
+        return Ok(None);
+    }
+    match managed_key_store(config)? {
+        Some(store) => {
+            let specs = store
+                .client_specs()
+                .with_context(|| "reading managed keys from [auth.admin.key_store]")?;
+            Ok(Some(ManagedKeySource {
+                store,
+                file_auth: config.auth.clone(),
+                specs,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// How often the daemon re-reads the managed-key store: seconds, so a key
+/// issued through the admin API is enforced roughly immediately — the
+/// requirement is "without a restart", not "in the same request".
+#[cfg(feature = "admin-ui")]
+const MANAGED_KEY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A comparable projection of the store's live key set: ids, verifiers
+/// and policies. Verifier secrets appear here on purpose (change
+/// detection must see a rotated PHC string) and never leave the process —
+/// the fingerprint is compared, never logged.
+#[cfg(feature = "admin-ui")]
+fn managed_key_fingerprint(
+    specs: &[(String, llm_proxy_core::ClientKeySpec)],
+) -> Vec<(String, String)> {
+    use llm_proxy_core::ClientKeySpec;
+    use secrecy::ExposeSecret;
+    let mut fingerprint: Vec<(String, String)> = specs
+        .iter()
+        .map(|(id, spec)| {
+            let policy = match spec {
+                ClientKeySpec::Verifier(_) => "verifier".to_owned(),
+                ClientKeySpec::Policy {
+                    allow_models,
+                    allow_providers,
+                    limits,
+                    budget,
+                    ..
+                } => format!("{allow_models:?}|{allow_providers:?}|{limits:?}|{budget:?}"),
+            };
+            (
+                id.clone(),
+                format!("{}|{policy}", spec.verifier().expose_secret()),
+            )
+        })
+        .collect();
+    fingerprint.sort();
+    fingerprint
+}
+
+/// Watches the managed-key store and, when the live key set changed,
+/// re-merges it over the file's `[auth]` and swaps both the client
+/// authenticator and the admission rules into the running state. A store
+/// read that fails keeps the installed set; an invalid merged set keeps
+/// the installed set too, loudly — both fail safe, never open.
+#[cfg(feature = "admin-ui")]
+fn spawn_managed_key_refresh(
+    state: AppState,
+    store: std::sync::Arc<llm_proxy_admin::ManagedKeys>,
+    file_auth: llm_proxy_core::AuthConfig,
+    initial: Vec<(String, llm_proxy_core::ClientKeySpec)>,
+    swapping: std::sync::Arc<llm_proxy_server::SwappingAdmission>,
+    install: AdmissionInstaller,
+) {
+    tokio::spawn(async move {
+        let mut installed = managed_key_fingerprint(&initial);
+        loop {
+            tokio::time::sleep(MANAGED_KEY_REFRESH_INTERVAL).await;
+            let specs = match store.client_specs() {
+                Ok(specs) => specs,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "reading the managed-key store for the live refresh failed; \
+                         the installed key set stands"
+                    );
+                    continue;
+                }
+            };
+            let seen = managed_key_fingerprint(&specs);
+            if seen == installed {
+                continue;
+            }
+            let mut auth = file_auth.clone();
+            for (id, spec) in &specs {
+                auth.clients.entry(id.clone()).or_insert(spec.clone());
+            }
+            match llm_proxy_server::ClientAuth::from_config(&auth) {
+                Ok(client_auth) => {
+                    swapping.replace(install(&auth));
+                    state.swap_client_auth(std::sync::Arc::new(client_auth));
+                    installed = seen;
+                    tracing::info!(
+                        live_keys = specs.len(),
+                        "the managed key set changed; authentication and policies \
+                         refreshed without a restart"
+                    );
+                }
+                Err(error) => tracing::error!(
+                    %error,
+                    "the refreshed managed key set is invalid; the previously \
+                     installed key set stands"
+                ),
+            }
+        }
+    });
 }
 
 /// Loads the provider and pool registry from the directory beside
@@ -553,7 +768,7 @@ enforce = true
     }
 
     #[derive(Clone)]
-    struct BufferWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(crate) struct BufferWriter(pub(crate) std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
         type Writer = BufferWriterGuard<'a>;
@@ -563,7 +778,7 @@ enforce = true
         }
     }
 
-    struct BufferWriterGuard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
+    pub(crate) struct BufferWriterGuard<'a>(std::sync::MutexGuard<'a, Vec<u8>>);
 
     impl<'a> std::io::Write for BufferWriterGuard<'a> {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1512,6 +1727,479 @@ messages = "msgs"
         assert!(
             String::from_utf8_lossy(&bytes).contains("upstream answer"),
             "the control call reached the upstream"
+        );
+    }
+}
+
+/// Managed keys issued or revoked while the daemon is already running (the
+/// admin surface's own store connection) must reach enforcement —
+/// authentication and admission — without a restart. The daemon watches
+/// the store and swaps the live client-auth and admission rules in place.
+#[cfg(test)]
+#[cfg(feature = "admin-ui")]
+mod managed_key_runtime_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::response::Response;
+    use secrecy::ExposeSecret;
+    use tower::ServiceExt as _;
+
+    use super::load_toml_state;
+
+    /// How long a runtime change may take to reach enforcement: the daemon
+    /// refreshes on a short interval, so seconds — never a restart.
+    const EFFECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    fn write_config(dir: &std::path::Path) -> std::path::PathBuf {
+        let store_path = dir.join("managed-keys.db");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+[server]
+bind = "127.0.0.1:3461"
+request_timeout = "300s"
+log_level = "info"
+server_name = "managed-runtime"
+
+[auth]
+mode = "client-keys"
+
+[auth.admin]
+token = "admin-tok"
+key_store = "{store}"
+
+[storage]
+path = "{usage}"
+"#,
+                store = store_path.display(),
+                usage = dir.join("usage.db").display()
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn write_provider(
+        dir: &std::path::Path,
+        name: &str,
+        adapter_key: &str,
+        protocol: &str,
+        route_key: &str,
+        endpoint: &str,
+    ) {
+        std::fs::create_dir_all(dir.join("providers")).unwrap();
+        std::fs::write(
+            dir.join(format!("providers/{name}.toml")),
+            format!(
+                r#"[provider]
+name = "{name}"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.{adapter_key}]
+protocol = "{protocol}"
+endpoint = "{endpoint}"
+[provider.routes]
+{route_key} = "{adapter_key}"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The admin surface's view of the store: a second connection to the
+    /// same file the daemon loaded, exactly what POST /keys uses.
+    fn admin_view(dir: &std::path::Path) -> llm_proxy_admin::ManagedKeys {
+        llm_proxy_admin::ManagedKeys::open(dir.join("managed-keys.db")).expect("key store")
+    }
+
+    async fn spawn_json_upstream(body: &'static str) -> std::net::SocketAddr {
+        let app = axum::Router::new().route(
+            "/{*path}",
+            axum::routing::post(move || async move {
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                tracing::trace!(%error, "fake upstream stopped");
+            }
+        });
+        addr
+    }
+
+    async fn post(
+        app: axum::Router,
+        uri: &str,
+        token: &secrecy::SecretString,
+        body: &str,
+    ) -> Response {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", token.expose_secret()),
+            )
+            .body(Body::from(body.to_owned()))
+            .expect("request");
+        app.oneshot(request).await.expect("oneshot is infallible")
+    }
+
+    /// Retry until the daemon has picked the key up. The 401 answers a
+    /// not-yet-installed key (authentication never saw it) and consume
+    /// nothing; the first other answer is the call that counts.
+    async fn first_admitted(
+        app: axum::Router,
+        uri: &str,
+        token: &secrecy::SecretString,
+        body: &str,
+    ) -> Response {
+        let deadline = std::time::Instant::now() + EFFECT_DEADLINE;
+        loop {
+            let response = post(app.clone(), uri, token, body).await;
+            if response.status() != StatusCode::UNAUTHORIZED {
+                return response;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the runtime-issued key never authenticated (still 401 after {EFFECT_DEADLINE:?})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn eventually_unauthorized(
+        app: axum::Router,
+        uri: &str,
+        token: &secrecy::SecretString,
+        body: &str,
+    ) {
+        let deadline = std::time::Instant::now() + EFFECT_DEADLINE;
+        loop {
+            let response = post(app.clone(), uri, token, body).await;
+            if response.status() == StatusCode::UNAUTHORIZED {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the revoked key kept authenticating (last answer {}) after {EFFECT_DEADLINE:?}",
+                response.status()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The audit's live repro, issued while the daemon is running: a key
+    /// created through the admin surface's store connection with tpm=60,
+    /// behind an upstream that reports prompt_tokens=50 per embeddings
+    /// call — three tiny calls must answer 200, 200, 429 exactly like the
+    /// equivalent file key.
+    #[tokio::test]
+    #[cfg(feature = "endpoint-families")]
+    async fn a_runtime_issued_managed_keys_tpm_is_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = spawn_json_upstream(
+            r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],
+                "model":"text-embedding-3-small","usage":{"prompt_tokens":50,"total_tokens":50}}"#,
+        )
+        .await;
+        write_provider(
+            dir.path(),
+            "embedder",
+            "embed",
+            "openai_chat_completions",
+            "embeddings",
+            &format!("http://{}/v1/embeddings", upstream),
+        );
+        let path = write_config(dir.path());
+
+        let state = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("daemon starts on the fresh store");
+        let app = llm_proxy_server::build_router(state);
+
+        let issued = admin_view(dir.path())
+            .create(&llm_proxy_admin::KeyPolicyInput {
+                tpm: Some(60),
+                ..llm_proxy_admin::KeyPolicyInput::default()
+            })
+            .expect("runtime issuance");
+
+        let call = |app: axum::Router| {
+            post(
+                app,
+                "/providers/embedder/v1/embeddings",
+                &issued.token,
+                r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+            )
+        };
+
+        let first = first_admitted(
+            app.clone(),
+            "/providers/embedder/v1/embeddings",
+            &issued.token,
+            r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+        )
+        .await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "the runtime-issued key serves once its policy is loaded"
+        );
+        let second = call(app.clone()).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let third = call(app.clone()).await;
+        assert_eq!(
+            third.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "third call crosses the runtime-issued tpm of 60 (50 charged per call)"
+        );
+    }
+
+    /// A key issued at runtime with an allow_models glob must have the
+    /// glob enforced: the model that does not match is a 403 (the key
+    /// authenticated; admission refused it), not a 401.
+    #[tokio::test]
+    async fn a_runtime_issued_managed_keys_allow_models_glob_is_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = spawn_json_upstream(
+            r#"{"id":"msg_h","type":"message","role":"assistant",
+                "content":[{"type":"text","text":"upstream answer"}],
+                "model":"claude-sonnet-4-6","stop_reason":"end_turn",
+                "stop_sequence":null,
+                "usage":{"input_tokens":10,"output_tokens":4}}"#,
+        )
+        .await;
+        write_provider(
+            dir.path(),
+            "loopy",
+            "msgs",
+            "anthropic_messages",
+            "messages",
+            &format!("http://{}/v1/messages", upstream),
+        );
+        let path = write_config(dir.path());
+
+        let state = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("daemon starts");
+        let app = llm_proxy_server::build_router(state);
+
+        let restricted = admin_view(dir.path())
+            .create(&llm_proxy_admin::KeyPolicyInput {
+                allow_models: vec!["nothing-matches-*".to_owned()],
+                ..llm_proxy_admin::KeyPolicyInput::default()
+            })
+            .expect("runtime issuance");
+        let plain = admin_view(dir.path())
+            .create(&llm_proxy_admin::KeyPolicyInput::default())
+            .expect("control issuance");
+
+        let refused = first_admitted(
+            app.clone(),
+            "/providers/loopy/v1/messages",
+            &restricted.token,
+            r#"{"model":"claude-sonnet-4-6","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "the glob refuses the non-matching model after the key authenticated"
+        );
+
+        let served = first_admitted(
+            app.clone(),
+            "/providers/loopy/v1/messages",
+            &plain.token,
+            r#"{"model":"claude-sonnet-4-6","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(served.status(), StatusCode::OK);
+    }
+
+    /// Revoking a key through the admin surface's store connection must
+    /// stop its token authenticating on the running daemon — no restart.
+    #[tokio::test]
+    async fn revoking_a_managed_key_stops_it_authenticating_without_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = spawn_json_upstream(
+            r#"{"id":"msg_h","type":"message","role":"assistant",
+                "content":[{"type":"text","text":"upstream answer"}],
+                "model":"claude-sonnet-4-6","stop_reason":"end_turn",
+                "stop_sequence":null,
+                "usage":{"input_tokens":10,"output_tokens":4}}"#,
+        )
+        .await;
+        write_provider(
+            dir.path(),
+            "loopy",
+            "msgs",
+            "anthropic_messages",
+            "messages",
+            &format!("http://{}/v1/messages", upstream),
+        );
+        let path = write_config(dir.path());
+        let seeded = admin_view(dir.path())
+            .create(&llm_proxy_admin::KeyPolicyInput::default())
+            .expect("seeded key");
+
+        let state = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("daemon starts with the seeded key");
+        let app = llm_proxy_server::build_router(state);
+        let body = r#"{"model":"claude-sonnet-4-6","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+        let served = post(
+            app.clone(),
+            "/providers/loopy/v1/messages",
+            &seeded.token,
+            body,
+        )
+        .await;
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "the seeded key authenticates before the revocation"
+        );
+
+        admin_view(dir.path())
+            .revoke(&seeded.key_id)
+            .expect("runtime revocation");
+
+        eventually_unauthorized(app, "/providers/loopy/v1/messages", &seeded.token, body).await;
+    }
+
+    /// A store whose keys were all revoked must still boot (the audit's
+    /// brick-on-restart repro): the rows exist, none is live, and the
+    /// daemon comes up failing closed until a key is issued again.
+    #[tokio::test]
+    async fn client_keys_mode_boots_after_every_managed_key_was_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = admin_view(dir.path());
+        let first = store
+            .create(&llm_proxy_admin::KeyPolicyInput::default())
+            .expect("first key");
+        let second = store
+            .create(&llm_proxy_admin::KeyPolicyInput::default())
+            .expect("second key");
+        store.revoke(&first.key_id).expect("revoke first");
+        store.revoke(&second.key_id).expect("revoke second");
+        write_provider(
+            dir.path(),
+            "loopy",
+            "msgs",
+            "anthropic_messages",
+            "messages",
+            "http://127.0.0.1:9/v1/messages",
+        );
+        let path = write_config(dir.path());
+
+        let state = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect("a store with only revoked keys still boots");
+        let app = llm_proxy_server::build_router(state);
+        let refused = post(
+            app,
+            "/providers/loopy/v1/messages",
+            &second.token,
+            r#"{"model":"claude-sonnet-4-6","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNAUTHORIZED,
+            "the revoked token does not authenticate after the restart-shaped boot"
+        );
+    }
+
+    /// A store-managed deployment must not log a false invalid-[auth]
+    /// ERROR on boot (BUG 3): with no file clients and live managed keys,
+    /// the effective auth is valid, so the boot log stays clean while the
+    /// tokens are accepted.
+    #[tokio::test]
+    async fn a_store_managed_boot_logs_no_false_auth_error() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        admin_view(dir.path())
+            .create(&llm_proxy_admin::KeyPolicyInput::default())
+            .expect("one live key");
+        write_provider(
+            dir.path(),
+            "loopy",
+            "msgs",
+            "anthropic_messages",
+            "messages",
+            "http://127.0.0.1:9/v1/messages",
+        );
+        let path = write_config(dir.path());
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let layer = super::build_log_layer(
+            &llm_proxy_core::LogFormat::Plain,
+            super::tests::BufferWriter(std::sync::Arc::clone(&buf)),
+        );
+        let subscriber = tracing_subscriber::registry().with(layer);
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let state = load_toml_state(
+                &path,
+                llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+                None,
+            )
+            .await
+            .expect("the store-backed boot succeeds");
+            let app = llm_proxy_server::build_router(state);
+            let refused = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/providers/loopy/v1/messages")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .expect("request"),
+                )
+                .await
+                .expect("served");
+            assert_eq!(
+                refused.status(),
+                StatusCode::UNAUTHORIZED,
+                "client auth is enforced by the merged managed key"
+            );
+        }
+
+        let captured = String::from_utf8(buf.lock().expect("buffer lock not poisoned").clone())
+            .expect("captured bytes are UTF-8");
+        assert!(
+            !captured.contains("invalid [auth] config"),
+            "a store-managed deployment must not log a false auth ERROR, got: {captured}"
         );
     }
 }

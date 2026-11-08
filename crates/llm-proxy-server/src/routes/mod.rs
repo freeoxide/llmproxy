@@ -358,7 +358,11 @@ async fn inject_request_id(
     next.run(req).await
 }
 async fn require_client_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if !state.client_auth.is_enforced() {
+    // The slot fetch is what makes runtime key changes visible here: the
+    // daemon swaps the authenticator without a restart, so each request
+    // reads the one serving right now.
+    let client_auth = state.client_auth.current();
+    if !client_auth.is_enforced() {
         let mut req = req;
         req.extensions_mut().insert(CallerId::anonymous());
         return next.run(req).await;
@@ -379,7 +383,7 @@ async fn require_client_auth(State(state): State<AppState>, req: Request, next: 
                 state.metrics.record_rate_limited();
                 None
             } else {
-                state.client_auth.authenticate(token.expose_secret()).await
+                client_auth.authenticate(token.expose_secret()).await
             }
         }
         None => None,

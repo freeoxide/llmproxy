@@ -3732,4 +3732,189 @@ mod tests {
             "stream must still terminate with [DONE]: {text}"
         );
     }
+
+    fn authorized_messages_request(token: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    /// Swapping the authenticator on the running state is what makes a
+    /// managed key issued or revoked through the admin API take effect:
+    /// the old token dies with the old authenticator (its digest cache
+    /// included), the new one starts working — no restart, no rebuild.
+    #[tokio::test]
+    async fn a_swapped_client_auth_takes_effect_on_the_running_router() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_client_auth(Arc::new(client_auth_for("laptop", "first-token")));
+        let app = build_router(state.clone());
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        let first = app
+            .clone()
+            .oneshot(authorized_messages_request("first-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        state.swap_client_auth(Arc::new(client_auth_for("laptop", "second-token")));
+
+        let old = app
+            .clone()
+            .oneshot(authorized_messages_request("first-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            old.status(),
+            StatusCode::UNAUTHORIZED,
+            "the old token must stop authenticating after the swap"
+        );
+        let new = app
+            .oneshot(authorized_messages_request("second-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(new.status(), StatusCode::OK);
+    }
+
+    fn admission_for(
+        key_id: &str,
+        allow_models: Vec<String>,
+        rpd: Option<u64>,
+        backend: Arc<dyn llm_proxy_engine::AdmissionBackend>,
+        registry: &ProviderRegistry,
+    ) -> Arc<llm_proxy_engine::PolicyAdmission> {
+        let spec = if allow_models.is_empty() && rpd.is_none() {
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from("unused"))
+        } else {
+            llm_proxy_core::ClientKeySpec::Policy {
+                verifier: secrecy::SecretString::from("unused"),
+                allow_models,
+                allow_providers: Vec::new(),
+                limits: Some(llm_proxy_core::KeyWindowLimits {
+                    rpm: None,
+                    tpm: None,
+                    rpd,
+                }),
+                budget: None,
+            }
+        };
+        let mut clients = HashMap::new();
+        clients.insert(key_id.to_owned(), spec);
+        let auth = llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+        };
+        Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
+            &auth, registry, backend,
+        ))
+    }
+
+    /// Swapping the admission rules on the running engine is what makes a
+    /// managed key's policy take effect the moment the daemon loads it:
+    /// the engine keeps serving on the same instance (no rebuild — the
+    /// caches and cooldowns stand) while the rules change under it.
+    #[tokio::test]
+    async fn swapped_admission_rules_take_effect_without_rebuilding_the_engine() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let registry = state.providers();
+        let swapping = Arc::new(llm_proxy_server::SwappingAdmission::new(admission_for(
+            "laptop",
+            Vec::new(),
+            None,
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new()),
+            &registry,
+        )));
+        let state = state
+            .with_client_auth(Arc::new(client_auth_for("laptop", "sekrit-token")))
+            .with_admission(Arc::clone(&swapping) as Arc<dyn llm_proxy_engine::Admission>);
+        let app = build_router(state.clone());
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        let allowed = app
+            .clone()
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let engine_before = state.engine().unwrap();
+        swapping.replace(admission_for(
+            "laptop",
+            vec!["other-*".to_owned()],
+            None,
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new()),
+            &registry,
+        ));
+        let engine_after = state.engine().unwrap();
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "a rules swap must not rebuild the engine"
+        );
+
+        let refused = app
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "the swapped-in allowlist must refuse the model the running engine serves"
+        );
+    }
+
+    /// The counters a key already charged survive a rules swap (issuing
+    /// another managed key must not hand anyone a fresh window): both the
+    /// old and the new rules run over the same backend.
+    #[tokio::test]
+    async fn an_admission_swap_keeps_the_counters_already_charged() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let registry = state.providers();
+        let backend: Arc<dyn llm_proxy_engine::AdmissionBackend> =
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
+        let swapping = Arc::new(llm_proxy_server::SwappingAdmission::new(admission_for(
+            "laptop",
+            Vec::new(),
+            Some(1),
+            Arc::clone(&backend),
+            &registry,
+        )));
+        let state = state
+            .with_client_auth(Arc::new(client_auth_for("laptop", "sekrit-token")))
+            .with_admission(Arc::clone(&swapping) as Arc<dyn llm_proxy_engine::Admission>);
+        let app = build_router(state);
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        let first = app
+            .clone()
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "rpd of 1 admits one");
+
+        swapping.replace(admission_for(
+            "laptop",
+            Vec::new(),
+            Some(1),
+            backend,
+            &registry,
+        ));
+
+        let second = app
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the day's request count survived the swap; a reset backend would have answered 200"
+        );
+    }
 }

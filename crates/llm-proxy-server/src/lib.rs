@@ -21,7 +21,7 @@ pub use middleware::{
     CallerId, ClientAuth, ClientAuthError, RateLimiter, RequestId, RequestIdGenerator,
 };
 pub use shutdown::shutdown_signal;
-pub use state::{AppState, BuildInfo};
+pub use state::{AppState, BuildInfo, SwappingAdmission};
 
 use axum::Router;
 

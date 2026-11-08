@@ -9,10 +9,12 @@ use anyhow::Result;
 use llm_proxy_core::{AppConfig, ProviderRegistry, ReplicaBackend};
 use llm_proxy_server::AppState;
 use secrecy::ExposeSecret;
-#[cfg(any(feature = "store-redis", feature = "store-postgres"))]
 use std::sync::Arc;
 
-/// Applies `[replica]` to `state`, returning the replacement state.
+/// Applies `[replica]` to `state`, returning the replacement state and,
+/// when a replica store took over admission, the installer that rebuilds
+/// its rules from a merged `[auth]` (the managed-key refresh swaps those
+/// in over the shared counters).
 ///
 /// # Errors
 ///
@@ -22,42 +24,21 @@ pub async fn apply_replica(
     config: &AppConfig,
     registry: &ProviderRegistry,
     state: AppState,
-) -> Result<AppState> {
+    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
     let Some(replica) = config.replica.as_ref() else {
-        return Ok(state);
+        return Ok((state, None));
     };
     let url = replica.url.expose_secret();
-    let auth = &config.auth;
     match replica.backend {
         ReplicaBackend::Redis => {
             #[cfg(feature = "store-redis")]
             {
-                let store = llm_proxy_store_redis::RedisStore::connect(url, &replica.prefix)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "connecting to the Redis replica store from [replica]: {error}"
-                        )
-                    })?;
-                let admission = llm_proxy_store_redis::replica_admission_over_config(
-                    auth,
-                    registry,
-                    store.clone(),
-                );
-                let cooldowns = Arc::new(llm_proxy_store_redis::RedisCooldowns::new(store.clone()));
-                let bus = Arc::new(llm_proxy_store_redis::RedisEventBus::new(store, "usage"));
-                tracing::info!(
-                    prefix = %replica.prefix,
-                    "replica mode: admission, cooldowns and usage shared through Redis"
-                );
-                Ok(state
-                    .with_admission(Arc::new(admission))
-                    .with_cooldowns(cooldowns)
-                    .with_event_bus(bus))
+                redis_replica(url, &replica.prefix, registry, state, swapping).await
             }
             #[cfg(not(feature = "store-redis"))]
             {
-                let _ = (url, auth, registry, state);
+                let _ = (url, registry, state, swapping);
                 anyhow::bail!(
                     "[replica] backend \"redis\" is configured but this build lacks the \
                      store-redis feature; rebuild with --features store-redis"
@@ -67,34 +48,11 @@ pub async fn apply_replica(
         ReplicaBackend::Postgres => {
             #[cfg(feature = "store-postgres")]
             {
-                let store = llm_proxy_store_postgres::PostgresStore::connect(url)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "connecting to the Postgres replica store from [replica]: {error}"
-                        )
-                    })?;
-                spawn_purge_timer(store.clone());
-                let admission = llm_proxy_store_postgres::replica_admission_over_config(
-                    auth,
-                    registry,
-                    store.clone(),
-                );
-                let cooldowns = Arc::new(llm_proxy_store_postgres::PostgresCooldowns::new(
-                    store.clone(),
-                ));
-                let bus = Arc::new(llm_proxy_store_postgres::PostgresEventBus::new(store));
-                tracing::info!(
-                    "replica mode: admission, cooldowns and usage shared through Postgres"
-                );
-                Ok(state
-                    .with_admission(Arc::new(admission))
-                    .with_cooldowns(cooldowns)
-                    .with_event_bus(bus))
+                postgres_replica(url, registry, state, swapping).await
             }
             #[cfg(not(feature = "store-postgres"))]
             {
-                let _ = (url, auth, registry, state);
+                let _ = (url, registry, state, swapping);
                 anyhow::bail!(
                     "[replica] backend \"postgres\" is configured but this build lacks the \
                      store-postgres feature; rebuild with --features store-postgres"
@@ -102,6 +60,118 @@ pub async fn apply_replica(
             }
         }
     }
+}
+
+/// The Redis arm of [`apply_replica`]: shared admission (over the store's
+/// own counters), cooldowns and usage feed, plus the rules-rebuild
+/// installer the managed-key refresh swaps in.
+#[cfg(feature = "store-redis")]
+async fn redis_replica(
+    url: &str,
+    prefix: &str,
+    registry: &ProviderRegistry,
+    state: AppState,
+    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
+    let store = llm_proxy_store_redis::RedisStore::connect(url, prefix)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("connecting to the Redis replica store from [replica]: {error}")
+        })?;
+    let admission = llm_proxy_store_redis::replica_admission_over_config(
+        &state.app_config().auth,
+        registry,
+        store.clone(),
+    );
+    let cooldowns = Arc::new(llm_proxy_store_redis::RedisCooldowns::new(store.clone()));
+    let bus = Arc::new(llm_proxy_store_redis::RedisEventBus::new(
+        store.clone(),
+        "usage",
+    ));
+    tracing::info!(
+        prefix = %prefix,
+        "replica mode: admission, cooldowns and usage shared through Redis"
+    );
+    let state = install_replica_admission(state, swapping, admission)
+        .with_cooldowns(cooldowns)
+        .with_event_bus(bus);
+    let installer = replica_admission_installer(state.clone(), move |auth, providers| {
+        llm_proxy_store_redis::replica_admission_over_config(auth, providers, store.clone())
+    });
+    Ok((state, Some(installer)))
+}
+
+/// The Postgres arm of [`apply_replica`]: the same wiring over the
+/// Postgres store, plus the stale-row purge timer.
+#[cfg(feature = "store-postgres")]
+async fn postgres_replica(
+    url: &str,
+    registry: &ProviderRegistry,
+    state: AppState,
+    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
+    let store = llm_proxy_store_postgres::PostgresStore::connect(url)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("connecting to the Postgres replica store from [replica]: {error}")
+        })?;
+    spawn_purge_timer(store.clone());
+    let admission = llm_proxy_store_postgres::replica_admission_over_config(
+        &state.app_config().auth,
+        registry,
+        store.clone(),
+    );
+    let cooldowns = Arc::new(llm_proxy_store_postgres::PostgresCooldowns::new(
+        store.clone(),
+    ));
+    let bus = Arc::new(llm_proxy_store_postgres::PostgresEventBus::new(
+        store.clone(),
+    ));
+    tracing::info!("replica mode: admission, cooldowns and usage shared through Postgres");
+    let state = install_replica_admission(state, swapping, admission)
+        .with_cooldowns(cooldowns)
+        .with_event_bus(bus);
+    let installer = replica_admission_installer(state.clone(), move |auth, providers| {
+        llm_proxy_store_postgres::replica_admission_over_config(auth, providers, store.clone())
+    });
+    Ok((state, Some(installer)))
+}
+
+/// Installs the replica-shared admission step: through the daemon's
+/// swappable wrapper when one was passed (so the managed-key refresh can
+/// replace the rules later), or directly as the override otherwise.
+#[cfg(any(feature = "store-redis", feature = "store-postgres"))]
+fn install_replica_admission(
+    state: AppState,
+    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+    admission: llm_proxy_engine::PolicyAdmission,
+) -> AppState {
+    match swapping {
+        Some(swapping) => {
+            swapping.replace(Arc::new(admission) as Arc<dyn llm_proxy_engine::Admission>);
+            state.with_admission(swapping as Arc<dyn llm_proxy_engine::Admission>)
+        }
+        None => state.with_admission(Arc::new(admission) as Arc<dyn llm_proxy_engine::Admission>),
+    }
+}
+
+/// The rules-rebuild closure over the shared store: the counters live in
+/// the store, so a rebuilt step keeps enforcing the same windows and
+/// budgets between replicas.
+#[cfg(any(feature = "store-redis", feature = "store-postgres"))]
+fn replica_admission_installer<
+    F: Fn(&llm_proxy_core::AuthConfig, &ProviderRegistry) -> llm_proxy_engine::PolicyAdmission
+        + Send
+        + Sync
+        + 'static,
+>(
+    state: AppState,
+    rebuild: F,
+) -> crate::state::AdmissionInstaller {
+    Box::new(move |auth| {
+        let providers = state.providers();
+        Arc::new(rebuild(auth, &providers)) as Arc<dyn llm_proxy_engine::Admission>
+    })
 }
 
 /// The Postgres store keeps stale window rows until purged; a timer bounds
