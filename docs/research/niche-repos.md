@@ -25,11 +25,24 @@ Candidate new gaps this wave surfaces (each backed by at least one niche
 repo): **timeout hierarchies** (phase-shaped TTFB/idle budgets),
 **request-payload cost transforms** (compaction, tool-output compression,
 history hygiene), **shadow-eval quality guards** for such transforms,
-**OAuth credential lifecycle** for non-cloud upstreams, **upstream
-cancellation propagation** on client disconnect, **engine-state-aware
+**OAuth credential lifecycle** for non-cloud upstreams, **engine-state-aware
 routing**, **admission queueing** with priority/fair-share, **caller
 SSO/RBAC**, **externally synced price catalogs**, and **hedged request
-races**.
+races**. **Upstream cancellation propagation** was withdrawn from this list
+2026-11-08 per research audit: llm-proxy already cancels the upstream
+request when a client disconnects, in every streaming phase; what remains
+open is usage settlement for cancelled streams.
+
+Demand caveats (added 2026-11-08 per research audit): several repositories
+researched in full here are very young or largely AI-written — xLB
+(created 2026-10-14, 38 commits), Antirion (2026-10-17), preflight
+(2026-09-20, 5 commits), tokdiet (32 stars), ostk-cache (10 stars, not
+buildable), completion-to-response (6 commits, archived) — and most carry a
+flag in their section, but yolorouter and mcp-gateway did not; flags are
+added in their sections below. Vendor numbers appear as fact in places,
+notably mcp-gateway's "~8 ms hot reload". Treat this survey as a catalogue
+of possibilities, not a ranking of demand; the fourth-wave record carries
+the full caveat list.
 
 Tagging policy: #6 tags rows that serve the OpenAI Responses API on the
 client side (the register's definition); multi-protocol or endpoint breadth
@@ -84,7 +97,7 @@ v0.4.0 roadmap: https://github.com/NVIDIA-NeMo/Switchyard/issues/1026.
 | Prometheus `/metrics` plus OTel spans under GenAI semantic conventions (cache-read/creation and reasoning tokens per call) | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/crates/switchyard-server/src/metrics.rs | #11, #12 |
 | Append-only JSONL routing log: durable per-request routing records (chosen model, fallbacks, usage, cost) queryable via `/v1/stats` | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/crates/switchyard-server/src/routing_log.rs | #2 |
 | Credential redaction middleware scrubbing provider keys from response headers and decompressed bodies | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/crates/switchyard-server/src/redaction.rs | #7 |
-| Caller-credential forwarding (use your Claude login upstream) incl. a Claude Code plugin | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/examples/claude/README.md | context (parity: llm-proxy ships opt-in passthrough BYOK — `crates/llm-proxy-core/src/provider_config.rs:378-385`, `crates/llm-proxy-server/src/routes/core_pipeline.rs:727-730`) |
+| Caller-credential forwarding (use your Claude login upstream) incl. a Claude Code plugin | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/examples/claude/README.md | context (parity: llm-proxy ships opt-in passthrough BYOK — `crates/llm-proxy-core/src/provider_config.rs:378-385`, swapped at `crates/llm-proxy-server/src/routes/core_pipeline.rs:294-304`, cite corrected 2026-11-08 per research audit) |
 | Responses continuation state and `responses_reasoning` replay policy; context compaction operation | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/docs/reference/toml_schema.md | #6, new — payload cost transforms |
 | Theoretical KV-cache hit-rate tracking (prefix-fingerprint match rate as a routing-quality signal) | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/crates/switchyard-server/src/stats/cache_eligibility.rs | new — engine-state-aware routing |
 | Unreleased main: speculative parallel model/decision calls with loser cancellation, host aborts, serializable routing state | https://github.com/NVIDIA-NeMo/Switchyard/blob/main/CHANGELOG.md | context (announced) |
@@ -345,7 +358,8 @@ cross-gateway numbers need care.
 proxy server and out-of-process data plane for agentic apps, built on Envoy;
 the data plane is Rust — proxy-wasm cdylib plugins (`llm_gateway`,
 `prompt_gateway`, `hermesllm`) inside Envoy plus the Rust "brightstaff"
-model-serving process — with a TypeScript `planoai` CLI. Apache-2.0; run
+model-serving process — with a Python `planoai` CLI (language corrected
+2026-11-08 per research audit). Apache-2.0; run
 via `planoai up config.yaml` or a single Docker image; declarative YAML.
 
 **Maintenance.** Active — last commit and release 0.4.39 both 2026-10-24,
@@ -438,7 +452,10 @@ llm-proxy, never code reuse (MIT versions were deprecated/yanked).
 
 **Maintenance.** Very active — last commit 2026-11-02, ~3,191 commits,
 releases every 1–4 weeks (stable v3.5.1 2026-09-04; v4.0.0-beta.3
-2026-10-06); 85 stars, single author.
+2026-10-06); 85 stars, single author. Caveat added 2026-11-08 per research
+audit: single-author scale, and this section states the vendor's own
+numbers as fact (notably "~8 ms hot reload") — treat them as vendor
+claims.
 
 **Sources.** Stats and activity: https://github.com/MikkoParkkola/mcp-gateway
 (repo page; ~3,191 commits) and
@@ -455,7 +472,7 @@ v4.0.0-beta.3 2026-10-06).
 | Per-client rate limiting with burst bucket (token bucket per caller key, not per-IP) | https://raw.githubusercontent.com/MikkoParkkola/mcp-gateway/main/gateway.example.yaml | #3 |
 | Cost governance with blocking tiers: currency, daily/per-tool/per-key budgets, 50/80/100% alert tiers where 100% blocks, `costs.json` persistence with anti-tamper hardening, cost-report meta-tool | https://raw.githubusercontent.com/MikkoParkkola/mcp-gateway/main/gateway.example.yaml | #2 |
 | SHA-256-keyed response cache plus three-state idempotency cache (in-flight → completed, SHA-256 over server:tool + canonical args, TTLs, failure eviction) and prompt_cache_key preservation | https://raw.githubusercontent.com/MikkoParkkola/mcp-gateway/main/ARCHITECTURE.md | #10 |
-| ~8 ms hot reload of backends and config without dropping connections (notify + meta-tools, transition tracker merging in-memory state) | https://raw.githubusercontent.com/MikkoParkkola/mcp-gateway/main/README.md | #16 |
+| ~8 ms hot reload of backends and config without dropping connections (notify + meta-tools, transition tracker merging in-memory state) — vendor-reported number, not independently measured | https://raw.githubusercontent.com/MikkoParkkola/mcp-gateway/main/README.md | #16 |
 | Key server: SHA-256 hashed expiring API keys with OIDC, policies, admin token; single-use dashboard bootstrap link; agent auth | https://raw.githubusercontent.com/MikkoParkkola/mcp-gateway/main/gateway.example.yaml | #9 |
 | Hash-chain transparency audit log of tool invocations, tested Prometheus alert rules, stats meta-tool | https://github.com/MikkoParkkola/mcp-gateway/releases | #12 (metrics.rs counters and shipped Prometheus alert rules; the hash-chain audit trail itself is comparison context) |
 | SSRF guard with resolves-then-pins DNS (rebinding defense), special-use IP blocking, cleartext-credential refusal at config load, Origin/Host cross-site validation, mTLS, HMAC+nonce message signing | https://raw.githubusercontent.com/MikkoParkkola/mcp-gateway/main/security-controls.toml | context |
@@ -833,6 +850,9 @@ coding CLIs; went multi-protocol with cost-optimization transforms in v0.2.0.
 **Maintenance.** Active — 606 commits, last commit 2026-10-28 (verified in
 the research run's shallow clone, HEAD 7ac9750); twenty releases at roughly
 weekly cadence, v0.1.0 (2026-07-21) → v0.2.9 (2026-10-27); 254 stars.
+Caveat added 2026-11-08 per research audit: the project launched July 2026,
+so all of its history is young — read its velocity with the demand caveats
+in the intro.
 
 **Sources.** Stats and activity: https://github.com/yolorouter/yolorouter
 (repo page: 606 commits) and the run's shallow clone at
@@ -1050,13 +1070,13 @@ are the wave-3 candidates listed in the intro.
 | Prompt-cache plumbing and cache locality (#14) | ostk-cache, claude-code-proxy (raine), CLIProxyAPI, sub2api, SMG, Claude Code Router, Otari, yolorouter, Plano, tokdiet (mutation guards), ThinkWatch (encrypted-history pinning), mistral.rs (engine-side KV cache) |
 | Payload cost transforms + shadow-eval guard (new) | tokdiet, ostk-cache, yolorouter, Plano, Switchyard (compact) |
 | Guardrails, DLP, secrets (#7) | preflight, Antirion, Plano, AISIX, ThinkWatch, mcp-gateway (tool poisoning), Otari, done-hub, Switchyard (redaction) |
-| Upstream cancellation propagation (new) | xLB, sub2api (499 classification) |
+| Upstream cancellation propagation (withdrawn) | xLB, sub2api (499 classification) — withdrawn as a gap 2026-11-08 per research audit: llm-proxy already propagates client disconnects upstream in every streaming phase; only cancelled-stream usage settlement remains |
 | Observability: Prometheus (#12), OTel (#11), percentiles/TTFT (#17) | Switchyard, xLB, SMG, Antirion, Plano, AISIX, mcp-gateway, preflight, done-hub, yolorouter, PromptCache, ThinkWatch, Otari, mistral.rs |
 | MCP (#8) | SMG, Antirion, Plano, AISIX, mcp-gateway, ThinkWatch, Claude Code Router (ToolHub), Otari, sub2api, done-hub, mistral.rs (client + server modes) |
 | OpenAI Responses client endpoint (#6) | Switchyard, claude-code-proxy (raine), mistral.rs, SMG, AISIX, Plano, ThinkWatch, CLIProxyAPI, sub2api, Claude Code Router, yolorouter, completion-to-response; wider endpoint breadth is `context` (endpoints.md scope) |
 | Cloud-native upstream auth (#4) | AISIX (Bedrock SigV4 / Vertex OAuth2 / Azure adapters), ThinkWatch (Bedrock SigV4 + Azure) |
 | Web admin UI (#19) | Antirion (embedded console), mcp-gateway (wizard/doctor/dashboard), CLIProxyAPI (v8 web panel), Claude Code Router (web UI), yolorouter (web console), tokdiet (web dashboard); terminal TUIs (claude-code-proxy, ollamaMQ) and SMG's HTTP admin API are tagged `context` |
-| Hot reload (#16) | mcp-gateway (~8 ms), ollamaMQ (TUI reload), CLIProxyAPI (management API), preflight (SIGHUP), AISIX (SIGHUP/etcd) |
+| Hot reload (#16) | mcp-gateway (~8 ms, vendor number), ollamaMQ (TUI reload), CLIProxyAPI (management API), preflight (SIGHUP), AISIX (SIGHUP/etcd) |
 | Hedged requests (new) | Antirion |
 
 ## Coverage appendix — all deduplicated wave-3 finds

@@ -28,8 +28,9 @@ commit `6bcf1ef4e4d32fc0eae69b528f0e10cfea3e433b` (`git rev-parse HEAD`,
 `crates/llm-proxy-provider/src/discovery.rs:145`; flat `TimeoutLayer` at
 `crates/llm-proxy-server/src/routes/mod.rs:64-67`; `MAX_BODY_BYTES` 32 MiB
 at `routes/mod.rs:37`; no `prompt_tokens_details` / `cached_tokens` anywhere
-in `crates/` or `apps/`; core usage already carries `cache_creation`/
-`cache_read` at `crates/llm-proxy-protocol/src/core.rs:639-641`; and the
+  in `crates/` or `apps/`; core usage already carries `cache_creation`/
+  `cache_read` at `crates/llm-proxy-protocol/src/core.rs:683-685` (cite
+  corrected 2026-11-08 per research audit; `:639-641` is `Cost`); and the
 rate limiter keys by caller key id when authenticated, client IP otherwise
 (`crates/llm-proxy-server/src/routes/core_pipeline.rs:173-176`) — per-key
 RPM already exists, matching the compendium's narrowed gap #3.
@@ -366,15 +367,21 @@ one account can expose hundreds of models testable only one-by-one, with a
 fixed prompt and no thinking-effort control
 (https://github.com/Wei-Shaw/sub2api/issues/8454, /issues/8494).
 
-**Directions (pulls).** Quota-exhaustion semantics — final non-retryable
-usage-limit errors carrying the real reset time
-(https://github.com/Wei-Shaw/sub2api/pull/7239); prompt-cache engineering by
+**Directions (pulls).** Prompt-cache engineering by
 mimicking first-party client fingerprints — cached tokens 0 → 34,304 by
 turn 4 (https://github.com/Wei-Shaw/sub2api/pull/8464); full pricing matrix
 at model-add time (https://github.com/Wei-Shaw/sub2api/pull/8364); durable
 outbox reworked after a production incident
 (https://github.com/Wei-Shaw/sub2api/pull/8468); least-privilege admin keys
 (https://github.com/Wei-Shaw/sub2api/pull/8476).
+
+Citation corrected 2026-11-08 per research audit: this list previously
+opened with "quota-exhaustion semantics — final non-retryable usage-limit
+errors carrying the real reset time" cited to
+`sub2api/pull/7239`, but that PR fixes a registration promo-code field; the
+described behaviour is CLIProxyAPI's
+(https://github.com/router-for-me/CLIProxyAPI/pull/5978, which parses the
+recovery time out of a 429 body).
 
 **Gaps vs llm-proxy.** Background OAuth refresh pool
 (`backend/internal/service/token_refresh_service.go:16-34`); upstream
@@ -614,11 +621,14 @@ a truncated upstream stream surfaced as a bare socket destroy with no
 terminal event (https://github.com/musistudio/claude-code-router/issues/1917);
 Codex OAuth import structurally broken by scope demands and per-profile
 refresh-token reuse (https://github.com/musistudio/claude-code-router/issues/1941, /issues/1879);
-no automatic same-provider credential failover — users must model every API
+same-provider credential failover is unclear rather than absent — users
+model every API
 key as a separate provider, and the filed feature request asks for pool
 rotation on 429/401/403/5xx/timeout with Retry-After awareness and
 quarantine of persistently unauthorized keys
-(https://github.com/musistudio/claude-code-router/issues/1923).
+(https://github.com/musistudio/claude-code-router/issues/1923, which
+describes the failover story as unclear, not absent — corrected 2026-11-08
+per research audit).
 
 **Directions (pulls).** Multi-attempt diagnosability — per-attempt
 `[stage|status]` summaries appended to `error.message` because Claude Code
@@ -702,8 +712,13 @@ replay (llm-proxy's `Thinking.signature` is passthrough-only — a grep for
 `encrypted_content` across llm-proxy crates returns nothing); upstream
 WebSocket transport; live attachable monitor; XML tool-call synthesis for
 models without native function calling (`src/providers/cursor/tool_use_xml.rs:1-50`);
-corporate TLS trust-store support (llm-proxy builds reqwest with bundled
-roots only, `crates/llm-proxy-provider/Cargo.toml:23`).
+corporate TLS trust-store support. (Parenthetical corrected 2026-11-08 per
+research audit: llm-proxy did not build reqwest with bundled roots only at
+the audited commit — reqwest's default features were on, so native-tls and
+the OS trust store were active and corporate roots already worked. Plan 03
+later disabled the defaults, making rustls with bundled webpki roots the
+single stack in `crates/llm-proxy-transport/Cargo.toml`, which is what
+makes trust-store support a real gap.)
 
 ### router-for-me/CLIProxyAPI
 
@@ -1008,10 +1023,13 @@ normalization into one Usage type (`types/common.go:10-135`); channel-level
 parameter policy (`providers/base/common.go:608-705`); client-header
 passthrough rules (`providers/base/common.go:160-266`);
 `context.WithoutCancel` disconnect settlement (`providers/base/common.go:276-301`);
-`{model}` URL templating (`providers/openai/base.go:138-189`); no-cache
+no-cache
 headers on the admin surface after a CDN-cached authorization bypass
 (`middleware/cache.go:8-16`); untranslated passthrough relay for whole
-endpoint families (`router/relay-router.go:53-65`).
+endpoint families (`router/relay-router.go:53-65`). (`{model}` URL
+templating was removed from this gap list 2026-11-08 per research audit:
+llm-proxy already implements it, `crates/llm-proxy-provider/src/adapter/mod.rs:283-317`,
+used by `providers/opencode-zen.toml.example:25`.)
 
 ### messkan/prompt-cache
 
@@ -1046,7 +1064,9 @@ cache-key hygiene via media digests (`cmd/api/content.go:40-105`).
 stale answers when the corpus changes (https://github.com/messkan/prompt-cache/issues/8);
 no multi-tenancy — one shared token, and the README itself warns "semantic
 similarity is not an authorization mechanism" (https://github.com/messkan/prompt-cache/issues/9);
-an adopter asked when v1.0.0 ships before committing (unanswered ~3 months)
+an adopter asked when v1.0.0 ships before committing — the owner replied
+within days, so this is not an unanswered months-old request (corrected
+2026-11-08 per research audit)
 (https://github.com/messkan/prompt-cache/issues/16); OpenShift non-root
 execution broken at release time (https://github.com/messkan/prompt-cache/issues/10).
 
@@ -1118,9 +1138,12 @@ plus a single per-chunk idle watchdog applied identically to prefill wait
 and reasoning pauses at `crates/llm-proxy-provider/src/transport.rs:71-81`);
 idempotency-aware replay boundary; wall-clock retry ceiling;
 active+passive health; per-backend concurrency caps; checkout-validated
-connection pooling with POST replay; OS TCP keepalive on upstream sockets
-(llm-proxy sets keepalive only on accepted client sockets); listener
-admission control.
+connection pooling with POST replay; listener
+admission control. (An "OS TCP keepalive on upstream sockets" gap was
+removed 2026-11-08 per research audit: reqwest 0.12.28 defaults
+tcp_keepalive to 15 s with interval 15 s and 3 retries, and llm-proxy's
+pooled builder does not override it — upstream sockets already get
+keepalive.)
 
 ### yolorouter/yolorouter
 
@@ -2393,8 +2416,7 @@ swapping breaks provider analytics
 
 **6. Hardcoded model catalogs lag provider launches.** claude-code-proxy —
 every new model needs a release (https://github.com/raine/claude-code-proxy/issues/198);
-sub2api — new models missing from sync
-(https://github.com/Wei-Shaw/sub2api/issues/8508); inference-gateway —
+inference-gateway —
 deprecation dimension added via models.dev
 (https://github.com/inference-gateway/inference-gateway/issues/793);
 RouterArena — unknown slugs block submissions
@@ -2402,7 +2424,11 @@ RouterArena — unknown slugs block submissions
 sentinel auto-filed eight drift issues
 (https://github.com/0xzr/freellmpool/issues/141); PurpleLlama — static
 vendor lists reject custom endpoints
-(https://github.com/meta-llama/PurpleLlama/pull/253).
+(https://github.com/meta-llama/PurpleLlama/pull/253). A "sub2api — new
+models missing from sync" item cited to
+https://github.com/Wei-Shaw/sub2api/issues/8508 was removed 2026-11-08 per
+research audit: that issue reports Claude Ultra quota acquisition, not
+model sync.
 
 **7. Pricing data rots; unpriced traffic looks free.** tokdiet — absent
 models silently $0.00 (https://github.com/agiwhitelist/tokdiet/issues/1);
@@ -2601,10 +2627,43 @@ tenant-claim-scoped tool profiles
 
 ## Recurring unmet needs — patterns in 3+ repositories
 
-Patterns demanded by users of three or more harvested repositories, each a
-direct backlog input (see `compensation-backlog.json`).
+Patterns observed in three or more harvested repositories, each a
+direct backlog input (see `compensation-backlog.json`). "Observed", not
+"demanded by users": R4, R6, R7, R8, R10 and R11 rest on 0–1 user-filed
+issues (corrected 2026-11-08 per research audit).
 
-**R1. Retry/failover that classifies before it reacts (12 repos).**
+### How strong the demand evidence is
+
+Caveats added 2026-11-08 per the research audit. Read this record's
+pain-point index, R-sections and the backlog they feed as a catalogue of
+possibilities, not a ranking of demand:
+
+- Of 261 cited issues, 114 have no comments and 238 have no reactions; only
+  5 have 3 or more reactions.
+- 26 of the 40 sweep repositories are not LLM gateways (engines, guardrail
+  libraries, MCP servers, a benchmark, a list). This was not disclosed
+  before: R9 is 4 of 6 guardrail libraries; R12 is 4 of 4 MCP gateways.
+- One account (`roy-tong`, 94 items across repositories in an
+  "AgentMeasure" campaign) filed AgentOps #1445, Routerly #144 and tokdiet
+  #1; R2 and R7 count these as independent demand.
+- Some citations are vendor pitches (mistral.rs #2490, ThinkWatch #113,
+  antirion #41) or self-described AI-written reports (koboldcpp
+  #2480/#2481, raine #163).
+- "Most bug-dense" and "dominant" rest on the latest 100 tracker items per
+  repository; R6's "fastest-growing upstream segment" had no source and is
+  withdrawn above.
+- Several "researched in full" repositories are very young and much of
+  their code is AI-written: xLB (created 2026-10-14, 38 commits), Antirion
+  (created 2026-10-17), preflight (2026-09-20, 5 commits), tokdiet
+  (32 stars), ostk-cache (10 stars, not buildable), completion-to-response
+  (6 commits, archived). The per-repo sections flag most of these;
+  yolorouter and mcp-gateway were not flagged there (see the wave-3 survey).
+- Vendor numbers are stated as fact in places, such as mcp-gateway's
+  "~8 ms hot reload".
+
+**R1. Retry/failover that classifies before it reacts (13 repos — 12
+implementations plus metapi in the failure examples; count corrected
+2026-11-08 per research audit).**
 ThinkWatch PR #122, Switchyard `client.rs:400-528`, xlb `config.rs:253-298`,
 done-hub `relay/main.go:74-176`, CLIProxyAPI conductor, sub2api failover
 loop, freellmpool PR #97, glide PR #68, one-hub issue #852, opencodex issue
@@ -2618,7 +2677,8 @@ reset times, not blanket account bans.
 llama-swap #1218, Routerly #144, otari #2869, Switchyard cache-write split,
 aisix `token_estimate.rs`, CLIProxyAPI PR #7074, plano PR #995. llm-proxy's
 core usage already carries cache fields fed only from Anthropic dialects
-(`crates/llm-proxy-protocol/src/core.rs:639-641,683-685`; no
+(`crates/llm-proxy-protocol/src/core.rs:683-685`, cite corrected 2026-11-08
+per research audit — `:639-641` is `Cost`; no
 `prompt_tokens_details` parsing anywhere — verified 2026-11-04).
 
 **R3. Context-window signaling and preflight (7 repos).** mistral.rs PR
@@ -2630,7 +2690,9 @@ compact-vs-retry; llm-proxy already has the offline counter and
 
 **R4. Session attribution and sticky routing (9 repos).** sub2api
 `balancer.go:194-309`, CLIProxyAPI `session_cache.go:31-45`, done-hub sticky
-sessions, otari session stats + #2792, Switchyard `routing_log.rs`, tokdiet
+sessions, otari session stats (#2792 is a budget-name feature request, not
+session attribution — cite corrected 2026-11-08 per research audit),
+Switchyard `routing_log.rs`, tokdiet
 `session.ts:20-61`, plano session affinity, ThinkWatch sealed pinning
 (`sealed.rs:1-92`), SMG cache-aware stickiness. llm-proxy's ledger records
 only key id — no session, repo, or client-tool attribution.
@@ -2645,14 +2707,18 @@ timeouts that heartbeat comments prevent.
 **R6. Subscription/OAuth upstream credentials (7 repos).** claude-code-proxy
 `auth/manager.rs:18-70`, CLIProxyAPI `internal/auth/`, done-hub OAuth
 channels, sub2api token providers, Routerly PR #107, metapi PR #430,
-copilot-api #255. The fastest-growing upstream segment is unreachable for
-llm-proxy's static bearer keys.
+copilot-api #255. This R-section rests on 0–1 user-filed issues (audit
+caveat, 2026-11-08); "fastest-growing upstream segment" had no source and
+is withdrawn (corrected 2026-11-08 per research audit).
 
 **R7. Externally synced price catalogs with explicit unpriced state
 (6 repos).** otari `pricing_refresh_service.py`, plano PR #971, done-hub
 `pricing_modelsdev.go`, CCR `generate-models-json.mjs`, RouterArena PR #218,
-tokdiet #1. llm-proxy's hand-typed fixed-point TOML has no refresh story
-and no way to distinguish unpriced from free.
+tokdiet #1. llm-proxy's hand-typed fixed-point TOML has no refresh story.
+Unpriced is distinguishable row by row — cost stays NULL against a 0
+"unmetered" price and the row API returns an Option — and only the usage
+summary folds unpriced rows to 0 (corrected 2026-11-08 per research
+audit).
 
 **R8. Per-key scoping, windows, and budgets (8 repos).** yolorouter
 `api_key.go`, otari `budgets.py`, mcp-gateway `enforcer.rs`, GoModel PR
