@@ -1,9 +1,13 @@
 # Core Protocol and Lifecycle
 
 This document collects the cross-provider rules that belong in the normalized
-core, streaming pipeline, routing layer, or operational lifecycle.
+core, streaming pipeline, routing layer, or operational lifecycle. Each
+section is dated; corrections and additions made by the 2026-11-08
+research-audit pass are marked inline.
 
 ## Normalization boundaries
+
+*Notes captured October 2026.*
 
 Use one normalized core per endpoint family. Chat, embeddings, rerank, image
 generation, audio, and files share infrastructure but not request or response
@@ -23,6 +27,8 @@ than silently pretending that images, reasoning blocks, citations, or terminal
 states survived unchanged.
 
 ## Capability-driven sanitization
+
+*Notes captured October 2026.*
 
 OpenAI-compatible does not mean field-compatible. Providers commonly reject
 otherwise valid fields such as `tool_choice`, `cache_control`,
@@ -51,6 +57,8 @@ provider-shaped request. Do not forward client auth headers or arbitrary
 provider fields without an allowlist.
 
 ## Streaming is a state machine
+
+*Notes captured October 2026.*
 
 A stream must track more than the latest chunk:
 
@@ -94,6 +102,8 @@ streams may still need a response object for accounting.
 
 ## Tool calls and structured output
 
+*Notes captured October 2026; current-behaviour addition 2026-11-08.*
+
 Tool calls require stateful assembly. Names and IDs often arrive before JSON
 arguments, argument fragments may span arbitrary boundaries, and parallel
 calls may use missing or repeated indices. Buffer by stable index and preserve
@@ -108,7 +118,11 @@ At protocol boundaries:
   `$defs`, `anyOf`, nullable types, defaults, titles, `required`, and whether
   schemas must be objects.
 - Treat structured output as a provider capability. It may be a native schema,
-  JSON mode, a synthetic forced tool call, or a prompt-level instruction.
+  JSON mode, a synthetic forced tool call, or a prompt-level instruction —
+  and the forced-tool-call route is model-gated at Anthropic: newer models
+  reject that structured-output path with a 400 (added 2026-11-08 per
+  research audit), so it must be a per-model capability, not a blanket
+  fallback.
 - Keep internal response-format tools separate from user tools so they do not
   leak into client-visible tool calls.
 - Validate provider-specific `tool_choice` support instead of forwarding the
@@ -121,6 +135,8 @@ follow-up phases. Such flows must inherit auth, budgets, region, user identity,
 and cancellation from the parent request.
 
 ## Reasoning and content
+
+*Notes captured October 2026.*
 
 Reasoning can be stateful across turns. Some providers require signed thinking
 blocks to be replayed, others reject invalid or incomplete blocks, and local
@@ -138,6 +154,8 @@ map when the core has no stable field, but do not pass it automatically to a
 different provider.
 
 ## Usage and cost
+
+*Notes captured October 2026; correction 2026-11-08.*
 
 Never present estimated or synthetic usage as provider-reported truth. Track
 provenance explicitly:
@@ -157,7 +175,9 @@ true deltas should be added only when the provider contract says they are
 deltas.
 
 Some providers require opt-in usage flags such as
-`stream_options.include_usage` or `usage.include`. Token-count endpoints may
+`stream_options.include_usage`. OpenRouter's `usage.include` is deprecated
+and has no effect — do not build on it (corrected 2026-11-08 per research
+audit). Token-count endpoints may
 also need their own schema bridge and provider headers. Local tokenization is a
 fallback, not a native-provider count.
 
@@ -173,6 +193,8 @@ limits, sticky sessions, and the credential that incurred the charge without
 exposing secrets.
 
 ## Routing and affinity
+
+*Notes captured October 2026.*
 
 Provider route identity should be explicit and canonical. Model aliases select
 an upstream model inside that provider; they should not silently select a
@@ -193,6 +215,8 @@ canceling legitimate repeated prompts.
 
 ## Cancellation and shutdown
 
+*Notes captured October 2026.*
+
 Client disconnect must cancel upstream streaming and release response bodies,
 sockets, stream wrappers, and credential state. Cancellation should cover the
 first-frame wait as well as the steady-state loop.
@@ -209,6 +233,8 @@ states. Bound every queue, retry loop, and flush deadline. A failed disk write
 must remain pending rather than being reported as durable.
 
 ## Core implementation checklist
+
+*Notes captured October 2026.*
 
 - Endpoint-specific request, response, and event types.
 - Stable content and tool-call indices.

@@ -5,9 +5,26 @@ construction, request capabilities, response repair, and streaming contracts
 can all vary behind otherwise familiar APIs.
 
 These are implementation notes for current and possible future adapters, not a
-support matrix.
+support matrix. Each section is dated; corrections and additions made by the
+2026-11-08 research-audit pass are marked inline.
 
 ## Anthropic and Claude routes
+
+*Notes captured October 2026; current-behaviour additions 2026-11-08.*
+
+Current behaviour worth encoding (added 2026-11-08, verified against
+https://platform.claude.com/docs):
+
+- Prompt caching allows at most **4 `cache_control` breakpoints**; a fifth
+  is a 400 ("no slots left"). The default TTL is **5 minutes**; `"ttl": "1h"`
+  opts into a 1-hour cache at 2x write price (5m writes are 1.25x), and
+  longer-TTL entries must precede shorter ones in the request.
+- Model-scoped 400s, not global rules: **Claude 4.6+ reject assistant
+  prefill** ("This model does not support assistant message prefill");
+  **Opus 4.7-class and later reject non-default `temperature`/`top_p`/
+  `top_k`**; **Claude 4.7+ reject manual `thinking` with `budget_tokens`**
+  in favour of adaptive thinking (which 400s on models that predate it).
+  Encode these as per-model capabilities, not version-wide conditionals.
 
 - Strip empty text blocks and invalid replayed thinking blocks; native Messages
   rejects histories that some OpenAI-compatible backends tolerate.
@@ -28,6 +45,8 @@ support matrix.
 
 ## AWS, Bedrock, and SageMaker
 
+*Notes captured October 2026; correction 2026-11-08.*
+
 Native AWS integration requires SigV4 plus region, service, ARN, role, and
 credential-refresh handling. Static keys, ambient credentials, AssumeRole,
 web identity, and profiles must not share unsafe cache lifetimes.
@@ -36,7 +55,9 @@ Bedrock has multiple protocol families:
 
 - Invoke and Converse rewrite OpenAI/Anthropic request shapes differently.
 - Structured output may be prompt-inlined instead of sent as a native field.
-- Guardrails may require `guarded_text` content blocks.
+- Guardrails may require guarded content blocks — LiteLLM's name for the
+  field is `guarded_text`; AWS Converse itself uses `guardContent`
+  (corrected 2026-11-08 per research audit).
 - Model IDs need normalization across ARNs, cross-region prefixes, throughput
   suffixes, and routing prefixes.
 - Converse request metadata and grounding tools have provider limits.
@@ -48,9 +69,17 @@ explicit, including temperature/token floors and response-envelope variants.
 
 ## Azure
 
+*Notes captured October 2026; current-behaviour addition 2026-11-08.*
+
 An exact Azure OpenAI-compatible URL may work through a generic adapter, but
 native Azure support needs more:
 
+- Azure now also exposes a stable **v1 path** — `{resource}.openai.azure.com/openai/v1/...`
+  — which matches OpenAI's surface, authenticates with the `api-key` header
+  (or Entra tokens), and needs no `api-version` query parameter
+  (https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle,
+  added 2026-11-08). Adapters must accept both this and the classic
+  api-version query surface.
 - Preserve an `api-version` already embedded in the base URL and normalize v1
   path variants without duplicating `/openai`.
 - Support Azure API keys and Azure AD bearer tokens with clear precedence.
@@ -64,6 +93,8 @@ native Azure support needs more:
   exposing OpenAI-shaped objects.
 
 ## Gemini and Vertex
+
+*Notes captured October 2026.*
 
 - Select `response_schema` versus `response_json_schema` by model capability
   and preserve property ordering where Vertex requires it.
@@ -82,8 +113,17 @@ native Azure support needs more:
 
 ## OpenAI, Responses, and compatible gateways
 
+*Notes captured October 2026; current-behaviour additions and correction
+2026-11-08.*
+
 OpenAI-compatible providers frequently need small but important repairs:
 
+- OpenAI exposes **`prompt_cache_key`** (optional string on chat
+  completions, and on Responses): "Used by OpenAI to cache responses for
+  similar requests to optimize your cache hit rates. Replaces the `user`
+  field" (https://developers.openai.com/api/docs/api-reference/chat/create,
+  added 2026-11-08). Carry it where the target supports it; it is a
+  cache-locality input, not a billing field.
 - Rewrite `max_completion_tokens` to `max_tokens` only when the target expects
   the older field.
 - Normalize null roles, token counts, logprob lists, and error codes before
@@ -102,7 +142,9 @@ OpenAI-compatible providers frequently need small but important repairs:
 Examples include:
 
 - OpenRouter: route/model/transforms live in `extra_body`; usage cost and
-  reasoning may require opt-in fields and response metadata.
+  reasoning may require opt-in fields and response metadata. OpenRouter's
+  `usage.include` is deprecated and has no effect (corrected 2026-11-08 per
+  research audit).
 - Vercel AI Gateway: provider options are nested under `extra_body`.
 - Perplexity: HTTP 200 can still contain a failed Responses object, and search
   citations are side-channel data.
@@ -114,6 +156,8 @@ Examples include:
   plain API-key endpoint.
 
 ## Local and self-hosted OpenAI-compatible runtimes
+
+*Notes captured October 2026.*
 
 - Ollama uses `/api/chat`, provider-prefix normalization, local parameter names,
   and sometimes `<think>` stream boundaries.
@@ -130,6 +174,8 @@ Placeholder credentials must never be confused with real authentication or
 forwarded beyond the configured local endpoint.
 
 ## Other provider transformation patterns
+
+*Notes captured October 2026.*
 
 Keep provider-specific behavior at the edge:
 
@@ -153,8 +199,17 @@ and response behavior it protects.
 
 ## OpenCode Go and Zen
 
-OpenCode exposes OpenAI-compatible gateways used by the example provider
-files:
+*Notes captured October 2026; correction 2026-11-08.*
+
+OpenCode's current documentation
+(https://opencode.ai/docs/console/models/, added 2026-11-08) describes its
+gateways under `opencode.ai/inference/...` — e.g.
+`/inference/openai/v1/chat/completions`, `/inference/openai/v1/responses`,
+`/inference/anthropic/v1/messages` and
+`/inference/google/v1beta/models/{model}`. The legacy `/zen` paths below
+still answer (verified: `/zen/v1/models` returns a live model list), and
+this project's `providers/opencode-*.toml.example` files use only those
+legacy paths:
 
 ```text
 Go:  https://opencode.ai/zen/go/v1
@@ -182,6 +237,8 @@ record the catalog source and retrieval time, and allow local overrides. Never
 infer routing support solely from catalog metadata.
 
 ## Provider adapter checklist
+
+*Notes captured October 2026.*
 
 - Authentication type and secret ownership.
 - Base URL normalization and version/query precedence.
