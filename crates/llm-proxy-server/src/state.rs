@@ -180,6 +180,11 @@ pub struct AppState {
     /// Replica-shared cooldowns (plan 09 step 1): one replica's cooldown is
     /// every replica's.
     pub(crate) cooldowns_override: Option<Arc<dyn llm_proxy_engine::Cooldowns>>,
+    /// Client key ids a managed key store issued at startup (plan 09 step
+    /// 2), recorded so a hot-reload diff can attribute the ids the running
+    /// config carries but the file never had. Key ids only — never the
+    /// verifiers.
+    pub(crate) runtime_issued_keys: Arc<[String]>,
     /// Shared by every clone of this state: axum hands each request its own
     /// `AppState` clone, and the engine carries process-wide state (response
     /// cache, single-flight, idempotency, cooldowns), so a per-clone cell
@@ -240,6 +245,7 @@ impl std::fmt::Debug for AppState {
             .field("model_catalogs", &self.model_catalogs)
             .field("event_bus", &self.event_bus)
             .field("client_auth", &self.client_auth)
+            .field("runtime_issued_keys", &self.runtime_issued_keys)
             .field(
                 "engine",
                 &self
@@ -315,6 +321,7 @@ impl AppState {
             config_source,
             admission_override: None,
             cooldowns_override: None,
+            runtime_issued_keys: Arc::from(Vec::new()),
             engine: Arc::new(EngineSlot::default()),
         }
     }
@@ -332,6 +339,25 @@ impl AppState {
     /// authenticated finish on their own answer.
     pub fn swap_client_auth(&self, next: Arc<ClientAuth>) -> Arc<ClientAuth> {
         self.client_auth.replace(next)
+    }
+
+    /// Record the client key ids a managed key store issued at startup
+    /// (builder-style). The daemon sets this when it merges the store's
+    /// keys into the running config, so a later hot-reload diff can tell
+    /// the runtime-issued ids from a genuine `[auth.clients]` file edit.
+    /// Ids that also name a file key are harmless: file keys win the merge,
+    /// so such an id only differs when the file itself changed it.
+    #[must_use]
+    pub fn with_runtime_issued_keys(mut self, ids: Vec<String>) -> Self {
+        self.runtime_issued_keys = Arc::from(ids);
+        self
+    }
+
+    /// The client key ids a managed key store issued at startup (empty for
+    /// a state built without one).
+    #[must_use]
+    pub fn runtime_issued_keys(&self) -> &[String] {
+        &self.runtime_issued_keys
     }
 
     /// Replace the per-provider egress clients (builder-style).

@@ -105,9 +105,15 @@ pub async fn reload_registry(
     if !restart.is_empty() {
         bail!(
             "restart-required: {} changed ({}); the reload was refused and nothing was \
-             applied. Restart the server to apply these fields.",
+             applied. Restart the server to apply these fields.{}",
             restart.len(),
-            restart.join(", ")
+            restart.join(", "),
+            managed_keys_note(
+                state.app_config(),
+                &next,
+                state.runtime_issued_keys(),
+                &restart
+            )
         );
     }
 
@@ -146,6 +152,57 @@ pub async fn reload_registry(
     let _previous_config = state.config_source().swap(next_config);
     let _previous = state.swap_engine(engine);
     Ok(report)
+}
+
+/// When a managed key store backs the server, the running config carries the
+/// ids the store issued at startup (the merge) while the re-read file never
+/// had them, so the restart-required diff names `auth.clients` on every
+/// reload. This attributes that diff to the runtime-issued keys — but only
+/// when they fully explain it: the ids the running config has and the file
+/// lacks must all be store-issued, the file must add no id of its own, and
+/// no shared id's spec may differ (those are genuine file edits, which keep
+/// the plain refusal).
+fn managed_keys_note(
+    running: &llm_proxy_core::AppConfig,
+    next: &llm_proxy_core::AppConfig,
+    runtime_ids: &[String],
+    restart: &[String],
+) -> String {
+    if runtime_ids.is_empty()
+        || !restart.iter().any(|change| change == "auth.clients")
+        || restart
+            .iter()
+            .any(|change| change.starts_with("auth.clients."))
+    {
+        return String::new();
+    }
+    let running_only: Vec<&String> = running
+        .auth
+        .clients
+        .keys()
+        .filter(|id| !next.auth.clients.contains_key(*id))
+        .collect();
+    let file_added = next
+        .auth
+        .clients
+        .keys()
+        .any(|id| !running.auth.clients.contains_key(id));
+    if file_added
+        || running_only.is_empty()
+        || !running_only.iter().all(|id| runtime_ids.contains(id))
+    {
+        return String::new();
+    }
+    let ids = running_only
+        .iter()
+        .map(|id| id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        " The auth.clients diff is the runtime-issued managed keys ({ids}) merged \
+         from [auth.admin.key_store], not an edit of the file's own [auth.clients]; \
+         editing the file cannot clear it."
+    )
 }
 
 /// Names what differs between two registries, provider by provider and pool
@@ -755,6 +812,95 @@ laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mj
             serde_json::to_value(&*snapshot_before).ok(),
             serde_json::to_value(&*snapshot_after).ok(),
             "the app-level sections are unchanged; only the snapshot identity moved"
+        );
+    }
+
+    const PHC_A: &str = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$bi0KNLfLnc1qQxSai7uQDVMEMeSRpD/+rFoYCc/kku8";
+    const PHC_B: &str = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$KXr5NGmScBYNmF2Vd4mjyfLxyGLpTMhPn5VmRQMb0fw";
+
+    fn write_auth_config(dir: &Path, clients: &[(&str, &str)]) -> PathBuf {
+        let path = dir.join("config.toml");
+        let mut body = String::from(
+            "[server]\nbind = \"127.0.0.1:3477\"\nrequest_timeout = \"300s\"\nlog_level = \
+             \"info\"\nhot_reload = true\nserver_name = \"reload-test\"\n\n[auth]\nmode = \
+             \"client-keys\"\n\n[auth.clients]\n",
+        );
+        for (id, phc) in clients {
+            body.push_str(&format!("{id} = \"{phc}\"\n"));
+        }
+        std::fs::write(&path, body).expect("config file");
+        path
+    }
+
+    /// With a managed key store live, the running config carries ids the
+    /// re-read file never had (the startup merge), so every reload would be
+    /// refused by an `auth.clients` diff that reads like a file edit. The
+    /// refusal must attribute that diff to the runtime-issued keys instead.
+    #[tokio::test]
+    async fn a_managed_keys_auth_diff_is_attributed_not_blamed_on_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        // Startup: the merged running config holds the operator key and the
+        // store-issued key; the file below already lacks the store's id.
+        write_auth_config(dir.path(), &[("laptop", PHC_A), ("issued", PHC_B)]);
+        let state = state_for(dir.path())
+            .await
+            .with_runtime_issued_keys(vec!["issued".to_owned()]);
+
+        // The re-read file keeps only the operator's own key.
+        let path = write_auth_config(dir.path(), &[("laptop", PHC_A)]);
+
+        let error = reload_registry(&state, &path, None)
+            .await
+            .expect_err("the merged config's extra ids are still restart-required");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restart-required:"),
+            "the refusal keeps the stable prefix: {message}"
+        );
+        assert!(
+            message.contains("auth.clients"),
+            "the diff names auth.clients: {message}"
+        );
+        assert!(
+            message.contains("runtime-issued managed keys (issued)"),
+            "the refusal attributes the diff to the store's key, not the file's own \
+             clients: {message}"
+        );
+        assert!(
+            message.contains("[auth.admin.key_store]"),
+            "the attribution names where the runtime keys came from: {message}"
+        );
+    }
+
+    /// A genuine file edit — an operator key removed from the file — must
+    /// not wear the runtime-issued attribution: the id the running config
+    /// has and the file lacks is not one the store issued.
+    #[tokio::test]
+    async fn a_removed_file_key_is_not_attributed_to_managed_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (endpoint, _addr) = spawn_echo_upstream(Duration::ZERO).await;
+        write_provider(dir.path(), "prov", &endpoint, 1);
+        write_auth_config(dir.path(), &[("laptop", PHC_A), ("phone", PHC_B)]);
+        let state = state_for(dir.path())
+            .await
+            .with_runtime_issued_keys(vec!["issued".to_owned()]);
+
+        // The operator removed the "phone" key from the file.
+        let path = write_auth_config(dir.path(), &[("laptop", PHC_A)]);
+
+        let error = reload_registry(&state, &path, None)
+            .await
+            .expect_err("a removed file key is restart-required");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("restart-required:") && message.contains("auth.clients"),
+            "the refusal keeps its plain form: {message}"
+        );
+        assert!(
+            !message.contains("runtime-issued"),
+            "a removed file key is a file edit, not a managed-keys artifact: {message}"
         );
     }
 }

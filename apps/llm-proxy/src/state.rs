@@ -108,26 +108,13 @@ pub async fn load_toml_state_from_config(
 
     // Managed keys (plan 09 step 2): when [auth.admin.key_store] is set
     // (and the admin-ui feature is compiled in), the store's live keys
-    // join the file's [auth.clients] — in the AuthConfig every consumer
-    // reads, not just the authenticator. ClientAuth verifies them, the
-    // engine's PolicyAdmission enforces the policies pinned on them
-    // (windows, budgets, allowlists) and the replica admissions carry
-    // them too. File keys win on id collisions, so the store can never
-    // shadow an operator key. Under auth.mode = "none" the merge is
-    // skipped instead of failing startup: no client auth is enforced in
-    // that mode, so the keys would be dead weight, and merging them would
-    // trip ClientAuth's mode-none-with-clients refusal on every restart.
+    // join the file's [auth.clients] (`merged_auth_config` states the merge
+    // rules).
     #[cfg(feature = "admin-ui")]
     let managed = managed_key_source(&app_config)?;
     #[cfg(feature = "admin-ui")]
     let app_config = match &managed {
-        Some(source) => {
-            let mut config = app_config;
-            for (id, spec) in source.specs.iter().cloned() {
-                config.auth.clients.entry(id).or_insert(spec);
-            }
-            config
-        }
+        Some(source) => merged_auth_config(app_config, &source.specs),
         None => app_config,
     };
     // A corrupt verifier must still refuse startup (AppState's own build
@@ -158,6 +145,12 @@ pub async fn load_toml_state_from_config(
         );
     }
 
+    // [auth.admin] key_store with the feature off is a startup error,
+    // never a silent skip (the same posture as [replica] and
+    // semantic-cache).
+    #[cfg(not(feature = "admin-ui"))]
+    refuse_key_store_without_admin_ui(&app_config)?;
+
     let base = AppState::new_with_catalog_dir(
         app_config.clone(),
         registry.clone(),
@@ -187,7 +180,11 @@ pub async fn load_toml_state_from_config(
                     std::sync::Arc::clone(&backend),
                 )),
             ));
+            // The startup merge added the store's ids to the running
+            // config; record them so a hot reload can attribute the ids the
+            // file never had instead of blaming the file's own clients.
             let base = base
+                .with_runtime_issued_keys(source.specs.iter().map(|(id, _)| id.clone()).collect())
                 .with_admission(std::sync::Arc::clone(&swapping)
                     as std::sync::Arc<dyn llm_proxy_engine::Admission>);
             let (state, replica_installer) = crate::replica::apply_replica(
@@ -223,6 +220,47 @@ pub async fn load_toml_state_from_config(
         .0;
 
     Ok(state)
+}
+
+/// The startup merge (plan 09 step 2): the store's live keys join the
+/// file's `[auth.clients]` — in the AuthConfig every consumer reads, not
+/// just the authenticator. ClientAuth verifies them, the engine's
+/// PolicyAdmission enforces the policies pinned on them (windows, budgets,
+/// allowlists) and the replica admissions carry them too. File keys win on
+/// id collisions, so the store can never shadow an operator key. Under
+/// auth.mode = "none" the merge is skipped instead of failing startup (see
+/// [`managed_key_source`]): no client auth is enforced in that mode, so the
+/// keys would be dead weight, and merging them would trip ClientAuth's
+/// mode-none-with-clients refusal on every restart.
+#[cfg(feature = "admin-ui")]
+fn merged_auth_config(
+    app_config: AppConfig,
+    specs: &[(String, llm_proxy_core::ClientKeySpec)],
+) -> AppConfig {
+    let mut config = app_config;
+    for (id, spec) in specs.iter().cloned() {
+        config.auth.clients.entry(id).or_insert(spec);
+    }
+    config
+}
+
+/// `[auth.admin] key_store` with the feature off is a startup error, never
+/// a silent skip: the store's keys could never load and no surface exists
+/// to manage them (the same posture as `[replica]` and semantic-cache).
+#[cfg(not(feature = "admin-ui"))]
+fn refuse_key_store_without_admin_ui(app_config: &AppConfig) -> Result<()> {
+    if app_config
+        .auth
+        .admin
+        .as_ref()
+        .is_some_and(|admin| admin.key_store.is_some())
+    {
+        anyhow::bail!(
+            "[auth.admin] key_store is configured but this build lacks the admin-ui \
+             feature; rebuild with --features admin-ui or remove key_store"
+        );
+    }
+    Ok(())
 }
 
 /// Rebuilds the single-node admission rules from a merged `[auth]` over
@@ -1112,6 +1150,55 @@ enabled = true
         )
         .await
         .expect("a bare /v1 target naming a configured provider builds the state");
+    }
+
+    /// A configured `[auth.admin] key_store` in a build without the
+    /// admin-ui feature is a startup error, never a silent skip: the
+    /// store's keys could never load here.
+    #[cfg(not(feature = "admin-ui"))]
+    #[tokio::test]
+    async fn load_toml_state_rejects_a_key_store_without_the_admin_ui_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_file(dir.path(), None);
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "keystore-test"
+
+[auth]
+mode = "client-keys"
+
+[auth.clients]
+laptop = "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg$bi0KNLfLnc1qQxSai7uQDVMEMeSRpD/+rFoYCc/kku8"
+
+[auth.admin]
+token = "admin-secret"
+key_store = "managed-keys.db"
+
+[storage]
+path = "usage.db"
+"#,
+        )
+        .unwrap();
+
+        let error = load_toml_state(
+            &path,
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            None,
+        )
+        .await
+        .expect_err("a key store without the admin-ui feature must refuse startup");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("key_store") && message.contains("admin-ui"),
+            "the error names the section and the missing feature: {message}"
+        );
     }
 
     fn admin_app_config(
