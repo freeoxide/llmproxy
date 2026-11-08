@@ -15,5 +15,8 @@ against the same snapshots, so the three implementations cannot drift apart.
 Linux artifacts are built and install-tested here. Windows x64 artifacts are
 produced by mingw-w64 cross-compilation and run-verified under wine 10.0
 with the official Windows node.exe and embeddable CPython (the full Node
-contract suite and the Python driver both pass; see the package READMEs).
-macOS artifacts need CI runners with Apple toolchains.
+contract suite and the Python driver both pass; see the package READMEs);
+the Node package also carries an msvc binary (cargo-xwin), verified the same
+way. macOS artifacts are produced by zig cross-compilation (universal2 for
+both packages) and verified structurally; a run on macOS hardware remains
+for CI.

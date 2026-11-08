@@ -13,15 +13,22 @@ Prebuilt wheels install with no Rust toolchain:
 pip install llm_proxy-0.1.0-cp39-abi3-manylinux_2_34_x86_64.whl
 ```
 
-Two wheels are produced here: the Linux x86_64 manylinux wheel (built and
-install-tested) and a Windows x64 wheel
+Three wheels are produced here: the Linux x86_64 manylinux wheel (built and
+install-tested), a Windows x64 wheel
 (`llm_proxy-0.1.0-cp39-abi3-win_amd64.whl`, mingw-w64 cross-compilation via
 `RUSTC_WRAPPER= .venv/bin/maturin build --release --target
-x86_64-pc-windows-gnu -o dist`). The Windows wheel is run-verified with the
-embeddable Windows CPython 3.13.5 under wine 10.0 — every shared-contract
-case, the error shape, streaming, cancellation and the ClientCancelled
-settlement pass (see `tests/windows_driver.py`). macOS wheels are left to
-CI runners with Apple toolchains. The abi3 wheel supports CPython 3.9+.
+x86_64-pc-windows-gnu -o dist`), and a macOS universal2 wheel
+(`llm_proxy-0.1.0-cp39-abi3-macosx_10_12_universal2.macosx_10_12_x86_64.macosx_11_0_arm64.whl`,
+zig cross-compilation via `RUSTC_WRAPPER= .venv/bin/maturin build --release
+--zig --target universal2-apple-darwin -o dist`; zig supplies the macOS libc
+stubs and `llvm-lipo` merges the two slices). The Windows wheel is
+run-verified with the embeddable Windows CPython 3.13.5 under wine 10.0 —
+every shared-contract case, the error shape, streaming, cancellation and the
+ClientCancelled settlement pass (see `tests/windows_driver.py`). The macOS
+wheel's extension is a fat `x86_64 + arm64` Mach-O whose undefined `Py_*`
+symbols resolve from the host interpreter and which links only system
+libraries (`libSystem`, `libiconv`, `libcharset`); a run on macOS hardware
+remains for CI. The abi3 wheels support CPython 3.9+.
 
 ## Use
 

@@ -59,8 +59,13 @@ the engine and add no logic of their own, so they start once its API has stopped
   which is run-verified with the embeddable Windows CPython 3.13.5 under
   wine 10.0: every shared-contract case, the error shape, streaming,
   cancellation and the `ClientCancelled` settlement pass
-  (`bindings/python/tests/windows_driver.py`). macOS wheels need CI runners
-  with Apple toolchains.
+  (`bindings/python/tests/windows_driver.py`). The macOS wheel is a
+  universal2 build produced by zig cross-compilation (`maturin build
+  --zig --target universal2-apple-darwin`; zig supplies the macOS libc
+  stubs, `llvm-lipo` merges the slices): structurally verified as a fat
+  `x86_64 + arm64` Mach-O whose undefined `Py_*` symbols resolve from the
+  host interpreter and which links only system libraries — a run on macOS
+  hardware remains for CI.
 - **Node package (step 3).** `bindings/node`: napi-rs + `@napi-rs/cli`
   (`napi build --platform --release`). The native module returns structured
   results (`{response, error}` objects, JSON-encoded `ErrorInfo` on
@@ -78,8 +83,17 @@ the engine and add no logic of their own, so they start once its API has stopped
   path finds no msvc binary (official node.exe is MSVC-built). The npm name
   is scoped
   (`@freeoxide/llm-proxy`) because the unscoped `llm-proxy` on npm belongs
-  to an unrelated package. macOS binaries need CI runners with Apple
-  toolchains.
+  to an unrelated package. An msvc binary
+  (`llm-proxy.win32-x64-msvc.node`) is produced by cargo-xwin
+  cross-compilation (the MSVC CRT/SDK libraries are fetched from Microsoft;
+  on msvc the napi symbols resolve dynamically from the host node.exe at
+  load, so no node import library is needed) and run-verified the same way:
+  13/13 with only the msvc binary present, 13/13 with both Windows binaries
+  present, 13/13 through the gnu fallback. The macOS binary is a
+  darwin-universal build produced by zig cross-compilation (`cargo zigbuild
+  --target universal2-apple-darwin`): structurally verified as a fat
+  `x86_64 + arm64` Mach-O whose undefined `napi_*` symbols resolve from the
+  host node at load — a run on macOS hardware remains for CI.
 - **Shared tests (step 4).** `bindings/shared/cases.json` holds the shared
   cases: the plan-02 contract fixtures (Claude Code, the Anthropic SDK, the
   OpenAI SDK, Codex — captured and synthesized; provenance in the fixture

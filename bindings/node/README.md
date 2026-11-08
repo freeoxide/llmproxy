@@ -36,8 +36,14 @@ Run-verified under wine 10.0 with the official node-v20.19.2 win-x64
 
     wine <node.exe> test/bindings.test.js   # 13/13 with llm-proxy.win32-x64-gnu.node
 
-An msvc build and macOS binaries are left to CI runners with those
-toolchains.
+A macOS binary (`llm-proxy.darwin-universal.node`) is produced by zig
+cross-compilation — `RUSTC_WRAPPER= cargo zigbuild --release --target
+universal2-apple-darwin`, then the resulting `libllm_proxy_node.dylib` is
+copied under its loader name (zig supplies the macOS libc stubs; `llvm-lipo`
+as `lipo` merges the x86_64 and arm64 slices). Statically verified: a fat
+`x86_64 + arm64` Mach-O whose undefined `napi_*` symbols resolve from the
+host node at load (`-undefined dynamic_lookup`) and which links only system
+libraries. A run on macOS hardware remains for CI.
 
 ## Use
 
