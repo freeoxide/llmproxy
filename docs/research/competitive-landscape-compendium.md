@@ -401,7 +401,9 @@ measurement, no trace export.
 | Semconv | OTel client-inference span shape standardized | https://raw.githubusercontent.com/open-telemetry/semantic-conventions-genai/main/docs/gen-ai/client-inference.md |
 
 Streaming SLO mechanics `new:` LiteLLM SSE `: ping` keep-alives
-(`keepalive_seconds` 1–300), `cancel_on_disconnect` (logged 499), and
+(`keepalive_seconds` 1–300), `cancel_on_disconnect` (logged 499 — documented
+for non-streaming calls, so it is not a streaming-cancel mechanism; corrected
+2026-11-08 per research audit), and
 `always_include_stream_usage` for billing when the final chunk never arrives
 (https://docs.litellm.ai/docs/proxy/config_settings); OpenRouter documents
 per-provider cancel-billing (abort propagates at ~24 providers;
@@ -603,9 +605,12 @@ Verdict: gap #18 (low, 2 gateways + 3 providers).
 
 llm-proxy: CLI serve/stop/status/validate/init/models/autostart
 (`apps/llm-proxy/src/cli.rs:23`), read-only usage admin API
-(`crates/llm-proxy-api/src/routes.rs:53-55,116-117`), musl single-binary releases,
-per-provider egress forward proxying
-(`crates/llm-proxy-provider/src/transport.rs:293`).
+(`crates/llm-proxy-api/src/routes.rs:53-55,116-117`), per-provider egress
+forward proxying (`crates/llm-proxy-provider/src/transport.rs:293`).
+A musl single-binary release workflow exists (`dist-workspace.toml`), but no
+release had shipped at the audited commit and the then-active native-tls left
+the build unproven (corrected 2026-11-08 per research audit; see the Extras
+row above for the full corrected statement).
 
 | Surface | Market | Source |
 |---------|--------|--------|
@@ -815,7 +820,7 @@ decision the candidate avoids).
 
 ### 7. Cloud-native upstream auth: SigV4/STS, Entra, ADC, mTLS (wave 2)
 
-Market: per-provider auth object separating credential acquisition from request attachment plus an expiry-driven credential cache; SigV4 computed last after every other request mutation; DualCache IAM policy (static ~59 min, ambient 600s, STS TTL minus 60s) and single-flight proactive token refresh with one 401 re-auth retry (`ref/litellm/litellm/llms/bedrock/base_aws_llm.py:74-148,1400-1439`, `ref/litellm/litellm/llms/vertex_ai/vertex_llm_base.py:480-603`); OIDC token exchange writing rotated secrets at expiry minus 5 minutes; upstream mTLS only at agentgateway (Upstream-auth table). llm-proxy: static bearer only
+Market: per-provider auth object separating credential acquisition from request attachment plus an expiry-driven credential cache; SigV4 computed last after every other request mutation; DualCache IAM policy (static ~59 min, ambient 600s, STS TTL minus 60s) and single-flight proactive token refresh with one 401 re-auth retry (`ref/litellm/litellm/llms/bedrock/base_aws_llm.py:74-148,1400-1439`, `ref/litellm/litellm/llms/vertex_ai/vertex_llm_base.py:480-603`); OIDC token exchange writing rotated secrets at expiry minus 5 minutes; upstream mTLS ships at agentgateway (file cert/key/root; SPIFFE rotation Enterprise), LiteLLM documents a client certificate, and Kong's Service entity carries `client_certificate` (untested through its AI plugins) — not agentgateway-only (corrected 2026-11-08 per research audit; Upstream-auth table). llm-proxy: static bearer only
 (`crates/llm-proxy-core/src/provider_config.rs:374-385`); the wave-2 grep
 matched zero Rust/TOML files. Deferred from near-term candidates: needs a
 config/schema and dependency decision.
@@ -846,7 +851,7 @@ near-term candidates: needs a config/schema decision.
 
 ### 10. Model lifecycle metadata in catalogs and /v1/models (wave 2)
 
-Market: providers publish `shutdown_date`, tri-state `lifecycle` + `deprecated_at`/`retires_at` (retired stays listed, inference fails), `modelLifecycle` (6-month or 45-day window); Gemini none. Gateways: catalog `expiration_date` (14 of 464 dated, expired delisted) + `canonical_slug` aliases; cost-map `deprecation_date` on 874 entries, urgency buckets, daily-lock Slack alerts, never blocks; no request-time signal or successor mapping anywhere cited (Model-lifecycle table). llm-proxy: extend `StaticModelCatalogEntry`
+Market: providers publish `shutdown_date`, tri-state `lifecycle` + `deprecated_at`/`retires_at` (retired stays listed, inference fails), `modelLifecycle` (6-month or 45-day window); Gemini none. Gateways: catalog `expiration_date` (14 of 464 dated, expired delisted) + `canonical_slug` aliases; cost-map `deprecation_date` on 874 entries, urgency buckets, daily-lock Slack alerts, never blocks; no request-time signal anywhere cited, and LiteLLM's cost map defines `successor_model` entries feeding deprecation guidance (not request rewrites) while no other gateway cited maps to a successor (corrected 2026-11-08 per research audit; Model-lifecycle table). llm-proxy: extend `StaticModelCatalogEntry`
 (`crates/llm-proxy-core/src/provider_config.rs:735-747`, currently
 `deny_unknown_fields`, so new fields need `#[serde(default)]`) and
 discovery's `parse_models` to capture per-kind lifecycle fields (OpenAI
