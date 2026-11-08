@@ -99,9 +99,11 @@ impl SwappingAdmission {
         Arc::clone(&guard)
     }
 
-    /// Atomically replace the enforced rules; requests already reserving
-    /// settle on the step they reserved through. Returns the step that
-    /// was enforcing until now.
+    /// Atomically replace the enforced rules. Reservations already handed
+    /// out settle on whichever step is current when they settle — not the
+    /// step they reserved through — so every step installed for one engine
+    /// must share the same underlying backend; charges and cooldowns then
+    /// survive the swap. Returns the step that was enforcing until now.
     pub fn replace(
         &self,
         next: Arc<dyn llm_proxy_engine::Admission>,
