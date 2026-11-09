@@ -90,11 +90,14 @@ jobs:
         working-directory: bindings/node
         run: |
           npm ci
-          # Generates binding.js/binding.d.ts and the host arm64 slice.
-          npx napi build --platform --release --js binding.js --dts binding.d.ts
+          # Generates binding.js/binding.d.ts plus the arm64 slice; an
+          # explicit --target puts each slice under target/<triple>/release,
+          # so lipo reads two deterministic paths instead of --platform's
+          # host-dependent location.
+          npx napi build --release --target aarch64-apple-darwin --js binding.js --dts binding.d.ts
           cargo build --release --target x86_64-apple-darwin
           lipo -create -output llm-proxy.darwin-universal.node \
-            target/release/libllm_proxy_node.dylib \
+            target/aarch64-apple-darwin/release/libllm_proxy_node.dylib \
             target/x86_64-apple-darwin/release/libllm_proxy_node.dylib
           node --test test/
 
