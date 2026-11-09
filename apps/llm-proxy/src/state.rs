@@ -162,18 +162,24 @@ pub async fn load_toml_state_from_config(
     .with_egress_clients(egress_clients)
     .with_event_bus(event_bus);
 
-    // A daemon on a managed key store enforces through a swappable
-    // admission step and a swappable authenticator: the refresh loop
-    // (below) replaces both in place when the store's live key set
-    // changes, so a key issued or revoked at runtime is enforced by the
-    // running server without a restart — same rules shape as an
-    // equivalent file key, and the counters survive the swap.
+    // A daemon on a managed key store enforces through ONE swappable
+    // (authenticator, admission rules) pair: the refresh loop (below)
+    // replaces both halves under a single write guard when the store's
+    // live key set changes, so a key issued or revoked at runtime is
+    // enforced by the running server without a restart — same rules shape
+    // as an equivalent file key, and the counters survive the swap.
     #[cfg(feature = "admin-ui")]
     let state = match managed {
         Some(source) => {
             let backend = std::sync::Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new())
                 as std::sync::Arc<dyn llm_proxy_engine::AdmissionBackend>;
-            let swapping = std::sync::Arc::new(llm_proxy_server::SwappingAdmission::new(
+            // The same merged `[auth]` the state itself validated above;
+            // re-parsed so the pair owns its authenticator half from the
+            // start (the parse is PHC-string work, no hashing).
+            let initial_auth = llm_proxy_server::ClientAuth::from_config(&app_config.auth)
+                .context("rebuilding client auth for the swap pair")?;
+            let pair = std::sync::Arc::new(llm_proxy_server::SwappingAuthPair::new(
+                std::sync::Arc::new(initial_auth),
                 std::sync::Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
                     &app_config.auth,
                     &registry,
@@ -185,13 +191,12 @@ pub async fn load_toml_state_from_config(
             // file never had instead of blaming the file's own clients.
             let base = base
                 .with_runtime_issued_keys(source.specs.iter().map(|(id, _)| id.clone()).collect())
-                .with_admission(std::sync::Arc::clone(&swapping)
-                    as std::sync::Arc<dyn llm_proxy_engine::Admission>);
+                .with_auth_pair(std::sync::Arc::clone(&pair));
             let (state, replica_installer) = crate::replica::apply_replica(
                 &app_config,
                 &registry,
                 base,
-                Some(std::sync::Arc::clone(&swapping)),
+                Some(std::sync::Arc::clone(&pair)),
             )
             .await?;
             let installer: AdmissionInstaller = match replica_installer {
@@ -199,11 +204,10 @@ pub async fn load_toml_state_from_config(
                 None => single_node_admission_installer(state.clone(), backend),
             };
             spawn_managed_key_refresh(
-                state.clone(),
                 source.store,
                 source.file_auth,
                 source.specs,
-                swapping,
+                pair,
                 installer,
             );
             state
@@ -227,11 +231,11 @@ pub async fn load_toml_state_from_config(
 /// just the authenticator. ClientAuth verifies them, the engine's
 /// PolicyAdmission enforces the policies pinned on them (windows, budgets,
 /// allowlists) and the replica admissions carry them too. File keys win on
-/// id collisions, so the store can never shadow an operator key. Under
-/// auth.mode = "none" the merge is skipped instead of failing startup (see
-/// [`managed_key_source`]): no client auth is enforced in that mode, so the
-/// keys would be dead weight, and merging them would trip ClientAuth's
-/// mode-none-with-clients refusal on every restart.
+/// id collisions, so the store can never shadow an operator key. The
+/// merge only runs in client-keys mode: `auth.mode = "none"` with a
+/// configured store is refused earlier (see [`managed_key_source`]), so
+/// the merge can never trip ClientAuth's mode-none-with-clients refusal
+/// with store keys.
 #[cfg(feature = "admin-ui")]
 fn merged_auth_config(
     app_config: AppConfig,
@@ -302,12 +306,17 @@ struct ManagedKeySource {
 }
 
 /// Opens the managed-key source for the serving state: `None` when no
-/// store is configured or `auth.mode = "none"` (with the same warning
-/// startup always emitted for that combination).
+/// store is configured. `auth.mode = "none"` with a store configured is a
+/// startup error, not a warning — no client auth is enforced in that
+/// mode, so the store's keys could never take effect and an operator
+/// could believe they have auth on an open proxy (the same
+/// never-a-silent-skip posture as a key store without the admin-ui
+/// feature).
 ///
 /// # Errors
 ///
-/// `anyhow` when the store cannot be opened or read.
+/// `anyhow` when `auth.mode = "none"` carries a configured `key_store`,
+/// or when the store cannot be opened or read.
 #[cfg(feature = "admin-ui")]
 fn managed_key_source(config: &AppConfig) -> Result<Option<ManagedKeySource>> {
     if config.auth.mode == llm_proxy_core::AuthMode::None {
@@ -317,9 +326,10 @@ fn managed_key_source(config: &AppConfig) -> Result<Option<ManagedKeySource>> {
             .as_ref()
             .is_some_and(|admin| admin.key_store.is_some())
         {
-            tracing::warn!(
-                "auth.mode is \"none\": managed keys from [auth.admin.key_store] are \
-                 not enforced; set auth.mode = \"client-keys\" to use them"
+            anyhow::bail!(
+                "[auth.admin] key_store is configured but auth.mode is \"none\", where no \
+                 client auth is enforced and the store's keys can never take effect; set \
+                 auth.mode = \"client-keys\" to use them, or remove key_store"
             );
         }
         return Ok(None);
@@ -387,17 +397,24 @@ fn should_log_invalid_refresh(consecutive: u32) -> bool {
 }
 
 /// Watches the managed-key store and, when the live key set changed,
-/// re-merges it over the file's `[auth]` and swaps both the client
-/// authenticator and the admission rules into the running state. A store
-/// read that fails keeps the installed set; an invalid merged set keeps
-/// the installed set too, loudly — both fail safe, never open.
+/// re-merges it over the file's `[auth]` and swaps the client
+/// authenticator and the admission rules into the running state — both
+/// halves of one pair under a single write guard, so no served instant
+/// mixes the old key set with the new rules. A store read that fails
+/// keeps the installed set; an invalid merged set keeps the installed set
+/// too, loudly — both fail safe, never open.
+///
+/// The running config snapshot keeps the file's `[auth]` as merged at
+/// startup; request-time authentication and admission go through the
+/// swapped pair, never the snapshot. The hot-reload diff that still names
+/// `auth.clients` because of the startup merge is attributed to the
+/// runtime-issued ids through [`AppState::runtime_issued_keys`].
 #[cfg(feature = "admin-ui")]
 fn spawn_managed_key_refresh(
-    state: AppState,
     store: std::sync::Arc<llm_proxy_admin::ManagedKeys>,
     file_auth: llm_proxy_core::AuthConfig,
     initial: Vec<(String, llm_proxy_core::ClientKeySpec)>,
-    swapping: std::sync::Arc<llm_proxy_server::SwappingAdmission>,
+    pair: std::sync::Arc<llm_proxy_server::SwappingAuthPair>,
     install: AdmissionInstaller,
 ) {
     tokio::spawn(async move {
@@ -427,15 +444,18 @@ fn spawn_managed_key_refresh(
             match llm_proxy_server::ClientAuth::from_config(&auth) {
                 Ok(client_auth) => {
                     invalid_refreshes = 0;
-                    // Admission first: for the instant between the two
-                    // swaps a revoked token can still authenticate while
-                    // its id is already unknown to the new rules (which
-                    // treat unknown callers as unrestricted). The mirror
-                    // order instead lets a just-issued key bypass its
-                    // limits for that instant; failing open on revoke for
-                    // two adjacent statements is the cheaper instant.
-                    swapping.replace(install(&auth));
-                    state.swap_client_auth(std::sync::Arc::new(client_auth));
+                    // ONE write-guard swap installs the new authenticator
+                    // and the new rules together: no instant exists where
+                    // the router authenticates against the old key set
+                    // while the engine already enforces the new rules (a
+                    // revoked token judging as unknown-and-unrestricted),
+                    // nor the mirror (a just-issued key riding the old
+                    // permissive rules). The per-ClientAuth digest cache
+                    // dies with the old half by design — preserving it
+                    // would let a revoked token's cached digest survive —
+                    // so one extra argon2 per live client per refresh is
+                    // the price of correct revocation.
+                    pair.replace(std::sync::Arc::new(client_auth), install(&auth));
                     installed = seen;
                     tracing::info!(
                         live_keys = specs.len(),
@@ -1618,21 +1638,29 @@ path = "{}"
         (dir, path, token.expect("seeded key"))
     }
 
-    /// auth.mode = "none" plus a key store with live keys must not break
-    /// the next restart: the merge is skipped (no client auth is enforced
-    /// in that mode) instead of tripping ClientAuth's
-    /// mode-none-with-clients refusal.
+    /// auth.mode = "none" plus a configured key store is a startup
+    /// refusal, not a warning: no client auth is enforced in that mode,
+    /// so the store's keys could never protect anything and an operator
+    /// reading a WARN line could believe they have auth on an open proxy.
+    /// The refusal names both fixes — flip the mode or drop the store.
+    /// (Regression: this used to boot with only a warning; the test
+    /// fails against that old behaviour by expecting the error.)
     #[tokio::test]
     #[cfg(feature = "admin-ui")]
-    async fn auth_mode_none_with_a_key_store_still_starts() {
+    async fn auth_mode_none_with_a_key_store_refuses_to_start() {
         let (_dir, path, _token) = config_with_seeded_key_store("none");
-        load_toml_state(
+        let error = load_toml_state(
             &path,
             llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
             None,
         )
         .await
-        .expect("mode none never merges managed keys, so startup succeeds");
+        .expect_err("mode none can never enforce managed keys; startup must refuse");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("client-keys") && message.contains("key_store"),
+            "the refusal must name the fix (set the mode or drop key_store): {message}"
+        );
     }
 
     /// client-keys mode with an empty [auth.clients] and a seeded key

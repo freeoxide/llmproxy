@@ -49,6 +49,13 @@ use uuid::Uuid;
 mod cooldowns;
 mod event_bus;
 
+/// An in-process Redis server speaking real RESP2 over TCP (the
+/// `test-server` feature): for this crate's tests and downstream
+/// integration tests in environments with no Redis binary. Never enabled
+/// in production builds.
+#[cfg(feature = "test-server")]
+pub mod test_server;
+
 pub use cooldowns::RedisCooldowns;
 pub use event_bus::RedisEventBus;
 

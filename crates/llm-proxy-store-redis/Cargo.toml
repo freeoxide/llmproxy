@@ -13,6 +13,14 @@ categories = ["web-programming::http-server"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# An in-process Redis server speaking real RESP2 over TCP, for this
+# crate's tests and downstream integration tests (the app's replica-arm
+# runtime tests) in environments with no Redis binary. Test-only; never
+# enable it in production builds.
+test-server = []
+
 [dependencies]
 llm-proxy-core = { workspace = true }
 llm-proxy-engine = { workspace = true }
@@ -31,3 +39,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 llm-proxy-core = { workspace = true }
 llm-proxy-protocol = { workspace = true }
+# Self dev-dependency: enables `test-server` for this crate's own test
+# targets, so the in-process server in src/test_server.rs serves the
+# integration tests in tests/.
+llm-proxy-store-redis = { workspace = true, features = ["test-server"] }

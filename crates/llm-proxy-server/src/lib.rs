@@ -4,6 +4,10 @@
 
 #![deny(missing_docs)]
 
+/// The live (authenticator, admission rules) pair, atomically swapped
+/// together. Private module: [`SwappingAuthPair`] is exported once, at the
+/// crate root, so it has exactly one external path.
+mod auth_pair;
 /// Host/Origin validation under anonymous auth (DNS-rebinding defense).
 pub mod host_guard;
 /// Ingress self-loop refusal (508 on requests carrying the egress hop marker).
@@ -17,11 +21,12 @@ pub mod shutdown;
 /// Shared application state and build metadata.
 pub mod state;
 
+pub use auth_pair::SwappingAuthPair;
 pub use middleware::{
     CallerId, ClientAuth, ClientAuthError, RateLimiter, RequestId, RequestIdGenerator,
 };
 pub use shutdown::shutdown_signal;
-pub use state::{AppState, BuildInfo, SwappingAdmission};
+pub use state::{AppState, BuildInfo};
 
 use axum::Router;
 

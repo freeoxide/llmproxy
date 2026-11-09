@@ -8,6 +8,7 @@ use llm_proxy_engine::{Engine, EngineBuilder, ModelCatalogService};
 use llm_proxy_storage::{EventBus, NoopBus};
 use llm_proxy_transport::ProxyClient;
 
+use crate::auth_pair::SwappingAuthPair;
 use crate::middleware::{ClientAuth, RateLimiter, RequestIdGenerator};
 
 /// Static information about this binary.
@@ -21,134 +22,6 @@ pub struct BuildInfo {
     pub target: &'static str,
     /// Git commit SHA the binary was built from.
     pub git_sha: &'static str,
-}
-
-/// The authenticator slot every request reads and the daemon can replace
-/// without a restart: managed keys issued or revoked at runtime swap the
-/// whole [`ClientAuth`] (verifiers and digest cache together, so a
-/// revoked token's cached digest dies with it) while requests already
-/// running finish on the authenticator they fetched.
-pub(crate) struct ClientAuthSlot {
-    current: std::sync::RwLock<Arc<ClientAuth>>,
-}
-
-impl ClientAuthSlot {
-    /// A slot serving `initial` until [`Self::replace`] swaps it.
-    pub(crate) fn new(initial: Arc<ClientAuth>) -> Self {
-        Self {
-            current: std::sync::RwLock::new(initial),
-        }
-    }
-
-    /// The authenticator serving right now.
-    pub(crate) fn current(&self) -> Arc<ClientAuth> {
-        let guard = self
-            .current
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Arc::clone(&guard)
-    }
-
-    /// Atomically replace the serving authenticator; every request from
-    /// now on authenticates against `next`. Returns the authenticator
-    /// that was serving until now.
-    pub(crate) fn replace(&self, next: Arc<ClientAuth>) -> Arc<ClientAuth> {
-        let mut guard = self
-            .current
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::replace(&mut *guard, next)
-    }
-}
-
-impl std::fmt::Debug for ClientAuthSlot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientAuthSlot")
-            .field("current", &self.current())
-            .finish()
-    }
-}
-
-/// An [`llm_proxy_engine::Admission`] step whose rules can be replaced
-/// without rebuilding the engine: the engine holds one `Arc` to this
-/// wrapper for its whole life, and a swap replaces the inner step — same
-/// [`llm_proxy_engine::AdmissionBackend`] counters, fresh rules — so
-/// issuing or revoking a managed key at runtime changes what the running
-/// engine enforces without resetting anyone's windows or budgets.
-///
-/// The lock is never held across an `.await`: each method clones the
-/// inner `Arc` out and delegates to the clone.
-pub struct SwappingAdmission {
-    inner: std::sync::RwLock<Arc<dyn llm_proxy_engine::Admission>>,
-}
-
-impl SwappingAdmission {
-    /// A wrapper delegating to `inner` until [`Self::replace`] swaps it.
-    #[must_use]
-    pub fn new(inner: Arc<dyn llm_proxy_engine::Admission>) -> Self {
-        Self {
-            inner: std::sync::RwLock::new(inner),
-        }
-    }
-
-    fn current(&self) -> Arc<dyn llm_proxy_engine::Admission> {
-        let guard = self
-            .inner
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Arc::clone(&guard)
-    }
-
-    /// Atomically replace the enforced rules. Reservations already handed
-    /// out settle on whichever step is current when they settle — not the
-    /// step they reserved through — so every step installed for one engine
-    /// must share the same underlying backend; charges and cooldowns then
-    /// survive the swap. Returns the step that was enforcing until now.
-    pub fn replace(
-        &self,
-        next: Arc<dyn llm_proxy_engine::Admission>,
-    ) -> Arc<dyn llm_proxy_engine::Admission> {
-        let mut guard = self
-            .inner
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::replace(&mut *guard, next)
-    }
-}
-
-impl std::fmt::Debug for SwappingAdmission {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SwappingAdmission")
-            .field("inner", &self.current())
-            .finish()
-    }
-}
-
-#[async_trait::async_trait]
-impl llm_proxy_engine::Admission for SwappingAdmission {
-    async fn reserve(
-        &self,
-        claim: &llm_proxy_engine::AdmissionClaim<'_>,
-    ) -> Result<llm_proxy_engine::AdmissionTicket, llm_proxy_engine::EngineError> {
-        self.current().reserve(claim).await
-    }
-
-    fn settle(
-        &self,
-        ticket: &llm_proxy_engine::AdmissionTicket,
-        outcome: &llm_proxy_engine::AdmissionOutcome<'_>,
-    ) {
-        self.current().settle(ticket, outcome);
-    }
-
-    async fn rekey(
-        &self,
-        ticket: &llm_proxy_engine::AdmissionTicket,
-        member: &str,
-        model: &str,
-    ) -> Result<(), llm_proxy_engine::EngineError> {
-        self.current().rekey(ticket, member, model).await
-    }
 }
 
 /// Application state shared with every handler.
@@ -170,7 +43,11 @@ pub struct AppState {
     pub(crate) request_id_gen: Arc<RequestIdGenerator>,
     pub(crate) model_catalogs: Arc<ModelCatalogService>,
     pub(crate) event_bus: Arc<dyn EventBus>,
-    pub(crate) client_auth: Arc<ClientAuthSlot>,
+    /// The authenticator the router reads per request, paired with the
+    /// admission rules the engine enforces when [`Self::with_auth_pair`]
+    /// wired the same pair into the engine: one lock, so a daemon's key
+    /// refresh swaps both halves in the same instant.
+    pub(crate) client_auth: Arc<SwappingAuthPair>,
     /// The configuration snapshots the engine reads per pipeline stage (plan
     /// 07 step 10): swapping the whole immutable snapshot is the one update
     /// path; nothing merges into a live one.
@@ -301,7 +178,16 @@ impl AppState {
                 Arc::new(ClientAuth::fail_closed())
             }
         };
-        let client_auth = Arc::new(ClientAuthSlot::new(client_auth));
+        // The rules half is a placeholder until a swap-capable setup wires
+        // a real pair in ([`Self::with_auth_pair`]): without an admission
+        // override the engine bakes its own PolicyAdmission at build time,
+        // so nothing reads this half. Wiring the placeholder (rather than
+        // the config's rules) keeps the pair honest — the halves installed
+        // together are the halves a runtime swap replaces together.
+        let client_auth = Arc::new(SwappingAuthPair::new(
+            client_auth,
+            Arc::new(llm_proxy_engine::AllowAllAdmission),
+        ));
         let app_config = Arc::new(app_config);
         let config_source = Arc::new(llm_proxy_engine::SwappingConfigSource::new(Arc::clone(
             &app_config,
@@ -328,19 +214,40 @@ impl AppState {
         }
     }
 
-    /// Replace the client-auth state (builder-style).
+    /// Replace the serving authenticator (builder-style), keeping the
+    /// pair's rules half: the swap-capable setups change authentication
+    /// and rules together through [`Self::with_auth_pair`] and
+    /// [`SwappingAuthPair::replace`]; this covers the states whose engine
+    /// admission is not the pair.
     #[must_use]
-    pub fn with_client_auth(mut self, client_auth: Arc<ClientAuth>) -> Self {
-        self.client_auth = Arc::new(ClientAuthSlot::new(client_auth));
+    pub fn with_client_auth(self, client_auth: Arc<ClientAuth>) -> Self {
+        self.client_auth.replace_client_auth(client_auth);
         self
     }
 
-    /// Swap the authenticator the running server authenticates against
-    /// (managed keys issued or revoked at runtime); returns the
-    /// authenticator that was serving until now. Requests already
-    /// authenticated finish on their own answer.
+    /// Swap the authenticator the running server authenticates against,
+    /// keeping the installed admission rules (one write-guard pair swap;
+    /// a managed-key daemon swaps both halves together through
+    /// [`SwappingAuthPair::replace`] instead). Returns the authenticator
+    /// that was serving until now. Requests already authenticated finish
+    /// on their own answer.
     pub fn swap_client_auth(&self, next: Arc<ClientAuth>) -> Arc<ClientAuth> {
-        self.client_auth.replace(next)
+        self.client_auth.replace_client_auth(next)
+    }
+
+    /// Wire one pair into both read paths (builder-style): the router
+    /// authenticates against the pair's client-auth half and the engine
+    /// enforces through the pair itself (an
+    /// [`llm_proxy_engine::Admission`] implementation delegating to the
+    /// pair's rules half) — so [`SwappingAuthPair::replace`] changes
+    /// authentication and enforcement in the same instant without
+    /// rebuilding the engine.
+    #[must_use]
+    pub fn with_auth_pair(mut self, pair: Arc<SwappingAuthPair>) -> Self {
+        let as_admission = Arc::clone(&pair);
+        self.admission_override = Some(as_admission);
+        self.client_auth = pair;
+        self
     }
 
     /// Record the client key ids a managed key store issued at startup
@@ -1093,10 +1000,10 @@ mod tests {
             make_build_info(),
         );
         assert!(
-            state.client_auth.current().is_enforced(),
+            state.client_auth.current_client_auth().is_enforced(),
             "invalid auth config must fail closed, not open"
         );
-        assert_eq!(state.client_auth.current().client_count(), 0);
+        assert_eq!(state.client_auth.current_client_auth().client_count(), 0);
     }
 
     #[derive(Clone)]

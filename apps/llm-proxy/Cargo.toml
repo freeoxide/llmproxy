@@ -87,4 +87,8 @@ tokio = { workspace = true }
 llm-proxy-protocol = { workspace = true }
 secrecy = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+# The in-process RESP2 server for the replica-arm runtime test
+# (tests/redis_replica_managed_keys.rs); test-only, never enabled in
+# production builds.
+llm-proxy-store-redis = { workspace = true, features = ["test-server"] }
 tempfile = "3"

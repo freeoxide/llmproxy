@@ -3824,16 +3824,17 @@ mod tests {
         let mock_url = spawn_mock_anthropic_non_stream().await;
         let state = state_with_anthropic_provider(&mock_url);
         let registry = state.providers();
-        let swapping = Arc::new(llm_proxy_server::SwappingAdmission::new(admission_for(
-            "laptop",
-            Vec::new(),
-            None,
-            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new()),
-            &registry,
-        )));
-        let state = state
-            .with_client_auth(Arc::new(client_auth_for("laptop", "sekrit-token")))
-            .with_admission(Arc::clone(&swapping) as Arc<dyn llm_proxy_engine::Admission>);
+        let pair = Arc::new(llm_proxy_server::SwappingAuthPair::new(
+            Arc::new(client_auth_for("laptop", "sekrit-token")),
+            admission_for(
+                "laptop",
+                Vec::new(),
+                None,
+                Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new()),
+                &registry,
+            ),
+        ));
+        let state = state.with_auth_pair(Arc::clone(&pair));
         let app = build_router(state.clone());
         let body = make_messages_body("claude-sonnet-4-6", false);
 
@@ -3845,7 +3846,7 @@ mod tests {
         assert_eq!(allowed.status(), StatusCode::OK);
 
         let engine_before = state.engine().unwrap();
-        swapping.replace(admission_for(
+        pair.replace_admission(admission_for(
             "laptop",
             vec!["other-*".to_owned()],
             None,
@@ -3879,16 +3880,17 @@ mod tests {
         let registry = state.providers();
         let backend: Arc<dyn llm_proxy_engine::AdmissionBackend> =
             Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
-        let swapping = Arc::new(llm_proxy_server::SwappingAdmission::new(admission_for(
-            "laptop",
-            Vec::new(),
-            Some(1),
-            Arc::clone(&backend),
-            &registry,
-        )));
-        let state = state
-            .with_client_auth(Arc::new(client_auth_for("laptop", "sekrit-token")))
-            .with_admission(Arc::clone(&swapping) as Arc<dyn llm_proxy_engine::Admission>);
+        let pair = Arc::new(llm_proxy_server::SwappingAuthPair::new(
+            Arc::new(client_auth_for("laptop", "sekrit-token")),
+            admission_for(
+                "laptop",
+                Vec::new(),
+                Some(1),
+                Arc::clone(&backend),
+                &registry,
+            ),
+        ));
+        let state = state.with_auth_pair(Arc::clone(&pair));
         let app = build_router(state);
         let body = make_messages_body("claude-sonnet-4-6", false);
 
@@ -3899,7 +3901,7 @@ mod tests {
             .unwrap();
         assert_eq!(first.status(), StatusCode::OK, "rpd of 1 admits one");
 
-        swapping.replace(admission_for(
+        pair.replace_admission(admission_for(
             "laptop",
             Vec::new(),
             Some(1),
@@ -3916,5 +3918,92 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "the day's request count survived the swap; a reset backend would have answered 200"
         );
+    }
+
+    /// The single-swap invariant, pinned through the running router: after
+    /// every whole-pair swap there is no observable state where the router
+    /// authenticates against the old key set while admission enforces the
+    /// new rules, nor the mirror. A key from the OLD pair must already 401
+    /// (the new authenticator forgot it) and never slip through the new
+    /// rules; a key from the NEW pair must hit the NEW rules (403 here),
+    /// never still be riding the old permissive ones (200). The two
+    /// adjacent swaps this design replaced could answer exactly those two
+    /// wrong codes in the window between them.
+    #[tokio::test]
+    async fn a_pair_swap_never_serves_the_old_authenticator_with_the_new_rules() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let registry = state.providers();
+        let backend: Arc<dyn llm_proxy_engine::AdmissionBackend> =
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
+        let permissive =
+            || admission_for("laptop", Vec::new(), None, Arc::clone(&backend), &registry);
+        let restrictive = || {
+            admission_for(
+                "laptop",
+                vec!["other-*".to_owned()],
+                None,
+                Arc::clone(&backend),
+                &registry,
+            )
+        };
+        let pair = Arc::new(llm_proxy_server::SwappingAuthPair::new(
+            Arc::new(client_auth_for("laptop", "one-token")),
+            permissive(),
+        ));
+        let state = state.with_auth_pair(Arc::clone(&pair));
+        let app = build_router(state);
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        // Sanity: generation one serves one-token under permissive rules.
+        let served = app
+            .clone()
+            .oneshot(authorized_messages_request("one-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        for swap in 0..4 {
+            let (token, rules, expected_new_key) = if swap % 2 == 0 {
+                ("two-token", restrictive(), StatusCode::FORBIDDEN)
+            } else {
+                ("one-token", permissive(), StatusCode::OK)
+            };
+            pair.replace(Arc::new(client_auth_for("laptop", token)), rules);
+            let other_token = if swap % 2 == 0 {
+                "one-token"
+            } else {
+                "two-token"
+            };
+
+            // The previous generation's token is already unknown to the
+            // new authenticator — 401, never authenticated-under-old and
+            // judged-under-new.
+            let stale = app
+                .clone()
+                .oneshot(authorized_messages_request(other_token, &body))
+                .await
+                .unwrap();
+            assert_eq!(
+                stale.status(),
+                StatusCode::UNAUTHORIZED,
+                "the swapped-out token must die in the same instant the rules flip"
+            );
+
+            // The installed token meets the INSTALLED rules: restrictive
+            // refuses the model (403), permissive serves (200) — a 403
+            // under permissive or a 200 under restrictive would mean the
+            // halves were one swap apart.
+            let fresh = app
+                .clone()
+                .oneshot(authorized_messages_request(token, &body))
+                .await
+                .unwrap();
+            assert_eq!(
+                fresh.status(),
+                expected_new_key,
+                "the freshly installed token must be judged by the freshly installed rules"
+            );
+        }
     }
 }

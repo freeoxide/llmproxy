@@ -79,7 +79,7 @@ fn caps(total: u32) -> HashMap<String, (Option<u32>, HashMap<String, u32>)> {
 /// holding its own connection.
 #[tokio::test]
 async fn two_instances_sharing_the_store_enforce_one_budget_between_them() {
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -147,7 +147,7 @@ async fn two_instances_sharing_the_store_enforce_one_budget_between_them() {
 
 #[tokio::test]
 async fn rate_windows_are_shared_across_instances() {
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -208,7 +208,7 @@ async fn a_tpm_refusal_rolls_back_the_request_counts_it_already_committed() {
     // budget-busting token demand must not also consume a request slot —
     // or every refused request would inflate rpm and rpd until the client
     // sees spurious 429s.
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -256,7 +256,7 @@ async fn a_budget_refusal_rolls_back_the_window_counts_it_already_committed() {
     // after rpm, rpd and the tpm reservation committed, and none of them
     // may stay — budget-exhausted callers must not also burn their rate
     // windows or hold token reservations for the rest of the minute.
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -302,7 +302,7 @@ async fn a_budget_refusal_rolls_back_the_window_counts_it_already_committed() {
 
 #[tokio::test]
 async fn concurrency_caps_are_shared_and_released_by_settlement() {
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -346,7 +346,7 @@ async fn concurrency_caps_are_shared_and_released_by_settlement() {
 
 #[tokio::test]
 async fn cooldowns_written_by_one_replica_are_seen_by_the_other() {
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -379,7 +379,7 @@ async fn cooldowns_written_by_one_replica_are_seen_by_the_other() {
 
 #[tokio::test]
 async fn usage_events_from_both_replicas_land_in_one_stream() {
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -420,7 +420,7 @@ async fn usage_events_from_both_replicas_land_in_one_stream() {
 /// the concurrency cap refuses never counted against the rate window.
 #[tokio::test]
 async fn a_cap_refusal_rolls_back_the_window_counters() {
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");
@@ -448,7 +448,7 @@ async fn a_cap_refusal_rolls_back_the_window_counters() {
 /// the shared spent counter — visible to any replica on the same store.
 #[tokio::test]
 async fn settlement_charges_shared_spend_in_micro_usd() {
-    let server = TestRedis::start();
+    let server = TestRedis::start().expect("bind the in-process test Redis");
     let store = RedisStore::connect(&server.url(), "test")
         .await
         .expect("connect");

@@ -24,7 +24,7 @@ pub async fn apply_replica(
     config: &AppConfig,
     registry: &ProviderRegistry,
     state: AppState,
-    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+    pair: Option<Arc<llm_proxy_server::SwappingAuthPair>>,
 ) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
     let Some(replica) = config.replica.as_ref() else {
         return Ok((state, None));
@@ -34,11 +34,11 @@ pub async fn apply_replica(
         ReplicaBackend::Redis => {
             #[cfg(feature = "store-redis")]
             {
-                redis_replica(url, &replica.prefix, registry, state, swapping).await
+                redis_replica(url, &replica.prefix, registry, state, pair).await
             }
             #[cfg(not(feature = "store-redis"))]
             {
-                let _ = (url, registry, state, swapping);
+                let _ = (url, registry, state, pair);
                 anyhow::bail!(
                     "[replica] backend \"redis\" is configured but this build lacks the \
                      store-redis feature; rebuild with --features store-redis"
@@ -48,11 +48,11 @@ pub async fn apply_replica(
         ReplicaBackend::Postgres => {
             #[cfg(feature = "store-postgres")]
             {
-                postgres_replica(url, registry, state, swapping).await
+                postgres_replica(url, registry, state, pair).await
             }
             #[cfg(not(feature = "store-postgres"))]
             {
-                let _ = (url, registry, state, swapping);
+                let _ = (url, registry, state, pair);
                 anyhow::bail!(
                     "[replica] backend \"postgres\" is configured but this build lacks the \
                      store-postgres feature; rebuild with --features store-postgres"
@@ -71,7 +71,7 @@ async fn redis_replica(
     prefix: &str,
     registry: &ProviderRegistry,
     state: AppState,
-    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+    pair: Option<Arc<llm_proxy_server::SwappingAuthPair>>,
 ) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
     let store = llm_proxy_store_redis::RedisStore::connect(url, prefix)
         .await
@@ -92,7 +92,7 @@ async fn redis_replica(
         prefix = %prefix,
         "replica mode: admission, cooldowns and usage shared through Redis"
     );
-    let state = install_replica_admission(state, swapping, admission)
+    let state = install_replica_admission(state, pair, admission)
         .with_cooldowns(cooldowns)
         .with_event_bus(bus);
     let installer = replica_admission_installer(state.clone(), move |auth, providers| {
@@ -108,7 +108,7 @@ async fn postgres_replica(
     url: &str,
     registry: &ProviderRegistry,
     state: AppState,
-    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+    pair: Option<Arc<llm_proxy_server::SwappingAuthPair>>,
 ) -> Result<(AppState, Option<crate::state::AdmissionInstaller>)> {
     let store = llm_proxy_store_postgres::PostgresStore::connect(url)
         .await
@@ -128,7 +128,7 @@ async fn postgres_replica(
         store.clone(),
     ));
     tracing::info!("replica mode: admission, cooldowns and usage shared through Postgres");
-    let state = install_replica_admission(state, swapping, admission)
+    let state = install_replica_admission(state, pair, admission)
         .with_cooldowns(cooldowns)
         .with_event_bus(bus);
     let installer = replica_admission_installer(state.clone(), move |auth, providers| {
@@ -137,19 +137,20 @@ async fn postgres_replica(
     Ok((state, Some(installer)))
 }
 
-/// Installs the replica-shared admission step: through the daemon's
-/// swappable wrapper when one was passed (so the managed-key refresh can
-/// replace the rules later), or directly as the override otherwise.
+/// Installs the replica-shared admission step: into the daemon's swap
+/// pair when one was passed (the pair is already wired into both the
+/// router's auth check and the engine, so the managed-key refresh can
+/// replace the rules later), or directly as the engine override otherwise.
 #[cfg(any(feature = "store-redis", feature = "store-postgres"))]
 fn install_replica_admission(
     state: AppState,
-    swapping: Option<Arc<llm_proxy_server::SwappingAdmission>>,
+    pair: Option<Arc<llm_proxy_server::SwappingAuthPair>>,
     admission: llm_proxy_engine::PolicyAdmission,
 ) -> AppState {
-    match swapping {
-        Some(swapping) => {
-            swapping.replace(Arc::new(admission) as Arc<dyn llm_proxy_engine::Admission>);
-            state.with_admission(swapping as Arc<dyn llm_proxy_engine::Admission>)
+    match pair {
+        Some(pair) => {
+            pair.replace_admission(Arc::new(admission) as Arc<dyn llm_proxy_engine::Admission>);
+            state
         }
         None => state.with_admission(Arc::new(admission) as Arc<dyn llm_proxy_engine::Admission>),
     }
