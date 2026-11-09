@@ -56,11 +56,10 @@ file stands alone: "Done — leave alone", work items, rule violations, rejected
 7. When a fix changes what a plan's "Done" section says, update that plan file in
    `docs/completed/` in the same change so it states the truth. Keep plan text factual
    and short.
-8. Git: work on one branch off this one (for example `fix/finish-plans`), never on
-   `master`. Commit per plan area (one or a few commits per plan) with messages like
-   `fix(engine): check key allowlists before cache and idempotency replay`. Push the
-   branch after every plan area so no work is lost if the session ends. At the end open
-   one pull request into `master` whose description is the final report.
+8. Git: work directly on `master`. Commit per plan area (one or a few commits per plan)
+   with messages like `fix(engine): check key allowlists before cache and idempotency
+   replay`, and push `master` after every plan area so no work is lost if the session
+   ends. Do not create other branches or pull requests.
 9. Do not edit the files in `docs/fix-brief/` except to delete the whole folder (and its
    row in `docs/README.md`) in the last commit, once every item is closed.
 
