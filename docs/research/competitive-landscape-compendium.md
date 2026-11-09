@@ -1,6 +1,6 @@
-# Competitive landscape compendium — llm-proxy research record (October 2026)
+# Competitive landscape compendium — llm-proxy research record (October–November 2026)
 
-Consolidated record of the two-wave competitive research summarized in
+Consolidated record of the three-wave competitive research summarized in
 [`competitive-gap-analysis.md`](competitive-gap-analysis.md), reorganized
 for deciding what to build next. Competitor claims and their URLs originate
 in the audited analysis (competitive-gap-analysis.md) and the research
@@ -8,9 +8,17 @@ runs' recorded findings; task counts and severity tiers come from the runs'
 final results; llm-proxy-side claims were re-verified against the working
 tree (code audit, 2026-10-28).
 
+The llm-proxy baseline below describes the tree at the
+[research audit](audit-2026-11-05/REPORT.md) (commit `79cf406`,
+2026-11-05). Claims the audit found false are corrected in place and
+marked "(corrected 2026-11-08 per research audit)". Plans 01–10 have since
+rebuilt most of the described subsystems; current behaviour is in
+[docs/goal.md](../goal.md) and [docs/completed/](../completed/).
+
 ## Scope and method
 
-- Two research waves, October 2026: 57 research tasks (product scouts, theme
+- Two research waves in October 2026 (plus the November waves recorded
+  below): 57 research tasks (product scouts, theme
   studies, doc sweeps, and 10 deep dives — 6 from wave 1, 4 from wave 2)
   plus 10 frontier analyses — 67 inventory items total, all accounted for
   in the coverage appendix. Wave-1 grep checks ran 2026-10-14; wave-2 code
@@ -74,7 +82,7 @@ were researched directly on 2026-10-28 (Scope and method).
 
 | Product | Line | Source |
 |---------|------|--------|
-| Cloudflare AI Gateway | Caching, guardrails (S1–S13 + P1), spend limits, OTLP under GenAI semconv, BYOK, encrypted-body Logpush, custom domains and providers | https://developers.cloudflare.com/ai-gateway/features/caching/ |
+| Cloudflare AI Gateway | Caching, guardrails (S1–S14 + P1), spend limits, OTLP under GenAI semconv, BYOK, encrypted-body Logpush, custom domains and providers — Guardrails, DLP, Auto Router and spend limits are Beta (corrected 2026-11-08 per research audit) | https://developers.cloudflare.com/ai-gateway/features/caching/ |
 | Vercel AI Gateway | Three client formats plus nine modalities incl. Decisions; BYOK, OIDC project tokens, session affinity, automatic prompt caching, budgets, trace drains | https://vercel.com/docs/ai-gateway/sdks-and-apis |
 | Azure API Management (GenAI Gateway) | `llm-token-limit` policy, managed identities, RediSearch semantic caching, REST-as-MCP export | https://learn.microsoft.com/en-us/azure/api-management/genai-gateway-capabilities |
 | AWS Bedrock AgentCore Gateway | Four inference wire formats, fallback rule blocks, dimension-keyed rate limits, Cedar-policy MCP authorization, per-target credential vaulting, VPC Lattice egress | https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html |
@@ -99,7 +107,11 @@ were researched directly on 2026-10-28 (Scope and method).
 | Respan (formerly Keywords AI) | OpenAI chat, Responses, and Anthropic surfaces over 1000+ models; scoped keys, budgets, retries, caching, guardrails, remote MCP server, dashboard | https://www.respan.ai/docs/documentation/features/gateway/gateway-quickstart |
 | OpenPipe | Sunset; migrated to Weights & Biases/CoreWeave, docs.openpipe.ai dead | https://openpipe.ai/security |
 | Glama | Hosted MCP gateway with per-tool ACLs; `x-glama-metadata` header | https://glama.ai/mcp/gateway |
-| Upstash "AI Gateway" | Negative finding: verified not to exist (11 live checks incl. sitemap, llms.txt, GitHub, npm, DNS) | https://upstash.com/docs/llms.txt |
+
+Negative finding, kept out of the product rows (housekeeping correction,
+2026-11-08): an "Upstash AI Gateway" named in one brief was verified not to
+exist — 11 live checks incl. sitemap, llms.txt, GitHub, npm, and DNS
+(https://upstash.com/docs/llms.txt).
 
 ### Chinese-ecosystem aggregators
 
@@ -178,8 +190,8 @@ Citations verified against the working tree (wave-2 items re-verified
 | Persistence | SQLite usage ledger, background writer, retention controls; only body-derived column is `body_hash` — full token/cost columns, no payloads | `crates/llm-proxy-storage/src/sqlite.rs:105-131`, `config.toml.example:56-68` |
 | Admin API | Read-only `/usage/summary|requests|keys` with window/group_by filters and cursor paging | `crates/llm-proxy-api/src/routes.rs:53-55,116-117` |
 | Metrics | Lock-free atomic counters incl. per-provider-model counts; latency ring buffer up to 1000 samples with in-process percentile helpers (never exposed); request ids; graceful shutdown | `crates/llm-proxy-core/src/metrics.rs:34-35,210-239`, `crates/llm-proxy-server/src/shutdown.rs` |
-| Middleware | Per-identity token-bucket RPM, burst-tolerant with continuous refill, keyed by key id when authenticated else client IP (since 2026-10-13), loopback exempt; dedup window rejecting identical in-flight path+body requests with 409 (rejection, not coalescing); opt-in forwarded-header trust, CORS, panic catching | `crates/llm-proxy-server/src/middleware.rs:117-129`, `crates/llm-proxy-server/src/routes/core_pipeline.rs:172-176`, `config.toml.example:14-21`, `crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185` |
-| Extras | Offline tiktoken counting, chars/4 fallback; per-provider fixed-point USD per-token prices, estimation only; per-provider egress forward proxy (socks5h/socks5/http/https); env-var interpolation; musl single-binary. Config changes require restart — `server.hot_reload=true` rejected at load | `crates/llm-proxy-core/src/token/tiktoken.rs` (HeuristicTokenizer; heuristic documented at `crates/llm-proxy-core/src/token/counter.rs:5`), `crates/llm-proxy-core/src/provider_config.rs:472,500`, `crates/llm-proxy-provider/src/transport.rs:124-125,293`, `crates/llm-proxy-core/src/provider_config.rs:1531-1538` |
+| Middleware | Per-identity token-bucket RPM, burst-tolerant with continuous refill, keyed by key id when authenticated else client IP (since 2026-10-13), loopback exempt; opt-in dedup window (off by default, 0 ms shipped) 409-rejecting an identical path+body seen within a fixed window of the first sighting — not in-flight tracking, caller-blind, bodies over 64 KiB exempt (rejection, not coalescing; corrected 2026-11-08 per research audit); opt-in forwarded-header trust, CORS, panic catching | `crates/llm-proxy-server/src/middleware.rs:117-129`, `crates/llm-proxy-server/src/routes/core_pipeline.rs:172-176`, `config.toml.example:14-21`, `crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185` |
+| Extras | Offline tiktoken counting, chars/4 fallback; per-provider fixed-point USD per-token prices, estimation only; per-provider egress forward proxy (socks5h/socks5/http/https); env-var interpolation; a musl single-binary release workflow exists but no release had shipped and unvendored `openssl-sys` behind the then-active native-tls left the musl build unproven (corrected 2026-11-08 per research audit; plan 03 later made rustls the only stack). Config changes require restart — `server.hot_reload=true` rejected at load | `crates/llm-proxy-core/src/token/tiktoken.rs` (HeuristicTokenizer; heuristic documented at `crates/llm-proxy-core/src/token/counter.rs:5`), `crates/llm-proxy-core/src/provider_config.rs:472,500`, `crates/llm-proxy-provider/src/transport.rs:124-125,293`, `crates/llm-proxy-core/src/provider_config.rs:1531-1538` |
 | Cancellation | `ClientCancelled` failure event persists with no usage payload — tokens delivered before cancellation never settle | `crates/llm-proxy-server/src/routes/core_pipeline.rs:952-985`, `crates/llm-proxy-storage/src/lib.rs:80` |
 
 ## Capability areas
@@ -299,7 +311,7 @@ price table; estimation only, never enforced.
 | LiteLLM budgets `new:` | Stackable multi-window `budget_limits` ($10/24h + $100/30d), IANA-tz calendar resets, `budget_reset_time`, soft budgets, temporary raises, tag budgets via header or W3C baggage | https://docs.litellm.ai/docs/proxy/users, https://docs.litellm.ai/docs/proxy/budget_reset_and_tz, https://docs.litellm.ai/docs/proxy/tag_budgets |
 | agentgateway budgets `new:` | Per-key USD-or-token rolling windows, Block (429 `budget_exceeded`) / Audit modes, multiple windows per key, needs SQLite/Postgres config DB | https://agentgateway.dev/docs/standalone/latest/documentation/llm/cost-controls/budget-limits/per-key.md |
 | Portkey enterprise `new:` | AND-condition usage policies with `group_by` counters (per-user/model/key/MCP-server), weekly/monthly resets, breach 412 | https://portkey.ai/docs/product/enterprise-offering/budget-policies |
-| Cloudflare `new:` | Spend rules by provider/model/metadata, split-by-value buckets (`cf.user_id`), budget-exceeded fallback to cheaper model — only budget→fallback action found | https://developers.cloudflare.com/ai-gateway/features/spend-limits/ |
+| Cloudflare `new:` | Spend rules by provider/model/metadata, split-by-value buckets (`cf.user_id`), budget-exceeded fallback to cheaper model (Beta); LiteLLM likewise routes within provider budgets — neither is the only budget→fallback action (corrected 2026-11-08 per research audit) | https://developers.cloudflare.com/ai-gateway/features/spend-limits/, https://docs.litellm.ai/docs/routing |
 | OpenRouter `new:` | Layered guardrail/workspace/key budgets with in-flight holds pre-rejecting oversized requests (`weight_exceeds_budget` vs retryable `in_flight_budget_exhausted`, both 402) | https://openrouter.ai/docs/api-reference/limits |
 | new-api / Tyk / Respan / GPT-Load / uni-api / Traefik Hub `new:` | new-api subscription + prepaid wallet; Tyk monthly budgets at LLM/App/team level with ~30s block-list pulse (enforcement Enterprise-only, Community never blocks); Respan alert/Block thresholds, customer 402; GPT-Load quotas as never-resetting totals or periodic windows from one minute to one year — soft enforcement, charged after completion; uni-api dollar-credit quotas (30-day default, 0 blocks); Traefik Hub `costLimit` | https://github.com/QuantumNous/new-api, https://raw.githubusercontent.com/TykTechnologies/ai-studio/main/docs/site/docs/budgeting.md, https://www.respan.ai/docs/documentation/features/gateway/limits, https://www.gpt-load.com/docs/access-keys, https://raw.githubusercontent.com/yym68686/uni-api/main/README.md, https://doc.traefik.io/traefik-hub/ai-gateway/middlewares/token-rate-limit |
 | Status codes `new:` | Not converged — Bifrost 402, Portkey 412, Respan 402/429, LiteLLM 400/401/429 | https://github.com/maximhq/bifrost/blob/dev/plugins/governance/main.go, https://portkey.ai/docs/api-reference/inference-api/error-codes, https://docs.litellm.ai/docs/proxy/users |
@@ -310,15 +322,16 @@ APIM enforce token quotas instead).
 
 ### Caching
 
-llm-proxy: no response cache; the dedup window rejects identical in-flight
-requests with 409
-(`crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185`) — pressure
-control, neither cache nor coalescing.
+llm-proxy: no response cache; the opt-in dedup window — off by default, a
+fixed window from first sighting, caller-blind, bodies over 64 KiB exempt —
+409-rejects repeats (`crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185`)
+— pressure control, neither cache nor coalescing (corrected 2026-11-08 per
+research audit).
 
 | Product | What it ships | Source |
 |---------|---------------|--------|
 | LiteLLM | 8+ backends, SHA-256 over recognized params, streams reassembled then replayed synthetically | https://docs.litellm.ai/docs/proxy/caching |
-| Portkey | Simple + semantic, TTL 60s–90d, namespacing | https://portkey.ai/docs/product/ai-gateway/cache-simple-and-semantic |
+| Portkey | Simple + semantic, TTL 60s–90d, namespacing (hosted product; the OSS gateway cache is exact-match, in memory only — corrected 2026-11-08 per research audit) | https://portkey.ai/docs/product/ai-gateway/cache-simple-and-semantic |
 | Cloudflare | SHA-256 over provider+endpoint+model+auth+body, TTL 60s–1mo | https://developers.cloudflare.com/ai-gateway/features/caching/ |
 | Helicone | Edge cache; OSS Rust proxy hashing seed+path+body, RFC 7234 freshness over Moka/Redis, buffered bodies, 2xx-only | https://docs.helicone.ai/features/advanced-usage/caching.md, https://github.com/helicone/ai-gateway |
 | OpenRouter | Opt-in exact-match with free hits | https://openrouter.ai/docs/guides/features/response-caching.md |
@@ -340,7 +353,7 @@ llm-proxy: no content inspection, redaction, or moderation.
 |---------|---------------|--------|
 | LiteLLM | ~50 guardrail services across seven hook phases incl. pre-call, post-call, MCP; `new:` reversible Presidio PII masking with `output_parse_pii` re-insertion | https://docs.litellm.ai/docs/proxy/guardrails/quick_start, https://docs.litellm.ai/release_notes, https://docs.litellm.ai/docs/tutorials/presidio_pii_masking.md |
 | Portkey | 20+ deterministic checks plus LLM checks (PII, moderation, language, gibberish), deny=446 / flag=246 driving fallback orchestration; `new:` pre-LLM PII redaction irreversible by design | https://portkey.ai/docs/product/guardrails, https://portkey.ai/docs/product/guardrails/pii-redaction |
-| Cloudflare | S1–S13 hazards (Llama Guard 3 8B) + P1 injection (Prompt Guard 2), per-category flag/block; DLP shared with Cloudflare One | https://developers.cloudflare.com/ai-gateway/features/guardrails/, https://developers.cloudflare.com/ai-gateway/features/dlp/ |
+| Cloudflare | S1–S14 hazards (Llama Guard 3 8B) + P1 injection (Prompt Guard 2), per-category flag/block; DLP shared with Cloudflare One — Guardrails and DLP are Beta (corrected 2026-11-08 per research audit) | https://developers.cloudflare.com/ai-gateway/features/guardrails/, https://developers.cloudflare.com/ai-gateway/features/dlp/ |
 | Kong | ai-sanitizer redacts 20+ PII entity types bidirectionally | https://developer.konghq.com/plugins/ai-sanitizer/ |
 | Bifrost (enterprise) | CEL rules, Gitleaks secret detection, LLM-as-judge | https://docs.getbifrost.ai/enterprise/guardrails |
 | LangSmith | In-path PII/secret redaction with placeholder restoration, incl. streams | https://docs.langchain.com/langsmith/llm-gateway-data-policy |
@@ -388,7 +401,9 @@ measurement, no trace export.
 | Semconv | OTel client-inference span shape standardized | https://raw.githubusercontent.com/open-telemetry/semantic-conventions-genai/main/docs/gen-ai/client-inference.md |
 
 Streaming SLO mechanics `new:` LiteLLM SSE `: ping` keep-alives
-(`keepalive_seconds` 1–300), `cancel_on_disconnect` (logged 499), and
+(`keepalive_seconds` 1–300), `cancel_on_disconnect` (logged 499 — documented
+for non-streaming calls, so it is not a streaming-cancel mechanism; corrected
+2026-11-08 per research audit), and
 `always_include_stream_usage` for billing when the final chunk never arrives
 (https://docs.litellm.ai/docs/proxy/config_settings); OpenRouter documents
 per-provider cancel-billing (abort propagates at ~24 providers;
@@ -432,7 +447,8 @@ llm-proxy: no MCP client, server, or gateway functionality.
 Protocol: Streamable HTTP + OAuth 2.1 resource-server auth standardized in
 the 2025-11-25 spec (https://modelcontextprotocol.io/specification/2025-11-25/basic/transports,
 https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization);
-the 2026-07-28 release candidate removes sessions and adds gateway-friendly
+the 2026-07-28 revision — final, not a release candidate (corrected
+2026-11-08 per research audit) — removes sessions and adds gateway-friendly
 per-operation routing headers (https://blog.modelcontextprotocol.io/posts/2026-07-28-release-candidate).
 
 | Product | What it ships | Source |
@@ -507,9 +523,9 @@ unreleased 2.3.0; upstream adapter exists at
 
 | Axis | Market | llm-proxy |
 |------|--------|-----------|
-| BYOK passthrough | Cloudflare per-request keys with aliased Secrets-Store selection (https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/); Vercel ordered per-provider credentials via `providerOptions.gateway.byok` with system fallback (https://vercel.com/docs/ai-gateway/authentication-and-byok/byok); OpenRouter prioritized/fallback BYOK with per-key model/user filters (https://openrouter.ai/docs/guides/overview/auth/byok.md); Agent Router ext-authz metadata or `x-aigw-api-key` header (https://theagentrouter.ai/docs/capabilities/security/upstream-auth); Bifrost `x-bf-direct-key` opt-in (https://docs.getbifrost.ai/features/keys-management.md); Portkey OSS by design (https://github.com/Portkey-AI/gateway) | Opt-in passthrough BYOK ships: `passthrough_auth: bool` per provider (`crates/llm-proxy-core/src/provider_config.rs:378-385`) makes the inbound client's bearer/x-api-key token the upstream credential (`crates/llm-proxy-server/src/routes/core_pipeline.rs:727-730`, passed to `resolve_target` at `:753-759`); a missing client token fails 401 'missing client auth token for passthrough provider' (`crates/llm-proxy-server/src/routes/error_response.rs:54`); shipped 2026-06-20 (commit 201e29e) |
+| BYOK passthrough | Cloudflare per-request keys with aliased Secrets-Store selection (https://developers.cloudflare.com/ai-gateway/configuration/bring-your-own-keys/); Vercel ordered per-provider credentials via `providerOptions.gateway.byok` with system fallback (https://vercel.com/docs/ai-gateway/authentication-and-byok/byok); OpenRouter prioritized/fallback BYOK with per-key model/user filters (https://openrouter.ai/docs/guides/overview/auth/byok.md); Agent Router ext-authz metadata or `x-aigw-api-key` header (https://theagentrouter.ai/docs/capabilities/security/upstream-auth); Bifrost `x-bf-direct-key` opt-in (https://docs.getbifrost.ai/features/keys-management.md); Portkey OSS by design (https://github.com/Portkey-AI/gateway) | Opt-in passthrough BYOK ships: `passthrough_auth: bool` per provider (`crates/llm-proxy-core/src/provider_config.rs:378-385`) makes the inbound client's bearer/x-api-key token the upstream credential — swapped at `crates/llm-proxy-server/src/routes/core_pipeline.rs:294-304`, flag read at `:727-730` (cite corrected 2026-11-08 per research audit); a missing client token fails 401 'missing client auth token for passthrough provider' (`crates/llm-proxy-server/src/routes/error_response.rs:54`); shipped 2026-06-20 (commit 201e29e) |
 | Data residency | Vercel ZDR-signed providers only, pinned regions (https://vercel.com/docs/ai-gateway/security-and-compliance); OpenRouter eu/us endpoints, per-key `allowed_data_regions` (https://openrouter.ai/docs/guides/features/in-region-routing.md); LiteLLM `region_name` fallback filtering (https://docs.litellm.ai/docs/proxy/reliability) | No data-posture-aware routing |
-| Saturation | LiteLLM fails over-capacity fast with 429 (https://docs.litellm.ai/docs/routing); uni-api cgroup-aware `RESOURCE_ADMISSION_MODE` admit-or-queue (https://raw.githubusercontent.com/yym68686/uni-api/main/README.md); vLLM stack priority-header routing (https://raw.githubusercontent.com/vllm-project/production-stack/main/src/vllm_router/routers/routing_logic.py); Helicone no queueing on rate limits (https://docs.helicone.ai/features/advanced-usage/custom-rate-limits.md) | 429 with no queueing or prioritization (`crates/llm-proxy-server/src/middleware.rs:136`) |
+| Saturation | LiteLLM fails over-capacity fast with 429 (https://docs.litellm.ai/docs/routing); uni-api cgroup-aware `RESOURCE_ADMISSION_MODE` admit-or-queue (https://raw.githubusercontent.com/yym68686/uni-api/main/README.md); vLLM stack priority-header routing (https://raw.githubusercontent.com/vllm-project/production-stack/main/src/vllm_router/routers/routing_logic.py); Helicone no queueing on rate limits (https://docs.helicone.ai/features/advanced-usage/custom-rate-limits.md) | 429 with no queueing or prioritization (`crates/llm-proxy-server/src/routes/core_pipeline.rs:177-180` via `error_response.rs:220-224`; cite corrected 2026-11-08 per research audit) |
 | SDKs | Vercel native AI SDK integration (https://vercel.com/docs/ai-gateway/sdks-and-apis); OpenRouter generated clients in three languages (https://openrouter.ai/docs/_llms/api-reference.txt); Portkey SDK a superset of the OpenAI SDK (https://portkey.ai/docs/product/ai-gateway/universal-api); Bifrost zero-code drop-ins for six SDKs (https://raw.githubusercontent.com/maximhq/bifrost/main/README.md) | Stock OpenAI/Anthropic SDKs via base-URL swap; no dedicated SDK |
 
 ### Upstream cloud authentication
@@ -531,7 +547,7 @@ vs SigV4 signature), plus an expiry-driven credential cache.
 | Agent Router | BackendSecurityPolicy CRD (APIKey/AWSCredentials/AzureCredentials/GCPCredentials) with controller-side OIDC token exchange writing rotated secrets at expiry minus 5 minutes; extproc SigV4 self-corrects the signing region from the resolved Bedrock host | https://theagentrouter.ai/docs/capabilities/security/upstream-auth, https://raw.githubusercontent.com/theagentrouter/agent-router/main/internal/backendauth/aws.go |
 | Azure APIM | Managed identities to Azure AI | https://learn.microsoft.com/en-us/azure/api-management/genai-gateway-capabilities |
 | AWS AgentCore | Per-target vaulting (token-vault ARNs, OAuth flows, SigV4 via the gateway role) | https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-outbound-auth.html |
-| Upstream mTLS | Only agentgateway (backendTLS file cert/key/root; SPIFFE SVID rotation Enterprise); LiteLLM, Kong, Portkey, Agent Router document none | https://agentgateway.dev/docs/standalone/latest/documentation/configuration/security/backend-tls/ |
+| Upstream mTLS | agentgateway (backendTLS file cert/key/root; SPIFFE SVID rotation Enterprise); LiteLLM documents a client certificate; Kong's Service entity carries `client_certificate` (untested through its AI plugins); Portkey and Agent Router document none (corrected 2026-11-08 per research audit) | https://agentgateway.dev/docs/standalone/latest/documentation/configuration/security/backend-tls/ |
 
 Verdict: gap #4 (high, 6 products).
 
@@ -540,9 +556,15 @@ Verdict: gap #4 (high, 6 products).
 `new:` llm-proxy: `CoreContent::Text` carries `cache:
 Option<CacheControl>`, but `CacheControl` has only a `type` field
 (`Ephemeral`/`Other`) — no TTL, so Anthropic's 1-hour lifetime is
-unrepresentable; no adapter translates markers, injects them, or routes for
-cache locality (`crates/llm-proxy-protocol/src/core.rs:142,261-286`,
-verified 2026-10-27). Cache read/write usage columns already land in the
+unrepresentable. The client adapters do translate system-block markers
+(`crates/llm-proxy-protocol/src/client/anthropic.rs:117-119`,
+`client/openai_chat.rs:84-95`); message-level markers are decoded and then
+dropped by the upstream Anthropic adapter
+(`crates/llm-proxy-provider/src/adapter/anthropic.rs:640,825`), and nothing
+injects markers or routes for cache locality (marker translation corrected
+2026-11-08 per research audit;
+`crates/llm-proxy-protocol/src/core.rs:142,261-286`). Cache read/write
+usage columns already land in the
 ledger (`crates/llm-proxy-storage/src/sqlite.rs:116-121`). Market treats
 prompt caching as a routing and translation concern:
 
@@ -575,7 +597,7 @@ blocks on a deprecated model.
 | Gemini | Model resource has no lifecycle fields | https://ai.google.dev/api/models |
 | OpenRouter | Catalog `expiration_date` (live check: 14 of 464 entries dated, expired delisted), `canonical_slug` permanent aliases, provider-feed deprecation pipeline | https://openrouter.ai/docs/guides/overview/models, https://openrouter.ai/docs/guides/providers/integration |
 | LiteLLM | Cost map `deprecation_date` on 874 entries, `/model/deprecations` urgency buckets, daily-lock Slack alerts — never blocks or rewrites | https://github.com/BerriAI/litellm/blob/main/litellm/proxy/common_utils/model_deprecation.py, https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json |
-| `new:` all gateways cited | None emits a request-time signal (sunset-style header, response field, staged rejection); no successor-model mapping ships anywhere cited | (synthesis of the sourced rows above) |
+| `new:` all gateways cited | None emits a request-time signal (sunset-style header, response field, staged rejection); LiteLLM's cited cost map defines `successor_model` entries feeding its deprecation guidance, not request rewrites, and no other gateway cited maps to a successor (corrected 2026-11-08 per research audit) | (synthesis of the sourced rows above) |
 
 Verdict: gap #18 (low, 2 gateways + 3 providers).
 
@@ -583,17 +605,20 @@ Verdict: gap #18 (low, 2 gateways + 3 providers).
 
 llm-proxy: CLI serve/stop/status/validate/init/models/autostart
 (`apps/llm-proxy/src/cli.rs:23`), read-only usage admin API
-(`crates/llm-proxy-api/src/routes.rs:53-55,116-117`), musl single-binary releases,
-per-provider egress forward proxying
-(`crates/llm-proxy-provider/src/transport.rs:293`).
+(`crates/llm-proxy-api/src/routes.rs:53-55,116-117`), per-provider egress
+forward proxying (`crates/llm-proxy-provider/src/transport.rs:293`).
+A musl single-binary release workflow exists (`dist-workspace.toml`), but no
+release had shipped at the audited commit and the then-active native-tls left
+the build unproven (corrected 2026-11-08 per research audit; see the Extras
+row above for the full corrected statement).
 
 | Surface | Market | Source |
 |---------|--------|--------|
 | Admin UIs | LiteLLM DB-backed control plane + Next.js UI; gproxy embedded console; Bifrost web UI with live log streaming; agentgateway UI with key management and CEL playground + experimental agctl CLI; new-api/one-api multi-user consoles with payments; Vercel CLI + REST + MCP control-plane tools; `new:` Higress console, Tyk AI Studio console with edge microgateways, IBM ContextForge admin UI with provider CRUD and model testing, GPT-Load health/log/route-check/usage UI, Respan dashboard | https://docs.litellm.ai/docs/proxy/virtual_keys, https://raw.githubusercontent.com/LeenHawk/gproxy/main/README.md, https://docs.getbifrost.ai/features/observability/default, https://agentgateway.dev/docs/standalone/latest/documentation/llm/cost-controls/costs.md, https://github.com/QuantumNous/new-api, https://vercel.com/docs/ai-gateway/sdks-and-apis, https://higress.cn/en/docs/latest/user/quickstart/, https://raw.githubusercontent.com/TykTechnologies/ai-studio/main/docs/site/docs/edge-gateways.md, https://ibm.github.io/mcp-context-forge/latest/api/llm-proxy/, https://www.gpt-load.com/docs/monitor, https://www.respan.ai/docs/ |
 | Prompt management | TensorZero prompts as config variants; Langfuse versioned prompts with stale-while-revalidate caching; Portkey immutable versioning A/B-tested via loadbalance configs | https://github.com/tensorzero/tensorzero/blob/main/docs/experimentation/run-adaptive-ab-tests.mdx, https://langfuse.com/docs/prompt-management/features/caching.md, https://portkey.ai/docs/product/prompt-engineering-studio/prompt-versioning |
-| Audit trails `new:` | LiteLLM entity lifecycle audit with before/after values and S3 export; Kong RSA-signed audit logs with TTL purge; Cloudflare config-change audit on all plans; Portkey audit logs API; new-api security audit log with step-up verification | https://docs.litellm.ai/docs/proxy/audit_logs, https://developer.konghq.com/gateway/audit-logs, https://developers.cloudflare.com/ai-gateway/reference/audit-logs/, https://portkey.ai/docs/product/enterprise-offering/audit-logs, https://github.com/QuantumNous/new-api/releases |
+| Audit trails `new:` | LiteLLM entity lifecycle audit with before/after values and S3 export (Enterprise edition — corrected 2026-11-08 per research audit); Kong RSA-signed audit logs with TTL purge; Cloudflare config-change audit on all plans; Portkey audit logs API; new-api security audit log with step-up verification | https://docs.litellm.ai/docs/proxy/audit_logs, https://developer.konghq.com/gateway/audit-logs, https://developers.cloudflare.com/ai-gateway/reference/audit-logs/, https://portkey.ai/docs/product/enterprise-offering/audit-logs, https://github.com/QuantumNous/new-api/releases |
 | Extensibility `new:` | LiteLLM CustomLogger callbacks + request-lifecycle hooks (modify/reject/stream/header) and custom auth/key-policy hooks; Bifrost Go `.so` plugins with hot reload incl. MCP hooks; Kong Lua/PDK plugins, serverless snippets, external runners; Higress and APISIX proxy-wasm in Go/Rust/C++; Portkey compiled TypeScript plugin manifests; Tyk one gRPC-isolated SDK for gateway/UI/analytics plugins. Hook names, registration, and lifecycle are bespoke — no common API emerged. Agent Router ships no custom extension point (ext_proc request closed stale) | https://docs.litellm.ai/docs/proxy/call_hooks, https://docs.litellm.ai/docs/observability/custom_callback, https://docs.getbifrost.ai/plugins, https://developer.konghq.com/custom-plugins/reference, https://developer.konghq.com/plugins/pre-function/, https://github.com/alibaba/higress/tree/main/plugins, https://apisix.apache.org/docs/apisix/plugins/ai-proxy/, https://github.com/Portkey-AI/gateway/blob/main/plugins/README.md, https://raw.githubusercontent.com/TykTechnologies/ai-studio/main/docs/site/docs/plugins-overview.md, https://theagentrouter.ai/ |
-| Config lifecycle `new:` | agentgateway hot-reloads everything except a startup-only list (adminAddr/storage/database/logging/tracing) via debounced file watch (re-registering on atomic replace), validate-then-swap, last-known-good fallback, `config_synchronized` metric, `--validate-only`, file/hybrid/readOnly modes; uni-api compiles validated snapshots atomically and swaps an all-`Arc` immutable snapshot under one write with revision-CAS overlays; LiteLLM converges pods by 30s DB polling, YAML-bootstrap-then-DB-overlay, router-update errors caught and swallowed (`ref/litellm/litellm/proxy/proxy_server.py:5027-5099`); Higress xDS push in milliseconds; Kong data planes fed from Konnect; APISIX dynamic from etcd; oc-go-cc fsnotify+SIGHUP (`ref/oc-go-cc/internal/config/watcher.go:19-101`); openproxy SIGUSR2 zero-downtime upgrade. No product cited ships versioned config with in-gateway history/diff/rollback — Kong decK keeps history in git | https://agentgateway.dev/docs/standalone/latest/documentation/setup/update, https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/state_manager.rs, https://github.com/yym68686/uni-api/blob/main/src/runtime/state.rs, https://docs.litellm.ai/docs/proxy/configs, https://docs.litellm.ai/docs/proxy/prod, https://github.com/higress-group/higress/blob/main/docs/architecture.md, https://developer.konghq.com/ai-gateway/, https://apisix.apache.org/docs/apisix/admin-api/, https://raw.githubusercontent.com/x5iu/openproxy/master/README.md, https://raw.githubusercontent.com/Kong/deck/main/README.md |
+| Config lifecycle `new:` | agentgateway hot-reloads everything except a startup-only list (adminAddr/storage/database/logging/tracing) via debounced file watch (re-registering on atomic replace), validate-then-swap, last-known-good fallback, `config_synchronized` metric, `--validate-only`, file/hybrid/readOnly modes; uni-api compiles validated snapshots atomically and swaps an all-`Arc` immutable snapshot under one write with revision-CAS overlays; LiteLLM converges pods by 30s DB polling, YAML-bootstrap-then-DB-overlay, router-update errors caught and swallowed (`ref/litellm/litellm/proxy/proxy_server.py:5027-5099`); Higress xDS push in milliseconds; Kong data planes fed from Konnect; APISIX dynamic from etcd; oc-go-cc fsnotify+SIGHUP (`ref/oc-go-cc/internal/config/watcher.go:19-101`); openproxy SIGUSR2 zero-downtime upgrade. In-gateway config history with rollback does exist at Cloudflare (dynamic-route versions, instant rollback) and Azure APIM (revisions); among the self-hosted products cited, none ships it — Kong decK keeps history in git (corrected 2026-11-08 per research audit) | https://agentgateway.dev/docs/standalone/latest/documentation/setup/update, https://github.com/agentgateway/agentgateway/blob/main/crates/agentgateway/src/state_manager.rs, https://github.com/yym68686/uni-api/blob/main/src/runtime/state.rs, https://docs.litellm.ai/docs/proxy/configs, https://docs.litellm.ai/docs/proxy/prod, https://github.com/higress-group/higress/blob/main/docs/architecture.md, https://developer.konghq.com/ai-gateway/, https://apisix.apache.org/docs/apisix/admin-api/, https://raw.githubusercontent.com/x5iu/openproxy/master/README.md, https://raw.githubusercontent.com/Kong/deck/main/README.md |
 | Rust performance | LiteLLM migrating translation to a bundled Rust core (beta, off by default); Portkey self-hosted gateway runs a Rust front-end from v2.30.0; TensorZero claimed 0.94 ms p99 at 10k QPS — self-published and archived. llm-proxy overhead was not measured; no performance comparison asserted | https://docs.litellm.ai/docs/proxy/rust_gateway, https://portkey.ai/docs/self-hosting/major-performance-improvements.md, https://github.com/tensorzero/tensorzero/blob/main/docs/gateway/benchmarks.mdx |
 
 Verdict: gap #16 (low, hot reload, 8 products — llm-proxy rejects
@@ -604,8 +629,13 @@ context.
 
 ### Transport, state, and deployment topology
 
-llm-proxy: plain-HTTP listener; TLS only on the upstream client (reqwest
-rustls-tls, `crates/llm-proxy-provider/Cargo.toml:23`); a 2026-10-14 grep
+llm-proxy: plain-HTTP listener; TLS only on the upstream client — and at
+the audited commit the active stack was native-tls/OpenSSL, not rustls:
+reqwest's default features were on, compiling `default-tls` and
+`rustls-tls` together, and reqwest selects native-tls
+(`crates/llm-proxy-provider/Cargo.toml:23`, corrected 2026-11-08 per
+research audit; plan 03 later disabled the defaults, making rustls the
+single stack in `crates/llm-proxy-transport/Cargo.toml`); a 2026-10-14 grep
 for server-side TLS (rustls/axum-server/certificate) across workspace
 Cargo.toml files returns no listener TLS dependency — HTTPS fronting is
 delegated to a reverse proxy; openproxy shows the in-proxy alternative
@@ -638,37 +668,50 @@ at" counts products named across both waves.
 
 | # | Severity | Gap | Ships at | Evidence | Detail |
 |---|----------|-----|----------|----------|--------|
-| 1 | high | Request-path retries, fallback chains, provider cooldowns | 22 products (LiteLLM, Portkey, Bifrost, Cloudflare, Agent Router, Higress, Kong, OpenRouter, Vercel, TensorZero, one-api, new-api, gproxy, oc-go-cc, agentgateway, AWS AgentCore, Tyk, F5, uni-api, GPT-Load, Respan, llm-api-key-proxy) | https://docs.litellm.ai/docs/proxy/reliability | No request-path retry/fallback in llm-proxy; scoped future work (`docs/research/core-protocol.md:170-186`) |
-| 2 | high | Per-key spend budgets with enforcement and periodic resets | 15 USD budgets (LiteLLM, Bifrost, OpenRouter, Vercel, Cloudflare, LangSmith, gproxy, BricksLLM, agentgateway, Portkey, Tyk, Respan, GPT-Load, uni-api, Traefik Hub); one-api/new-api/Azure APIM enforce token quotas instead | https://docs.getbifrost.ai/features/governance/budget-and-limits.md | Pricing estimation-only, no enforcement (`crates/llm-proxy-core/src/provider_config.rs:472`) |
-| 3 | medium | Token-based (TPM) and concurrency rate limits — per-key RPM already exists for authenticated callers (token bucket keyed by key id, core_pipeline.rs:172-176, since 2026-10-13); unauthenticated callers fall back to per-IP (narrowed 2026-10-28: per-key RPM now exists) | 14 (LiteLLM, Kong, Agent Router, Higress, Bifrost, gproxy, new-api, agentgateway, AWS AgentCore, Traefik Hub, Respan, GPT-Load, uni-api, TensorZero) | https://docs.litellm.ai/docs/proxy/users | TPM and concurrency caps absent; limiter is a burst-tolerant token bucket keyed by key id when authenticated else client IP (`crates/llm-proxy-server/src/middleware.rs:117-129`) |
+| 1 | high | Request-path retries, fallback chains, provider cooldowns | 22 products (LiteLLM, Portkey, Bifrost, Cloudflare, Agent Router, Higress, Kong, OpenRouter, Vercel, TensorZero, one-api, new-api, gproxy, oc-go-cc, agentgateway, AWS AgentCore, Tyk, F5, uni-api, GPT-Load, Respan, llm-api-key-proxy); 21 without a paid license — Kong's is `ai-proxy-advanced` | https://docs.litellm.ai/docs/proxy/reliability | No request-path retry/fallback in llm-proxy; scoped future work (`docs/research/core-protocol.md:170-186`) |
+| 2 | high | Per-key spend budgets with enforcement and periodic resets | 15 USD budgets (LiteLLM, Bifrost, OpenRouter, Vercel, Cloudflare, LangSmith, gproxy, BricksLLM, agentgateway, Portkey, Tyk, Respan, GPT-Load, uni-api, Traefik Hub); 12 self-hostable without a paid edition or beta (Portkey budgets enterprise, Cloudflare spend limits Beta, Tyk enforcement Enterprise); one-api/new-api/Azure APIM enforce token quotas instead | https://docs.getbifrost.ai/features/governance/budget-and-limits.md | Pricing estimation-only, no enforcement (`crates/llm-proxy-core/src/provider_config.rs:472`) |
+| 3 | medium | Token-based (TPM) and concurrency rate limits — per-key RPM already exists for authenticated callers (token bucket keyed by key id, core_pipeline.rs:172-176, since 2026-10-13); unauthenticated callers fall back to per-IP (narrowed 2026-10-28: per-key RPM now exists) | 14 (LiteLLM, Kong, Agent Router, Higress, Bifrost, gproxy, new-api, agentgateway, AWS AgentCore, Traefik Hub, Respan, GPT-Load, uni-api, TensorZero); 13 without a paid license — Kong's is `ai-rate-limiting-advanced` | https://docs.litellm.ai/docs/proxy/users | TPM and concurrency caps absent; limiter is a burst-tolerant token bucket keyed by key id when authenticated else client IP (`crates/llm-proxy-server/src/middleware.rs:117-129`) |
 | 4 | high | Cloud-native upstream auth (SigV4/STS, Entra refresh, ADC) | 6 (agentgateway, LiteLLM, Kong, Agent Router, Azure APIM, AWS AgentCore) | https://agentgateway.dev/docs/standalone/latest/documentation/configuration/security/backend-authn/ | Static bearer only (`crates/llm-proxy-core/src/provider_config.rs:374-385`) |
 | 5 | high | Upstream credential pools with rotation, cooldowns, quota windows | 8 (llm-api-key-proxy, gproxy, Bifrost, Higress, new-api, openproxy, GPT-Load, uni-api) | https://github.com/Mirrowel/LLM-API-Key-Proxy | One static key per provider (`crates/llm-proxy-core/src/provider_config.rs:375`); rotator defaults `ref/llm-api-key-proxy/src/rotator_library/config/defaults.py:139-158` |
 | 6 | high | OpenAI Responses client endpoint (`/v1/responses`) | 15 (LiteLLM, Portkey OSS, OpenRouter, Vercel, LangSmith, Helicone, new-api, Agent Router, agentgateway, AWS AgentCore, Cloudflare, Respan, uni-api, GPT-Load, Martian); Tyk only in unreleased 2.3.0 | https://vercel.com/docs/ai-gateway/sdks-and-apis | Upstream Responses adapter exists, client surface does not (`crates/llm-proxy-server/src/routes/mod.rs:69-79`) |
-| 7 | medium | Guardrails (PII redaction, moderation, injection detection) | 17 products | https://docs.litellm.ai/docs/proxy/guardrails/quick_start | llm-proxy ships none |
-| 8 | medium | MCP gateway functionality | 11 (LiteLLM, Cloudflare, agentgateway, Bifrost, Kong, Azure APIM, AWS AgentCore, IBM ContextForge, Higress, Glama, Tyk) | https://docs.litellm.ai/docs/mcp | No MCP client, server, or federation |
-| 9 | medium | Client-key lifecycle API without restart | 12 (LiteLLM, Bifrost, OpenRouter, Vercel, rust-llm-proxy, one-api, Portkey, agentgateway, GPT-Load, Respan, Tyk, uni-api) | https://portkey.ai/docs/product/enterprise-offering/org-management/api-key-rotation | Keys are static config (`config.toml.example:42-54`) |
-| 10 | medium | Exact-match response caching | 8 exact-match (LiteLLM, Portkey, Cloudflare, Helicone, OpenRouter, Higress, Respan, Tyk); semantic at Bifrost, Kong, Azure APIM, LiteLLM Qdrant, vLLM alpha | https://portkey.ai/docs/product/ai-gateway/cache-simple-and-semantic | No cache; dedup rejects the second caller (`crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185`) |
+| 7 | medium | Guardrails (PII redaction, moderation, injection detection) | 17 products; 15 without a paid license or beta (Kong's is `ai-sanitizer`; Cloudflare Guardrails and DLP are Beta) | https://docs.litellm.ai/docs/proxy/guardrails/quick_start | llm-proxy ships none |
+| 8 | medium | MCP gateway functionality | 11 (LiteLLM, Cloudflare, agentgateway, Bifrost, Kong, Azure APIM, AWS AgentCore, IBM ContextForge, Higress, Glama, Tyk); 10 without a paid license (Kong's is `ai-mcp-proxy`; Tyk's MCP proxying with upstream OAuth 2.1 is Enterprise) | https://docs.litellm.ai/docs/mcp | No MCP client, server, or federation |
+| 9 | medium | Client-key lifecycle API without restart | 12 (LiteLLM, Bifrost, OpenRouter, Vercel, rust-llm-proxy, one-api, Portkey, agentgateway, GPT-Load, Respan, Tyk, uni-api); 11 without a paid edition (Portkey key rotation is enterprise) | https://portkey.ai/docs/product/enterprise-offering/org-management/api-key-rotation | Keys are static config (`config.toml.example:42-54`) |
+| 10 | medium | Exact-match response caching | 8 exact-match (LiteLLM, Portkey, Cloudflare, Helicone, OpenRouter, Higress, Respan, Tyk — Portkey's OSS cache is exact-match in memory only); semantic at Bifrost, Kong (paid `ai-semantic-cache`), Azure APIM, LiteLLM Qdrant, vLLM alpha | https://portkey.ai/docs/product/ai-gateway/cache-simple-and-semantic | No cache; the opt-in dedup window (off by default) rejects the second caller (`crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185`) |
 | 11 | medium | OTel GenAI trace export | 9 (Cloudflare, Vercel, OpenRouter, agentgateway, LiteLLM, Bifrost, Tyk, IBM ContextForge, vLLM stack) | https://developers.cloudflare.com/ai-gateway/observability/otel-integration/ | No OTLP span export |
 | 12 | medium | Prometheus /metrics scrape endpoint | 9 (LiteLLM, agentgateway, Bifrost, Kong, TensorZero, vLLM stack, Higress, Tyk, IBM ContextForge) | https://docs.litellm.ai/docs/proxy/prometheus | Counters in-process only (`crates/llm-proxy-core/src/metrics.rs`) |
-| 13 | medium | Weighted/multi-strategy load balancing per model group | 12 (LiteLLM, Portkey, Kong, gproxy, Bifrost, OpenRouter, Cloudflare Auto Router, Higress, uni-api, GPT-Load, AWS AgentCore, Tyk) | https://developer.konghq.com/plugins/ai-proxy-advanced/ | Alias resolves to exactly one provider (`crates/llm-proxy-core/src/provider_config.rs:392-394`); inline: https://developers.cloudflare.com/ai-gateway/features/auto-router/, https://github.com/higress-group/higress/blob/main/plugins/wasm-go/extensions/ai-load-balancer/README_EN.md |
-| 14 | medium | Cross-provider prompt-cache plumbing and cache-locality routing | 7 (OpenRouter, LiteLLM, Vercel, Helicone, Bifrost, GPT-Load, new-api) | https://vercel.com/docs/ai-gateway/models-and-providers/automatic-caching | `CacheControl` cannot express TTLs; nothing translates or pins (`crates/llm-proxy-protocol/src/core.rs:261-286`) |
-| 15 | medium | Upstream credential encryption at rest / secret-manager references | 8 (gproxy, LiteLLM, Kong, Tyk, IBM ContextForge, new-api, GPT-Load, Portkey) | https://docs.litellm.ai/docs/secret_managers/overview.md | Plaintext TOML |
+| 13 | medium | Weighted/multi-strategy load balancing per model group | 12 (LiteLLM, Portkey, Kong, gproxy, Bifrost, OpenRouter, Cloudflare Auto Router, Higress, uni-api, GPT-Load, AWS AgentCore, Tyk); 10 without a paid license or beta (Kong's is `ai-proxy-advanced`; Cloudflare Auto Router is Beta) | https://developer.konghq.com/plugins/ai-proxy-advanced/ | Alias resolves to exactly one provider (`crates/llm-proxy-core/src/provider_config.rs:392-394`); inline: https://developers.cloudflare.com/ai-gateway/features/auto-router/, https://github.com/higress-group/higress/blob/main/plugins/wasm-go/extensions/ai-load-balancer/README_EN.md |
+| 14 | medium | Cross-provider prompt-cache plumbing and cache-locality routing | 7 (OpenRouter, LiteLLM, Vercel, Helicone, Bifrost, GPT-Load, new-api) | https://vercel.com/docs/ai-gateway/models-and-providers/automatic-caching | `CacheControl` cannot express TTLs; system-block markers translate but message-level markers are dropped, and nothing injects or pins (`crates/llm-proxy-protocol/src/core.rs:261-286`, corrected 2026-11-08 per research audit) |
+| 15 | medium | Upstream credential encryption at rest / secret-manager references | 8 (gproxy, LiteLLM, Kong, Tyk, IBM ContextForge, new-api, GPT-Load, Portkey); 7 without a paid edition (Portkey secret references and KMS are enterprise/hosted) | https://docs.litellm.ai/docs/secret_managers/overview.md | Plaintext TOML |
 | 16 | low | Config hot reload without restart | 8 (agentgateway, uni-api, Higress, Kong, APISIX, LiteLLM, oc-go-cc, openproxy) | https://agentgateway.dev/docs/standalone/latest/documentation/setup/update | `server.hot_reload` rejected (`crates/llm-proxy-core/src/provider_config.rs:1531-1538`) |
 | 17 | low | No exposure surface for latency percentiles (no /metrics; snapshots and p95/p99 helpers exist in-process only, metrics.rs:210-239) | 9 (LiteLLM, agentgateway, Bifrost, oc-go-cc, vLLM stack, Kong, Tyk, Helicone, AWS AgentCore) | https://agentgateway.dev/docs/standalone/latest/documentation/observability/metrics/reference/ | Latency samples and percentile helpers in-process only (`crates/llm-proxy-core/src/metrics.rs:34-35,210-239`); TTFT unmeasured |
 | 18 | low | Model lifecycle metadata (deprecation dates, successor aliases) | 2 gateways (LiteLLM, OpenRouter); 3 providers publish fields (OpenAI, Anthropic, Bedrock) | https://openrouter.ai/docs/guides/overview/models | Discovery discards it (`crates/llm-proxy-provider/src/discovery.rs:272-288`) |
 | 19 | — (report rank 19) | Web admin UI | 11 (LiteLLM, gproxy, Bifrost, agentgateway, new-api, one-api, Higress, Tyk, IBM ContextForge, GPT-Load, Respan) | https://docs.litellm.ai/docs/proxy/virtual_keys | Admin is read-only JSON (`crates/llm-proxy-api/src/routes.rs:53-55,116-117`) |
-| 20 | — (report rank 20) | Stream-cancellation usage settlement | 2 document cancelled-stream billing/accounting (LiteLLM, OpenRouter) | https://docs.litellm.ai/docs/proxy/config_settings | `ClientCancelled` persists with no usage payload — delivered tokens never settle (`crates/llm-proxy-server/src/routes/core_pipeline.rs:952-985`, `crates/llm-proxy-storage/src/lib.rs:80`); OpenRouter: https://openrouter.ai/docs/api_reference/streaming |
+| 20 | — (report rank 20) | Stream-cancellation usage settlement | 2 document accounting for cancelled requests (LiteLLM: per-chunk usage; its `cancel_on_disconnect` is documented for non-streaming calls — OpenRouter: per-provider cancel-billing + final usage chunk; corrected 2026-11-08 per research audit) | https://docs.litellm.ai/docs/proxy/config_settings | `ClientCancelled` persists with no usage payload — delivered tokens never settle (`crates/llm-proxy-server/src/routes/core_pipeline.rs:952-985`, `crates/llm-proxy-storage/src/lib.rs:80`); cancellation propagation itself already works upstream once streaming; OpenRouter: https://openrouter.ai/docs/api_reference/streaming |
 
 Prevalence counts include the audited analysis's `new:` additions (Apache
-APISIX, Traefik Hub), which sit outside the 67-item inventory.
+APISIX, Traefik Hub), which sit outside the 67-item inventory. They mean
+"someone sells this", not self-hostable parity: rows affected by paid-tier
+or beta features restate the count without them (corrected 2026-11-08 per
+research audit — Kong `ai-proxy-advanced`/`ai-rate-limiting-advanced`/
+`ai-semantic-cache`/`ai-sanitizer`/`ai-mcp-proxy` need an AI license;
+Portkey budgets, key rotation, secret references and KMS are enterprise or
+hosted; LiteLLM audit logs are Enterprise; Tyk upstream OAuth is
+Enterprise; Cloudflare Guardrails, DLP, Auto Router and spend limits are
+Beta).
 
 Third wave (November 2026): the niche survey
-([`niche-repos.md`](niche-repos.md)) surfaces ten candidate gaps that fall
+([`niche-repos.md`](niche-repos.md)) surfaces nine candidate gaps that fall
 outside this register — timeout hierarchies, request-payload cost
 transforms, shadow-eval quality guards, OAuth credential lifecycle for
-non-cloud upstreams, upstream cancellation propagation, engine-state-aware
+non-cloud upstreams, engine-state-aware
 routing, admission queueing, caller SSO/RBAC, hash-verified price catalogs,
-and hedged request races. Each is defined and evidenced there and tagged per
+and hedged request races. Upstream cancellation propagation was removed
+from this list: llm-proxy already cancels the upstream request when the
+client disconnects once streaming, in every phase (audit probe E6); what is
+missing there is usage settlement and a settled row for disconnects before
+the first event (corrected 2026-11-08 per research audit). Each remaining
+gap is defined and evidenced there and tagged per
 capability in [`repos-registry.json`](repos-registry.json); they are
 candidates for register entries, not yet ranked.
 
@@ -687,33 +730,47 @@ are stated as the analysis gives them.
 
 ### 1. Request-path retries, fallback chains, cooldowns (wave 1)
 
-Market: per-exception retry policies, typed fallback chains, cooldowns tripped on 429 or >50% failure rate; no fallback after stream start; default-on circuit breakers (Routing table). llm-proxy: the streaming path already awaits the first `CoreEvent` via
-`FirstByteResult` before SSE headers commit
-(`crates/llm-proxy-server/src/routes/core_pipeline.rs:702-705`); after the
-first event, keep the in-band error invariant
+Market: per-exception retry policies, typed fallback chains, cooldowns tripped on 429 or >50% failure rate; no fallback after stream start; default-on circuit breakers (Routing table). llm-proxy: the first-byte window cannot host this as built — 429/5xx/connect
+errors return at `send_stream`
+(`crates/llm-proxy-server/src/routes/core_pipeline.rs:792-808`) before
+`FirstByteResult` exists, and the window closes on the first encoded
+event, a prelude frame (`message_start`, role-only chat chunk,
+`response.created`, first Gemini chunk) before any visible output
+(corrected 2026-11-08 per research audit); fallback needs retries wrapped
+around the send plus a bounded hold before commit, and after the first
+event the in-band error invariant
 (`docs/protocol.md:139-151`). Done when a 429/5xx/connect error from the
-primary advances to the configured fallback in that window and the ledger
+primary advances to the configured fallback before commit and the ledger
 records both attempts — requires extending the usage-row schema with an
 attempt ordinal and provider per upstream attempt (or an attempts-count
 column), a storage migration scoped into this candidate
-(`crates/llm-proxy-storage/src/sqlite.rs:105-131`).
+(`crates/llm-proxy-storage/src/sqlite.rs:105-131`). Plan 04 shipped this:
+classified retries around the send, per-route hold budgets, pools and
+attempt-level ledger rows.
 
 ### 2. Client-key budgets and virtual-key lifecycle (wave 1)
 
 Market: layered USD budgets with periodic resets — stackable multi-window limits, calendar-aligned resets, reservation; lazy window reset (https://github.com/maximhq/bifrost/blob/dev/plugins/governance/store.go); Block/Audit modes; status codes not converged (Cost table). llm-proxy: check-then-accrue — reject when the in-memory counter is over
 budget, accrue actual cost after completion against the existing SQLite
-ledger (`crates/llm-proxy-storage/src/sqlite.rs:105`). Reset windows are a
-rolling duration (calendar alignment later). Accrued spend must be
-rehydrated from the ledger on startup so a restart does not zero an
-in-flight window; the window start is persisted with the key record.
+ledger (`crates/llm-proxy-storage/src/sqlite.rs:105`). Two preconditions
+the candidate originally glossed (corrected 2026-11-08 per research
+audit): streaming cost is often NULL — the default chat stream sent
+`include_usage: false` and the documented Anthropic delta yielded no usage
+— so "accrue settled cost" needs the stream usage fixes first; and no key
+record exists to persist a window start with (clients are a TOML map of
+id→PHC hash), nor an API to rehydrate spend from the write-only ledger.
 Deliberately not reservation-based: bounded overshoot from in-flight calls
-is accepted, and LiteLLM's cost reservation silently skips when cost is
-unestimatable (https://github.com/BerriAI/litellm/issues/35524). Done when
+is accepted, and the cited LiteLLM reservation-skips-when-unestimatable
+behaviour comes from
+https://github.com/BerriAI/litellm/issues/35524, closed 2026-10-08 with a
+linked fix — a historical example, not a current one. Done when
 an over-budget key gets 402 pre-dispatch, settled cost lands in the ledger,
 and accrued spend survives a restart. Virtual-key lifecycle
 (issuance/rotation/revocation without restart) is deferred: it needs a
 control-plane decision the candidate avoids; current shape
-`config.toml.example:42-54`.
+`config.toml.example:42-54`. Plan 05 resolved the admission-model
+contradiction with one reserve-then-settle `Admission` step and shipped
+budgets, windows and key records.
 
 ### 3. TPM and per-key/concurrency rate limits (wave 1)
 
@@ -731,18 +788,27 @@ Market: SHA-256 keys over recognized parameters; 60s TTL floors; single-flight a
 in-memory v1 with a bounded TTL (floor/default/max per the 60s-floor
 convention), an entry cap, and LRU eviction under the cap. Done when a
 second identical request is served from the store with a HIT header and
-zero recorded usage, entries expire at the TTL and evict under the cap, and
-the dedup window still rejects concurrent identical misses before origin
-(`crates/llm-proxy-server/src/routes/core_pipeline.rs:182-185`) —
-coalescing (serving the second caller) remains unbuilt.
+zero recorded usage, entries expire at the TTL and evict under the cap.
+The dedup window cannot coexist in front of this: it is off by default,
+keys raw path+body (not `CoreRequest`) from first sighting, and runs
+before any cache lookup, so with it on the second identical request gets
+its 409 where a HIT is required — the original done-condition was
+self-contradictory (corrected 2026-11-08 per research audit). Coalescing
+(serving the second caller) remains unbuilt.
 
 ### 5. Upstream credential pools (wave 1)
 
 Market: same-key server-error retries under a global deadline with rotator defaults (`ref/llm-api-key-proxy/src/rotator_library/config/defaults.py:139-158`); key-pool failover with cooldown restore; tier-priority scheduling with credential isolation (Routing table). llm-proxy: optional `[[provider.credentials]]` tables extending the single
 `api_key` field (`crates/llm-proxy-core/src/provider_config.rs:375`) with
-per-credential cooldown state and quota windows persisted via the existing
-storage layer. Done when a credential that 401s is locked out, its cooldown
-survives restart, and the credential id appears in ledger rows.
+per-credential cooldown state and quota windows. This is not "without
+changing request handling" as the build-order list claimed, and the
+existing storage layer is a write-only usage ledger with no state store,
+so cooldown persistence needs new state storage (both corrected
+2026-11-08 per research audit). Done when a credential that 401s is locked
+out, its cooldown
+survives restart, and the credential id appears in ledger rows. Plan 04
+shipped credential selection and failure feedback in the attempt loop with
+the key id in ledger rows.
 
 ### 6. Prometheus /metrics and OTel GenAI telemetry export (wave 1)
 
@@ -754,20 +820,28 @@ decision the candidate avoids).
 
 ### 7. Cloud-native upstream auth: SigV4/STS, Entra, ADC, mTLS (wave 2)
 
-Market: per-provider auth object separating credential acquisition from request attachment plus an expiry-driven credential cache; SigV4 computed last after every other request mutation; DualCache IAM policy (static ~59 min, ambient 600s, STS TTL minus 60s) and single-flight proactive token refresh with one 401 re-auth retry (`ref/litellm/litellm/llms/bedrock/base_aws_llm.py:74-148,1400-1439`, `ref/litellm/litellm/llms/vertex_ai/vertex_llm_base.py:480-603`); OIDC token exchange writing rotated secrets at expiry minus 5 minutes; upstream mTLS only at agentgateway (Upstream-auth table). llm-proxy: static bearer only
+Market: per-provider auth object separating credential acquisition from request attachment plus an expiry-driven credential cache; SigV4 computed last after every other request mutation; DualCache IAM policy (static ~59 min, ambient 600s, STS TTL minus 60s) and single-flight proactive token refresh with one 401 re-auth retry (`ref/litellm/litellm/llms/bedrock/base_aws_llm.py:74-148,1400-1439`, `ref/litellm/litellm/llms/vertex_ai/vertex_llm_base.py:480-603`); OIDC token exchange writing rotated secrets at expiry minus 5 minutes; upstream mTLS ships at agentgateway (file cert/key/root; SPIFFE rotation Enterprise), LiteLLM documents a client certificate, and Kong's Service entity carries `client_certificate` (untested through its AI plugins) — not agentgateway-only (corrected 2026-11-08 per research audit; Upstream-auth table). llm-proxy: static bearer only
 (`crates/llm-proxy-core/src/provider_config.rs:374-385`); the wave-2 grep
 matched zero Rust/TOML files. Deferred from near-term candidates: needs a
 config/schema and dependency decision.
 
 ### 8. Cross-provider prompt-cache plumbing (wave 2)
 
-Market: bidirectional marker translation (`cache_control` ↔ `prompt_cache_breakpoint`, TTLs dropped; Bedrock `cachePoint`, Gemini `cachedContents`, 4-block cap); auto-injection with advisory anchors that degrade with warnings; sticky cache-locality routing — 10-min pin only when cache-read price beats prompt price, 300s pin by SHA-256 of cacheable prefix + tools, per-provider pin lifetimes capped 1h, LRU-10,000 soft affinity (Prompt-caching table). llm-proxy: add a `ttl` field to `CacheControl`
-(`crates/llm-proxy-protocol/src/core.rs:261-266`) and pass markers through
-both client adapters so Anthropic 5m/1h semantics survive a round trip;
-cache read/write usage columns already exist
+Market: bidirectional marker translation (`cache_control` ↔ `prompt_cache_breakpoint`, TTLs dropped; Bedrock `cachePoint`, Gemini `cachedContents`, 4-block cap); auto-injection with advisory anchors that degrade with warnings; sticky cache-locality routing — 10-min pin only when cache-read price beats prompt price, 300s pin by SHA-256 of cacheable prefix + tools, per-provider pin lifetimes capped 1h, LRU-10,000 soft affinity (Prompt-caching table). llm-proxy: more than a core field (corrected 2026-11-08 per research
+audit): a `ttl` on the wire marker makes the containing block unparseable
+today (the Anthropic request decoder deletes the whole block, HTTP 200,
+WARN only), `cache` exists only on `Text`, message-level markers are
+dropped by the upstream adapter, and the "ledger records cache-write
+tokens" half needs the Anthropic stream usage decode fixed. Fix spans the
+wire `CacheControl` (`crates/llm-proxy-protocol/src/anthropic.rs:113`,
+`openai.rs:11`, core at `:261-266`), `cache` slots on the other content
+kinds, the adapter drop at `crates/llm-proxy-provider/src/adapter/anthropic.rs:640,825`
+and the stream decoder at `:337-361`; cache read/write usage columns
+already exist
 (`crates/llm-proxy-storage/src/sqlite.rs:116-121`). Done when a request
-carrying a 1h marker on `/v1/messages` produces the same marker upstream
-and the ledger records cache-write tokens.
+carrying a 1h marker on `/v1/messages` produces the same marker upstream —
+on any block kind — and stream runs record cache-write tokens. Plan 01
+shipped the wire TTL, block-level markers and the stream usage merge.
 
 ### 9. Hot-reloadable configuration (wave 2)
 
@@ -777,7 +851,7 @@ near-term candidates: needs a config/schema decision.
 
 ### 10. Model lifecycle metadata in catalogs and /v1/models (wave 2)
 
-Market: providers publish `shutdown_date`, tri-state `lifecycle` + `deprecated_at`/`retires_at` (retired stays listed, inference fails), `modelLifecycle` (6-month or 45-day window); Gemini none. Gateways: catalog `expiration_date` (14 of 464 dated, expired delisted) + `canonical_slug` aliases; cost-map `deprecation_date` on 874 entries, urgency buckets, daily-lock Slack alerts, never blocks; no request-time signal or successor mapping anywhere cited (Model-lifecycle table). llm-proxy: extend `StaticModelCatalogEntry`
+Market: providers publish `shutdown_date`, tri-state `lifecycle` + `deprecated_at`/`retires_at` (retired stays listed, inference fails), `modelLifecycle` (6-month or 45-day window); Gemini none. Gateways: catalog `expiration_date` (14 of 464 dated, expired delisted) + `canonical_slug` aliases; cost-map `deprecation_date` on 874 entries, urgency buckets, daily-lock Slack alerts, never blocks; no request-time signal anywhere cited, and LiteLLM's cost map defines `successor_model` entries feeding deprecation guidance (not request rewrites) while no other gateway cited maps to a successor (corrected 2026-11-08 per research audit; Model-lifecycle table). llm-proxy: extend `StaticModelCatalogEntry`
 (`crates/llm-proxy-core/src/provider_config.rs:735-747`, currently
 `deny_unknown_fields`, so new fields need `#[serde(default)]`) and
 discovery's `parse_models` to capture per-kind lifecycle fields (OpenAI
@@ -797,15 +871,24 @@ UI, cloud-native upstream auth, hot reload, credential encryption at rest,
 stream-cancellation usage settlement) are deferred: each needs a
 dependency, config/schema, or control-plane decision the candidates avoid.
 
-1. Pre-first-event retry/fallback — the pre-commit window already exists
-   (`crates/llm-proxy-server/src/routes/core_pipeline.rs:702-705`,
-   `FirstByteResult`), so fallback slots in without breaking the in-band
-   error invariant; done includes the attempts migration
+1. Pre-first-event retry/fallback — the pre-commit window does not admit
+   this as built: 429/5xx/connect errors return at `send_stream`
+   (`crates/llm-proxy-server/src/routes/core_pipeline.rs:792-808`) before
+   `FirstByteResult` exists, and the window closes on the first encoded
+   event, a prelude frame before any visible output
+   (`core_pipeline.rs:702-705`; corrected 2026-11-08 per research audit);
+   fallback needs retries around the send plus a bounded hold before
+   commit; done includes the attempts migration
    (`crates/llm-proxy-storage/src/sqlite.rs:105-131`).
-2. Client-key budgets, check-then-accrue — the ledger already records
-   settled cost, so enforcement is a counter over it; reservation rejected
-   because LiteLLM's silently skips unestimatable cost
-   (https://github.com/BerriAI/litellm/issues/35524); done: 402 pre-dispatch,
+2. Client-key budgets, check-then-accrue — the ledger does not already
+   record settled streaming cost (the default chat stream sent
+   `include_usage: false` and the documented Anthropic delta yielded no
+   usage, so streaming spend was often NULL), and it is optional and
+   write-only from the server, so enforcement is not just a counter over
+   it (corrected 2026-11-08 per research audit); the cited
+   reservation-skips example
+   (https://github.com/BerriAI/litellm/issues/35524) closed 2026-10-08
+   with a linked fix; done: 402 pre-dispatch,
    settled cost in ledger, spend survives restart.
 3. TPM (per-key RPM already exists, `core_pipeline.rs:172-176`) — the
    offline token counter exists and token estimates are cheap and
@@ -816,14 +899,22 @@ dependency, config/schema, or control-plane decision the candidates avoid.
    done: admin-listener endpoint scraping counters plus latency histogram
    and stream TTFT.
 5. Exact-match response cache — canonical `CoreRequest` serialization gives
-   a stable key and the dedup window already discriminates identical
-   requests; done: HIT header, zero usage on hit, TTL expiry, LRU eviction
-   under cap, dedup still rejects concurrent misses.
+   a stable key; the dedup window keys raw path+body from first sighting
+   and runs before any cache lookup, so it cannot front the cache (with it
+   on, the second identical request gets 409 where a HIT is required;
+   corrected 2026-11-08 per research audit); done: HIT header, zero usage
+   on hit, TTL expiry, LRU eviction under cap.
 6. Credential pools — `[[provider.credentials]]` extends the single
-   `api_key` field without changing request handling; done: 401 lockout,
+   `api_key` field, which requires credential selection and failure
+   feedback in the pipeline plus a ledger column for the key used — not
+   "without changing request handling" (corrected 2026-11-08 per research
+   audit); done: 401 lockout,
    cooldown survives restart, credential id in ledger rows.
-7. Prompt-cache TTL and marker passthrough — `CacheControl` is the only
-   missing field and the ledger columns already exist; done: 1h marker on
+7. Prompt-cache TTL and marker passthrough — `CacheControl` is not the
+   only missing piece: the wire marker, `cache` slots on non-text content
+   kinds, the adapter's message-level marker drop and the Anthropic stream
+   usage decode all need work (corrected 2026-11-08 per research audit;
+   the ledger columns already exist); done: 1h marker on
    `/v1/messages` round-trips upstream, cache-write tokens land in the
    ledger.
 8. Model lifecycle capture — discovery already parses model lists, so this

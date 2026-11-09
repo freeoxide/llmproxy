@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use llm_proxy_core::{AppConfig, ProviderRegistry, load_app_config};
-use llm_proxy_provider::ProviderAdapterRegistry;
+use llm_proxy_adapters::ProviderAdapterRegistry;
+use llm_proxy_core::{AppConfig, load_app_config};
 
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{providers_dir_for, resolve_config};
@@ -36,26 +36,32 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
         "  trust_forwarded_headers: {}",
         app_config.server.trust_forwarded_headers
     );
-    println!(
-        "  dedup_window:    {}ms",
-        app_config.server.dedup_window.as_millis()
-    );
     println!("  server_name:     {}", app_config.server.server_name);
 
-    let providers_dir = providers_dir_for(&path);
-    let registry = if providers_dir.exists() {
-        ProviderRegistry::load_from_dir(&providers_dir)
-            .with_context(|| format!("loading providers from {}", providers_dir.display()))?
-    } else {
-        ProviderRegistry::from_providers(vec![])
-            .with_context(|| "building empty provider registry")?
+    // Config provenance (backlog 34): every resolved setting with the layer
+    // it came from, so "why is my flag ignored?" is answerable from output.
+    // The raw file text (pre-interpolation) is what attributes the env
+    // layer; the parsed config supplies the resolved values.
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("re-reading config from {}", path.display()))?;
+    let env = crate::provenance::RuntimeEnvOverrides {
+        rust_log_format: std::env::var("RUST_LOG_FORMAT").ok(),
     };
+    let report = crate::provenance::provenance_report(&raw, &app_config, &env);
+    println!();
+    println!(
+        "=== Resolved settings ({}) ===",
+        crate::provenance::PRECEDENCE
+    );
+    for row in &report {
+        println!("  {} = {}  [{}]", row.setting, row.value, row.source);
+    }
 
+    let providers_dir = providers_dir_for(&path);
+    // Every gate startup runs (protocols, self-loop, bare /v1 targets, the
+    // auth/passthrough combination) runs here too, on the same shared path.
     let adapter_registry = ProviderAdapterRegistry::builtin();
-    let known_protocols = adapter_registry.protocol_names();
-    registry
-        .validate_protocols(known_protocols)
-        .with_context(|| "validating provider protocols")?;
+    let registry = crate::state::load_registry_with_checks(&app_config, &path, &adapter_registry)?;
 
     println!();
     println!("=== Providers ({} loaded) ===", registry.len());
@@ -63,17 +69,11 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
         println!("  (none)");
     } else {
         for provider in registry.iter() {
-            let route_count = provider
-                .routes
-                .chat_completions
-                .iter()
-                .chain(provider.routes.messages.iter())
-                .count();
             println!(
                 "  {} ({} adapters, {} routes, {} aliases)",
                 provider.name,
                 provider.adapters.len(),
-                route_count,
+                configured_routes(provider).len(),
                 provider.model_aliases.len()
             );
         }
@@ -112,17 +112,24 @@ pub fn cmd_validate(config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// Every route `provider` configures, as (`[provider.routes]` key, adapter
+/// name), in declaration order.
+fn configured_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<(&'static str, &str)> {
+    llm_proxy_core::ProviderRouteKind::ALL
+        .iter()
+        .filter_map(|kind| {
+            provider
+                .routes
+                .get(*kind)
+                .map(|adapter| (kind.config_key(), adapter))
+        })
+        .collect()
+}
+
 fn print_provider_routes(provider: &llm_proxy_core::ProviderConfig) -> Vec<String> {
     println!("{}:", provider.name);
 
-    let route_entries: Vec<(&str, &String)> = provider
-        .routes
-        .chat_completions
-        .as_ref()
-        .map(|a| ("chat_completions", a))
-        .into_iter()
-        .chain(provider.routes.messages.as_ref().map(|a| ("messages", a)))
-        .collect();
+    let route_entries = configured_routes(provider);
 
     if route_entries.is_empty() {
         println!("  (no routes configured)");
@@ -148,6 +155,41 @@ mod tests {
     use crate::defaults::DEFAULT_CONFIG_TOML;
 
     #[test]
+    fn validate_lists_every_configured_route_kind() {
+        // A provider routing a dialect route and two endpoint families:
+        // all three are listed (and counted), not only chat and messages.
+        let provider: llm_proxy_core::ProviderConfig = toml::from_str::<toml::Table>(
+            r#"[provider]
+name = "mixed"
+api_key = "k"
+auth_style = "bearer"
+[provider.adapters.resp]
+protocol = "openai_responses"
+endpoint = "http://127.0.0.1:9/v1/responses"
+[provider.adapters.embed]
+protocol = "openai_chat_completions"
+endpoint = "http://127.0.0.1:9/v1/embeddings"
+[provider.routes]
+responses = "resp"
+embeddings = "embed"
+batches = "embed"
+"#,
+        )
+        .ok()
+        .and_then(|table| table.get("provider").cloned())
+        .and_then(|provider| provider.try_into().ok())
+        .expect("provider parses");
+        assert_eq!(
+            configured_routes(&provider),
+            vec![
+                ("responses", "resp"),
+                ("embeddings", "embed"),
+                ("batches", "embed")
+            ]
+        );
+    }
+
+    #[test]
     fn cmd_validate_valid_config_file() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
@@ -165,5 +207,145 @@ mod tests {
 
         let result = cmd_validate(Some(&config));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cmd_validate_accepts_the_shipped_example_config() {
+        let example =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.toml.example");
+        let raw = std::fs::read_to_string(&example)
+            .unwrap()
+            // The example references env vars only inside commented-out
+            // lines, but config loading scans the raw text for them.
+            .replace("${HOME}", "/tmp")
+            .replace("${ADMIN_TOKEN}", "test-admin-token");
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, raw).unwrap();
+
+        cmd_validate(Some(&config))
+            .unwrap_or_else(|e| panic!("config.toml.example must validate as shipped: {e:#}"));
+    }
+
+    #[test]
+    fn cmd_validate_rejects_an_upstream_that_resolves_to_the_own_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/loopy.toml"),
+            r#"[provider]
+name = "loopy"
+api_key = "k"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "http://localhost:3456/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#,
+        )
+        .unwrap();
+
+        let err = cmd_validate(Some(&config))
+            .expect_err("an upstream naming this proxy's own listener is invalid");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("loopy") && message.contains("3456"),
+            "the error names the provider and the listener: {message}"
+        );
+        assert!(
+            message.contains("forever"),
+            "the error says what would happen: {message}"
+        );
+    }
+
+    #[test]
+    fn cmd_validate_rejects_cleartext_credentials_to_a_remote_host() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("providers")).unwrap();
+        std::fs::write(
+            dir.path().join("providers/leaky.toml"),
+            r#"[provider]
+name = "leaky"
+api_key = "k"
+auth_style = "bearer"
+
+[provider.adapters.chat]
+protocol = "openai_chat_completions"
+endpoint = "http://api.example.com/v1/chat/completions"
+
+[provider.routes]
+chat_completions = "chat"
+"#,
+        )
+        .unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let err = result.expect_err("cleartext credentials to a remote host are invalid");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("leaky") && message.contains("api.example.com"),
+            "the validate error names the provider and the host: {message}"
+        );
+        assert!(
+            message.contains("cleartext"),
+            "the validate error says what is wrong: {message}"
+        );
+    }
+
+    #[test]
+    fn cmd_validate_rejects_a_bare_v1_target_naming_no_provider_or_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            r#"[server]
+bind = "127.0.0.1:3456"
+request_timeout = "300s"
+log_level = "info"
+hot_reload = false
+server_name = "t"
+
+[server.bare_v1]
+enabled = true
+[server.bare_v1.models]
+"claude-sonnet-4-6" = "ghost-pool"
+"#,
+        )
+        .unwrap();
+
+        let result = cmd_validate(Some(&config));
+        let err = result.expect_err("a bare /v1 model mapping to an unknown target is invalid");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("bare_v1") && message.contains("ghost-pool"),
+            "the validate error names the section and the unknown target: {message}"
+        );
     }
 }

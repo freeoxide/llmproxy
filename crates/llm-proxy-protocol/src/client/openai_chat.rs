@@ -83,22 +83,18 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
-                    ttl: None,
+                    ttl: cc.ttl,
                 });
                 if !text.is_empty() || cache.is_some() {
                     system.push(CoreContent::Text { text, cache });
                 }
             }
             "user" => {
-                let text = msg.content_text();
                 let cache = msg.cache_control.map(|cc| CacheControl {
                     r#type: CacheControlType::from(cc.r#type),
-                    ttl: None,
+                    ttl: cc.ttl,
                 });
-                let mut content = Vec::new();
-                if !text.is_empty() || cache.is_some() {
-                    content.push(CoreContent::Text { text, cache });
-                }
+                let content = decode_user_content(&msg.content, cache);
                 messages.push(CoreMessage {
                     role: CoreRole::User,
                     content,
@@ -108,12 +104,13 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                 let assistant_text = msg.content_text();
                 let mut content = Vec::new();
                 if let Some(thinking) = msg.reasoning_content {
-                    if !thinking.is_empty() {
-                        content.push(CoreContent::Thinking {
-                            text: thinking,
-                            signature: None,
-                        });
-                    }
+                    // Preserve an explicitly empty `reasoning_content`: some
+                    // providers (DeepSeek) require the field on replayed
+                    // assistant turns even when it is empty.
+                    content.push(CoreContent::Thinking {
+                        text: thinking,
+                        signature: None,
+                    });
                 }
                 for tc in msg.tool_calls {
                     let tc_id = tc.id.ok_or_else(|| {
@@ -135,6 +132,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         id: tc_id,
                         name: tc_name,
                         input: tc_args,
+                        signature: None,
                     });
                 }
                 if !assistant_text.is_empty() {
@@ -170,6 +168,7 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
                         tool_use_id,
                         content: inner_content,
                         is_error,
+                        cache: None,
                     }],
                 });
             }
@@ -232,6 +231,9 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
         top_p: req.top_p,
         max_tokens: req.max_tokens,
         stop,
+        // The OpenAI Chat wire format has no top_k parameter; if a client
+        // sends one it stays in `extra` and the cross-format policy decides.
+        top_k: None,
         reasoning_effort: req.reasoning_effort,
         thinking: req.thinking,
     };
@@ -266,6 +268,109 @@ pub fn decode_request(req: ChatCompletionRequest) -> Result<CoreRequest, Protoco
         metadata,
         provider_hints,
     })
+}
+
+/// Decodes a user message `content` field into core blocks: a bare string, or
+/// an array of structured parts (`text`, `image_url`). `image_url` parts map
+/// to the neutral core image source: `{"type":"url","url":...}` or
+/// `{"type":"base64","media_type":...,"data":...}` (from a `data:` URI), the
+/// shape the Anthropic wire format already uses.
+fn decode_user_content(
+    content: &serde_json::Value,
+    message_cache: Option<CacheControl>,
+) -> Vec<CoreContent> {
+    match content {
+        serde_json::Value::String(text) => {
+            if text.is_empty() && message_cache.is_none() {
+                return Vec::new();
+            }
+            vec![CoreContent::Text {
+                text: text.clone(),
+                cache: message_cache,
+            }]
+        }
+        serde_json::Value::Array(parts) => {
+            let mut blocks = Vec::new();
+            let mut cache = message_cache;
+            for part in parts {
+                let Some(obj) = part.as_object() else {
+                    tracing::warn!(
+                        ?part,
+                        "OpenAI Chat: unsupported content part shape; dropping"
+                    );
+                    continue;
+                };
+                match obj.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        if text.is_empty() && cache.is_none() {
+                            continue;
+                        }
+                        blocks.push(CoreContent::Text {
+                            text: text.to_owned(),
+                            cache: cache.take(),
+                        });
+                    }
+                    Some("image_url") => {
+                        if let Some(image) = decode_image_url_part(obj) {
+                            blocks.push(CoreContent::Image { source: image });
+                        }
+                    }
+                    other => {
+                        tracing::warn!(
+                            part_type = ?other,
+                            "OpenAI Chat: unsupported content part type in user message; dropping"
+                        );
+                    }
+                }
+            }
+            blocks
+        }
+        serde_json::Value::Null => Vec::new(),
+        other => {
+            tracing::warn!(
+                ?other,
+                "OpenAI Chat: user content is neither a string nor an array of parts; dropping"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Maps an OpenAI `{"type":"image_url","image_url":{"url":...}}` part to the
+/// neutral core image source. `data:` URIs become base64 sources; http(s)
+/// URLs become url sources. Anything else is dropped with a warning naming
+/// the problem, never silently.
+fn decode_image_url_part(
+    part: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let url = part
+        .get("image_url")
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("url"))
+        .and_then(|v| v.as_str())?;
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest.split_once(',')?;
+        let media_type = meta.split(';').next().unwrap_or_default().to_owned();
+        let is_base64 = meta.to_ascii_lowercase().contains(";base64");
+        if !is_base64 || media_type.is_empty() || data.is_empty() {
+            tracing::warn!(
+                data_uri_meta = meta,
+                "OpenAI Chat: image_url data URI is not base64 or has no media type; dropping"
+            );
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        }));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return Some(serde_json::json!({"type": "url", "url": url}));
+    }
+    tracing::warn!(url, "OpenAI Chat: unsupported image_url scheme; dropping");
+    None
 }
 
 fn decode_tool_choice(value: serde_json::Value) -> CoreToolChoice {
@@ -354,7 +459,9 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
                     None => text,
                 });
             }
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 let args_str = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
                 tool_calls.push(ToolCall {
                     index: Some(tool_calls.len() as i32),
@@ -399,6 +506,11 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
             CoreContent::Refusal { text } => {
                 refusal_text = Some(text);
             }
+            CoreContent::Opaque { .. } => {
+                tracing::warn!(
+                    "OpenAI Chat Completions has no encoding for opaque client blocks; dropping"
+                );
+            }
         }
     }
 
@@ -431,7 +543,7 @@ pub fn encode_response(resp: CoreResponse) -> Result<ChatCompletionResponse, Pro
             finish_reason: Some(finish_reason),
             delta: None,
         }],
-        usage,
+        usage: Some(usage),
         extra: serde_json::Map::new(),
     })
 }
@@ -472,12 +584,18 @@ fn encode_usage(usage: &Usage) -> UsageInfo {
         total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
         prompt_cache_hit_tokens: usage.cache_read_input_tokens,
         prompt_cache_miss_tokens: usage.cache_creation_input_tokens,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
     }
 }
 
 /// Stateful encoder that converts [`CoreEvent`] values into OpenAI
 /// [`ChatCompletionChunk`] values, reusing a stable `id`/`model`/`created`
 /// across chunks (stored as `Arc<str>` so cloning is a refcount bump).
+/// The terminal `finish_reason` chunk is held back until
+/// [`StreamEncoder::finish`] because providers send the usage chunk after
+/// the finish chunk; flushing early would report zeros to clients that
+/// asked for usage.
 #[derive(Debug)]
 pub struct StreamEncoder {
     id: Arc<str>,
@@ -486,6 +604,7 @@ pub struct StreamEncoder {
     include_usage: bool,
     finished: bool,
     pending_usage: Option<UsageInfo>,
+    pending_stop: Option<String>,
 }
 
 impl StreamEncoder {
@@ -499,6 +618,7 @@ impl StreamEncoder {
             include_usage,
             finished: false,
             pending_usage: None,
+            pending_stop: None,
         }
     }
 
@@ -515,6 +635,27 @@ impl StreamEncoder {
         event: CoreEvent,
     ) -> Result<Vec<ChatCompletionChunk>, ProtocolError> {
         if self.finished {
+            return Ok(Vec::new());
+        }
+
+        if self.pending_stop.is_some() {
+            if let CoreEvent::Error { .. } = event {
+                // The error itself cannot be a chunk — the route emits it as
+                // a bare error-object data line — but the buffered finish
+                // chunk is still owed to the client: flush it (with usage,
+                // when the client asked) and stop encoding.
+                return self.finish();
+            }
+            // The finish chunk is buffered; only a trailing usage update is
+            // still meaningful (it becomes the final usage chunk).
+            if let CoreEvent::UsageDelta { usage } = event {
+                self.pending_usage = Some(encode_usage(&usage));
+            } else {
+                tracing::trace!(
+                    event = ?event,
+                    "StreamEncoder: dropping event after buffered MessageStop"
+                );
+            }
             return Ok(Vec::new());
         }
 
@@ -652,36 +793,10 @@ impl StreamEncoder {
             }
 
             CoreEvent::MessageStop { stop_reason, .. } => {
-                let finish = encode_finish_reason(stop_reason);
-                chunks.push(self.make_chunk(Choice {
-                    index: 0,
-                    message: None,
-                    finish_reason: Some(finish),
-                    delta: Some(ChatMessage {
-                        role: String::new(),
-                        content: serde_json::Value::String(String::new()),
-                        reasoning_content: None,
-                        tool_calls: vec![],
-                        name: None,
-                        tool_call_id: None,
-                        cache_control: None,
-                        refusal: None,
-                        is_error: None,
-                    }),
-                }));
-
-                if self.include_usage {
-                    let usage = self.pending_usage.take().unwrap_or(UsageInfo {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                        prompt_cache_hit_tokens: None,
-                        prompt_cache_miss_tokens: None,
-                    });
-                    chunks.push(self.make_usage_chunk(usage));
-                }
-
-                self.finished = true;
+                // Hold the finish chunk back: the usage chunk routinely
+                // arrives after it and must carry real numbers, not zeros.
+                // `finish()` flushes both, in OpenAI's documented order.
+                self.pending_stop = Some(encode_finish_reason(stop_reason));
             }
 
             CoreEvent::Error { error } => {
@@ -698,25 +813,32 @@ impl StreamEncoder {
         Ok(chunks)
     }
 
-    /// Flush remaining buffered events when the stream ended without a
-    /// `MessageStop`: emits a synthetic `finish_reason = "stop"` chunk (with
-    /// a warning), plus the final usage chunk when `include_usage` is set.
+    /// Flush remaining buffered events: a buffered `MessageStop` emits the
+    /// finish chunk plus the final usage chunk when `include_usage` is set;
+    /// a stream that ended without one emits a synthetic
+    /// `finish_reason = "stop"` chunk (with a warning) instead.
     pub fn finish(&mut self) -> Result<Vec<ChatCompletionChunk>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
 
-        tracing::warn!(
-            "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal chunk"
-        );
+        let finish_reason = match self.pending_stop.take() {
+            Some(finish) => finish,
+            None => {
+                tracing::warn!(
+                    "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal chunk"
+                );
+                "stop".to_owned()
+            }
+        };
 
         let mut chunks = Vec::new();
 
         chunks.push(self.make_chunk(Choice {
             index: 0,
             message: None,
-            finish_reason: Some("stop".to_owned()),
+            finish_reason: Some(finish_reason),
             delta: Some(ChatMessage {
                 role: String::new(),
                 content: serde_json::Value::String(String::new()),
@@ -737,6 +859,8 @@ impl StreamEncoder {
                 total_tokens: 0,
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             });
             chunks.push(self.make_usage_chunk(usage));
         }
@@ -767,9 +891,12 @@ impl StreamEncoder {
     }
 
     /// Mark the encoder as finished so subsequent `finish()` calls return
-    /// empty; used after emitting an in-band error.
+    /// empty; used after emitting an in-band error. Any buffered finish
+    /// chunk has already been flushed by the `Error` event (see
+    /// [`StreamEncoder::encode_event`]).
     pub fn mark_finished(&mut self) {
         self.finished = true;
+        self.pending_stop = None;
     }
 }
 
@@ -812,6 +939,105 @@ pub fn stream_error_sse_payload(error: &crate::core::CoreStreamError) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn user_image_url_parts_decode_to_neutral_image_blocks() {
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: serde_json::json!([
+                    { "type": "text", "text": "what is this?" },
+                    { "type": "image_url", "image_url": { "url": "https://example.com/cat.png" } },
+                    { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,aGVsbG8=" } }
+                ]),
+                reasoning_content: None,
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+                cache_control: None,
+                refusal: None,
+                is_error: None,
+            }],
+            stream: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            thinking: None,
+            tools: vec![],
+            tool_choice: None,
+            stop: None,
+            stream_options: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        };
+        let core = decode_request(req).expect("decode");
+        let content = &core.messages[0].content;
+        assert_eq!(
+            content.len(),
+            3,
+            "text and both images must decode: {content:?}"
+        );
+        match &content[0] {
+            CoreContent::Text { text, .. } => assert_eq!(text, "what is this?"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        match &content[1] {
+            CoreContent::Image { source } => {
+                assert_eq!(source["type"], "url");
+                assert_eq!(source["url"], "https://example.com/cat.png");
+            }
+            other => panic!("expected url image, got {other:?}"),
+        }
+        match &content[2] {
+            CoreContent::Image { source } => {
+                assert_eq!(source["type"], "base64");
+                assert_eq!(source["media_type"], "image/jpeg");
+                assert_eq!(source["data"], "aGVsbG8=");
+            }
+            other => panic!("expected base64 image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_reasoning_content_survives_decode_for_replay() {
+        // DeepSeek-style providers require reasoning_content on replayed
+        // assistant turns even when empty; an explicit empty string decodes
+        // to an (empty) Thinking block instead of vanishing.
+        let req = ChatCompletionRequest {
+            model: "deepseek-reasoner".into(),
+            messages: vec![ChatMessage {
+                role: "assistant".into(),
+                content: serde_json::json!(""),
+                reasoning_content: Some(String::new()),
+                tool_calls: vec![],
+                name: None,
+                tool_call_id: None,
+                cache_control: None,
+                refusal: None,
+                is_error: None,
+            }],
+            stream: None,
+            temperature: None,
+            top_p: None,
+            max_tokens: None,
+            reasoning_effort: None,
+            thinking: None,
+            tools: vec![],
+            tool_choice: None,
+            stop: None,
+            stream_options: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        };
+        let core = decode_request(req).expect("decode");
+        match &core.messages[0].content[0] {
+            CoreContent::Thinking { text, .. } => assert_eq!(text, ""),
+            other => panic!("expected an empty Thinking block, got {other:?}"),
+        }
+    }
+
     use crate::core::UsageProvenance;
     use crate::openai::{FunctionDef, ToolDef};
 
@@ -928,7 +1154,9 @@ mod tests {
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages[1].role, CoreRole::Assistant);
         match &core.messages[1].content[0] {
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -1041,6 +1269,7 @@ mod tests {
         let mut req = make_openai_request();
         req.messages[0].cache_control = Some(OpenAICacheControl {
             r#type: "ephemeral".into(),
+            ttl: None,
         });
         let core = decode_request(req).unwrap();
         match &core.messages[0].content[0] {
@@ -1135,6 +1364,7 @@ mod tests {
         req.messages[0].content = serde_json::Value::String(String::new());
         req.messages[0].cache_control = Some(OpenAICacheControl {
             r#type: "ephemeral".into(),
+            ttl: None,
         });
         let core = decode_request(req).unwrap();
         assert_eq!(
@@ -1169,6 +1399,7 @@ mod tests {
                 tool_call_id: None,
                 cache_control: Some(OpenAICacheControl {
                     r#type: "ephemeral".into(),
+                    ttl: None,
                 }),
                 refusal: None,
                 is_error: None,
@@ -1254,6 +1485,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "SF"}),
+                signature: None,
             }],
             stop_reason: StopReason::ToolUse,
             stop_sequence: None,
@@ -1417,8 +1649,54 @@ mod tests {
                 stop_sequence: None,
             })
             .unwrap();
+        assert!(
+            chunks.is_empty(),
+            "finish chunk is held back until finish(): got {chunks:?}"
+        );
+        let chunks = enc.finish().unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].choices[0].finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn streaming_error_after_message_stop_flushes_finish_chunk() {
+        // The error itself is a route-level data line (the chunk schema cannot
+        // carry it), but the buffered finish chunk must still reach the client
+        // before the error ends the stream — not be dropped by it.
+        let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, true);
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::ToolUse,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let chunks = enc
+            .encode_event(CoreEvent::Error {
+                error: CoreStreamError::new(
+                    CoreStreamErrorKind::Upstream,
+                    "connection reset after terminal".into(),
+                ),
+            })
+            .unwrap();
+        let finish_pos = chunks
+            .iter()
+            .position(|c| {
+                c.choices
+                    .first()
+                    .is_some_and(|ch| ch.finish_reason.is_some())
+            })
+            .expect("buffered finish chunk must flush ahead of the error");
+        assert_eq!(
+            chunks[finish_pos].choices[0].finish_reason.as_deref(),
+            Some("tool_calls")
+        );
+        assert!(
+            chunks.iter().any(|c| c.usage.is_some()),
+            "include_usage clients still get the usage chunk: {chunks:?}"
+        );
+        assert!(
+            enc.finish().unwrap().is_empty(),
+            "no synthetic second terminal after the error"
+        );
     }
 
     #[test]
@@ -1428,12 +1706,12 @@ mod tests {
             usage: Usage::provider_reported(50, 100),
         })
         .unwrap();
-        let chunks = enc
-            .encode_event(CoreEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                stop_sequence: None,
-            })
-            .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let chunks = enc.finish().unwrap();
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].choices.len(), 1);
         assert!(chunks[1].usage.is_some());
@@ -1441,19 +1719,69 @@ mod tests {
     }
 
     #[test]
-    fn streaming_no_usage_when_not_included() {
+    fn usage_after_finish_chunk_reaches_include_usage_clients() {
+        // OpenAI's documented chunk order: finish_reason chunk first, then
+        // the usage chunk. A client that asked for usage must see the real
+        // numbers, not the zeros buffered at finish time.
+        let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, true);
+        enc.encode_event(CoreEvent::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::UsageDelta {
+            usage: Usage::provider_reported(100, 5),
+        })
+        .unwrap();
+
+        let chunks = enc.finish().unwrap();
+        let usage_chunk = chunks
+            .iter()
+            .find(|c| c.usage.is_some())
+            .expect("usage chunk after finish()");
+        let usage = usage_chunk.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 5);
+        let finish_pos = chunks
+            .iter()
+            .position(|c| {
+                c.choices
+                    .first()
+                    .is_some_and(|ch| ch.finish_reason.is_some())
+            })
+            .expect("finish chunk");
+        let usage_pos = chunks
+            .iter()
+            .position(|c| c.usage.is_some())
+            .expect("usage chunk");
+        assert!(
+            finish_pos < usage_pos,
+            "finish chunk must precede the usage chunk: {chunks:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_no_usage_chunk_when_client_did_not_ask() {
+        // The proxy always asks the upstream for usage, but a client that did
+        // not set stream_options.include_usage must not receive a usage chunk.
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
         enc.encode_event(CoreEvent::UsageDelta {
             usage: Usage::provider_reported(50, 100),
         })
         .unwrap();
-        let chunks = enc
-            .encode_event(CoreEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                stop_sequence: None,
-            })
-            .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let chunks = enc.finish().unwrap();
         assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].usage.is_none());
     }
 
     #[test]
@@ -1517,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_finish_after_stop_is_empty() {
+    fn streaming_finish_after_stop_flushes_buffered_terminal_once() {
         let mut enc = StreamEncoder::new("chatcmpl-1".into(), "gpt-4o".into(), 1000, false);
         enc.encode_event(CoreEvent::MessageStop {
             stop_reason: StopReason::EndTurn,
@@ -1525,7 +1853,13 @@ mod tests {
         })
         .unwrap();
         let remaining = enc.finish().unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(
+            remaining.len(),
+            1,
+            "buffered finish chunk flushes on finish()"
+        );
+        let again = enc.finish().unwrap();
+        assert!(again.is_empty(), "second finish() must be empty");
     }
 
     #[test]
@@ -1737,6 +2071,7 @@ mod tests {
                 tool_use_id: "call_1".into(),
                 content: vec![],
                 is_error: false,
+                cache: None,
             }],
             stop_reason: StopReason::EndTurn,
             stop_sequence: None,

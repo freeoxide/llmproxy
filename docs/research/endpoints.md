@@ -1,10 +1,15 @@
 # Extended Endpoint Families
 
+Each section is dated; corrections made by the 2026-11-08 research-audit
+pass are marked inline.
+
 Additional endpoints should reuse routing, transport, auth, observability, and
 cost infrastructure, but each needs its own normalized request, response, and
 event contract. They should not be forced through the chat core.
 
 ## Embeddings
+
+*Notes captured October 2026.*
 
 - Dimensions are capabilities. Providers may rename `dimensions`, constrain
   allowed sizes, or ignore it; reject or warn when the returned vector size can
@@ -22,6 +27,8 @@ bridges, model-prefix removal, and separate text/image embedding paths.
 
 ## Rerank
 
+*Notes captured October 2026.*
+
 A normalized rerank core needs a query, ordered documents, top-N selection,
 scores, optional returned documents, and usage. Provider adapters may:
 
@@ -35,6 +42,8 @@ scores, optional returned documents, and usage. Provider adapters may:
 Rerank is not an embeddings sub-route even when providers share credentials.
 
 ## Realtime and WebSocket protocols
+
+*Notes captured October 2026.*
 
 Realtime is a bidirectional event protocol, not HTTP streaming with a different
 content type. Track session configuration, conversation items, audio buffers,
@@ -55,6 +64,8 @@ offers a native WebSocket surface.
 
 ## Transcription and text-to-speech
 
+*Notes captured October 2026.*
+
 Audio endpoints need a distinct binary/multipart boundary:
 
 - Let the HTTP client generate multipart boundaries; do not retain a JSON
@@ -72,6 +83,8 @@ OpenAI/Hosted-vLLM transcription paths, Azure Speech endpoint normalization,
 Polly/ElevenLabs provider contracts, and long-running document/audio jobs.
 
 ## Image and video generation
+
+*Notes captured October 2026.*
 
 Model family can select a different endpoint and request schema. Normalize:
 
@@ -96,6 +109,8 @@ reversible scheme.
 
 ## Files, containers, and vector stores
 
+*Notes captured October 2026; correction 2026-11-08.*
+
 - Preserve query strings while appending resource IDs to configured base URLs.
 - Treat resumable and multipart upload flows as explicit state machines.
 - Keep file purpose, MIME type, ownership, expiry, and provider identity.
@@ -108,9 +123,15 @@ reversible scheme.
 
 Anthropic Files/Skills, Gemini resumable uploads, OpenAI containers, and managed
 vector stores use different beta headers and object lifecycles. They should not
-share one untyped pass-through handler.
+share one untyped pass-through handler. Correction 2026-11-08 per research
+audit: Anthropic Files no longer needs a beta header — only
+`anthropic-version` (https://platform.claude.com/docs/en/api/files) — so
+attribute beta-header handling per family rather than assuming Files carries
+one.
 
 ## OCR, batch, and fine-tuning
+
+*Notes captured October 2026.*
 
 OCR can be synchronous, an upload-plus-job flow, or a bridge through a vision
 chat model. Normalize page selection, input source, polling, page output,
@@ -122,6 +143,8 @@ provider affinity. Streaming JSONL results should be transformed incrementally
 rather than loaded into memory as one response.
 
 ## Search bridges
+
+*Notes captured October 2026.*
 
 Search is structured retrieval, not assistant text. A core search result should
 preserve:
@@ -148,6 +171,8 @@ multi-stage workflow. They must inherit auth, budgets, user identity,
 cancellation, and observability from the parent request.
 
 ## Endpoint implementation checklist
+
+*Notes captured October 2026.*
 
 - Dedicated core request/response/event types.
 - Capability validation before dispatch.

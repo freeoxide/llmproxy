@@ -40,6 +40,7 @@ mod tests {
                 },
                 streaming: false,
                 body_hash: "digest".to_owned(),
+                session_id: None,
             },
         ));
         let closer = std::sync::Arc::new(bus);
@@ -65,10 +66,17 @@ mod tests {
                 server_name: "admin-usage-test".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::ZERO,
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: on_main_listener,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,
@@ -81,6 +89,8 @@ mod tests {
                 max_rows: None,
                 prune_interval: Duration::from_secs(3600),
             }),
+            replica: None,
+            mcp: None,
         }
     }
 
@@ -88,8 +98,8 @@ mod tests {
         AppState::new(
             config,
             llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry"),
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -123,6 +133,7 @@ mod tests {
             path,
             Some(llm_proxy_core::AdminAuthConfig {
                 token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
             }),
             false,
         ));
@@ -134,6 +145,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "admin")]
     #[tokio::test]
     async fn main_listener_optin_serves_usage_behind_the_admin_token() {
         let dir = tempfile::tempdir().unwrap();
@@ -142,6 +154,7 @@ mod tests {
             path,
             Some(llm_proxy_core::AdminAuthConfig {
                 token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
             }),
             true,
         ));
@@ -173,6 +186,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "admin")]
     #[tokio::test]
     async fn dedicated_admin_router_serves_usage_behind_the_admin_token() {
         let dir = tempfile::tempdir().unwrap();
@@ -181,6 +195,7 @@ mod tests {
             path,
             Some(llm_proxy_core::AdminAuthConfig {
                 token: secrecy::SecretString::from(ADMIN_TOKEN),
+                key_store: None,
             }),
             false,
         ));

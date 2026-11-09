@@ -15,87 +15,6 @@ use sha2::{Digest, Sha256};
 
 use argon2::PasswordVerifier;
 
-const MAX_DEDUP_ENTRIES: usize = 10_000;
-
-const MAX_DEDUP_BODY_SIZE: usize = 64 * 1024;
-
-/// Deduplicates requests by SHA-256 hash of the request path and body.
-///
-/// A second identical path+body inside the window (default 500 ms; 0
-/// disables) is rejected.
-#[derive(Debug)]
-pub struct RequestDeduplicator {
-    in_flight: Mutex<HashMap<[u8; 32], Instant>>,
-    window_ms: u64,
-}
-
-impl RequestDeduplicator {
-    /// Create a new deduplicator with a 500 ms window.
-    pub fn new() -> Self {
-        Self::with_window_ms(500)
-    }
-
-    /// Create a new deduplicator with a custom deduplication window.
-    pub fn with_window_ms(window_ms: u64) -> Self {
-        Self {
-            in_flight: Mutex::new(HashMap::new()),
-            window_ms,
-        }
-    }
-
-    /// Check whether this request body is a duplicate.
-    ///
-    /// Deprecated: prefer [`Self::is_duplicate_with_path`], which includes the
-    /// request path in the hash.
-    #[deprecated(note = "use is_duplicate_with_path instead")]
-    pub fn is_duplicate(&self, body: &[u8]) -> bool {
-        self.is_duplicate_with_path("", body)
-    }
-
-    /// Check whether this request is a duplicate, keyed by path and body.
-    /// The path distinguishes requests to different protocol endpoints
-    /// that carry the same body.
-    pub fn is_duplicate_with_path(&self, path: &str, body: &[u8]) -> bool {
-        if self.window_ms == 0 {
-            return false;
-        }
-        if body.len() > MAX_DEDUP_BODY_SIZE {
-            return false;
-        }
-        let hash = Self::hash_path_body(path, body);
-        let now = Instant::now();
-
-        let mut map = self.in_flight.lock().unwrap_or_else(|e| {
-            tracing::warn!("request deduplicator mutex poisoned; recovering from panic");
-            e.into_inner()
-        });
-
-        map.retain(|_, t| now.duration_since(*t).as_millis() < self.window_ms as u128);
-
-        if map.contains_key(&hash) {
-            return true;
-        }
-
-        if map.len() < MAX_DEDUP_ENTRIES {
-            map.insert(hash, now);
-        }
-        false
-    }
-
-    fn hash_path_body(path: &str, body: &[u8]) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(path.as_bytes());
-        hasher.update(body);
-        hasher.finalize().into()
-    }
-}
-
-impl Default for RequestDeduplicator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 const MAX_RATE_LIMIT_BUCKETS: usize = 100_000;
 
 #[derive(Debug)]
@@ -335,6 +254,26 @@ struct CachedDigest {
     key_id: String,
 }
 
+/// Splits a prefixed client token `<key-id>.<secret>` (audit conflict 12,
+/// plan 05 step 2). The id is everything before the first `.`; both parts
+/// must be non-empty. A token without a `.` is a legacy bare secret and
+/// returns `None` (the scanning fallback handles it).
+fn split_prefixed_token(token: &str) -> Option<(&str, &str)> {
+    let (key_id, secret) = token.split_once('.')?;
+    (!key_id.is_empty() && !secret.is_empty()).then_some((key_id, secret))
+}
+
+/// Whether a managed key store is configured (`[auth.admin].key_store`):
+/// it can be a deployment's only key source, so client-keys mode may
+/// start with no verifiers loaded and fail closed per request until the
+/// admin listener issues one.
+fn has_key_store(config: &AuthConfig) -> bool {
+    config
+        .admin
+        .as_ref()
+        .is_some_and(|admin| admin.key_store.is_some())
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -373,11 +312,22 @@ pub enum ClientAuthError {
 /// Client-key authentication state: the configured verifiers plus a digest
 /// cache for verified keys. Holds hashed verifiers only, never plaintext.
 ///
+/// Tokens come in two shapes. The documented one is `<key-id>.<secret>`:
+/// the id selects exactly one verifier, so a bad token costs at most one
+/// argon2 run and an unknown id costs none, whatever the number of keys
+/// (audit conflict 12). A bare secret with no `.` is the legacy shape and
+/// is checked against every verifier in turn — its cost grows with the key
+/// count, which is why new keys are issued prefixed.
+///
 /// Manual `Debug` prints the mode and key ids, never the verifier strings.
 pub struct ClientAuth {
     enforced: bool,
+    /// Sorted by `key_id` so a prefix lookup is a binary search.
     verifiers: Vec<ClientVerifier>,
     cache: Mutex<Vec<CachedDigest>>,
+    /// argon2 password verifications run so far: the observable lookup
+    /// cost, exposed so the scaling property is testable.
+    verifications: AtomicU64,
 }
 
 impl std::fmt::Debug for ClientAuth {
@@ -401,21 +351,26 @@ impl ClientAuth {
     ///
     /// Returns [`ClientAuthError`] on contradictory mode/client combinations,
     /// reserved or empty key ids, or an unparseable verifier string.
+    /// Client-keys mode may start with no verifiers at all when a managed
+    /// key store is configured: with none loaded yet every proxy request
+    /// fails closed until one is issued, which the admin listener (behind
+    /// its own token) can always do.
     pub fn from_config(config: &AuthConfig) -> Result<Self, ClientAuthError> {
         match config.mode {
             AuthMode::None if !config.clients.is_empty() => {
                 return Err(ClientAuthError::ModeNoneWithClients);
             }
-            AuthMode::ClientKeys if config.clients.is_empty() => {
+            AuthMode::ClientKeys if config.clients.is_empty() && !has_key_store(config) => {
                 return Err(ClientAuthError::ClientKeysWithoutClients);
             }
             AuthMode::None | AuthMode::ClientKeys => {}
         }
         let mut verifiers = Vec::with_capacity(config.clients.len());
-        for (key_id, phc) in &config.clients {
+        for (key_id, spec) in &config.clients {
             if key_id.is_empty() || key_id == ANONYMOUS_CALLER {
                 return Err(ClientAuthError::InvalidKeyId(key_id.clone()));
             }
+            let phc = spec.verifier();
             if let Err(source) = argon2::password_hash::phc::PasswordHash::new(phc.expose_secret())
             {
                 return Err(ClientAuthError::InvalidVerifier {
@@ -433,6 +388,7 @@ impl ClientAuth {
             enforced: matches!(config.mode, AuthMode::ClientKeys),
             verifiers,
             cache: Mutex::new(Vec::new()),
+            verifications: AtomicU64::new(0),
         })
     }
 
@@ -446,6 +402,7 @@ impl ClientAuth {
             enforced: true,
             verifiers: Vec::new(),
             cache: Mutex::new(Vec::new()),
+            verifications: AtomicU64::new(0),
         }
     }
 
@@ -461,6 +418,13 @@ impl ClientAuth {
         self.verifiers.len()
     }
 
+    /// How many argon2 password verifications this authenticator has run:
+    /// the lookup cost a bad token incurs, cumulative since construction.
+    #[must_use]
+    pub fn argon2_verifications(&self) -> u64 {
+        self.verifications.load(Ordering::Relaxed)
+    }
+
     fn cached_key_id(&self, digest: &[u8; 32]) -> Option<String> {
         let cache = self.cache.lock().unwrap_or_else(|e| {
             tracing::warn!("client auth digest cache poisoned; recovering from panic");
@@ -472,32 +436,42 @@ impl ClientAuth {
             .map(|entry| entry.key_id.clone())
     }
 
-    async fn verify_uncached(&self, token: &str) -> Option<String> {
-        let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        let verifiers: Vec<(String, String)> = self
-            .verifiers
-            .iter()
-            .map(|v| (v.key_id.clone(), v.phc.expose_secret().to_owned()))
-            .collect();
+    /// Runs argon2 against `candidates` (key id, PHC) in order, off the
+    /// async runtime, and caches the digest of a matching token.
+    async fn verify_against(
+        &self,
+        token: &str,
+        digest: [u8; 32],
+        candidates: Vec<(String, String)>,
+    ) -> Option<String> {
+        if candidates.is_empty() {
+            return None;
+        }
         let token = token.to_owned();
-        let matched = tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             let argon2 = argon2::Argon2::default();
-            for (key_id, phc) in &verifiers {
-                if let Ok(hash) = argon2::password_hash::phc::PasswordHash::new(phc)
-                    && argon2.verify_password(token.as_bytes(), &hash).is_ok()
-                {
-                    return Some(key_id.clone());
+            let mut runs = 0u64;
+            let mut matched = None;
+            for (key_id, phc) in &candidates {
+                let Ok(hash) = argon2::password_hash::phc::PasswordHash::new(phc) else {
+                    continue;
+                };
+                runs += 1;
+                if argon2.verify_password(token.as_bytes(), &hash).is_ok() {
+                    matched = Some(key_id.clone());
+                    break;
                 }
             }
-            None
+            (matched, runs)
         })
         .await
         .map_err(|error| {
             tracing::warn!(%error, "client auth verification task failed");
             error
         })
-        .ok()
-        .flatten();
+        .ok();
+        let (matched, runs) = outcome.unwrap_or((None, 0));
+        self.verifications.fetch_add(runs, Ordering::Relaxed);
         if let Some(key_id) = &matched {
             let mut cache = self.cache.lock().unwrap_or_else(|e| {
                 tracing::warn!("client auth digest cache poisoned; recovering from panic");
@@ -516,7 +490,26 @@ impl ClientAuth {
         matched
     }
 
-    pub(crate) async fn authenticate(&self, token: &str) -> Option<String> {
+    /// The one verifier a prefixed token names, if that key id exists.
+    fn verifier_for(&self, key_id: &str) -> Option<(String, String)> {
+        self.verifiers
+            .binary_search_by(|v| v.key_id.as_str().cmp(key_id))
+            .ok()
+            .and_then(|index| self.verifiers.get(index))
+            .map(|v| (v.key_id.clone(), v.phc.expose_secret().to_owned()))
+    }
+
+    /// Resolves a presented token to its key id, or `None`.
+    ///
+    /// Order: the digest cache (no argon2), then — for a `<key-id>.<secret>`
+    /// token — the one verifier that id names (one argon2 run, none when
+    /// the id is unknown), else the legacy scan of every verifier.
+    ///
+    /// This is the check the managed-key flow must satisfy: a store's
+    /// `client_specs()` verifiers have to accept the tokens that store
+    /// issues (the secret after the first `.`), which is what
+    /// `llm-proxy-admin` tests against.
+    pub async fn authenticate(&self, token: &str) -> Option<String> {
         if !self.enforced || self.verifiers.is_empty() {
             return None;
         }
@@ -524,7 +517,20 @@ impl ClientAuth {
         if let Some(key_id) = self.cached_key_id(&digest) {
             return Some(key_id);
         }
-        self.verify_uncached(token).await
+        match split_prefixed_token(token) {
+            Some((key_id, secret)) => {
+                let candidates = self.verifier_for(key_id).into_iter().collect();
+                self.verify_against(secret, digest, candidates).await
+            }
+            None => {
+                let candidates = self
+                    .verifiers
+                    .iter()
+                    .map(|v| (v.key_id.clone(), v.phc.expose_secret().to_owned()))
+                    .collect();
+                self.verify_against(token, digest, candidates).await
+            }
+        }
     }
 }
 
@@ -634,6 +640,14 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn crlf_header_values_cannot_exist_at_the_http_layer() {
+        // The selector re-checks for CR/LF as hardening, but the HTTP layer
+        // itself refuses to build such a value, so header injection cannot
+        // reach the selector's input in the first place.
+        axum::http::HeaderValue::from_str("ok\r\ninjected: 1").unwrap_err();
+    }
+
     fn cheap_phc(token: &str, salt: &[u8]) -> String {
         let params = argon2::Params::new(8, 1, 1, None).expect("valid test params");
         let hasher = argon2::Argon2::new(
@@ -656,7 +670,10 @@ mod tests {
 
     fn auth_config_with(phc: &str) -> llm_proxy_core::AuthConfig {
         let mut clients = HashMap::new();
-        clients.insert("laptop".to_owned(), SecretString::from(phc.to_owned()));
+        clients.insert(
+            "laptop".to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(phc.to_owned())),
+        );
         llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
@@ -670,7 +687,10 @@ mod tests {
             let mut clients = HashMap::new();
             clients.insert(
                 "laptop".to_owned(),
-                SecretString::from(cheap_phc("secret", b"0123456789abcdef")),
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                    "secret",
+                    b"0123456789abcdef",
+                ))),
             );
             llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::None,
@@ -694,14 +714,38 @@ mod tests {
         ));
     }
 
+    /// A managed-key store can be a deployment's only key source: with
+    /// one configured, client-keys mode must start even with no keys
+    /// loaded yet (a fresh store, or the last key revoked) and fail
+    /// closed per request — otherwise the daemon could never bootstrap
+    /// its first key through the admin listener.
+    #[tokio::test]
+    async fn client_keys_with_a_key_store_starts_empty_and_fails_closed() {
+        let config = llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients: HashMap::new(),
+            admin: Some(llm_proxy_core::AdminAuthConfig {
+                token: SecretString::from("admin-tok".to_owned()),
+                key_store: Some(std::path::PathBuf::from("managed-keys.db")),
+            }),
+        };
+        let auth = ClientAuth::from_config(&config).expect("boots with an empty store");
+        assert!(auth.is_enforced(), "the mode is still enforced");
+        assert!(
+            auth.authenticate("anything.secret").await.is_none(),
+            "every request fails closed until a key is issued"
+        );
+    }
+
     #[test]
     fn client_auth_from_config_rejects_bad_key_ids_and_hashes() {
         for bad_id in ["", "anonymous"] {
             let mut config = auth_config_with(&cheap_phc("secret", b"0123456789abcdef"));
             config.clients.remove("laptop");
-            config
-                .clients
-                .insert(bad_id.to_owned(), SecretString::from("x".to_owned()));
+            config.clients.insert(
+                bad_id.to_owned(),
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from("x".to_owned())),
+            );
             assert!(
                 matches!(
                     ClientAuth::from_config(&config),
@@ -744,7 +788,10 @@ mod tests {
         for (id, token) in [("alpha", "one"), ("beta", "two"), ("gamma", "three")] {
             clients.insert(
                 id.to_owned(),
-                SecretString::from(cheap_phc(token, b"0123456789abcdef")),
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                    token,
+                    b"0123456789abcdef",
+                ))),
             );
         }
         let config = llm_proxy_core::AuthConfig {
@@ -756,6 +803,89 @@ mod tests {
         assert_eq!(auth.authenticate("two").await.as_deref(), Some("beta"));
         assert_eq!(auth.authenticate("three").await.as_deref(), Some("gamma"));
         assert_eq!(auth.authenticate("four").await, None);
+    }
+
+    /// An authenticator over `count` keys, each with its own cheap PHC.
+    async fn auth_with_keys(count: usize) -> ClientAuth {
+        let mut clients = HashMap::new();
+        clients.insert(
+            "laptop".to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                "the-real-secret",
+                b"0123456789abcdef",
+            ))),
+        );
+        for index in 0..count.saturating_sub(1) {
+            clients.insert(
+                format!("key-{index:03}"),
+                llm_proxy_core::ClientKeySpec::Verifier(SecretString::from(cheap_phc(
+                    format!("secret-{index}").as_str(),
+                    b"0123456789abcdef",
+                ))),
+            );
+        }
+        let config = llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+        };
+        ClientAuth::from_config(&config).expect("valid config")
+    }
+
+    /// What one failed authentication cost in argon2 runs.
+    async fn bad_token_cost(auth: &ClientAuth, token: &str) -> u64 {
+        let before = auth.argon2_verifications();
+        assert_eq!(auth.authenticate(token).await, None, "token must not pass");
+        auth.argon2_verifications() - before
+    }
+
+    #[tokio::test]
+    async fn a_bad_prefixed_token_costs_the_same_no_matter_the_key_count() {
+        for count in [3, 60] {
+            let auth = auth_with_keys(count).await;
+            assert_eq!(
+                bad_token_cost(&auth, "ghost.wrong-secret").await,
+                0,
+                "an unknown key id must not run argon2 at all ({count} keys)"
+            );
+            assert_eq!(
+                bad_token_cost(&auth, "laptop.wrong-secret").await,
+                1,
+                "a known id names exactly one verifier ({count} keys)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prefixed_token_with_the_right_secret_authenticates_and_caches() {
+        let auth = auth_with_keys(30).await;
+        let before = auth.argon2_verifications();
+        assert_eq!(
+            auth.authenticate("laptop.the-real-secret").await.as_deref(),
+            Some("laptop")
+        );
+        assert_eq!(auth.argon2_verifications() - before, 1);
+        // The digest cache answers the repeat without argon2.
+        assert_eq!(
+            auth.authenticate("laptop.the-real-secret").await.as_deref(),
+            Some("laptop")
+        );
+        assert_eq!(auth.argon2_verifications() - before, 1);
+    }
+
+    #[test]
+    fn prefixed_token_splitting_rules() {
+        assert_eq!(
+            split_prefixed_token("laptop.secret"),
+            Some(("laptop", "secret"))
+        );
+        assert_eq!(
+            split_prefixed_token("laptop.dotted.secret"),
+            Some(("laptop", "dotted.secret"))
+        );
+        assert_eq!(split_prefixed_token("no-dot"), None);
+        assert_eq!(split_prefixed_token(".leading"), None);
+        assert_eq!(split_prefixed_token("trailing."), None);
     }
 
     #[test]
@@ -826,26 +956,6 @@ mod tests {
     }
 
     #[test]
-    fn dedup_new_request_is_not_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    fn dedup_same_body_is_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    fn dedup_different_body_is_not_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(!dedup.is_duplicate_with_path("", b"world"));
-    }
-
-    #[test]
     fn request_id_format() {
         let generator = RequestIdGenerator::new();
         let id = generator.next_id();
@@ -876,42 +986,6 @@ mod tests {
             assert!(limiter.is_allowed("10.0.0.1"));
         }
         assert!(limiter.is_allowed("10.0.0.2"));
-    }
-
-    #[test]
-    fn dedup_same_body_different_path_is_not_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", b"hello"));
-        assert!(!dedup.is_duplicate_with_path("/v1/chat/completions", b"hello"));
-    }
-
-    #[test]
-    fn dedup_same_body_same_path_is_duplicate() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", b"hello"));
-        assert!(dedup.is_duplicate_with_path("/v1/messages", b"hello"));
-    }
-
-    #[test]
-    fn dedup_custom_window() {
-        let dedup = RequestDeduplicator::with_window_ms(1000);
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    fn dedup_zero_window_is_disabled() {
-        let dedup = RequestDeduplicator::with_window_ms(0);
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-        assert!(!dedup.is_duplicate_with_path("", b"hello"));
-    }
-
-    #[test]
-    #[expect(deprecated, reason = "is_duplicate shim is exercised directly here")]
-    fn dedup_path_less_shim_still_works() {
-        let dedup = RequestDeduplicator::new();
-        assert!(!dedup.is_duplicate(b"hello"));
-        assert!(dedup.is_duplicate(b"hello"));
     }
 
     #[test]
@@ -1002,28 +1076,6 @@ mod tests {
         assert!(
             !limiter.is_allowed("10.0.0.1"),
             "second request should be rejected at 1 RPM limit"
-        );
-    }
-
-    #[test]
-    fn dedup_large_body_is_not_tracked() {
-        let dedup = RequestDeduplicator::with_window_ms(5000);
-        let large_body = vec![b'x'; 65 * 1024];
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", &large_body));
-        assert!(
-            !dedup.is_duplicate_with_path("/v1/messages", &large_body),
-            "large body should not be tracked for dedup"
-        );
-    }
-
-    #[test]
-    fn dedup_body_at_cap_is_still_tracked() {
-        let dedup = RequestDeduplicator::with_window_ms(5000);
-        let body_at_cap = vec![b'x'; 64 * 1024];
-        assert!(!dedup.is_duplicate_with_path("/v1/messages", &body_at_cap));
-        assert!(
-            dedup.is_duplicate_with_path("/v1/messages", &body_at_cap),
-            "body at exactly the cap should still be tracked"
         );
     }
 

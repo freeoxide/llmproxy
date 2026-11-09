@@ -18,11 +18,12 @@ mod tests {
         routing::post,
     };
     use futures::FutureExt;
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, build_router};
+    use llm_proxy_transport::ProxyClient;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -258,6 +259,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -267,6 +270,8 @@ mod tests {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: Arc::new(extra_headers),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -274,11 +279,15 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: Some("chat".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: HashMap::new(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
@@ -293,13 +302,22 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
 
         AppState::new(
@@ -888,6 +906,8 @@ mod tests {
             api_key: secrecy::SecretString::from(api_key),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -897,6 +917,8 @@ mod tests {
                         protocol: "openai_chat_completions".to_owned(),
                         endpoint: "https://openrouter.ai/api/v1/chat/completions".to_owned(),
                         headers: Arc::new(headers),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -904,11 +926,15 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: Some("chat".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: HashMap::new(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let app_config = AppConfig {
@@ -922,13 +948,22 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         AppState::new(
             app_config,

@@ -198,16 +198,307 @@ path = "{storage}"
 
         let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
         let mut client = TcpStream::connect(server.addr).unwrap();
+        // The host guard under anonymous auth refuses a Host that does not
+        // name this listener, so the request must spell its address.
         write!(
             client,
-            "POST /providers/upstream/v1/chat/completions HTTP/1.1\r\nHost: t\r\n\
-             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
+            "POST /providers/upstream/v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\n\
+             Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n{body}",
+            addr = server.addr,
+            length = body.len(),
         )
         .unwrap();
         let _held_open = accept_within_limit(&upstream);
 
         server.send_sigterm();
         assert_eq!(server.wait_for_exit().code(), Some(1));
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod log_format_startup {
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    /// BUG-25 regression, at the binary: `server.log_format = "json"` in the
+    /// config must shape the daemon's own startup logs, and `RUST_LOG_FORMAT`
+    /// must still win over it.
+    fn first_log_line(log_format_setting: &str, env_format: Option<&str>) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                r#"[server]
+bind = "{addr}"
+request_timeout = "60s"
+shutdown_timeout = "1s"
+log_level = "info"
+log_format = "{log_format_setting}"
+hot_reload = false
+server_name = "log-format-test"
+"#
+            ),
+        )
+        .unwrap();
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_llm-proxy"));
+        command
+            .args(["serve", "--config"])
+            .arg(dir.path().join("config.toml"))
+            .env("HOME", dir.path())
+            .env_remove("RUST_LOG_FORMAT")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Some(value) = env_format {
+            command.env("RUST_LOG_FORMAT", value);
+        }
+        let mut child = command.spawn().unwrap();
+
+        // The first subscriber line appears once the server is up.
+        let started = std::time::Instant::now();
+        let line = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "server never logged anything"
+            );
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("server exited early: {status:?}");
+            }
+            if tcp_stream_probe(addr) {
+                break read_first_line(&mut child);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if let Err(error) = child.kill() {
+            eprintln!("failed to stop the log-format test server: {error}");
+        }
+        if let Err(error) = child.wait() {
+            eprintln!("failed to reap the log-format test server: {error}");
+        }
+        line
+    }
+
+    fn tcp_stream_probe(addr: std::net::SocketAddr) -> bool {
+        std::net::TcpStream::connect(addr).is_ok()
+    }
+
+    fn read_first_line(child: &mut std::process::Child) -> String {
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("a log line arrives");
+        line
+    }
+
+    fn looks_like_json(line: &str) -> bool {
+        let trimmed = line.trim();
+        trimmed.starts_with('{') && trimmed.ends_with('}')
+    }
+
+    #[test]
+    fn config_json_format_shapes_the_startup_logs() {
+        let line = first_log_line("json", None);
+        assert!(
+            looks_like_json(&line),
+            "server.log_format = \"json\" must produce JSON logs, got: {line}"
+        );
+    }
+
+    #[test]
+    fn rust_log_format_wins_over_the_configured_format() {
+        let line = first_log_line("json", Some("plain"));
+        assert!(
+            !looks_like_json(&line),
+            "RUST_LOG_FORMAT=plain must override server.log_format = \"json\", got: {line}"
+        );
+    }
+
+    #[test]
+    fn the_default_remains_plain() {
+        let line = first_log_line("plain", None);
+        assert!(
+            !looks_like_json(&line),
+            "plain must stay plain, got: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod hot_reload_signal {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Plan 07 step 11, end to end against the real binary: SIGHUP re-reads
+    /// the provider files, and a request after the signal reaches the
+    /// provider's new upstream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sighup_swaps_a_changed_providers_upstream() {
+        // The blocking HTTP posts below run on this thread; the fake
+        // upstreams need the runtime's other workers to answer, hence the
+        // multi-thread flavor.
+        let before_addr = spawn_upstream("before-reload").await;
+        let after_addr = spawn_upstream("after-reload").await;
+        let marker = "after-reload";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bind = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("probe bind")
+            .local_addr()
+            .expect("probe addr");
+        write_live_provider(dir.path(), &before_addr.to_string());
+        write_e2e_config(dir.path(), bind);
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_llm-proxy"))
+            .args(["serve", "--config"])
+            .arg(dir.path().join("config.toml"))
+            .env("HOME", dir.path())
+            .env("NO_PROXY", "127.0.0.1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("server starts");
+
+        let post = |body: &str| -> String {
+            let mut stream = TcpStream::connect(bind).expect("connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("read timeout");
+            let request = format!(
+                "POST /providers/live/v1/messages HTTP/1.1\r\nHost: {bind}\r\n\
+                 Content-Type: application/json\r\nContent-Length: {length}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                length = body.len(),
+            );
+            stream.write_all(request.as_bytes()).expect("write");
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).expect("read");
+            reply
+        };
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#;
+
+        // Wait for the server to accept, then check the pre-reload upstream.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(Instant::now() < deadline, "server never started accepting");
+            if let Some(status) = child.try_wait().expect("child state") {
+                panic!("server exited early: {status:?}");
+            }
+            if TcpStream::connect(bind).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let reply = post(body);
+        assert!(reply.contains("200"), "pre-reload request: {reply:.200}");
+        assert!(
+            reply.contains("before-reload"),
+            "pre-reload marker: {reply:.200}"
+        );
+
+        // Point the provider at the other upstream and signal SIGHUP.
+        write_live_provider(dir.path(), &after_addr.to_string());
+        let status = Command::new("kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(status.success(), "SIGHUP sent");
+
+        // The swap lands shortly; the next requests see the new upstream.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let reply = post(body);
+            if reply.contains(marker) {
+                assert!(
+                    reply.contains("200"),
+                    "post-reload request served by the new upstream: {reply:.200}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the reloaded provider never answered from its new upstream"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        if let Err(error) = child.kill().and_then(|()| child.wait().map(drop)) {
+            eprintln!("failed to stop the reload-e2e server: {error}");
+        }
+    }
+
+    fn write_live_provider(dir: &std::path::Path, endpoint: &str) {
+        std::fs::create_dir_all(dir.join("providers")).expect("providers dir");
+        std::fs::write(
+            dir.join("providers/live.toml"),
+            format!(
+                r#"[provider]
+name = "live"
+api_key = "k"
+auth_style = "x-api-key"
+[provider.adapters.messages]
+protocol = "anthropic_messages"
+endpoint = "http://{endpoint}/v1/messages"
+[provider.routes]
+messages = "messages"
+"#
+            ),
+        )
+        .expect("provider file");
+    }
+
+    fn write_e2e_config(dir: &std::path::Path, bind: std::net::SocketAddr) {
+        std::fs::write(
+            dir.join("config.toml"),
+            format!(
+                r#"[server]
+bind = "{bind}"
+request_timeout = "60s"
+shutdown_timeout = "1s"
+log_level = "warn"
+hot_reload = true
+server_name = "reload-e2e"
+[auth]
+mode = "none"
+"#
+            ),
+        )
+        .expect("config");
+    }
+
+    async fn spawn_upstream(marker: &'static str) -> std::net::SocketAddr {
+        use axum::routing::post;
+        let app = axum::Router::new().route(
+            "/{*path}",
+            post(move || async move {
+                let body = format!(
+                    r#"{{"id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"{marker}"}}],"model":"m","stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":2,"output_tokens":1}}}}"#
+                );
+                (
+                    axum::http::StatusCode::OK,
+                    [("content-type", "application/json")],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("reload-e2e upstream stopped: {error}");
+            }
+        });
+        addr
     }
 }

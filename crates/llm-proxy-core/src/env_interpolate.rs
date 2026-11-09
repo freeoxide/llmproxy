@@ -2,6 +2,11 @@
 
 use regex::Regex;
 
+#[expect(
+    clippy::expect_used,
+    reason = "the pattern is a compile-time-constant regex literal; a failure is a programming \
+              error caught the moment this static is first used, not a runtime input"
+)]
 static ENV_VAR_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"\$\{([A-Za-z0-9_]+)\}").expect("env var regex is valid")
 });

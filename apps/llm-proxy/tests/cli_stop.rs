@@ -10,7 +10,7 @@ mod tests {
 
     use llm_proxy_app::commands::{cmd_stop, cmd_stop_with_timing};
     use llm_proxy_app::paths::CommandPaths;
-    use llm_proxy_core::PidManager;
+    use llm_proxy_app::pid::PidManager;
 
     fn tempdir_paths(dir: &Path) -> CommandPaths {
         CommandPaths::new(PidManager::new(dir), dir.join("config.toml"))

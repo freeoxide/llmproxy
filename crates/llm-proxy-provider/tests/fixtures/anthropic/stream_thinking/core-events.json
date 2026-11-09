@@ -1,8 +1,0 @@
-[
-  { "type": "message_start" },
-  { "type": "content_start" },
-  { "type": "thinking_delta" },
-  { "type": "content_start" },
-  { "type": "text_delta" },
-  { "type": "message_stop" }
-]

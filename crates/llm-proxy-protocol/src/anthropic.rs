@@ -4,9 +4,10 @@
 
 use serde::{Deserialize, Serialize, Serializer};
 
-/// A request to the Anthropic Messages API.
+/// A request to the Anthropic Messages API. Unknown fields are tolerated (no
+/// `deny_unknown_fields`, they land in `extra`) so same-format passthrough can
+/// forward them and the cross-format policy can name them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct MessageRequest {
     /// The model identifier (e.g. "claude-sonnet-4-20250514").
@@ -30,6 +31,12 @@ pub struct MessageRequest {
     /// Nucleus sampling parameter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
+    /// Top-K sampling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    /// Custom stop sequences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
     /// Optional metadata attached to the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
@@ -41,6 +48,10 @@ pub struct MessageRequest {
     /// as defined by the Anthropic Messages API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// Unrecognized request fields; preserved so same-format passthrough can
+    /// forward them and the cross-format policy can reject them by name.
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl MessageRequest {
@@ -92,9 +103,9 @@ impl MessageRequest {
     }
 }
 
-/// A content block inside the `system` array.
+/// A content block inside the `system` array. Unknown fields are tolerated
+/// (no `deny_unknown_fields`) so future Anthropic system-block options decode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SystemContentBlock {
     /// Block type, typically `"text"`.
     #[serde(rename = "type")]
@@ -186,7 +197,8 @@ impl Message {
 
 /// A block of content within a message; `r#type` selects the populated
 /// fields (`"text"`, `"tool_use"`, `"tool_result"`, `"thinking"`,
-/// `"redacted_thinking"`, `"image"`). Unknown types must be tolerated.
+/// `"redacted_thinking"`, `"image"`, `"document"`). Unknown types must be
+/// tolerated.
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct ContentBlock {
@@ -224,9 +236,11 @@ pub struct ContentBlock {
     /// Signature for the thinking block (extended thinking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
-    /// Image source (for `"image"` blocks).
+    /// Media source of `"image"` and `"document"` blocks, kept as opaque JSON
+    /// so every documented shape (`base64`, `url`, `file`, ...) decodes;
+    /// adapters interpret only the shapes they understand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<ImageSource>,
+    pub source: Option<serde_json::Value>,
     /// Cache control directive (for `"text"` blocks, but potentially others).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
@@ -326,7 +340,7 @@ impl ContentBlock {
 
     /// Create an image content block.
     #[must_use]
-    pub fn new_image(source: ImageSource) -> Self {
+    pub fn new_image(source: serde_json::Value) -> Self {
         ContentBlock {
             r#type: "image".to_owned(),
             text: None,
@@ -444,7 +458,7 @@ where
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        source: Option<ImageSource>,
+        source: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -498,11 +512,16 @@ impl Serialize for ContentBlock {
             "tool_use" => {
                 let empty_object = serde_json::Value::Object(serde_json::Map::new());
                 let input = self.input.as_ref().unwrap_or(&empty_object);
-                let mut map = serializer.serialize_map(Some(4))?;
+                let has_sig = self.signature.is_some();
+                let len = if has_sig { 5 } else { 4 };
+                let mut map = serializer.serialize_map(Some(len))?;
                 map.serialize_entry("type", &self.r#type)?;
                 map.serialize_entry("id", self.id.as_deref().unwrap_or(""))?;
                 map.serialize_entry("name", self.name.as_deref().unwrap_or(""))?;
                 map.serialize_entry("input", input)?;
+                if let Some(ref sig) = self.signature {
+                    map.serialize_entry("signature", sig)?;
+                }
                 map.end()
             }
             "tool_result" => {
@@ -514,6 +533,9 @@ impl Serialize for ContentBlock {
                 }
                 if let Some(is_error) = self.is_error {
                     map.serialize_entry("is_error", &is_error)?;
+                }
+                if let Some(ref cc) = self.cache_control {
+                    map.serialize_entry("cache_control", cc)?;
                 }
                 map.end()
             }
@@ -539,11 +561,7 @@ impl Serialize for ContentBlock {
                 map.serialize_entry("type", &self.r#type)?;
                 map.serialize_entry(
                     "source",
-                    self.source.as_ref().unwrap_or(&ImageSource {
-                        r#type: String::new(),
-                        media_type: String::new(),
-                        data: String::new(),
-                    }),
+                    self.source.as_ref().unwrap_or(&serde_json::Value::Null),
                 )?;
                 map.end()
             }
@@ -552,30 +570,24 @@ impl Serialize for ContentBlock {
     }
 }
 
-/// An image source embedded in a content block.
+/// A tool definition for function calling. Unknown fields (server-tool
+/// discriminators, cache markers, future options) are tolerated so they decode
+/// on the request path; same-format passthrough forwards the raw tool JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageSource {
-    /// Source type, typically `"base64"`.
-    #[serde(rename = "type")]
-    pub r#type: String,
-    /// MIME type of the image (e.g. `"image/png"`).
-    pub media_type: String,
-    /// Base64-encoded image data.
-    pub data: String,
-}
-
-/// A tool definition for function calling.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Tool {
     /// The tool name.
     pub name: String,
     /// Human-readable description of what the tool does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// JSON Schema describing the tool's input parameters.
-    pub input_schema: serde_json::Value,
+    /// JSON Schema describing the tool's input parameters; optional because
+    /// server tools (e.g. `web_search`) carry no schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+    /// Unrecognized tool fields (server-tool `type`, `cache_control`, ...),
+    /// preserved for passthrough and named rejection cross-format.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The result of executing a tool call.
@@ -618,13 +630,17 @@ pub struct MessageResponse {
 }
 
 /// Token usage statistics returned with every response; counts are `i32`,
-/// matching the Anthropic JSON integer wire format.
+/// matching the Anthropic JSON integer wire format. `message_delta` usage
+/// objects carry only `output_tokens` (cumulative), so every field defaults
+/// rather than failing the whole event's parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Usage {
     /// Number of tokens in the input prompt.
+    #[serde(default)]
     pub input_tokens: i32,
     /// Number of tokens in the generated output.
+    #[serde(default)]
     pub output_tokens: i32,
     /// Tokens used to create a new cache entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,6 +648,31 @@ pub struct Usage {
     /// Tokens read from an existing cache entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<i32>,
+    /// Breakdown of cache creation tokens by TTL window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// Per-TTL breakdown of cache-creation tokens on an Anthropic usage object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CacheCreation {
+    /// Tokens written to a 5-minute ephemeral cache entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<i32>,
+    /// Tokens written to a 1-hour ephemeral cache entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<i32>,
+}
+
+impl CacheCreation {
+    /// Total tokens across both TTL windows, saturating on overflow.
+    #[must_use]
+    pub fn total_input_tokens(&self) -> i32 {
+        self.ephemeral_5m_input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.ephemeral_1h_input_tokens.unwrap_or(0))
+    }
 }
 
 /// A streaming delta event for a content block.
@@ -733,9 +774,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         };
         assert_eq!(req.system_text(), "");
     }
@@ -754,9 +798,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         };
         assert_eq!(req.system_text(), "You are helpful");
     }
@@ -779,9 +826,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         };
         assert_eq!(req.system_text(), "You are helpful. \nBe concise.");
     }
@@ -877,9 +927,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         };
         req.validate().expect("request should validate");
     }
@@ -898,9 +951,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         };
         let err = req.validate().unwrap_err();
         assert!(
@@ -919,9 +975,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         };
         let err = req.validate().unwrap_err();
         assert!(

@@ -13,7 +13,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{AdminAuth, require_admin};
-use crate::reader::{GroupBy, MAX_PAGE_LIMIT, RequestFilter, UsageReader, now_unix_millis};
+use llm_proxy_storage::{GroupBy, MAX_PAGE_LIMIT, RequestFilter, UsageReader, now_unix_millis};
 
 const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
@@ -21,11 +21,14 @@ const DEFAULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(24 * 
 pub(crate) struct UsageState {
     pub(crate) reader: UsageReader,
     pub(crate) admin: AdminAuth,
+    pub(crate) metrics: Option<std::sync::Arc<llm_proxy_core::Metrics>>,
 }
 
 /// Read-only, admin-authenticated `/usage` query surface over the usage
 /// ledger: every route is a `GET` behind the admin bearer token, and no
-/// response carries request bodies.
+/// response carries request bodies. With metrics attached, the same surface
+/// also serves `/metrics` (Prometheus exposition of the runtime counters,
+/// plan 07 step 7) behind the same token.
 #[derive(Debug)]
 pub struct UsageApi {
     state: UsageState,
@@ -40,34 +43,84 @@ impl UsageApi {
             state: UsageState {
                 reader: UsageReader::new(db_path),
                 admin: AdminAuth::new(admin_token),
+                metrics: None,
             },
         }
     }
 
+    /// Attach the runtime metrics registry, enabling the `/metrics` route
+    /// (backlog 21).
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<llm_proxy_core::Metrics>) -> Self {
+        self.state.metrics = Some(metrics);
+        self
+    }
+
     /// The `/usage` router with state applied, ready to serve or merge; admin
-    /// middleware and `nosniff`/panic-catch/trace layers are already applied.
+    /// middleware and `nosniff`/`no-store`/panic-catch/trace layers are
+    /// already applied.
     #[must_use = "the Router must be used with a server or merged into one"]
     pub fn router(self) -> axum::Router {
         let state = self.state;
-        axum::Router::new()
+        let mut routes = axum::Router::new()
             .route("/usage/summary", get(summary))
             .route("/usage/requests", get(requests))
-            .route("/usage/keys", get(keys))
+            .route("/usage/keys", get(keys));
+        if state.metrics.is_some() {
+            routes = routes.route("/metrics", get(prometheus_metrics));
+        }
+        routes
             .layer(from_fn_with_state(state.clone(), require_admin))
             .layer(TraceLayer::new_for_http())
             .layer(SetResponseHeaderLayer::if_not_present(
                 header::X_CONTENT_TYPE_OPTIONS,
                 HeaderValue::from_static("nosniff"),
             ))
+            // Authenticated API responses must never be cached by an
+            // intermediary (backlog 37, after done-hub's CDN-cached-admin
+            // bypass): `overriding`, so a value set anywhere along the path
+            // cannot win. `Pragma` covers HTTP/1.0 shared caches that never
+            // learned `Cache-Control`.
+            .layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            ))
+            .layer(SetResponseHeaderLayer::overriding(
+                header::PRAGMA,
+                HeaderValue::from_static("no-cache"),
+            ))
             .layer(CatchPanicLayer::new())
             .with_state(state)
     }
 }
 
+/// Prometheus exposition of the runtime counters (backlog 21): the same
+/// counters the admin API reports, in a scraper's format, behind the admin
+/// token.
+async fn prometheus_metrics(
+    State(state): State<UsageState>,
+) -> Result<axum::response::Response, UsageApiError> {
+    let Some(metrics) = state.metrics else {
+        return Err(UsageApiError::InvalidParam(
+            "metrics are not attached to this surface".to_owned(),
+        ));
+    };
+    let body = metrics.get_snapshot().to_prometheus_text();
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response())
+}
+
 #[derive(Debug)]
 pub(crate) enum UsageApiError {
     InvalidParam(String),
-    Query(crate::reader::UsageQueryError),
+    Query(llm_proxy_storage::UsageQueryError),
 }
 
 #[derive(Serialize)]
@@ -122,7 +175,7 @@ struct SummaryBody {
     since_ms: i64,
     until_ms: i64,
     group_by: &'static str,
-    groups: Vec<crate::reader::SummaryGroup>,
+    groups: Vec<llm_proxy_storage::SummaryGroup>,
 }
 
 async fn summary(
@@ -179,7 +232,7 @@ struct RequestsParams {
 
 #[derive(Serialize)]
 struct RequestsBody {
-    rows: Vec<crate::reader::RequestRow>,
+    rows: Vec<llm_proxy_storage::RequestRow>,
     next_cursor: Option<String>,
 }
 
@@ -265,7 +318,7 @@ async fn requests(
 
 #[derive(Serialize)]
 struct KeysBody {
-    callers: Vec<crate::reader::CallerSummary>,
+    callers: Vec<llm_proxy_storage::CallerSummary>,
 }
 
 async fn keys(State(state): State<UsageState>) -> Result<Json<KeysBody>, UsageApiError> {

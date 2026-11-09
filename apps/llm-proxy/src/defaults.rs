@@ -12,11 +12,31 @@ bind = "127.0.0.1:3456"
 request_timeout = "300s"
 log_level = "info"
 # log_format = "plain"  # "plain" (default) | "json"; RUST_LOG_FORMAT env overrides at startup
+# Hot reload (plan 07): SIGHUP / `llm-proxy reload` re-reads the provider
+# files; server/auth/storage changes are refused with a restart-required
+# error. Off by default.
 hot_reload = false
 rate_limit_rpm = 100
 trust_forwarded_headers = false
-dedup_window = "0ms"
 server_name = "llm-proxy"
+
+# Exact-match response cache and Idempotency-Key replay (plan 06): both off
+# by default — with every opt-in off the proxy stores no prompt or response.
+# See docs/data-class-policy.md.
+# [server.cache]
+# enabled = true
+# ttl = "10m"
+# max_entries = 1000
+# [server.idempotency]
+# enabled = true
+# ttl = "24h"
+# max_entries = 1000
+
+# Metrics export (plan 07): the admin listener serves /metrics (Prometheus)
+# behind the admin token; an OTLP push is opt-in here.
+# [server.metrics.otlp]
+# endpoint = "http://127.0.0.1:4318/v1/metrics"
+# interval = "60s"
 "#;
 
 /// Default provider TOML for opencode-go.
@@ -63,6 +83,12 @@ messages = "anthropic"
 # cache_creation = "0.000003"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
+
+# Prompt-cache hygiene (plan 06): opt-in edits at the provider edge that
+# protect the provider's own prompt cache. Off by default.
+# [provider.prompt_cache]
+# strip_volatile = ["/metadata/user_id"]
+# inject_markers = true
 "#;
 
 /// Default provider TOML for opencode-zen.
@@ -117,4 +143,10 @@ messages = "anthropic"
 # cache_creation = "0.000003"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
+
+# Prompt-cache hygiene (plan 06): opt-in edits at the provider edge that
+# protect the provider's own prompt cache. Off by default.
+# [provider.prompt_cache]
+# strip_volatile = ["/metadata/user_id"]
+# inject_markers = true
 "#;

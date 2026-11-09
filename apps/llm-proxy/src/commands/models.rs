@@ -5,8 +5,9 @@ use llm_proxy_core::{
     CatalogFile, CatalogFileMetadata, ProviderConfig, ProviderRegistry, StaticModelCatalogEntry,
     merge_catalog,
 };
-use llm_proxy_provider::DiscoveryClient;
-use llm_proxy_server::{ModelCatalogService, write_catalog_atomic};
+use llm_proxy_engine::ModelCatalogService;
+use llm_proxy_engine::write_catalog_atomic;
+use llm_proxy_transport::DiscoveryClient;
 
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{providers_dir_for, resolve_config};

@@ -3,9 +3,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use axum::serve::{Listener, ListenerExt};
+use llm_proxy_adapters::ProviderAdapterRegistry;
 use llm_proxy_core::LogFormat;
-use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
-use llm_proxy_server::{admin_router, build_router, shutdown_signal};
+#[cfg(not(feature = "admin-ui"))]
+use llm_proxy_server::admin_router;
+use llm_proxy_server::{build_router, shutdown_signal};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;
@@ -13,7 +15,60 @@ use tracing::info;
 use crate::config_validation::validate_toml_extension;
 use crate::paths::{config_dir, resolve_config};
 use crate::pid::{is_process_running, read_pid, remove_pid, write_pid, write_pid_value};
-use crate::state::{init_tracing, load_toml_state};
+use crate::state::init_tracing;
+
+/// Hot reload (plan 07 step 11): the SIGHUP listener needs the state
+/// before the router takes it.
+fn start_hot_reload(state: &llm_proxy_server::AppState, path: PathBuf, port_override: Option<u16>) {
+    let reload_state = state.clone();
+    let hot_reload_enabled = state.app_config().server.hot_reload;
+    if hot_reload_enabled {
+        info!(
+            "hot reload enabled: SIGHUP (or `llm-proxy reload`) re-reads the provider files; \
+             [server]/[auth]/[storage] changes are refused with a restart-required error"
+        );
+    }
+    spawn_reload_listener(reload_state, path, hot_reload_enabled, port_override);
+}
+
+/// Loads the TOML config and builds the serving state: the config loads
+/// before the subscriber is built so `server.log_format` is honoured
+/// (BUG-25, with `RUST_LOG_FORMAT` still winning), then the state —
+/// providers, auth, ledger, replica stores — comes up from it.
+async fn load_serve_state(
+    path: &Path,
+    port_override: Option<u16>,
+) -> Result<llm_proxy_server::AppState> {
+    let app_config = llm_proxy_core::load_app_config(path)
+        .with_context(|| format!("loading TOML config from {}", path.display()))?;
+    let app_config = apply_port_override(app_config, port_override);
+    init_tracing(&crate::state::startup_log_format(&app_config));
+
+    let adapter_registry = ProviderAdapterRegistry::builtin();
+    crate::state::load_toml_state_from_config(app_config, path, adapter_registry).await
+}
+
+/// The `--background` path: the parent only logs spawn failures; the
+/// daemon child runs this same command with `--daemonize` and initializes
+/// tracing itself from the resolved config.
+fn spawn_in_background(config_path: Option<&Path>, port_override: Option<u16>) -> Result<()> {
+    init_tracing(&LogFormat::from_env());
+    spawn_daemon(config_path, port_override)
+}
+
+/// Applies the `--port` CLI override to the loaded config (step 10's stated
+/// precedence: CLI over config).
+fn apply_port_override(
+    mut app_config: llm_proxy_core::AppConfig,
+    port_override: Option<u16>,
+) -> llm_proxy_core::AppConfig {
+    if let Some(port) = port_override {
+        let mut bind = app_config.server.bind;
+        bind.set_port(port);
+        app_config.server.bind = bind;
+    }
+    app_config
+}
 
 /// Run the `serve` command.
 ///
@@ -24,50 +79,36 @@ pub async fn cmd_serve(
     background: bool,
     daemonize: bool,
 ) -> Result<()> {
-    init_tracing(&LogFormat::from_env());
-
-    if background && !daemonize {
-        let path = resolve_config(config_path.as_deref());
-        validate_toml_extension(&path)?;
-        return spawn_daemon(config_path.as_deref(), port_override);
-    }
-
     let path = resolve_config(config_path.as_deref());
-
     validate_toml_extension(&path)?;
 
-    let adapter_registry = ProviderAdapterRegistry::builtin();
-    let proxy_client = ProxyClient::try_new().with_context(
-        || "building proxy HTTP client (check HTTP_PROXY/HTTPS_PROXY and TLS config)",
-    )?;
+    if background && !daemonize {
+        return spawn_in_background(config_path.as_deref(), port_override);
+    }
 
-    let state = load_toml_state(&path, adapter_registry, proxy_client, port_override)?;
+    let state = load_serve_state(&path, port_override).await?;
 
     let admin = bind_admin_listener(&state).await?;
+    let mcp = bind_mcp_gateway(&state).await?;
 
-    if let Err(first_err) = write_pid() {
-        if let Some(existing_pid) = read_pid()? {
-            if is_process_running(existing_pid) {
-                bail!(
-                    "server already running with PID {} (PID file: {})",
-                    existing_pid,
-                    crate::paths::pid_file_path().display()
-                );
-            }
-            info!("stale PID file found (PID {}), cleaning up", existing_pid);
-        }
-        remove_pid()?;
-        write_pid().with_context(|| {
-            format!(
-                "failed to create PID file after removing stale entry: {}",
-                first_err
-            )
-        })?;
-    }
+    claim_pid_file()?;
 
     let bind_addr = state.bind_address();
     let shutdown_deadline = state.shutdown_timeout();
     let event_bus = std::sync::Arc::clone(state.event_bus());
+    // Opt-in OTLP push of the runtime counters (plan 07 step 7): the guard
+    // keeps the export loop alive until the server stops, then flushes.
+    let otlp_guard = match state.app_config().server.metrics.otlp.as_ref() {
+        Some(otlp) => Some(
+            crate::otel_metrics::start_otlp_metrics(state.metrics(), &otlp.endpoint, otlp.interval)
+                .with_context(|| "starting OTLP metric export from [server.metrics.otlp]")?,
+        ),
+        None => None,
+    };
+    // Hot reload (plan 07 step 11): the SIGHUP listener needs the state
+    // before the router takes it.
+    start_hot_reload(&state, path.clone(), port_override);
+
     let app = build_router(state);
 
     let listener = bind_listener(bind_addr).await?.tap_io(|tcp_stream| {
@@ -95,13 +136,23 @@ pub async fn cmd_serve(
                 .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()))
                 .await
             {
-                tracing::error!(%error, "admin usage listener failed");
+                tracing::error!(%error, "admin surface listener failed");
+            }
+        }
+    };
+    let mcp_serve = async {
+        if let Some((listener, router)) = mcp {
+            if let Err(error) = axum::serve(listener, router.into_make_service())
+                .with_graceful_shutdown(wait_for_shutdown(shutdown.clone()))
+                .await
+            {
+                tracing::error!(%error, "MCP gateway listener failed");
             }
         }
     };
 
     let servers = async {
-        let (main, ()) = tokio::join!(serve.into_future(), admin_serve);
+        let (main, (), ()) = tokio::join!(serve.into_future(), admin_serve, mcp_serve);
         main
     };
     let Some(result) = drain_within_deadline(
@@ -117,6 +168,10 @@ pub async fn cmd_serve(
     if let Err(e) = remove_pid() {
         tracing::warn!(error = %e, "failed to remove PID file during shutdown");
     }
+
+    // Dropping the guard flushes the last OTLP export before the process
+    // goes away.
+    drop(otlp_guard);
 
     if let Err(close_err) = tokio::task::spawn_blocking(move || event_bus.close()).await {
         tracing::warn!(error = %close_err, "usage-ledger close task failed to join");
@@ -134,6 +189,31 @@ pub async fn cmd_serve(
     }
 }
 
+/// Writes the daemon's PID file, clearing a stale entry when the recorded
+/// process is gone and refusing when another server is alive.
+fn claim_pid_file() -> Result<()> {
+    if let Err(first_err) = write_pid() {
+        if let Some(existing_pid) = read_pid()? {
+            if is_process_running(existing_pid) {
+                bail!(
+                    "server already running with PID {} (PID file: {})",
+                    existing_pid,
+                    crate::paths::pid_file_path().display()
+                );
+            }
+            info!("stale PID file found (PID {}), cleaning up", existing_pid);
+        }
+        remove_pid()?;
+        write_pid().with_context(|| {
+            format!(
+                "failed to create PID file after removing stale entry: {}",
+                first_err
+            )
+        })?;
+    }
+    Ok(())
+}
+
 /// Starts the one signal listener shared by every shutdown waiter, so the drain
 /// deadline begins at the moment the servers begin to drain.
 fn spawn_shutdown_listener() -> watch::Receiver<bool> {
@@ -143,6 +223,62 @@ fn spawn_shutdown_listener() -> watch::Receiver<bool> {
         started.send_replace(true);
     });
     shutdown
+}
+
+/// Listens for SIGHUP and reloads the provider and pool files (plan 07 step
+/// 11). Without `server.hot_reload = true` the signal is acknowledged and
+/// ignored, so an operator poking the daemon changes nothing silently.
+/// `port_override` is the `--port` the server was started with, reapplied to
+/// every re-read config so the CLI layer keeps outranking the file.
+#[cfg(unix)]
+fn spawn_reload_listener(
+    state: llm_proxy_server::AppState,
+    config_path: PathBuf,
+    enabled: bool,
+    port_override: Option<u16>,
+) {
+    tokio::spawn(async move {
+        let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(hangup) => hangup,
+            Err(error) => {
+                tracing::warn!(%error, "cannot listen for SIGHUP; hot reload unavailable");
+                return;
+            }
+        };
+        while hangup.recv().await.is_some() {
+            if !enabled {
+                tracing::info!(
+                    "SIGHUP ignored: server.hot_reload = false; restart the server to apply \
+                     config changes"
+                );
+                continue;
+            }
+            match crate::reload::reload_registry(&state, &config_path, port_override).await {
+                Ok(report) => {
+                    if report.is_empty() {
+                        info!("reload: nothing changed");
+                    } else {
+                        info!("{report}");
+                    }
+                }
+                Err(error) => tracing::error!(
+                    %error,
+                    "reload refused; the running configuration stands"
+                ),
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_reload_listener(
+    _state: llm_proxy_server::AppState,
+    _config_path: PathBuf,
+    _enabled: bool,
+    _port_override: Option<u16>,
+) {
+    // SIGHUP does not exist on this platform; `llm-proxy reload` says so too.
 }
 
 async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
@@ -197,6 +333,28 @@ async fn bind_admin_listener(
     let Some(addr) = state.app_config().server.effective_admin_bind() else {
         bail!("admin API enabled but no admin bind could be derived");
     };
+    // The full admin surface (plan 09 steps 2-3) when the feature is on:
+    // key management, usage and config views, the web UI and MCP tools.
+    // Otherwise the read-only /usage API stands.
+    #[cfg(feature = "admin-ui")]
+    let router = {
+        use llm_proxy_admin::AdminSurface;
+        use secrecy::ExposeSecret;
+        let Some(admin) = state.app_config().auth.admin.as_ref() else {
+            bail!("admin posture enabled but [auth.admin] is not configured");
+        };
+        let mut surface = AdminSurface::new(admin.token.expose_secret());
+        if let Some(keys) = crate::state::managed_key_store_for_serve(state.app_config()) {
+            surface = surface.keys(keys);
+        }
+        if let Some(storage) = state.app_config().storage.as_ref() {
+            surface = surface.usage(llm_proxy_storage::UsageReader::new(storage.path.clone()));
+        }
+        surface
+            .config(std::sync::Arc::clone(&state.app_config_arc()))
+            .router()
+    };
+    #[cfg(not(feature = "admin-ui"))]
     let Some(router) = admin_router(state) else {
         bail!("admin API enabled but no /usage router could be built");
     };
@@ -207,6 +365,53 @@ async fn bind_admin_listener(
         "admin usage API listening (read-only, behind the admin token)"
     );
     Ok(Some((listener, router)))
+}
+
+/// The MCP gateway listener (plan 09 step 6): `[mcp]` is its own surface
+/// with its own tokens, sharing the engine's admission and the ledger.
+#[cfg(feature = "mcp-gateway")]
+async fn bind_mcp_gateway(
+    state: &llm_proxy_server::AppState,
+) -> Result<Option<(TcpListener, axum::Router)>> {
+    use std::sync::Arc;
+    let Some(config) = state.app_config().mcp.clone() else {
+        return Ok(None);
+    };
+    if config.tokens.is_empty() {
+        bail!("[mcp] is configured with no tokens: the gateway would refuse everyone");
+    }
+    let admission = state
+        .engine()
+        .map(|engine| engine.shared_admission())
+        .map_err(|error| anyhow::anyhow!("building the engine for the MCP gateway: {error}"))?;
+    let gateway = llm_proxy_mcp::McpGateway::new(
+        config.clone(),
+        admission,
+        Arc::clone(state.event_bus()),
+        Arc::new(llm_proxy_transport::ProxyClient::new()),
+    );
+    let addr = gateway.bind();
+    let router = gateway.router();
+    let listener = bind_listener(addr).await?;
+    info!(
+        addr = %addr,
+        upstreams = config.upstreams.len(),
+        "MCP gateway listening (own tokens, shared admission and ledger)"
+    );
+    Ok(Some((listener, router)))
+}
+
+#[cfg(not(feature = "mcp-gateway"))]
+async fn bind_mcp_gateway(
+    state: &llm_proxy_server::AppState,
+) -> Result<Option<(TcpListener, axum::Router)>> {
+    if state.app_config().mcp.is_some() {
+        bail!(
+            "[mcp] is configured but this build lacks the mcp-gateway feature; \
+             rebuild with --features mcp-gateway"
+        );
+    }
+    Ok(None)
 }
 
 async fn bind_listener(bind_addr: std::net::SocketAddr) -> Result<TcpListener> {

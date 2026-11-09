@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-proxy admin</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 2rem; max-width: 60rem; }
+  h1 { font-size: 1.3rem; } h2 { font-size: 1rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  code, .mono { font-family: ui-monospace, monospace; }
+  button { cursor: pointer; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  .muted { opacity: .7; }
+  .revoked { opacity: .55; text-decoration: line-through; }
+  #token { user-select: all; }
+  dialog { border: 1px solid color-mix(in srgb, currentColor 30%, transparent); border-radius: 6px; padding: 1rem; }
+</style>
+</head>
+<body>
+<h1>llm-proxy admin</h1>
+<p class="muted">Key management, usage and config, on the dedicated admin listener. The token stays in this browser.</p>
+
+<div class="row">
+  <label for="token-input">Admin token</label>
+  <input id="token-input" type="password" placeholder="Authorization: Bearer …" size="32">
+  <button id="load">Load</button>
+  <span id="status" class="muted"></span>
+</div>
+
+<h2>Usage (24 h, by provider)</h2>
+<table id="usage"><thead><tr>
+  <th>provider</th><th>requests</th><th>input</th><th>output</th><th>cost</th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Client keys</h2>
+<div class="row">
+  <button id="create-key">Issue key</button>
+  <span class="muted">The token is shown once.</span>
+</div>
+<p id="issued" class="mono" hidden></p>
+<table id="keys"><thead><tr>
+  <th>id</th><th>created</th><th>state</th><th>policy</th><th></th>
+</tr></thead><tbody></tbody></table>
+
+<h2>Config</h2>
+<p class="muted">The running configuration with secrets redacted.</p>
+<details><summary>show</summary><pre id="config" class="mono"></pre></details>
+
+<dialog id="issue">
+  <form method="dialog" id="issue-form">
+    <h2>Issue a client key</h2>
+    <p><label>Model globs (comma-separated, empty = all)<br><input name="allow_models" size="40" placeholder="claude-*"></label></p>
+    <p><label>Provider globs<br><input name="allow_providers" size="40" placeholder="anthropic*"></label></p>
+    <p class="row"><label>RPM <input name="rpm" size="6" inputmode="numeric"></label>
+       <label>TPM <input name="tpm" size="8" inputmode="numeric"></label>
+       <label>USD/day <input name="usd_per_day" size="8" placeholder="5.00"></label></p>
+    <p class="row"><button value="cancel">Cancel</button> <button id="issue-submit" value="ok">Issue</button></p>
+  </form>
+</dialog>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let token = "";
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      "Authorization": "Bearer " + token,
+      ...(options.body ? {"Content-Type": "application/json"} : {}),
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(response.status + " " + text);
+  }
+  return response.status === 202 ? null : response.json();
+}
+
+function setStatus(text) { $("status").textContent = text; }
+
+async function loadUsage() {
+  const summary = await api("/usage/summary?window=24h&group_by=provider");
+  const body = $("usage").tBodies[0];
+  body.replaceChildren();
+  for (const group of summary.groups || []) {
+    const row = document.createElement("tr");
+    const cells = [
+      group.provider ?? group.model ?? group.caller ?? "",
+      String(group.requests ?? 0),
+      String(group.input_tokens ?? 0),
+      String(group.output_tokens ?? 0),
+      group.cost_usd == null ? "n/a" : group.cost_usd,
+    ];
+    cells.forEach((cell) => {
+      const td = document.createElement("td");
+      td.textContent = cell;
+      row.append(td);
+    });
+    body.append(row);
+  }
+}
+
+async function loadKeys() {
+  const { keys } = await api("/keys");
+  const body = $("keys").tBodies[0];
+  body.replaceChildren();
+  for (const key of keys) {
+    const row = document.createElement("tr");
+    if (key.revoked_at) row.className = "revoked";
+    const policy = [];
+    if ((key.policy.allow_models || []).length) policy.push("models: " + key.policy.allow_models.join(","));
+    if (key.policy.rpm) policy.push(key.policy.rpm + " rpm");
+    if (key.policy.usd_per_day) policy.push("$" + key.policy.usd_per_day + "/day");
+    const cells = [
+      key.id, key.created_at, key.revoked_at ? "revoked" : "live", policy.join(" · ") || "unrestricted",
+    ];
+    cells.forEach((cell) => {
+      const td = document.createElement("td");
+      td.textContent = cell;
+      row.append(td);
+    });
+    const action = document.createElement("td");
+    if (!key.revoked_at) {
+      const revoke = document.createElement("button");
+      revoke.textContent = "revoke";
+      revoke.addEventListener("click", async () => {
+        await api("/keys/" + encodeURIComponent(key.id) + "/revoke", {method: "POST"});
+        await loadKeys();
+      });
+      action.append(revoke);
+    }
+    row.append(action);
+    body.append(row);
+  }
+}
+
+async function loadConfig() {
+  const config = await api("/config");
+  $("config").textContent = JSON.stringify(config, null, 2);
+}
+
+async function loadAll() {
+  token = $("token-input").value.trim();
+  if (!token) { setStatus("enter a token"); return; }
+  try {
+    await Promise.all([loadUsage(), loadKeys(), loadConfig()]);
+    setStatus("");
+  } catch (error) {
+    setStatus(error.message);
+  }
+}
+
+$("load").addEventListener("click", loadAll);
+$("token-input").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") loadAll();
+});
+
+$("create-key").addEventListener("click", () => $("issue").showModal());
+$("issue-form").addEventListener("submit", async (event) => {
+  if (event.submitter && event.submitter.value !== "ok") return;
+  event.preventDefault();
+  const data = new FormData(event.target);
+  const policy = {};
+  const models = String(data.get("allow_models") || "").trim();
+  const providers = String(data.get("allow_providers") || "").trim();
+  if (models) policy.allow_models = models.split(",").map((s) => s.trim());
+  if (providers) policy.allow_providers = providers.split(",").map((s) => s.trim());
+  for (const [field, key] of [["rpm", "rpm"], ["tpm", "tpm"]]) {
+    const raw = String(data.get(field) || "").trim();
+    if (raw) policy[key] = Number(raw);
+  }
+  const usd = String(data.get("usd_per_day") || "").trim();
+  if (usd) policy.usd_per_day = usd;
+  try {
+    const issued = await api("/keys", {method: "POST", body: JSON.stringify(policy)});
+    $("issued").hidden = false;
+    $("issued").textContent = issued.token + "  (shown once)";
+    $("issue").close();
+    await loadKeys();
+  } catch (error) {
+    setStatus(error.message);
+  }
+});
+</script>
+</body>
+</html>

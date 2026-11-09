@@ -40,7 +40,9 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         .map(|t| CoreTool {
             name: t.name,
             description: t.description,
-            input_schema: t.input_schema,
+            input_schema: t
+                .input_schema
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
         })
         .collect();
 
@@ -50,7 +52,8 @@ pub fn decode_request(req: MessageRequest) -> Result<CoreRequest, ProtocolError>
         temperature: req.temperature,
         top_p: req.top_p,
         max_tokens: Some(req.max_tokens),
-        stop: None,
+        stop: req.stop_sequences.filter(|s| !s.is_empty()),
+        top_k: req.top_k,
         reasoning_effort: None,
         thinking: req.thinking,
     };
@@ -144,29 +147,66 @@ fn decode_message(msg: &Message) -> Result<CoreMessage, ProtocolError> {
         }
     };
 
-    let blocks = msg
-        .content_blocks()
-        .map_err(|error| malformed_block("message content", &error))?;
-    let mut content = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        content.push(decode_content_block(block)?);
-    }
+    let content = match msg.content.as_array() {
+        Some(items) => items
+            .iter()
+            .map(|item| decode_wire_block(item, "message content"))
+            .collect::<Result<Vec<_>, _>>()?,
+        // A string (one text block), null (no blocks) or an invalid shape.
+        None => msg
+            .content_blocks()
+            .map_err(|error| malformed_block("message content", &error))?
+            .into_iter()
+            .map(decode_content_block)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
 
     Ok(CoreMessage { role, content })
+}
+
+/// Block types the decoder models in the core. Every other type is carried
+/// verbatim as [`CoreContent::Opaque`] so same-format passthrough can forward
+/// it: Anthropic requires replayed server-tool blocks back unmodified.
+const MODELED_BLOCK_TYPES: &[&str] = &[
+    "text",
+    "image",
+    "document",
+    "tool_use",
+    "tool_result",
+    "thinking",
+    "redacted_thinking",
+];
+
+/// Decodes one wire block. Unmodeled types bypass the typed [`ContentBlock`]
+/// decode, so fields the proxy has no model for can never fail the request.
+fn decode_wire_block(
+    item: &serde_json::Value,
+    context: &str,
+) -> Result<CoreContent, ProtocolError> {
+    let unmodeled = item
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|block_type| !MODELED_BLOCK_TYPES.contains(&block_type));
+    if unmodeled {
+        return Ok(CoreContent::Opaque {
+            block: item.clone(),
+        });
+    }
+    let block = serde_json::from_value::<ContentBlock>(item.clone())
+        .map_err(|error| malformed_block(context, &error))?;
+    decode_content_block(block)
 }
 
 fn decode_tool_result_blocks(arr: &[serde_json::Value]) -> Result<Vec<CoreContent>, ProtocolError> {
     let mut blocks = Vec::with_capacity(arr.len());
     for item in arr {
-        let cb = serde_json::from_value::<ContentBlock>(item.clone())
-            .map_err(|error| malformed_block("tool_result content", &error))?;
-        match decode_content_block(cb) {
+        match decode_wire_block(item, "tool_result content") {
             Ok(core) => blocks.push(core),
             Err(ProtocolError::Decode(msg)) => {
                 let truncated = crate::util::truncate_str_safe(&msg, 64);
                 tracing::warn!(
                     decode_error = truncated,
-                    "skipping unknown block inside tool_result content array"
+                    "skipping undecodable block inside tool_result content array"
                 );
             }
             Err(other) => return Err(other),
@@ -219,10 +259,12 @@ fn decode_tool_result_block(block: ContentBlock) -> Result<CoreContent, Protocol
             "tool_result block missing required 'tool_use_id' field".into(),
         ));
     }
+    let cache = block.cache_control.map(decode_cache_control);
     Ok(CoreContent::ToolResult {
         tool_use_id,
         content: inner_content,
         is_error,
+        cache,
     })
 }
 
@@ -241,12 +283,12 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                     "Anthropic client: cache_control on image block is not supported; dropping"
                 );
             }
-            let source = block
-                .source
-                .map(|s| serde_json::to_value(&s).unwrap_or(serde_json::Value::Null))
-                .unwrap_or(serde_json::Value::Null);
+            let source = block.source.unwrap_or(serde_json::Value::Null);
             Ok(CoreContent::Image { source })
         }
+        "document" => Ok(CoreContent::Document {
+            source: block.source.unwrap_or(serde_json::Value::Null),
+        }),
         "tool_use" => {
             let id = block.id.unwrap_or_default();
             if id.is_empty() {
@@ -266,6 +308,7 @@ fn decode_content_block(block: ContentBlock) -> Result<CoreContent, ProtocolErro
                 input: block
                     .input
                     .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                signature: block.signature,
             })
         }
         "tool_result" => decode_tool_result_block(block),
@@ -370,25 +413,25 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             block.cache_control = cc;
             Ok(block)
         }
-        CoreContent::Image { source } => {
-            let img_source = serde_json::from_value(source).unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "Image source deserialization failed; producing empty ImageSource fallback"
-                );
-                anthropic::ImageSource {
-                    r#type: String::new(),
-                    media_type: String::new(),
-                    data: String::new(),
-                }
-            });
-            Ok(ContentBlock::new_image(img_source))
+        CoreContent::Image { source } => Ok(ContentBlock::new_image(source)),
+        CoreContent::ToolUse {
+            id,
+            name,
+            input,
+            signature,
+        } => {
+            let mut block = ContentBlock::new_tool_use(id, name, input);
+            // Tool-call signatures (e.g. Gemini thought signatures routed
+            // through an Anthropic-dialect client) ride the `signature` field
+            // so clients that replay blocks verbatim return them to us.
+            block.signature = signature;
+            Ok(block)
         }
-        CoreContent::ToolUse { id, name, input } => Ok(ContentBlock::new_tool_use(id, name, input)),
         CoreContent::ToolResult {
             tool_use_id,
             content,
             is_error,
+            cache,
         } => {
             let content_val = if content.len() == 1 {
                 if let CoreContent::Text { ref text, .. } = content[0] {
@@ -401,11 +444,12 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             } else {
                 Some(serde_json::to_value(&content).unwrap_or(serde_json::Value::Null))
             };
-            Ok(ContentBlock::new_tool_result(
-                tool_use_id,
-                content_val,
-                Some(is_error),
-            ))
+            let mut block = ContentBlock::new_tool_result(tool_use_id, content_val, Some(is_error));
+            block.cache_control = cache.map(|c| AnthropicCacheControl {
+                r#type: c.r#type.as_str().to_owned(),
+                ttl: c.ttl,
+            });
+            Ok(block)
         }
         CoreContent::Thinking { text, signature } => {
             let mut block = ContentBlock::new_thinking(text);
@@ -450,6 +494,12 @@ fn encode_content_block(content: CoreContent) -> Result<ContentBlock, ProtocolEr
             );
             Err(ProtocolError::Encode(
                 "Anthropic Messages does not support Refusal blocks".into(),
+            ))
+        }
+        CoreContent::Opaque { .. } => {
+            tracing::warn!("opaque client block has no Anthropic response encoding; omitting");
+            Err(ProtocolError::EncodeSkippable(
+                "opaque client blocks have no Anthropic response encoding".into(),
             ))
         }
     }
@@ -497,6 +547,7 @@ fn encode_usage(usage: &Usage) -> anthropic::Usage {
         output_tokens: usage.output_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens,
         cache_read_input_tokens: usage.cache_read_input_tokens,
+        cache_creation: None,
     }
 }
 
@@ -548,15 +599,26 @@ fn encode_error_event(error: &CoreStreamError) -> MessageEvent {
 
 /// Stateful encoder that converts [`CoreEvent`] values into Anthropic SSE
 /// [`MessageEvent`] values, buffering the latest `UsageDelta` and coalescing
-/// it into the terminal `message_delta` + `message_stop` pair.
+/// it into the terminal `message_delta` + `message_stop` pair. The terminal
+/// pair is held back until [`StreamEncoder::finish`] because providers send
+/// usage after the finish event; flushing on `MessageStop` would report the
+/// buffered (zero) usage instead of the real numbers.
 #[derive(Debug)]
 pub struct StreamEncoder {
     msg_id: String,
     model: String,
     pending_usage: Option<anthropic::Usage>,
+    pending_stop: Option<PendingStop>,
     started: bool,
     finished: bool,
     open_text_blocks: Vec<usize>,
+}
+
+/// A `MessageStop` waiting for the trailing usage event before it is flushed.
+#[derive(Debug)]
+struct PendingStop {
+    stop_reason: StopReason,
+    stop_sequence: Option<String>,
 }
 
 impl StreamEncoder {
@@ -567,6 +629,7 @@ impl StreamEncoder {
             msg_id,
             model,
             pending_usage: None,
+            pending_stop: None,
             started: false,
             finished: false,
             open_text_blocks: Vec::new(),
@@ -595,6 +658,7 @@ impl StreamEncoder {
                     output_tokens: 0,
                     cache_creation_input_tokens: None,
                     cache_read_input_tokens: None,
+                    cache_creation: None,
                 },
             }),
             index: None,
@@ -617,6 +681,7 @@ impl StreamEncoder {
             output_tokens: 0,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_creation: None,
         });
 
         self.open_text_blocks.sort_unstable();
@@ -676,6 +741,29 @@ impl StreamEncoder {
                 event = ?event,
                 "StreamEncoder: dropping event after stream finished"
             );
+            return Ok(Vec::new());
+        }
+
+        if self.pending_stop.is_some() {
+            if let CoreEvent::Error { error } = event {
+                // An error after the buffered terminal must neither swallow
+                // the terminal nor be swallowed by it: flush the buffered
+                // pair ahead of the error event, then stop encoding. This is
+                // the wire shape clients saw before the terminal was buffered.
+                let mut events = self.finish()?;
+                events.push(encode_error_event(&error));
+                return Ok(events);
+            }
+            // The terminal pair is buffered; only a trailing usage update is
+            // still meaningful (it lands in the terminal message_delta).
+            if let CoreEvent::UsageDelta { usage } = event {
+                self.pending_usage = Some(encode_usage(&usage));
+            } else {
+                tracing::trace!(
+                    event = ?event,
+                    "StreamEncoder: dropping event after buffered MessageStop"
+                );
+            }
             return Ok(Vec::new());
         }
 
@@ -795,7 +883,14 @@ impl StreamEncoder {
                 stop_reason,
                 stop_sequence,
             } => {
-                self.encode_message_stop(stop_reason, stop_sequence, &mut events);
+                // Hold the terminal pair back: usage routinely arrives after
+                // the finish event and belongs in the terminal message_delta.
+                // Nothing is lost — `finish()` flushes it with the freshest
+                // buffered usage.
+                self.pending_stop = Some(PendingStop {
+                    stop_reason,
+                    stop_sequence,
+                });
             }
 
             CoreEvent::Error { error } => {
@@ -819,19 +914,30 @@ impl StreamEncoder {
     }
 
     /// Mark the encoder as finished without emitting synthetic terminal
-    /// events; later `finish()` calls return an empty vec.
+    /// events; later `finish()` calls return an empty vec. A buffered
+    /// `MessageStop` is dropped: callers are the error paths, which have
+    /// already delivered the buffered terminal ahead of the error event (an
+    /// `Error` event flushes it) or a terminal error event on its own.
     pub fn mark_finished(&mut self) {
         self.finished = true;
+        self.pending_stop = None;
     }
 
-    /// Flush remaining buffered events when the stream ended without a
-    /// `MessageStop`: emits a synthetic `message_delta` (stop reason
-    /// `"end_turn"`, with a warning) + `message_stop` pair.
+    /// Flush remaining buffered events: a buffered `MessageStop` is emitted
+    /// with the freshest usage; a stream that ended without one emits a
+    /// synthetic `message_delta` (stop reason `"end_turn"`, with a warning) +
+    /// `message_stop` pair.
     pub fn finish(&mut self) -> Result<Vec<MessageEvent>, ProtocolError> {
         if self.finished {
             return Ok(Vec::new());
         }
         self.finished = true;
+
+        if let Some(pending) = self.pending_stop.take() {
+            let mut events = Vec::new();
+            self.encode_message_stop(pending.stop_reason, pending.stop_sequence, &mut events);
+            return Ok(events);
+        }
 
         tracing::warn!(
             "StreamEncoder::finish() called without prior MessageStop; emitting synthetic terminal events"
@@ -842,6 +948,7 @@ impl StreamEncoder {
             output_tokens: 0,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            cache_creation: None,
         });
 
         let events = vec![
@@ -906,9 +1013,12 @@ mod tests {
             tools: vec![],
             temperature: None,
             top_p: None,
+            top_k: None,
+            stop_sequences: None,
             metadata: None,
             thinking: None,
             tool_choice: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -961,7 +1071,9 @@ mod tests {
         let core = decode_request(req).unwrap();
         assert_eq!(core.messages.len(), 2);
         match &core.messages[1].content[0] {
-            CoreContent::ToolUse { id, name, input } => {
+            CoreContent::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(id, "tu_1");
                 assert_eq!(name, "get_weather");
                 assert_eq!(input["city"], "SF");
@@ -1056,6 +1168,63 @@ mod tests {
     }
 
     #[test]
+    fn every_documented_image_source_decodes_with_the_source_intact() {
+        let sources = [
+            serde_json::json!({ "type": "base64", "media_type": "image/png", "data": "iVBOR..." }),
+            serde_json::json!({ "type": "url", "url": "https://example.com/cat.jpg" }),
+            serde_json::json!({ "type": "file", "file_id": "file_fixture_01" }),
+        ];
+        for source in sources {
+            let mut req = make_anthropic_request();
+            req.messages.push(Message {
+                role: "user".into(),
+                content: serde_json::json!([{ "type": "image", "source": source }]),
+            });
+            let core = decode_request(req)
+                .unwrap_or_else(|e| panic!("image source {source} must decode: {e}"));
+            match &core.messages[1].content[..] {
+                [CoreContent::Image { source: decoded }] => assert_eq!(decoded, &source),
+                other => panic!("expected one Image for {source}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn document_blocks_decode_to_core_documents_in_order() {
+        let url_source =
+            serde_json::json!({ "type": "url", "url": "https://example.com/report.pdf" });
+        let base64_source = serde_json::json!({
+            "type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjcK"
+        });
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                { "type": "document", "source": url_source },
+                {
+                    "type": "document",
+                    "source": base64_source,
+                    "cache_control": { "type": "ephemeral" }
+                },
+                { "type": "text", "text": "Summarize both." }
+            ]),
+        });
+        let core = decode_request(req).expect("document blocks must decode");
+        match &core.messages[1].content[..] {
+            [
+                CoreContent::Document { source: first },
+                CoreContent::Document { source: second },
+                CoreContent::Text { text, .. },
+            ] => {
+                assert_eq!(first, &url_source);
+                assert_eq!(second, &base64_source);
+                assert_eq!(text, "Summarize both.");
+            }
+            other => panic!("expected two Documents then Text, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn tool_choice_decodes_to_core() {
         let mut req = make_anthropic_request();
         req.tool_choice = Some(serde_json::json!({"type": "auto"}));
@@ -1143,7 +1312,6 @@ mod tests {
     fn system_content_the_proxy_cannot_read_is_rejected_not_dropped() {
         let unreadable = [
             serde_json::json!([{ "type": "text", "text": "ok" }, { "type": "text", "text": 42 }]),
-            serde_json::json!([{ "type": "text", "text": "ok", "not_a_field": true }]),
             serde_json::json!([{ "type": "image" }]),
             serde_json::json!([{ "type": "text" }]),
             serde_json::json!(42),
@@ -1156,6 +1324,36 @@ mod tests {
                 "expected a rejection for system = {system}"
             );
         }
+    }
+
+    #[test]
+    fn system_blocks_with_unknown_fields_decode_instead_of_failing() {
+        // Plan 02: the request path tolerates unknown fields so same-format
+        // passthrough can forward them; unreadable content is still rejected
+        // (previous test).
+        let mut req = make_anthropic_request();
+        req.system = Some(serde_json::json!([
+            { "type": "text", "text": "ok", "not_a_field": true }
+        ]));
+        let core = decode_request(req).expect("unknown system-block fields must not 400");
+        assert_eq!(core.system.len(), 1);
+        match &core.system[0] {
+            CoreContent::Text { text, .. } => assert_eq!(text, "ok"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_sequences_and_top_k_decode_into_sampling() {
+        let mut req = make_anthropic_request();
+        req.stop_sequences = Some(vec!["END".into(), "STOP".into()]);
+        req.top_k = Some(5);
+        let core = decode_request(req).unwrap();
+        assert_eq!(
+            core.sampling.stop.as_deref(),
+            Some(["END".to_owned(), "STOP".to_owned()].as_slice())
+        );
+        assert_eq!(core.sampling.top_k, Some(5));
     }
 
     #[test]
@@ -1298,6 +1496,7 @@ mod tests {
                 id: "tu_1".into(),
                 name: "get_weather".into(),
                 input: serde_json::json!({"city": "SF"}),
+                signature: None,
             }],
             stop_reason: StopReason::ToolUse,
             stop_sequence: None,
@@ -1543,12 +1742,12 @@ mod tests {
             text: "hi".into(),
         })
         .unwrap();
-        let stop = enc
-            .encode_event(CoreEvent::MessageStop {
-                stop_reason: StopReason::EndTurn,
-                stop_sequence: None,
-            })
-            .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let stop = enc.finish().unwrap();
 
         assert!(
             stop.iter()
@@ -1581,7 +1780,12 @@ mod tests {
                 stop_sequence: None,
             })
             .unwrap();
+        assert!(
+            events.is_empty(),
+            "terminal pair is held back until finish(): got {events:?}"
+        );
 
+        let events = enc.finish().unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].r#type, "message_delta");
         assert!(events[0].usage.is_some());
@@ -1591,6 +1795,37 @@ mod tests {
             Some("end_turn")
         );
         assert_eq!(events[1].r#type, "message_stop");
+    }
+
+    #[test]
+    fn usage_arriving_after_message_stop_reaches_the_client() {
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+
+        enc.encode_event(CoreEvent::TextDelta {
+            index: 0,
+            text: "hi".into(),
+        })
+        .unwrap();
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        // Standard OpenAI-style ordering: usage arrives after the finish
+        // event. It must land in the terminal message_delta the client sees.
+        enc.encode_event(CoreEvent::UsageDelta {
+            usage: Usage::provider_reported(100, 5),
+        })
+        .unwrap();
+
+        let events = enc.finish().unwrap();
+        let delta = events
+            .iter()
+            .find(|e| e.r#type == "message_delta")
+            .expect("terminal message_delta after finish");
+        let usage = delta.usage.as_ref().expect("usage on terminal delta");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 5);
     }
 
     #[test]
@@ -1643,7 +1878,46 @@ mod tests {
         })
         .unwrap();
         let remaining = enc.finish().unwrap();
-        assert!(remaining.is_empty());
+        assert_eq!(remaining.len(), 2, "buffered stop flushes on finish()");
+        assert_eq!(remaining[0].r#type, "message_delta");
+        assert_eq!(remaining[1].r#type, "message_stop");
+        let again = enc.finish().unwrap();
+        assert!(again.is_empty(), "second finish() must be empty");
+    }
+
+    #[test]
+    fn streaming_error_after_message_stop_flushes_terminal_then_error() {
+        // A transport error or in-band error frame arriving after the
+        // upstream terminal must neither be dropped nor drop the buffered
+        // terminal pair: the client sees the terminal, then the error.
+        let mut enc = StreamEncoder::new("msg_1".into(), "m".into());
+        enc.encode_event(CoreEvent::MessageStop {
+            stop_reason: StopReason::EndTurn,
+            stop_sequence: None,
+        })
+        .unwrap();
+        let events = enc
+            .encode_event(CoreEvent::Error {
+                error: CoreStreamError::new(
+                    CoreStreamErrorKind::Upstream,
+                    "connection reset after terminal".into(),
+                ),
+            })
+            .unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.r#type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec!["message_delta", "message_stop", "error"],
+            "terminal pair must flush ahead of the error event: {events:?}"
+        );
+        assert!(
+            events.last().is_some_and(|e| e.error.is_some()),
+            "the error event must carry the failure: {events:?}"
+        );
+        assert!(
+            enc.finish().unwrap().is_empty(),
+            "no synthetic second terminal after the error"
+        );
     }
 
     #[test]
@@ -1774,6 +2048,17 @@ mod tests {
     }
 
     #[test]
+    fn encode_image_forwards_a_url_source_verbatim() {
+        let source = serde_json::json!({"type": "url", "url": "https://example.com/cat.jpg"});
+        let block = encode_content_block(CoreContent::Image {
+            source: source.clone(),
+        })
+        .unwrap();
+        let wire = serde_json::to_value(&block).unwrap();
+        assert_eq!(wire, serde_json::json!({"type": "image", "source": source}));
+    }
+
+    #[test]
     fn encode_refusal_returns_encode_error() {
         let content = CoreContent::Refusal {
             text: "I cannot help with that".into(),
@@ -1893,17 +2178,71 @@ mod tests {
     }
 
     #[test]
-    fn unknown_block_type_returns_decode_error() {
+    fn unmodeled_block_types_are_carried_verbatim_as_opaque() {
+        // `data` is a string on the typed block: an unmodeled block's own field
+        // shapes must never reach the typed decode, at top level or nested.
+        let unmodeled =
+            serde_json::json!({ "type": "future_unknown_block", "data": { "nested": true } });
+        let mut req = make_anthropic_request();
+        req.messages.push(Message {
+            role: "user".into(),
+            content: serde_json::json!([
+                unmodeled,
+                { "type": "tool_result", "tool_use_id": "tu_1", "content": [unmodeled] }
+            ]),
+        });
+        let core = decode_request(req).expect("unmodeled blocks must not fail the decode");
+        match &core.messages[1].content[..] {
+            [
+                CoreContent::Opaque { block },
+                CoreContent::ToolResult { content, .. },
+            ] => {
+                assert_eq!(block, &unmodeled);
+                assert_eq!(content, &vec![CoreContent::Opaque { block: unmodeled }]);
+            }
+            other => panic!("expected Opaque then ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_search_replay_blocks_decode_as_opaque_blocks_in_order() {
+        let server_tool_use = serde_json::json!({
+            "type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+            "input": { "query": "claude shannon birth date" }
+        });
+        let search_result = serde_json::json!({
+            "type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+            "content": [{
+                "type": "web_search_result", "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                "title": "Claude Shannon - Wikipedia", "encrypted_content": "EqgfCioIARgB",
+                "page_age": "April 30, 2025"
+            }]
+        });
         let mut req = make_anthropic_request();
         req.messages.push(Message {
             role: "assistant".into(),
             content: serde_json::json!([
-                { "type": "future_unknown_block", "data": "some-data" }
+                { "type": "text", "text": "Searching." },
+                server_tool_use,
+                search_result,
+                { "type": "text", "text": "Born April 30, 1916." }
             ]),
         });
-        let result = decode_request(req);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ProtocolError::Decode(_)));
+        let core = decode_request(req).expect("server-tool replay blocks must decode");
+        match &core.messages[1].content[..] {
+            [
+                CoreContent::Text { text: before, .. },
+                CoreContent::Opaque { block: tool_use },
+                CoreContent::Opaque { block: tool_result },
+                CoreContent::Text { text: after, .. },
+            ] => {
+                assert_eq!(before, "Searching.");
+                assert_eq!(tool_use, &server_tool_use);
+                assert_eq!(tool_result, &search_result);
+                assert_eq!(after, "Born April 30, 1916.");
+            }
+            other => panic!("expected Text, two Opaque blocks, Text; got {other:?}"),
+        }
     }
 
     #[test]
@@ -1912,7 +2251,10 @@ mod tests {
         req.tools = vec![Tool {
             name: "get_weather".into(),
             description: Some("Get weather".into()),
-            input_schema: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            input_schema: Some(
+                serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            ),
+            extra: serde_json::Map::new(),
         }];
         let core = decode_request(req).unwrap();
         assert_eq!(core.tools.len(), 1);

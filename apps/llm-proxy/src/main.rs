@@ -20,12 +20,17 @@ async fn main() -> Result<()> {
             let paths = default_command_paths();
             cmd_stop(&paths)
         }
+        Commands::Reload => {
+            let paths = default_command_paths();
+            cmd_reload(&paths)
+        }
         Commands::Status => {
             let paths = default_command_paths();
             cmd_status(&paths)
         }
         Commands::Init => cmd_init(),
         Commands::Validate { config } => cmd_validate(config.as_deref()),
+        Commands::Doctor { config, probe } => cmd_doctor(config.as_deref(), probe).await,
         Commands::Models {
             config,
             provider,
@@ -33,6 +38,12 @@ async fn main() -> Result<()> {
             write_catalog,
             require_success,
         } => cmd_models(config, provider, live, write_catalog, require_success).await,
+        Commands::PricingSync {
+            config,
+            provider,
+            url,
+            dry_run,
+        } => cmd_pricing_sync(config, provider, url, dry_run).await,
         Commands::Autostart { action } => match action {
             AutostartAction::Enable {
                 config,

@@ -24,14 +24,14 @@ pub fn config_dir() -> PathBuf {
 /// config file `status` reads for the `listen` address.
 #[derive(Debug, Clone)]
 pub struct CommandPaths {
-    pid_manager: llm_proxy_core::PidManager,
+    pid_manager: crate::pid::PidManager,
     config_path: PathBuf,
 }
 
 impl CommandPaths {
     /// Build a [`CommandPaths`] from an explicit PID manager and config path.
     #[must_use]
-    pub fn new(pid_manager: llm_proxy_core::PidManager, config_path: PathBuf) -> Self {
+    pub fn new(pid_manager: crate::pid::PidManager, config_path: PathBuf) -> Self {
         Self {
             pid_manager,
             config_path,
@@ -40,7 +40,7 @@ impl CommandPaths {
 
     /// The PID file manager backing `stop`/`status`.
     #[must_use]
-    pub fn pid_manager(&self) -> &llm_proxy_core::PidManager {
+    pub fn pid_manager(&self) -> &crate::pid::PidManager {
         &self.pid_manager
     }
 
@@ -55,7 +55,7 @@ impl CommandPaths {
 #[must_use]
 pub fn default_command_paths() -> CommandPaths {
     CommandPaths::new(
-        llm_proxy_core::PidManager::new(config_dir()),
+        crate::pid::PidManager::new(config_dir()),
         default_config_path(),
     )
 }

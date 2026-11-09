@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Response};
@@ -14,6 +13,42 @@ use crate::state::AppState;
 
 use super::core_pipeline;
 use super::error_response::{ClientProtocol, RouteError, route_error_response};
+/// Bare `/v1/chat/completions` (plan 04 step 11): resolve the model to a
+/// provider or pool, then run the same handler the provider-scoped route
+/// runs.
+pub(crate) async fn handle_bare_chat_completions(
+    state: State<AppState>,
+    meta: RequestMeta,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response<Body> {
+    if !state.app_config().server.bare_v1.enabled {
+        return route_error_response(ClientProtocol::OpenAiChat, &RouteError::NotFound);
+    }
+    let model = match core_pipeline::bare_model_of(&body) {
+        Ok(model) => model,
+        Err(error) => {
+            warn!(error = %error, "bare /v1/chat/completions request failed");
+            return route_error_response(ClientProtocol::OpenAiChat, &error);
+        }
+    };
+    match core_pipeline::resolve_bare_target(&state, &model) {
+        Ok(target) => {
+            match handle_chat_completions_inner(state.0, meta, target, headers, body).await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(error = %error, "request failed");
+                    route_error_response(ClientProtocol::OpenAiChat, &error)
+                }
+            }
+        }
+        Err(error) => {
+            warn!(error = %error, "bare /v1/chat/completions target resolution failed");
+            route_error_response(ClientProtocol::OpenAiChat, &error)
+        }
+    }
+}
+
 pub(crate) async fn handle_chat_completions(
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -50,27 +85,41 @@ async fn handle_chat_completions_inner(
         );
     };
     core_pipeline::validate_provider_name(&provider).inspect_err(&emit_failed)?;
-    if state.providers().get(&provider).is_none() {
+    if !core_pipeline::route_target_exists(&state, &provider) {
         let err = RouteError::UnknownProvider(provider.clone());
         emit_failed(&err);
         return Err(err);
     }
     core_pipeline::validate_json_content_type(&headers).inspect_err(&emit_failed)?;
 
-    let request_path = format!("/providers/{provider}/v1/chat/completions");
-    let ctx = core_pipeline::prepare_request(&state, &meta, &headers, &body, &request_path)
-        .inspect_err(&emit_failed)?;
-    let req: ChatCompletionRequest = match Json::<ChatCompletionRequest>::from_bytes(&body) {
-        Ok(Json(value)) => value,
-        Err(rejection) => {
-            let err = json_rejection_to_route_error(rejection);
+    let ctx =
+        core_pipeline::prepare_request(&state, &meta, &headers, &body).inspect_err(&emit_failed)?;
+    let raw: serde_json::Value = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(value) => value,
+        Err(e) => {
+            let err = RouteError::InvalidRequest(format!("invalid JSON syntax: {e}"));
+            emit_failed(&err);
+            return Err(err);
+        }
+    };
+    let req: ChatCompletionRequest = match serde::Deserialize::deserialize(raw.clone()) {
+        Ok(req) => req,
+        Err(e) => {
+            let err =
+                RouteError::InvalidRequest(format!("JSON body did not match expected type: {e}"));
             emit_failed(&err);
             return Err(err);
         }
     };
     let core = openai_chat::decode_request(req)
         .map_err(core_pipeline::protocol_error_to_route)
-        .inspect_err(|e| emit_failed(e))?;
+        .inspect_err(&emit_failed)?;
+    // The raw body rides along so same-format routes can forward it verbatim
+    // and the cross-format policy can name leftover fields.
+    let wire = llm_proxy_adapters::ClientWireRequest::new(
+        llm_proxy_adapters::ClientWireFormat::OpenAiChatCompletions,
+        raw,
+    );
 
     let is_streaming = core.stream;
     info!(
@@ -86,26 +135,25 @@ async fn handle_chat_completions_inner(
         provider_name: &provider,
         route_kind: ProviderRouteKind::ChatCompletions,
         client_protocol: ClientProtocol::OpenAiChat,
+        ollama_generate: false,
+    };
+    let inbound = core_pipeline::InboundRequest {
+        auth: inbound_auth,
+        headers,
+        wire,
     };
     if is_streaming {
-        core_pipeline::handle_core_stream(state, ctx, dispatch, core, inbound_auth).await
+        core_pipeline::handle_core_stream(
+            state,
+            ctx,
+            dispatch,
+            core,
+            inbound,
+            ClientProtocol::OpenAiChat.stream_wire(),
+        )
+        .await
     } else {
-        core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound_auth).await
-    }
-}
-fn json_rejection_to_route_error(rejection: axum::extract::rejection::JsonRejection) -> RouteError {
-    use axum::extract::rejection::JsonRejection;
-    match rejection {
-        JsonRejection::JsonSyntaxError(e) => {
-            RouteError::InvalidRequest(format!("invalid JSON syntax: {e}"))
-        }
-        JsonRejection::JsonDataError(e) => {
-            RouteError::InvalidRequest(format!("JSON body did not match expected type: {e}"))
-        }
-        JsonRejection::MissingJsonContentType(_) => {
-            RouteError::InvalidRequest("missing application/json Content-Type".to_owned())
-        }
-        other => RouteError::InvalidRequest(format!("could not read request body: {other}")),
+        core_pipeline::handle_core_once(state, ctx, dispatch, core, inbound).await
     }
 }
 

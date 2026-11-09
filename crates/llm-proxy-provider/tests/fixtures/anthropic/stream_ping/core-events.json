@@ -1,7 +1,0 @@
-[
-  { "type": "ping" },
-  { "type": "message_start" },
-  { "type": "content_start" },
-  { "type": "text_delta" },
-  { "type": "message_stop" }
-]

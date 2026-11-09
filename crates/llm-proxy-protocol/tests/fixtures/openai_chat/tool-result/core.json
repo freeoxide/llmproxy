@@ -4,7 +4,7 @@
   "messages": [
     { "role": "User", "content": [{ "Text": { "text": "What is the weather?", "cache": null } }] },
     { "role": "Assistant", "content": [{ "ToolUse": { "id": "call_1", "name": "get_weather", "input": { "city": "SF" } } }] },
-    { "role": "Tool", "content": [{ "ToolResult": { "tool_use_id": "call_1", "content": [{ "Text": { "text": "72F and sunny", "cache": null } }], "is_error": false } }] }
+    { "role": "Tool", "content": [{ "ToolResult": { "tool_use_id": "call_1", "content": [{ "Text": { "text": "72F and sunny", "cache": null } }], "is_error": false, "cache": null } }] }
   ],
   "tools": [],
   "tool_choice": null,

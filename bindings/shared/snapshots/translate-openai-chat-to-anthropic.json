@@ -1,0 +1,10 @@
+{
+  "error": {
+    "kind": "InvalidRequest",
+    "message": "request not representable for this provider: field(s) frequency_penalty, logit_bias, presence_penalty, response_format, seed, store have no anthropic_messages equivalent; remove them or enable the route's lossy mode",
+    "retry_after_secs": null,
+    "should_retry": false,
+    "status": 400
+  },
+  "result": null
+}

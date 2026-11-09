@@ -1,0 +1,13 @@
+{
+  "accept": "text/event-stream",
+  "authorization": "Bearer codex-capture-placeholder-key-not-real",
+  "content-type": "application/json",
+  "originator": "codex_exec",
+  "session-id": "01c0ffee-0000-4000-8000-0000000000c1",
+  "thread-id": "01c0ffee-0000-4000-8000-0000000000c1",
+  "user-agent": "codex_exec/0.167.0 (Debian 13.0.0; x86_64) unknown (codex_exec; 0.167.0)",
+  "x-client-request-id": "01c0ffee-0000-4000-8000-0000000000c1",
+  "x-codex-beta-features": "remote_compaction_v2",
+  "x-codex-turn-metadata": "{\"installation_id\":\"01c0ffee-0000-4000-8000-0000000000c2\",\"session_id\":\"01c0ffee-0000-4000-8000-0000000000c1\",\"thread_id\":\"01c0ffee-0000-4000-8000-0000000000c1\",\"agent_name\":\"/root\",\"turn_id\":\"01c0ffee-0000-4000-8000-0000000000c3\",\"window_id\":\"01c0ffee-0000-4000-8000-0000000000c1:0\",\"window_number\":0,\"context_window_id\":\"01c0ffee-0000-4000-8000-0000000000c5\",\"request_kind\":\"turn\",\"history_initialization\":\"new\",\"root_turn_id\":\"01c0ffee-0000-4000-8000-0000000000c3\",\"thread_source\":\"user\",\"turn_trigger\":\"exec\",\"sandbox\":\"seccomp\",\"sandbox_mode\":\"read-only\",\"auto_review_enabled\":false,\"node_repl_auto_review_required\":false,\"node_repl_disabled\":false,\"workspaces\":{\"/tmp/codex-scratch\":{\"has_changes\":true}},\"turn_started_at_unix_ms\":1762500000000,\"analytics_enabled\":true,\"model\":\"gpt-5.1-codex\",\"reasoning_effort\":\"medium\"}",
+  "x-codex-window-id": "01c0ffee-0000-4000-8000-0000000000c1:0"
+}

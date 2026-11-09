@@ -183,3 +183,42 @@ mod tests {
         result.unwrap_err();
     }
 }
+
+#[cfg(test)]
+mod doctor_parsing {
+    use clap::Parser;
+    use llm_proxy_app::cli::{Cli, Commands};
+
+    #[test]
+    fn doctor_defaults_to_reachability_only_and_opting_into_the_probe() {
+        let plain = Cli::try_parse_from(["llm-proxy", "doctor"]).expect("doctor parses");
+        let Commands::Doctor { probe, config } = plain.command else {
+            panic!("expected the doctor command");
+        };
+        assert!(
+            !probe,
+            "the one-token probe must be opt-in: it spends quota"
+        );
+        assert!(config.is_none());
+
+        let probing = Cli::try_parse_from(["llm-proxy", "doctor", "--probe", "-c", "x.toml"])
+            .expect("doctor --probe parses");
+        let Commands::Doctor { probe, config } = probing.command else {
+            panic!("expected the doctor command");
+        };
+        assert!(probe);
+        assert_eq!(config.as_deref(), Some(std::path::Path::new("x.toml")));
+    }
+}
+
+#[cfg(test)]
+mod reload_parsing {
+    use clap::Parser;
+    use llm_proxy_app::cli::{Cli, Commands};
+
+    #[test]
+    fn reload_parses_as_a_flagless_command() {
+        let cli = Cli::try_parse_from(["llm-proxy", "reload"]).expect("reload parses");
+        assert!(matches!(cli.command, Commands::Reload));
+    }
+}

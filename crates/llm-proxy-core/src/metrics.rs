@@ -29,7 +29,7 @@ pub struct Metrics {
     requests_failed: AtomicI64,
     upstream_calls: AtomicI64,
     rate_limited: AtomicI64,
-    deduplicated: AtomicI64,
+    cache_hits: AtomicI64,
     client_cancelled: AtomicI64,
     /// Ring-buffer holding the last [`LATENCY_CAP`] latency samples.
     latencies: Mutex<VecDeque<Duration>>,
@@ -48,7 +48,7 @@ impl Metrics {
             requests_failed: AtomicI64::new(0),
             upstream_calls: AtomicI64::new(0),
             rate_limited: AtomicI64::new(0),
-            deduplicated: AtomicI64::new(0),
+            cache_hits: AtomicI64::new(0),
             client_cancelled: AtomicI64::new(0),
             latencies: Mutex::new(VecDeque::with_capacity(LATENCY_CAP)),
             model_counts: Mutex::new(HashMap::new()),
@@ -127,9 +127,10 @@ impl Metrics {
         self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a deduplicated (cache-hit) request.
-    pub fn record_deduplicated(&self) {
-        self.deduplicated.fetch_add(1, Ordering::Relaxed);
+    /// Record a request served without a fresh upstream attempt: a response
+    /// cache hit, a single-flight join, or an idempotent replay (plan 06).
+    pub fn record_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Take an approximate point-in-time snapshot of all counters.
@@ -144,7 +145,7 @@ impl Metrics {
         let requests_failed = self.requests_failed.load(Ordering::Relaxed);
         let upstream_calls = self.upstream_calls.load(Ordering::Relaxed);
         let rate_limited = self.rate_limited.load(Ordering::Relaxed);
-        let deduplicated = self.deduplicated.load(Ordering::Relaxed);
+        let cache_hits = self.cache_hits.load(Ordering::Relaxed);
         let client_cancelled = self.client_cancelled.load(Ordering::Relaxed);
 
         let latencies = self
@@ -170,7 +171,7 @@ impl Metrics {
             requests_failed,
             upstream_calls,
             rate_limited,
-            deduplicated,
+            cache_hits,
             client_cancelled,
             latencies,
             model_counts,
@@ -202,8 +203,9 @@ pub struct Snapshot {
     pub upstream_calls: i64,
     /// Requests rejected by the rate limiter.
     pub rate_limited: i64,
-    /// Requests that were deduplicated before reaching upstream.
-    pub deduplicated: i64,
+    /// Requests served without a fresh upstream attempt: a response cache
+    /// hit, a single-flight join, or an idempotent replay.
+    pub cache_hits: i64,
     /// Requests whose client disconnected (or were torn down by the timeout
     /// layer) mid-stream; tracked separately from `requests_failed`.
     pub client_cancelled: i64,
@@ -237,6 +239,145 @@ impl Snapshot {
     pub fn calculate_p99(&self) -> Duration {
         percentile(&self.latencies, 99.0)
     }
+
+    /// Render the snapshot in the Prometheus text exposition format
+    /// (format version 0.0.4): every counter as a `_total` counter, the
+    /// latency samples as a summary with 0.5/0.95/0.99 quantiles, and the
+    /// per-provider-model request counts as a labeled counter family.
+    /// Attribute values are escaped per the exposition spec.
+    #[must_use]
+    pub fn to_prometheus_text(&self) -> String {
+        let mut out = String::with_capacity(2048);
+        let counter = |name: &str, help: &str, value: i64, out: &mut String| {
+            out.push_str("# HELP ");
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(help);
+            out.push_str("\n# TYPE ");
+            out.push_str(name);
+            out.push_str(" counter\n");
+            out.push_str(name);
+            out.push(' ');
+            // i64 formats exactly; no float precision loss for counters.
+            out.push_str(&value.to_string());
+            out.push('\n');
+        };
+        counter(
+            "llm_proxy_requests_total",
+            "Requests received (streaming and non-streaming).",
+            self.requests_received,
+            &mut out,
+        );
+        counter(
+            "llm_proxy_requests_streamed_total",
+            "Requests that asked for a stream.",
+            self.requests_streamed,
+            &mut out,
+        );
+        counter(
+            "llm_proxy_requests_success_total",
+            "Requests that completed successfully.",
+            self.requests_success,
+            &mut out,
+        );
+        counter(
+            "llm_proxy_requests_failed_total",
+            "Requests that failed (genuine upstream/decode failures).",
+            self.requests_failed,
+            &mut out,
+        );
+        counter(
+            "llm_proxy_upstream_calls_total",
+            "Calls made to upstream providers.",
+            self.upstream_calls,
+            &mut out,
+        );
+        counter(
+            "llm_proxy_rate_limited_total",
+            "Requests rejected by the rate limiter.",
+            self.rate_limited,
+            &mut out,
+        );
+        counter(
+            "llm_proxy_cache_hits_total",
+            "Requests served without a fresh upstream attempt (cache hit, single-flight join, idempotent replay).",
+            self.cache_hits,
+            &mut out,
+        );
+        counter(
+            "llm_proxy_client_cancelled_total",
+            "Requests whose client disconnected or was torn down mid-stream.",
+            self.client_cancelled,
+            &mut out,
+        );
+
+        out.push_str("# HELP llm_proxy_request_latency_seconds Request latency.\n");
+        out.push_str("# TYPE llm_proxy_request_latency_seconds summary\n");
+        let quantiles = [
+            ("0.5", self.calculate_percentile(50.0)),
+            ("0.95", self.calculate_p95()),
+            ("0.99", self.calculate_p99()),
+        ];
+        for (label, value) in quantiles {
+            out.push_str(&format!(
+                "llm_proxy_request_latency_seconds{{quantile=\"{label}\"}} {}\n",
+                seconds(value)
+            ));
+        }
+        let sum: Duration = self.latencies.iter().sum();
+        out.push_str(&format!(
+            "llm_proxy_request_latency_seconds_sum {}\n",
+            seconds(sum)
+        ));
+        out.push_str(&format!(
+            "llm_proxy_request_latency_seconds_count {}\n",
+            i64::try_from(self.latencies.len()).unwrap_or(i64::MAX),
+        ));
+
+        out.push_str(
+            "# HELP llm_proxy_model_requests_total Requests served per provider and model.\n",
+        );
+        out.push_str("# TYPE llm_proxy_model_requests_total counter\n");
+        for (key, value) in &self.model_counts {
+            // Key format is "{provider}:{model}" (KEY_SEPARATOR); split at the
+            // first separator so a model id containing ':' stays whole.
+            let (provider, model) = key.split_once(KEY_SEPARATOR).unwrap_or((key.as_str(), ""));
+            out.push_str(&format!(
+                "llm_proxy_model_requests_total{{provider=\"{}\",model=\"{}\"}} {}\n",
+                escape_label(provider),
+                escape_label(model),
+                (*value)
+            ));
+        }
+        out
+    }
+}
+
+/// A duration as fractional seconds for the exposition format.
+fn seconds(duration: Duration) -> String {
+    let nanos = duration.as_nanos();
+    let secs = (nanos / 1_000_000_000).to_string();
+    let frac = (nanos % 1_000_000_000).to_string();
+    if frac == "0" {
+        format!("{secs}.0")
+    } else {
+        format!("{secs}.{}", {
+            let mut padded = frac;
+            while padded.len() < 9 {
+                padded.insert(0, '0');
+            }
+            padded.trim_end_matches('0').to_owned()
+        })
+    }
+}
+
+/// Escapes a label value per the exposition spec: backslash, double quote
+/// and line feeds.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn percentile(samples: &[Duration], pct: f64) -> Duration {
@@ -273,7 +414,7 @@ mod tests {
         assert_eq!(snap.requests_failed, 0);
         assert_eq!(snap.upstream_calls, 0);
         assert_eq!(snap.rate_limited, 0);
-        assert_eq!(snap.deduplicated, 0);
+        assert_eq!(snap.cache_hits, 0);
         assert_eq!(snap.client_cancelled, 0);
         assert!(snap.latencies.is_empty());
         assert!(snap.model_counts.is_empty());
@@ -350,16 +491,16 @@ mod tests {
     }
 
     #[test]
-    fn record_rate_limited_and_deduplicated() {
+    fn record_rate_limited_and_cache_hit() {
         let m = Metrics::new();
         m.record_rate_limited();
         m.record_rate_limited();
         m.record_rate_limited();
-        m.record_deduplicated();
+        m.record_cache_hit();
 
         let snap = m.get_snapshot();
         assert_eq!(snap.rate_limited, 3);
-        assert_eq!(snap.deduplicated, 1);
+        assert_eq!(snap.cache_hits, 1);
     }
 
     #[test]
@@ -423,7 +564,7 @@ mod tests {
                 m.record_rate_limited();
             }
             if i % 7 == 0 {
-                m.record_deduplicated();
+                m.record_cache_hit();
             }
         }
 
@@ -446,6 +587,96 @@ mod tests {
         let snap = m.get_snapshot();
         assert_eq!(snap.requests_received, 2000);
         assert_eq!(snap.requests_success + snap.requests_failed, 2000);
+    }
+
+    #[test]
+    fn prometheus_exposition_carries_every_counter_with_types() {
+        let m = Metrics::new();
+        m.record_request(true);
+        m.record_request(false);
+        m.record_success("openai", "gpt-4o", Duration::from_millis(120));
+        m.record_failure();
+        m.record_rate_limited();
+        m.record_cache_hit();
+        m.record_client_cancel();
+        let text = m.get_snapshot().to_prometheus_text();
+
+        for (name, expected) in [
+            ("llm_proxy_requests_total", "2"),
+            ("llm_proxy_requests_streamed_total", "1"),
+            ("llm_proxy_requests_success_total", "1"),
+            ("llm_proxy_requests_failed_total", "1"),
+            ("llm_proxy_upstream_calls_total", "2"),
+            ("llm_proxy_rate_limited_total", "1"),
+            ("llm_proxy_cache_hits_total", "1"),
+            ("llm_proxy_client_cancelled_total", "1"),
+        ] {
+            let line = format!("{name} {expected}");
+            assert!(
+                text.contains(&line),
+                "exposition must carry {name} {expected}:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("# TYPE {name} counter")),
+                "exposition must type {name} as counter:\n{text}"
+            );
+            assert!(
+                text.contains(&format!("# HELP {name} ")),
+                "exposition must document {name}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn prometheus_exposition_renders_latency_quantiles_and_model_labels() {
+        let m = Metrics::new();
+        for i in 0..100 {
+            m.record_success("prov-a", "model:x", Duration::from_millis(i));
+        }
+        m.record_success("prov-b", "gpt-4o", Duration::from_millis(5));
+        let text = m.get_snapshot().to_prometheus_text();
+
+        assert!(
+            text.contains("# TYPE llm_proxy_request_latency_seconds summary"),
+            "latency must be a summary:\n{text}"
+        );
+        for quantile in ["0.5", "0.95", "0.99"] {
+            assert!(
+                text.contains(&format!("quantile=\"{quantile}\"")),
+                "quantile {quantile} missing:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("llm_proxy_request_latency_seconds_count 101"),
+            "the sample count must reflect every recorded latency:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "llm_proxy_model_requests_total{provider=\"prov-a\",model=\"model:x\"} 100"
+            ),
+            "provider/model labels must carry the counts:\n{text}"
+        );
+        assert!(
+            text.contains("llm_proxy_model_requests_total{provider=\"prov-b\",model=\"gpt-4o\"} 1"),
+            "provider/model labels must carry the counts:\n{text}"
+        );
+    }
+
+    #[test]
+    fn prometheus_exposition_escapes_label_values() {
+        let snapshot = Snapshot {
+            model_counts: HashMap::from([("weird\\".to_owned() + "prov:\"model\nline", 1)]),
+            ..Snapshot::default()
+        };
+        let text = snapshot.to_prometheus_text();
+        assert!(
+            text.contains("provider=\"weird\\\\prov\""),
+            "backslash must be escaped: {text}"
+        );
+        assert!(
+            !text.contains("\nline"),
+            "a raw newline inside a label value would corrupt the exposition: {text:?}"
+        );
     }
 
     #[test]

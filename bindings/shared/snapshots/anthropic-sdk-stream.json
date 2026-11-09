@@ -1,0 +1,107 @@
+{
+  "error": null,
+  "response": null,
+  "stream_events": [
+    {
+      "MessageStart": {
+        "id": "msg_s",
+        "model": {
+          "requested": "claude-sonnet-4-5",
+          "upstream": "claude-sonnet-4-5-20250929"
+        }
+      }
+    },
+    {
+      "ContentStart": {
+        "index": 0,
+        "kind": "Text"
+      }
+    },
+    {
+      "TextDelta": {
+        "index": 0,
+        "text": "hi"
+      }
+    },
+    {
+      "UsageDelta": {
+        "usage": {
+          "cache_creation_input_tokens": null,
+          "cache_read_input_tokens": null,
+          "input_tokens": 10,
+          "output_tokens": 2,
+          "provenance": "ProviderReported",
+          "reasoning_tokens": null
+        }
+      }
+    },
+    {
+      "MessageStop": {
+        "stop_reason": "EndTurn",
+        "stop_sequence": null
+      }
+    }
+  ],
+  "upstream_headers": {
+    "authorization": "Bearer operator-anthropic-key",
+    "content-type": "application/json"
+  },
+  "upstream_request": {
+    "max_tokens": 1024,
+    "messages": [
+      {
+        "content": "Summarize.",
+        "role": "user"
+      }
+    ],
+    "metadata": {
+      "user_id": "user_capture_fixture"
+    },
+    "model": "claude-sonnet-4-5-20250929",
+    "stop_sequences": [
+      "\n\nHuman:"
+    ],
+    "stream": true,
+    "system": [
+      {
+        "cache_control": {
+          "ttl": "1h",
+          "type": "ephemeral"
+        },
+        "text": "You are a terse weather assistant.",
+        "type": "text"
+      }
+    ],
+    "temperature": 0.1,
+    "tool_choice": {
+      "disable_parallel_tool_use": true,
+      "type": "auto"
+    },
+    "tools": [
+      {
+        "description": "Get the current weather for a city.",
+        "input_schema": {
+          "properties": {
+            "city": {
+              "type": "string"
+            },
+            "unit": {
+              "enum": [
+                "C",
+                "F"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ],
+          "type": "object"
+        },
+        "name": "get_weather"
+      }
+    ],
+    "top_k": 40,
+    "top_p": 0.9
+  }
+}

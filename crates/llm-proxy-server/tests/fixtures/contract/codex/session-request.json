@@ -1,0 +1,83 @@
+{
+  "model": "gpt-5.1-codex",
+  "instructions": "You are a coding agent running in the Codex CLI. You have tools to read files, run shell commands, and apply patches. Prefer the smallest change that solves the task.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "<environment_context>\nWorking directory: /home/user/repo\nIs a git repo: true\nPlatform: linux\n</environment_context>\n\nFind the failing test and fix it."
+        }
+      ]
+    },
+    {
+      "type": "reasoning",
+      "id": "rs_fixture_0001",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "Run the test suite to see the failure first."
+        }
+      ],
+      "encrypted_content": "gAAAAABfixture_encrypted_reasoning_not_real"
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_fixture_0001",
+      "name": "shell",
+      "arguments": "{\"command\":[\"cargo\",\"test\",\"-p\",\"demo\"],\"workdir\":\"/home/user/repo\",\"timeout_ms\":120000}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_fixture_0001",
+      "output": "test parse::tests::flags ... FAILED\nfailures:\n        parse::tests::flags\ntest result: FAILED. 41 passed; 1 failed"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "shell",
+      "description": "Runs a shell command inside the repo working directory.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "workdir": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+          "timeout_ms": { "anyOf": [{ "type": "integer" }, { "type": "null" }] }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "function",
+      "name": "apply_patch",
+      "description": "Apply a patch to the files in the working directory.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "patch": { "type": "string" }
+        },
+        "required": ["patch"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "store": false,
+  "include": ["reasoning.encrypted_content"],
+  "prompt_cache_key": "fixture-session-7f3a",
+  "stream": true
+}

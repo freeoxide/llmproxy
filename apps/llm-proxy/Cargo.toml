@@ -1,5 +1,5 @@
 [package]
-name = "llm-proxy"
+name = "llm-proxy-app"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -21,19 +21,57 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Replica-shared stores (plan 09 step 1): `[replica]` in config refuses to
+# start without the matching feature.
+store-redis = ["dep:llm-proxy-store-redis"]
+store-postgres = ["dep:llm-proxy-store-postgres"]
+# The admin surface (plan 09 steps 2-3): key management, usage and config
+# views, the web UI and MCP tools on the dedicated admin listener.
+admin-ui = ["dep:llm-proxy-admin"]
+# The semantic response cache (plan 09 step 5).
+semantic-cache = ["llm-proxy-server/semantic-cache"]
+# The MCP gateway (plan 09 step 6): `[mcp]` starts it on its own
+# listener with its own tokens.
+mcp-gateway = ["dep:llm-proxy-mcp"]
+# The non-chat endpoint families (plan 09 step 7): embeddings, rerank,
+# audio, images, files and batches. Provider routes naming a family
+# refuse to start without it.
+endpoint-families = ["llm-proxy-server/endpoint-families"]
+
 [dependencies]
-llm-proxy-server = { workspace = true }
+llm-proxy-server = { workspace = true, features = ["admin"] }
+
+# OTel OTLP metric export (plan 07 step 7, backlog 21). The blocking reqwest
+# client carries its own reactor thread, which is what the SDK's thread-based
+# PeriodicReader needs.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-json", "reqwest-blocking-client", "metrics"] }
+secrecy = { workspace = true }
 llm-proxy-core = { workspace = true }
-llm-proxy-provider = { path = "../../crates/llm-proxy-provider" }
-llm-proxy-storage = { path = "../../crates/llm-proxy-storage" }
+llm-proxy-adapters = { workspace = true }
+llm-proxy-transport = { workspace = true }
+llm-proxy-engine = { workspace = true }
+llm-proxy-storage = { workspace = true, features = ["sqlite"] }
+llm-proxy-store-redis = { workspace = true, optional = true }
+llm-proxy-store-postgres = { workspace = true, optional = true }
+llm-proxy-admin = { workspace = true, optional = true }
+llm-proxy-mcp = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -44,7 +82,13 @@ vergen-gix = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1.42", features = ["yaml", "filters"] }
-llm-proxy-protocol = { path = "../../crates/llm-proxy-protocol" }
+axum = { workspace = true }
+tokio = { workspace = true }
+llm-proxy-protocol = { workspace = true }
 secrecy = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+# The in-process RESP2 server for the replica-arm runtime test
+# (tests/redis_replica_managed_keys.rs); test-only, never enabled in
+# production builds.
+llm-proxy-store-redis = { workspace = true, features = ["test-server"] }
 tempfile = "3"
-toml = { workspace = true }

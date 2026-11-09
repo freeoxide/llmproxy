@@ -20,19 +20,26 @@ jobs:
 
       - name: Lint inheritance
         run: |
-          for f in $(find . -name Cargo.toml -not -path './target/*' -not -path './ref/*' -not -path './Cargo.toml'); do
+          # bindings/{node,python} are standalone workspace roots packaged by
+          # napi/maturin; they cannot inherit the root workspace's lints.
+          for f in $(find . -name Cargo.toml -not -path './target/*' -not -path './ref/*' -not -path './bindings/node/Cargo.toml' -not -path './bindings/python/Cargo.toml' -not -path './Cargo.toml'); do
             grep -q 'workspace = true' "$f" || { echo "Missing [lints] workspace = true in $f"; exit 1; }
           done
 
       - name: Test
         run: cargo test --workspace --all-features
 
+      # The SDK's documented server-less embedding configuration
+      # (`--no-default-features`): its test targets must compile there too.
+      - name: SDK without default features
+        run: cargo test -p llm-proxy-sdk --no-default-features --locked
+
       - name: Locked build
         run: cargo build --locked
 
   # Replaces the rustc `unused_crate_dependencies` lint, which cannot
   # distinguish a genuinely unused dependency from one that a sibling
-  # compilation target of the same crate uses. cargo-shear analyses the
+  # compilation target of that crate uses. cargo-shear analyses the
   # whole workspace and does not have that false-positive mode.
   unused-deps:
     runs-on: ubuntu-latest
@@ -46,3 +53,71 @@ jobs:
       # rustc 1.98, above the 1.96.1 toolchain pinned above. Bump both together.
       - run: cargo install cargo-shear --locked --version 1.13.0
       - run: cargo shear
+
+  # The macOS leg of the plan-10 done-when line (`pip install` and `npm
+  # install` work on each platform with no Rust toolchain): builds the
+  # universal2 artifacts on a macOS runner, installs the wheel and the
+  # packed npm tarball (no Rust involved in either install), and runs both
+  # binding contract suites against them. The Linux artifacts are exercised
+  # by the same suites locally; Windows via wine (see the package READMEs).
+  bindings-macos:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build the universal2 wheel and run the Python suite against the install
+        working-directory: bindings/python
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install maturin
+          .venv/bin/maturin build --release --target universal2-apple-darwin -o dist
+          python -m venv .venv-test
+          .venv-test/bin/pip install dist/llm_proxy-*.whl pytest
+          .venv-test/bin/python -m pytest tests -q
+
+      - name: Run the Node suite against the darwin-universal binary
+        working-directory: bindings/node
+        run: |
+          npm ci
+          # Generates binding.js/binding.d.ts and the host arm64 slice.
+          npx napi build --platform --release --js binding.js --dts binding.d.ts
+          cargo build --release --target x86_64-apple-darwin
+          lipo -create -output llm-proxy.darwin-universal.node \
+            target/release/libllm_proxy_node.dylib \
+            target/x86_64-apple-darwin/release/libllm_proxy_node.dylib
+          node --test test/
+
+      - name: npm install of the packed tarball loads the binary, no Rust toolchain
+        working-directory: bindings/node
+        run: |
+          npm pack
+          smoke_dir="${RUNNER_TEMP}/npm-smoke"
+          mkdir -p "${smoke_dir}"
+          cd "${smoke_dir}"
+          npm init -y >/dev/null
+          npm install "${GITHUB_WORKSPACE}/bindings/node/freeoxide-llm-proxy-0.1.0.tgz"
+          node -e "
+            const { Proxy } = require('@freeoxide/llm-proxy');
+            const proxy = new Proxy({ providers: [{
+              name: 'x', api_key: 'k', auth_style: 'bearer',
+              adapters: { a: { protocol: 'anthropic_messages',
+                               endpoint: 'http://127.0.0.1:9/v1/messages' } },
+              routes: { messages: 'a' },
+            }] });
+            const out = proxy.translateRequest(
+              { model: 'claude-sonnet-4-5', max_tokens: 8,
+                messages: [{ role: 'user', content: 'hi' }] },
+              'anthropic_messages', 'openai_chat_completions');
+            if (!out || out.model !== 'claude-sonnet-4-5') process.exit(1);
+          "

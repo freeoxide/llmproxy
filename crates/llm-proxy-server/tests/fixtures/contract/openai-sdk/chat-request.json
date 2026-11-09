@@ -1,0 +1,57 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    { "role": "system", "content": "You extract structured data." },
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Extract the invoice total as JSON." },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    }
+  ],
+  "max_completion_tokens": 1024,
+  "temperature": 0.2,
+  "top_p": 0.9,
+  "frequency_penalty": 0.1,
+  "presence_penalty": 0.2,
+  "logit_bias": { "50256": -100 },
+  "logprobs": true,
+  "n": 1,
+  "parallel_tool_calls": false,
+  "prompt_cache_key": "invoice-extraction-v1",
+  "reasoning_effort": "medium",
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "invoice_total",
+      "schema": { "type": "object", "properties": { "total": { "type": "number" } } }
+    }
+  },
+  "seed": 7,
+  "service_tier": "flex",
+  "store": false,
+  "stop": ["\n\n"],
+  "stream": false,
+  "stream_options": { "include_usage": false },
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_currency",
+        "description": "Look up a currency symbol.",
+        "parameters": {
+          "type": "object",
+          "properties": { "code": { "type": "string" } }
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "user": "sdk-user-42"
+}

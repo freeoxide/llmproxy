@@ -13,13 +13,14 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use axum::routing::post;
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AdminAuthConfig, AppConfig, AuthMode, AuthStyle, ProviderAdapterConfig, ProviderConfig,
         ProviderRegistry, ProviderRoutesConfig, ServerConfig, StorageConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, ClientAuth, admin_router, build_router};
     use llm_proxy_storage::{EventBus, ProxyEvent, RecordingBus, SqliteEventBus};
+    use llm_proxy_transport::ProxyClient;
     use tower::ServiceExt;
 
     const LAPTOP_TOKEN: &str = "prx6-laptop-client-token-4f1a9c73";
@@ -71,7 +72,7 @@ mod tests {
             let phc = cheap_phc(token, salt.as_bytes());
             clients.insert(
                 (*key_id).to_owned(),
-                secrecy::SecretString::from(phc.clone()),
+                llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc.clone())),
             );
             phcs.push(phc);
         }
@@ -87,6 +88,7 @@ mod tests {
     fn admin_config() -> AdminAuthConfig {
         AdminAuthConfig {
             token: secrecy::SecretString::from(ADMIN_TOKEN),
+            key_store: None,
         }
     }
 
@@ -101,6 +103,8 @@ mod tests {
             api_key: secrecy::SecretString::from(PROVIDER_KEY),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut adapters = HashMap::new();
@@ -110,6 +114,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 adapters
@@ -117,11 +123,15 @@ mod tests {
             routes: ProviderRoutesConfig {
                 messages: Some("main".to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: HashMap::new(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         AppState::new(
@@ -136,10 +146,17 @@ mod tests {
                     server_name: "secret-abuse-test".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::ZERO,
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: on_main,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: llm_proxy_core::AuthConfig {
                     mode: AuthMode::None,
@@ -152,6 +169,8 @@ mod tests {
                     max_rows: None,
                     prune_interval: Duration::from_secs(3600),
                 }),
+                replica: None,
+                mcp: None,
             },
             ProviderRegistry::from_providers(vec![provider]).expect("registry builds"),
             ProviderAdapterRegistry::builtin(),
@@ -620,6 +639,7 @@ mod tests {
                 },
                 streaming: false,
                 body_hash: "seed-digest".to_owned(),
+                session_id: None,
             },
         ));
         close_ledger(Arc::clone(&bus)).await;

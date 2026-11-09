@@ -15,15 +15,15 @@ mod tests {
     use time::OffsetDateTime;
     use tower::ServiceExt;
 
-    const ADMIN_TOKEN: &str = "test-admin-token";
+    pub(super) const ADMIN_TOKEN: &str = "test-admin-token";
 
-    struct Ledger {
+    pub(super) struct Ledger {
         _dir: tempfile::TempDir,
-        path: std::path::PathBuf,
+        pub(super) path: std::path::PathBuf,
         t0: OffsetDateTime,
     }
 
-    fn received_event(
+    pub(super) fn received_event(
         id: &str,
         caller: &str,
         provider: &str,
@@ -43,10 +43,11 @@ mod tests {
             },
             streaming: true,
             body_hash: format!("sha256-digest-{id}"),
+            session_id: None,
         })
     }
 
-    fn completed_event(
+    pub(super) fn completed_event(
         id: &str,
         provider: &str,
         model: &str,
@@ -80,10 +81,25 @@ mod tests {
             }),
             stop_reason: StopReason::EndTurn,
             latency_ms: 4321,
+            credential_id: None,
+            cache_hit: false,
         })
     }
 
-    fn failed_event(id: &str, provider: Option<&str>, ts: OffsetDateTime) -> ProxyEvent {
+    fn completed_event_without_cost(
+        id: &str,
+        provider: &str,
+        model: &str,
+        ts: OffsetDateTime,
+    ) -> ProxyEvent {
+        let mut event = completed_event(id, provider, model, ts, "0");
+        if let ProxyEvent::ResponseCompleted(done) = &mut event {
+            done.cost = None;
+        }
+        event
+    }
+
+    pub(super) fn failed_event(id: &str, provider: Option<&str>, ts: OffsetDateTime) -> ProxyEvent {
         ProxyEvent::ResponseFailed(ResponseFailed {
             request_id: id.to_owned(),
             timestamp: ts,
@@ -96,7 +112,7 @@ mod tests {
         })
     }
 
-    async fn seed() -> Ledger {
+    pub(super) async fn seed() -> Ledger {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("usage.db");
         let bus = SqliteEventBus::open(
@@ -130,6 +146,15 @@ mod tests {
             ),
             received_event("req-3", "phone", "prov-b", "claude-3", t0 + second * 2),
             failed_event("req-3", Some("prov-b"), t0 + second * 6),
+            // prov-free serves usage with no pricing entry: unpriced.
+            received_event(
+                "req-4",
+                "tablet",
+                "prov-free",
+                "free-model",
+                t0 + second / 2,
+            ),
+            completed_event_without_cost("req-4", "prov-free", "free-model", t0 + second / 2),
             failed_event("orphan-1", None, t0 + second * 3),
             received_event(
                 "old-1",
@@ -160,8 +185,95 @@ mod tests {
         }
     }
 
-    fn app_for(path: &std::path::Path) -> axum::Router {
+    pub(super) fn app_for(path: &std::path::Path) -> axum::Router {
         llm_proxy_api::UsageApi::new(path.to_owned(), ADMIN_TOKEN).router()
+    }
+
+    /// Seeds a ledger with one priced completion and two served copies of it
+    /// (cache hits: usage kept for the record, no cost), for the summary's
+    /// served-copy accounting.
+    async fn seed_with_served_copies() -> Ledger {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(
+            &path,
+            llm_proxy_storage::RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                prune_every: std::time::Duration::from_secs(3600),
+            },
+        )
+        .expect("open ledger");
+        let t0 = OffsetDateTime::now_utc();
+        let second = std::time::Duration::from_secs(1);
+        let mut events = vec![
+            received_event("orig", "laptop", "prov-a", "claude-3", t0),
+            completed_event(
+                "orig",
+                "prov-a",
+                "claude-3",
+                t0 + second,
+                "0.1000000000000000000000001",
+            ),
+        ];
+        for (id, offset) in [("copy-1", 2), ("copy-2", 3)] {
+            events.push(received_event(
+                id,
+                "laptop",
+                "prov-a",
+                "claude-3",
+                t0 + second * offset,
+            ));
+            let mut served = completed_event(id, "prov-a", "claude-3", t0 + second * offset, "0");
+            if let ProxyEvent::ResponseCompleted(done) = &mut served {
+                done.cost = None;
+                done.cache_hit = true;
+            }
+            events.push(served);
+        }
+        for event in &events {
+            bus.emit(event);
+        }
+        let closer = std::sync::Arc::new(bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close joined");
+        Ledger {
+            _dir: dir,
+            path,
+            t0,
+        }
+    }
+
+    #[tokio::test]
+    async fn served_copies_never_inflate_tokens_cost_or_unpriced_counts() {
+        // Plan 05 step 6: cache hits charge nothing and are recorded as
+        // hits. One upstream call served to three requests must show one
+        // call's tokens and cost, two hits, and no unpriced completions.
+        let ledger = seed_with_served_copies().await;
+        let (status, body) = get_json(
+            app_for(&ledger.path),
+            "/usage/summary?group_by=provider",
+            Some(ADMIN_TOKEN),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let group = &body["groups"][0];
+        assert_eq!(group["requests"], 3, "every served request is a request");
+        assert_eq!(group["cache_hits"], 2);
+        assert_eq!(
+            group["tokens"]["input"], 100,
+            "one upstream call's tokens, not three"
+        );
+        assert_eq!(group["tokens"]["output"], 50);
+        assert_eq!(
+            group["cost"]["total"], "0.1000000000000000000000001",
+            "one upstream call's cost, not three"
+        );
+        assert_eq!(
+            group["unpriced"], 0,
+            "a served copy has no cost by design; it is not an unpriced completion"
+        );
     }
 
     async fn get_json(app: axum::Router, uri: &str, token: Option<&str>) -> (StatusCode, Value) {
@@ -208,6 +320,51 @@ mod tests {
         }
     }
 
+    /// Backlog 37: every admin API response — successes and the 401 refusal
+    /// alike — must forbid intermediary caching. A CDN that caches an
+    /// authenticated response turns the token check into a one-time check.
+    #[tokio::test]
+    async fn every_admin_response_forbids_caching() {
+        let ledger = seed().await;
+        for path in ["/usage/summary", "/usage/requests", "/usage/keys"] {
+            for token in [Some(ADMIN_TOKEN), Some("wrong-token"), None] {
+                let app = app_for(&ledger.path);
+                let builder = Request::builder().uri(path);
+                let builder = match token {
+                    Some(token) => builder.header("authorization", format!("Bearer {token}")),
+                    None => builder,
+                };
+                let response = app
+                    .oneshot(builder.body(Body::empty()).expect("request builds"))
+                    .await
+                    .expect("oneshot");
+                let status = response.status();
+                let cache_control = response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                let pragma = response
+                    .headers()
+                    .get("pragma")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                assert!(
+                    status.is_success() || status == StatusCode::UNAUTHORIZED,
+                    "{path}: unexpected status {status}"
+                );
+                assert_eq!(
+                    cache_control, "no-store",
+                    "{path} ({status}) must carry Cache-Control: no-store, got {cache_control:?}"
+                );
+                assert_eq!(
+                    pragma, "no-cache",
+                    "{path} ({status}) must carry Pragma: no-cache, got {pragma:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn summary_groups_by_provider_with_exact_decimal_costs() {
         let ledger = seed().await;
@@ -251,6 +408,20 @@ mod tests {
         let prov_b = find("prov-b");
         assert_eq!(prov_b["requests"], 1);
         assert_eq!(prov_b["errors"], 1);
+
+        // BUG-24: usage on an unpriced model is an explicit unpriced state,
+        // never a silent $0.
+        let prov_free = find("prov-free");
+        assert_eq!(prov_free["requests"], 1);
+        assert!(
+            prov_free["cost"].is_null(),
+            "a group of unpriced rows must report null cost, got {}",
+            prov_free["cost"]
+        );
+        assert_eq!(prov_free["unpriced"], 1);
+        assert_eq!(prov_free["cache_hits"], 0);
+        // Priced groups stay priced, with the same exact decimals as before.
+        assert_eq!(prov_a["unpriced"], 0);
 
         let null_group = groups
             .iter()
@@ -440,7 +611,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            vec!["req-3", "req-2", "req-1", "old-1"],
+            vec!["req-3", "req-2", "req-4", "req-1", "old-1"],
             "until is exclusive on the ledger time axis (orphan-1 at t0+3s is out)"
         );
 
@@ -554,7 +725,7 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            vec!["<null>", "phone", "laptop"],
+            vec!["<null>", "phone", "laptop", "tablet"],
             "caller ordering follows last-seen timestamps, null caller included"
         );
     }
@@ -608,5 +779,205 @@ mod tests {
         tokio::task::spawn_blocking(move || closer.close())
             .await
             .expect("close joined");
+    }
+}
+
+#[cfg(test)]
+mod metrics_route {
+    use super::tests::ADMIN_TOKEN;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use llm_proxy_core::Metrics;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    /// Backlog 21: the admin surface serves the runtime counters as
+    /// Prometheus text, behind the admin token like every other route.
+    #[tokio::test]
+    async fn metrics_serves_prometheus_text_behind_the_admin_token() {
+        let ledger = super::tests::seed().await;
+        let metrics = Arc::new(Metrics::new());
+        metrics.record_request(false);
+        metrics.record_failure();
+        metrics.record_success("prov-a", "gpt-4o", Duration::from_millis(5));
+        let app = llm_proxy_api::UsageApi::new(ledger.path.clone(), ADMIN_TOKEN)
+            .with_metrics(Arc::clone(&metrics))
+            .router();
+
+        // No or wrong token: the same 401 as every other admin route.
+        for token in [None, Some("wrong-token")] {
+            let mut builder = Request::builder().uri("/metrics");
+            if let Some(token) = token {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).expect("request builds"))
+                .await
+                .expect("oneshot");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        // no-store applies here like everywhere on the admin surface.
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(
+            text.contains("llm_proxy_requests_total 1"),
+            "the scraped exposition carries the live counter: {text}"
+        );
+        assert!(
+            text.contains("llm_proxy_requests_failed_total 1"),
+            "the scraped exposition carries the live counter: {text}"
+        );
+        assert!(
+            text.contains(r#"llm_proxy_model_requests_total{provider="prov-a",model="gpt-4o"} 1"#),
+            "the scraped exposition carries per-model counts: {text}"
+        );
+    }
+
+    /// Without metrics attached there is no /metrics route at all: the
+    /// surface keeps its exact shape unless the operator's server wired one.
+    #[tokio::test]
+    async fn without_metrics_attached_the_route_does_not_exist() {
+        let ledger = super::tests::seed().await;
+        let app = llm_proxy_api::UsageApi::new(ledger.path, ADMIN_TOKEN).router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod in_flight_visibility {
+    use super::tests::{ADMIN_TOKEN, app_for, completed_event, failed_event, received_event};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use llm_proxy_storage::{EventBus, RetentionPolicy, SqliteEventBus};
+    use serde_json::Value;
+    use std::time::Duration;
+    use time::OffsetDateTime;
+    use tower::ServiceExt;
+
+    /// Backlog 27: /usage/requests already returns rows written at
+    /// RequestReceived; now each row says which state it is in, and
+    /// in-flight rows carry elapsed time measured at query time.
+    #[tokio::test]
+    async fn request_rows_report_state_and_in_flight_elapsed_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(
+            &path,
+            RetentionPolicy {
+                max_age: None,
+                max_rows: None,
+                prune_every: Duration::from_secs(3600),
+            },
+        )
+        .expect("open ledger");
+        let t0 = OffsetDateTime::now_utc();
+        let second = Duration::from_secs(1);
+
+        // A request whose received row exists and never completed: in flight.
+        bus.emit(&received_event(
+            "live-1", "laptop", "prov-a", "claude-3", t0,
+        ));
+        // One that completed.
+        bus.emit(&received_event(
+            "done-1",
+            "laptop",
+            "prov-a",
+            "claude-3",
+            t0 + second,
+        ));
+        bus.emit(&completed_event(
+            "done-1",
+            "prov-a",
+            "claude-3",
+            t0 + 2 * second,
+            "0.5",
+        ));
+        // One that failed.
+        bus.emit(&received_event(
+            "sad-1",
+            "laptop",
+            "prov-a",
+            "claude-3",
+            t0 + 3 * second,
+        ));
+        bus.emit(&failed_event("sad-1", Some("prov-a"), t0 + 4 * second));
+        let closer = std::sync::Arc::new(bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close joined");
+
+        let app = app_for(&path);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/usage/requests")
+                    .header("authorization", format!("Bearer {ADMIN_TOKEN}"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("body is JSON");
+
+        let find = |id: &str| {
+            body["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["request_id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing from rows: {body}"))
+                .clone()
+        };
+        let live = find("live-1");
+        assert_eq!(live["state"], "in_flight", "row: {live}");
+        let elapsed = live["elapsed_ms"].as_i64().expect("elapsed is present");
+        assert!(
+            elapsed >= 0,
+            "elapsed time is measured at query time: {live}"
+        );
+        let done = find("done-1");
+        assert_eq!(done["state"], "completed", "row: {done}");
+        assert!(
+            done["elapsed_ms"].is_null(),
+            "settled rows carry latency_ms, not elapsed: {done}"
+        );
+        let sad = find("sad-1");
+        assert_eq!(sad["state"], "failed", "row: {sad}");
+        assert!(sad["elapsed_ms"].is_null(), "row: {sad}");
     }
 }

@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 pub struct CacheControl {
     /// Discriminator – typically `"ephemeral"`.
     pub r#type: String,
+    /// Cache lifetime such as `"5m"` or `"1h"`; absent on the OpenAI wire
+    /// shape but carried through core translation from Anthropic clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
 }
 
 impl CacheControl {
@@ -86,8 +90,10 @@ pub struct FunctionCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// `"system"`, `"user"`, `"assistant"`, or `"tool"`; empty when absent
-    /// (streaming deltas omit it). Known-role validation happens at decode.
-    #[serde(default)]
+    /// (streaming deltas omit it). Never serialized when empty so deltas do
+    /// not carry a bogus `"role": ""` field. Known-role validation happens
+    /// at decode.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub role: String,
     /// The content body: a plain string or an array of structured content
     /// parts (e.g. text/`image_url`); `serde_json::Value` accepts both forms.
@@ -243,15 +249,37 @@ pub struct UsageInfo {
     /// Prompt tokens that missed the cache.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_miss_tokens: Option<i32>,
+    /// OpenAI-documented prompt token breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// OpenAI-documented completion token breakdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
 
-fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+/// OpenAI `usage.prompt_tokens_details` breakdown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PromptTokensDetails {
+    /// Prompt tokens served from an OpenAI cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<i32>,
+}
+
+/// OpenAI `usage.completion_tokens_details` breakdown.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CompletionTokensDetails {
+    /// Completion tokens spent on reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<i32>,
+}
+
+fn deserialize_option_on_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de> + Default,
+    T: serde::Deserialize<'de>,
 {
     use serde::Deserialize as _;
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+    Option::<T>::deserialize(deserializer)
 }
 
 /// A single completion alternative inside a response or chunk; `message`
@@ -287,10 +315,14 @@ pub struct ChatCompletionResponse {
     /// Ordered list of completion alternatives.
     pub choices: Vec<Choice>,
     /// Token usage for this request. Some providers omit `usage` or send
-    /// `null` on 2xx; `#[serde(default)]` + `deserialize_default_on_null`
-    /// map both to zero token counts instead of a decode failure.
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
-    pub usage: UsageInfo,
+    /// `null` on 2xx; both decode as `None` so the caller can label the
+    /// usage as missing rather than as provider-reported zeros.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_option_on_null"
+    )]
+    pub usage: Option<UsageInfo>,
     /// Catch-all for provider-specific response fields; `#[serde(flatten)]`
     /// precludes `deny_unknown_fields`, so unknown fields are captured.
     #[serde(flatten)]
@@ -344,11 +376,85 @@ mod tests {
     fn cache_control_round_trip() {
         let cc = CacheControl {
             r#type: "ephemeral".into(),
+            ttl: None,
         };
         let json = serde_json::to_string(&cc).unwrap();
         assert_eq!(json, r#"{"type":"ephemeral"}"#);
         let back: CacheControl = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cc);
+    }
+
+    #[test]
+    fn cache_control_carries_ttl() {
+        let json = r#"{"type":"ephemeral","ttl":"1h"}"#;
+        let back: CacheControl = serde_json::from_str(json).unwrap();
+        assert_eq!(back.ttl.as_deref(), Some("1h"));
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn usage_info_parses_openai_token_details() {
+        let json = r#"{
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "total_tokens": 105,
+            "prompt_tokens_details": {"cached_tokens": 30},
+            "completion_tokens_details": {"reasoning_tokens": 2}
+        }"#;
+        let usage: UsageInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            usage.prompt_tokens_details.and_then(|d| d.cached_tokens),
+            Some(30)
+        );
+        assert_eq!(
+            usage
+                .completion_tokens_details
+                .and_then(|d| d.reasoning_tokens),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn response_usage_absent_or_null_decodes_as_none() {
+        for json in [
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[]}"#,
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[],"usage":null}"#,
+        ] {
+            let resp: ChatCompletionResponse = serde_json::from_str(json).unwrap();
+            assert!(resp.usage.is_none(), "usage must decode as None for {json}");
+        }
+    }
+
+    #[test]
+    fn stream_delta_role_is_not_serialized_when_empty() {
+        let chunk = ChatCompletionChunk {
+            id: "c".into(),
+            object: "chat.completion.chunk".into(),
+            created: 1,
+            model: "m".into(),
+            choices: vec![Choice {
+                index: 0,
+                message: None,
+                finish_reason: None,
+                delta: Some(ChatMessage {
+                    role: String::new(),
+                    content: serde_json::Value::String("hi".into()),
+                    reasoning_content: None,
+                    tool_calls: vec![],
+                    name: None,
+                    tool_call_id: None,
+                    cache_control: None,
+                    refusal: None,
+                    is_error: None,
+                }),
+            }],
+            usage: None,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(
+            !json.contains("\"role\":\"\""),
+            "delta must not carry role=\": {json}"
+        );
     }
 
     #[test]
@@ -395,6 +501,8 @@ mod tests {
             total_tokens: 150,
             prompt_cache_hit_tokens: Some(10),
             prompt_cache_miss_tokens: None,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
         };
         let json = serde_json::to_string(&usage).unwrap();
         let back: UsageInfo = serde_json::from_str(&json).unwrap();

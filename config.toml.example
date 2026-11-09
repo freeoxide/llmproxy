@@ -10,15 +10,19 @@ log_level = "info"
 # Structured log output: "plain" (default) or "json". Also settable via the
 # RUST_LOG_FORMAT env var, which wins at startup.
 # log_format = "plain"
+# Hot reload (plan 07): when true, SIGHUP (or `llm-proxy reload`) re-reads
+# the provider and pool files under providers/ and swaps them in without
+# dropping in-flight requests. Changes anywhere else — [server], [auth],
+# [storage] — are refused with a restart-required error naming the field,
+# instead of being half-applied. When false, reload signals are ignored.
 hot_reload = false
-# Requests per minute allowed per client IP. 0 disables rate limiting.
+# Requests per minute, keyed by the caller's client key id when
+# authenticated and by client IP otherwise. 0 disables rate limiting.
 # Direct loopback connections are exempt unless trust_forwarded_headers = true.
 rate_limit_rpm = 100
 # Use X-Forwarded-For / X-Real-IP for client identity. Enable only behind a
 # trusted reverse proxy that overwrites these headers.
 trust_forwarded_headers = false
-# Window for rejecting identical path/body requests. "0ms" disables dedup.
-dedup_window = "0ms"
 server_name = "llm-proxy"
 # Dedicated listener for the read-only admin /usage API. Only read when
 # [auth.admin] is configured. Defaults to "127.0.0.1" on the port after
@@ -33,6 +37,47 @@ server_name = "llm-proxy"
 # only (no dedicated socket) — the option for setups where a second port
 # is not available.
 # admin_on_main_listener = false
+
+# Context-window preflight. "warn" (default) logs when the request may
+# not fit; "enforce" also rejects (400), but only when the estimated
+# input exceeds the window by margin_tokens — estimates use chars/4 for
+# non-OpenAI models and never count tools or images, so marginal cases
+# only warn.
+[server.preflight]
+mode = "warn"
+margin_tokens = 512
+
+# Exact-match response cache (plan 06). Off by default: with it off the
+# proxy stores no prompt or response. When enabled, complete non-streaming
+# responses are stored in memory, keyed per caller (one caller's cached
+# response is never returned to another), for `ttl`; a hit is answered
+# without an upstream call and is recorded as a cache hit (nothing
+# charged). See docs/data-class-policy.md for what each opt-in stores.
+# [server.cache]
+# enabled = true
+# ttl = "10m"
+# max_entries = 1000
+
+# Metrics export (plan 07). The proxy's counters (requests, streams,
+# failures, upstream calls, rate limits, cache hits, cancellations,
+# latency quantiles, per-provider-model counts) are always kept in
+# process. The read-only admin listener serves them at /metrics in
+# Prometheus text format behind the admin token; this section adds an
+# opt-in OTLP push to a collector.
+# [server.metrics.otlp]
+# endpoint = "http://127.0.0.1:4318/v1/metrics"
+# interval = "60s"
+
+# Idempotency-Key replay (plan 06). Off by default: the header is ignored.
+# When enabled, a request carrying an "Idempotency-Key" header claims the
+# key before budget checks; a matching retry within `ttl` replays the
+# stored response (no second upstream call, nothing charged), and a
+# request arriving while the first is still in flight gets 409. Failures
+# are not stored, so a retry after a failure executes again.
+# [server.idempotency]
+# enabled = true
+# ttl = "24h"
+# max_entries = 1000
 
 # Client authentication for proxy routes.
 #
@@ -50,8 +95,37 @@ mode = "none"
 # [auth]
 # mode = "client-keys"
 #
+# Present each key as "<key-id>.<secret>", e.g.
+#   Authorization: Bearer laptop.2V7mZ9xQ4k...
+# The id prefix selects exactly one verifier, so a wrong token costs at
+# most one argon2 run regardless of how many keys exist. A bare secret
+# with no dot still works (checked against every key in turn), but its
+# lookup cost grows with the key count.
+#
 # [auth.clients]
 # laptop = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
+#
+# A key may instead be a table carrying its admission policy:
+#
+# [auth.clients.laptop]
+# verifier = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$..."
+# # Glob allowlists. A restricted key whose request names no model is
+# # refused (403) rather than passed through unattributed.
+# allow_models = ["claude-*", "gpt-4o"]
+# allow_providers = ["anthropic", "openai"]
+# [auth.clients.laptop.limits]
+# rpm = 60
+# tpm = 200_000
+# rpd = 5_000
+# [auth.clients.laptop.budget]
+# # Spend cap per UTC day. Requests reserve their estimated cost first
+# # (input estimate + max_tokens at the model's pricing), so concurrent
+# # requests cannot overspend it by more than what is reserved. A model
+# # with no pricing entry cannot be estimated: "reject" it (default) or
+# # reserve a fixed amount:
+# usd_per_day = "10.00"
+# # unestimatable = "reject"
+# # unestimatable = { reserve_usd = { usd = "0.50" } }
 
 # Usage ledger persistence. Absent (the default) disables persistence:
 # usage events go to an in-memory no-op sink and nothing is written to disk.

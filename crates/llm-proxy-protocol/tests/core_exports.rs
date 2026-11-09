@@ -152,6 +152,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "search".into(),
                     input: serde_json::json!({"query": "rust serde"}),
+                    signature: None,
                 },
             ],
             stop_reason: StopReason::ToolUse,

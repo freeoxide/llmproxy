@@ -15,8 +15,9 @@ use secrecy::SecretString;
 
 use crate::error::CoreError;
 use crate::provider_config::{
-    AuthStyle, ModelId, ModelPricing, ProviderConfig, ProviderRouteKind, StaticModelCatalogEntry,
-    endpoint_without_query, load_provider_config,
+    AuthStyle, ModelId, ModelPricing, PoolConfig, PoolFile, ProviderConfig, ProviderRouteKind,
+    StaticModelCatalogEntry, endpoint_without_query, load_provider_config,
+    validate_pool_config_against,
 };
 
 /// Typed failures from resolving a provider-scoped route.
@@ -88,6 +89,17 @@ pub struct ProviderAdapterTargetConfig {
     /// per request is a refcount bump, not a map clone. Downstream code that
     /// needs to mutate materializes an owned copy.
     pub headers: Arc<HashMap<String, String>>,
+    /// Resolved inbound-header forwarding allowlist for this route: the
+    /// configured names, or the protocol default
+    /// ([`crate::provider_config::default_forwarded_inbound_headers`]).
+    pub forward_inbound_headers: Arc<Vec<String>>,
+    /// Per-route `lossy` opt-in from the adapter config.
+    pub lossy: bool,
+    /// Prompt-cache hygiene for this provider (plan 06 steps 6-7): the
+    /// provider-edge edits — volatile-byte removal and marker injection —
+    /// applied last, after every other mutation phase. `Arc`-shared
+    /// straight from provider config.
+    pub prompt_cache: Option<Arc<crate::provider_config::PromptCacheConfig>>,
 }
 
 impl std::fmt::Debug for ProviderAdapterTargetConfig {
@@ -102,6 +114,9 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
             .field("requested_model", &self.requested_model)
             .field("upstream_model", &self.upstream_model)
             .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("forward_inbound_headers", &self.forward_inbound_headers)
+            .field("lossy", &self.lossy)
+            .field("prompt_cache", &self.prompt_cache)
             .finish()
     }
 }
@@ -122,27 +137,32 @@ impl std::fmt::Debug for ProviderAdapterTargetConfig {
 #[non_exhaustive]
 pub struct ProviderRegistry {
     providers: HashMap<String, ProviderConfig>,
+    pools: HashMap<String, PoolConfig>,
 }
 
 impl ProviderRegistry {
-    /// Load all provider TOML files from a directory.
+    /// Load all provider and pool TOML files from a directory.
     ///
-    /// Reads every `*.toml` file in `path`, parses each as a [`crate::provider_config::ProviderFile`],
-    /// and indexes them by provider name. Returns an error if:
+    /// Reads every `*.toml` file in `path`, parses each as a
+    /// [`crate::provider_config::ProviderFile`] (a `[provider]` table) or a
+    /// [`crate::provider_config::PoolFile`] (a `[pool]` table), and indexes
+    /// them by name. Returns an error if:
     ///
     /// - the directory cannot be read,
     /// - any TOML file cannot be parsed or fails validation,
-    /// - two files declare the same provider name (duplicate).
+    /// - two files declare the same provider name, the same pool name, or a
+    ///   name claimed by both a provider and a pool (duplicate).
     ///
     /// Protocol validation is performed separately via [`Self::validate_protocols`]
     /// after loading, typically by passing `ProviderAdapterRegistry::protocol_names()`.
+    /// Pool membership is validated here via [`Self::validate_pools`].
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::ProviderResolution`] for duplicate provider names.
-    /// Returns [`CoreError::ConfigLoad`], [`CoreError::ConfigParse`], or
-    /// [`CoreError::ConfigValidation`] for I/O, parse, or validation failures
-    /// in individual files.
+    /// Returns [`CoreError::ProviderResolution`] for duplicate names and
+    /// invalid pools. Returns [`CoreError::ConfigLoad`],
+    /// [`CoreError::ConfigParse`], or [`CoreError::ConfigValidation`] for
+    /// I/O, parse, or validation failures in individual files.
     pub fn load_from_dir(path: impl AsRef<Path>) -> Result<Self, CoreError> {
         let path = path.as_ref();
         let entries = std::fs::read_dir(path).map_err(|source| CoreError::ConfigLoad {
@@ -151,6 +171,7 @@ impl ProviderRegistry {
         })?;
 
         let mut providers: HashMap<String, ProviderConfig> = HashMap::new();
+        let mut pools: HashMap<String, PoolConfig> = HashMap::new();
         let mut source_paths: HashMap<String, std::path::PathBuf> = HashMap::new();
 
         let mut sorted_entries: Vec<_> =
@@ -191,6 +212,43 @@ impl ProviderRegistry {
                 continue;
             }
 
+            let raw =
+                std::fs::read_to_string(&file_path).map_err(|source| CoreError::ConfigLoad {
+                    path: file_path.clone(),
+                    source,
+                })?;
+            // A `[pool]` table names this file a pool definition; anything
+            // else parses as a provider file.
+            let looks_like_pool = raw
+                .lines()
+                .any(|line| line.trim_start().starts_with("[pool"));
+
+            if looks_like_pool {
+                let file: PoolFile = toml::from_str(&raw).map_err(CoreError::ConfigParse)?;
+                let name = file.pool.name.clone();
+                match pools.entry(name.clone()) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        let first_path = source_paths
+                            .get(e.key())
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(unknown)".to_owned());
+                        return Err(CoreError::ProviderResolution {
+                            message: format!(
+                                "duplicate pool name \"{}\": already defined in {}, redefined in {}",
+                                name,
+                                first_path,
+                                file_path.display()
+                            ),
+                        });
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        source_paths.insert(name, file_path.clone());
+                        e.insert(file.pool);
+                    }
+                }
+                continue;
+            }
+
             let provider = load_provider_config(&file_path, None)?;
 
             match providers.entry(provider.name.clone()) {
@@ -216,10 +274,12 @@ impl ProviderRegistry {
             }
         }
 
-        Ok(Self { providers })
+        let registry = Self { providers, pools };
+        registry.validate_pools()?;
+        Ok(registry)
     }
 
-    /// Build a registry from an existing map of provider configs.
+    /// Build a registry from an existing map of provider configs (no pools).
     ///
     /// # Errors
     ///
@@ -228,9 +288,22 @@ impl ProviderRegistry {
     pub fn from_providers(
         providers: impl IntoIterator<Item = ProviderConfig>,
     ) -> Result<Self, CoreError> {
-        let mut map: HashMap<String, ProviderConfig> = HashMap::new();
+        Self::from_parts(providers, [])
+    }
+
+    /// Build a registry from provider configs plus pool definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::ProviderResolution`] if duplicate provider or
+    /// pool names are found, or a pool name collides with a provider name.
+    pub fn from_parts(
+        providers: impl IntoIterator<Item = ProviderConfig>,
+        pools: impl IntoIterator<Item = PoolConfig>,
+    ) -> Result<Self, CoreError> {
+        let mut provider_map: HashMap<String, ProviderConfig> = HashMap::new();
         for provider in providers {
-            if let Some(existing) = map.get(&provider.name) {
+            if let Some(existing) = provider_map.get(&provider.name) {
                 return Err(CoreError::ProviderResolution {
                     message: format!(
                         "duplicate provider name \"{}\": defined in multiple entries",
@@ -238,9 +311,72 @@ impl ProviderRegistry {
                     ),
                 });
             }
-            map.insert(provider.name.clone(), provider);
+            provider_map.insert(provider.name.clone(), provider);
         }
-        Ok(Self { providers: map })
+        let mut pool_map: HashMap<String, PoolConfig> = HashMap::new();
+        for pool in pools {
+            if let Some(existing) = pool_map.get(&pool.name) {
+                return Err(CoreError::ProviderResolution {
+                    message: format!(
+                        "duplicate pool name \"{}\": defined in multiple entries",
+                        existing.name
+                    ),
+                });
+            }
+            pool_map.insert(pool.name.clone(), pool);
+        }
+        let registry = Self {
+            providers: provider_map,
+            pools: pool_map,
+        };
+        registry.validate_pools()?;
+        Ok(registry)
+    }
+
+    /// Validate every pool: structure, membership against configured
+    /// providers, and that no pool name collides with a provider name (the
+    /// two share the `/providers/{name}/...` URL namespace, so a collision
+    /// would make the route ambiguous).
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::ProviderResolution`] naming the first invalid pool.
+    pub fn validate_pools(&self) -> Result<(), CoreError> {
+        for pool in self.pools.values() {
+            let known: Vec<String> = self.providers.keys().cloned().collect();
+            validate_pool_config_against(pool, &known).map_err(|error| {
+                CoreError::ProviderResolution {
+                    message: error.to_string(),
+                }
+            })?;
+            if self.providers.contains_key(&pool.name) {
+                return Err(CoreError::ProviderResolution {
+                    message: format!(
+                        "pool name \"{}\" collides with a provider name; the two share the \
+                         /providers/{{name}}/ URL namespace, so route targets would be ambiguous",
+                        pool.name
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The pool configured under this name, if any.
+    #[must_use]
+    pub fn pool(&self, name: &str) -> Option<&PoolConfig> {
+        self.pools.get(name)
+    }
+
+    /// An iterator over every configured pool.
+    pub fn pools(&self) -> impl Iterator<Item = &PoolConfig> {
+        self.pools.values()
+    }
+
+    /// Whether `name` addresses a configured provider or pool.
+    #[must_use]
+    pub fn contains_route(&self, name: &str) -> bool {
+        self.providers.contains_key(name) || self.pools.contains_key(name)
     }
 
     /// Validate that all protocols referenced by all registered providers are
@@ -315,13 +451,9 @@ impl ProviderRegistry {
         })?;
 
         let adapter_name = provider.routes.get(route_kind).ok_or_else(|| {
-            let route_name = match route_kind {
-                ProviderRouteKind::ChatCompletions => "chat_completions",
-                ProviderRouteKind::Messages => "messages",
-            };
             ProviderRouteResolutionError::UnsupportedRoute {
                 provider: provider.name.clone(),
-                route: route_name,
+                route: route_kind.config_key(),
             }
         })?;
 
@@ -363,6 +495,21 @@ impl ProviderRegistry {
             requested_model: requested_model.to_owned(),
             upstream_model: upstream_model.to_owned(),
             headers: Arc::clone(&adapter_cfg.headers),
+            forward_inbound_headers: Arc::new(
+                adapter_cfg
+                    .forward_inbound_headers
+                    .clone()
+                    .unwrap_or_else(|| {
+                        crate::provider_config::default_forwarded_inbound_headers(
+                            &adapter_cfg.protocol,
+                        )
+                        .iter()
+                        .map(|name| (*name).to_owned())
+                        .collect()
+                    }),
+            ),
+            lossy: adapter_cfg.lossy,
+            prompt_cache: provider.prompt_cache.clone().map(Arc::new),
         })
     }
 
@@ -440,6 +587,8 @@ mod tests {
             api_key: SecretString::from("api-secret"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -450,16 +599,22 @@ mod tests {
                         "x-secret".to_owned(),
                         "header-secret".to_owned(),
                     )])),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::from([("short".to_owned(), "upstream".to_owned())]),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let target = registry
@@ -480,6 +635,8 @@ mod tests {
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -487,11 +644,14 @@ mod tests {
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1/chat/completions".to_owned(),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::from([(
                 "alias-name".to_owned(),
@@ -506,6 +666,9 @@ mod tests {
                     ..ModelPricing::default()
                 },
             )]),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let p = registry
@@ -543,6 +706,8 @@ mod tests {
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -550,6 +715,9 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers([provider]).expect("registry");
 
@@ -583,6 +751,118 @@ chat_completions = "chat"
 "#
         );
         std::fs::write(dir.join(filename), content).expect("write provider toml");
+    }
+
+    fn write_pool(dir: &std::path::Path, filename: &str, name: &str, members: &str) {
+        let content = format!(
+            r#"
+[pool]
+name = "{name}"
+members = [{members}]
+"#
+        );
+        std::fs::write(dir.join(filename), content).expect("write pool toml");
+    }
+
+    #[test]
+    fn load_from_dir_loads_pools_and_keeps_them_addressable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "alpha.toml", "alpha");
+        write_provider(dir.path(), "beta.toml", "beta");
+        write_pool(dir.path(), "pools.toml", "both", "\"alpha\", \"beta\"");
+
+        let registry = ProviderRegistry::load_from_dir(dir.path()).expect("load_from_dir");
+        assert_eq!(registry.len(), 2, "pool files are not providers");
+        let pool = registry.pool("both").expect("pool loaded");
+        assert_eq!(pool.members, ["alpha", "beta"]);
+        assert!(registry.contains_route("both"));
+        assert!(registry.contains_route("alpha"));
+        assert!(!registry.contains_route("nope"));
+    }
+
+    #[test]
+    fn load_from_dir_rejects_a_pool_name_matching_a_provider_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "alpha.toml", "alpha");
+        write_pool(dir.path(), "clash.toml", "alpha", "\"alpha\"");
+
+        let err = ProviderRegistry::load_from_dir(dir.path()).expect_err("collision");
+        assert!(
+            err.to_string().contains("collides with a provider name"),
+            "expected a name-collision error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_from_dir_rejects_a_pool_naming_an_unknown_member() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "alpha.toml", "alpha");
+        write_pool(dir.path(), "pool.toml", "broken", "\"alpha\", \"ghost\"");
+
+        let err = ProviderRegistry::load_from_dir(dir.path()).expect_err("unknown member");
+        assert!(
+            err.to_string()
+                .contains("\"ghost\" is not a configured provider"),
+            "expected an unknown-member error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_from_dir_rejects_duplicate_pool_names() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_provider(dir.path(), "alpha.toml", "alpha");
+        write_pool(dir.path(), "a.toml", "dup", "\"alpha\"");
+        write_pool(dir.path(), "b.toml", "dup", "\"alpha\"");
+
+        let err = ProviderRegistry::load_from_dir(dir.path()).expect_err("duplicate pool");
+        assert!(err.to_string().contains("duplicate pool name"));
+    }
+
+    #[test]
+    fn from_parts_rejects_pool_name_collisions_with_providers() {
+        let provider = ProviderConfig {
+            name: "clash".to_owned(),
+            api_key: SecretString::from("key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters: HashMap::new(),
+            routes: ProviderRoutesConfig::default(),
+            model_aliases: HashMap::new(),
+            discovery: None,
+            catalog: None,
+            pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        let pool = PoolConfig {
+            name: "clash".to_owned(),
+            members: vec!["clash".to_owned()],
+            retry: Default::default(),
+            affinity: Default::default(),
+            health: Default::default(),
+        };
+        let err = ProviderRegistry::from_parts(vec![provider], vec![pool]).expect_err("collision");
+        assert!(err.to_string().contains("collides with a provider name"));
+    }
+
+    #[test]
+    fn pool_without_members_is_rejected_at_validation() {
+        let pool = PoolConfig {
+            name: "empty".to_owned(),
+            members: vec![],
+            retry: Default::default(),
+            affinity: Default::default(),
+            health: Default::default(),
+        };
+        let err = crate::provider_config::validate_pool_config(&pool).expect_err("empty pool");
+        assert!(
+            err.to_string().contains("no members"),
+            "expected a no-members error, got: {err}"
+        );
     }
 
     #[test]
@@ -652,16 +932,22 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig {
                 chat_completions: Some("nonexistent_adapter".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
@@ -683,6 +969,8 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -690,6 +978,9 @@ chat_completions = "chat"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let provider_b = ProviderConfig {
             name: "dup".to_owned(),
@@ -718,6 +1009,8 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -725,6 +1018,9 @@ chat_completions = "chat"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         assert!(!registry.is_empty());
@@ -746,6 +1042,8 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -753,6 +1051,9 @@ chat_completions = "chat"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let models = registry.catalog_models("test").expect("provider exists");
@@ -766,6 +1067,8 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -773,6 +1076,9 @@ chat_completions = "chat"
             discovery: None,
             catalog: Some(ProviderCatalogConfig::default()),
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let models = registry.catalog_models("test").expect("provider exists");
@@ -786,6 +1092,8 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::from([(
                 "chat".to_owned(),
@@ -793,16 +1101,22 @@ chat_completions = "chat"
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: "https://example.com/v1/chat/completions".to_owned(),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             )]),
             routes: ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let target = registry
@@ -819,6 +1133,8 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -826,6 +1142,9 @@ chat_completions = "chat"
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let provider_b = ProviderConfig {
             name: "b".to_owned(),
@@ -849,6 +1168,8 @@ chat_completions = "chat"
                     protocol: "openai_chat_completions".to_owned(),
                     endpoint: format!("https://example.com/v{i}"),
                     headers: Arc::new(HashMap::new()),
+                    forward_inbound_headers: None,
+                    lossy: false,
                 },
             );
         }
@@ -857,16 +1178,22 @@ chat_completions = "chat"
             api_key: SecretString::from("key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters,
             routes: ProviderRoutesConfig {
                 chat_completions: Some("nonexistent".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let error = registry

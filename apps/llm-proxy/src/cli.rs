@@ -38,6 +38,9 @@ pub enum Commands {
     },
     /// Stop a running server.
     Stop,
+    /// Signal a running server to re-read its provider files (hot reload;
+    /// needs server.hot_reload = true, unix only).
+    Reload,
     /// Check if the server is running.
     Status,
     /// Create a default config file.
@@ -47,6 +50,17 @@ pub enum Commands {
         /// Path to config file (must be TOML).
         #[arg(short, long)]
         config: Option<PathBuf>,
+    },
+    /// Live-check every configured provider: reachability, and with --probe
+    /// a one-token request (which can cost money). Each failure names its fix.
+    Doctor {
+        /// Path to config file (must be TOML).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Also send one real one-token request per provider. Off by default:
+        /// probes spend upstream quota.
+        #[arg(long)]
+        probe: bool,
     },
     /// List provider-scoped models.
     Models {
@@ -65,6 +79,21 @@ pub enum Commands {
         /// Return an error instead of falling back when live discovery fails.
         #[arg(long, requires = "live")]
         require_success: bool,
+    },
+    /// Sync model pricing from the models.dev catalogue.
+    PricingSync {
+        /// Path to config file (must be TOML).
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Only sync this provider (its configured name, not the models.dev id).
+        #[arg(long)]
+        provider: Option<String>,
+        /// Catalogue URL. Defaults to https://models.dev/api.json.
+        #[arg(long)]
+        url: Option<String>,
+        /// Show what would be written without touching any file.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Manage auto-start on login.
     Autostart {

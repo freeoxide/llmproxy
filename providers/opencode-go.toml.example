@@ -45,6 +45,21 @@ messages = "anthropic"
 # cache_creation = "0.000003"
 # cache_read = "0.00000125"
 # reasoning = "0.000010"
+#
+# Opt-in pricing sync from models.dev (llm-proxy pricing sync). The sync
+# replaces the whole [provider.pricing] table; hand-tuned entries do not
+# survive it, so providers with manual prices stay out.
+#
+# [provider.pricing_sync]
+# models_dev_id = "openai"
+
+# In-flight request caps. A saturated cap answers 503 with a short
+# Retry-After, never 429. Absent = uncapped.
+#
+# [provider.concurrency]
+# total = 8
+# [provider.concurrency.models]
+# "gpt-4o" = 4
 
 # Route this provider's upstream traffic through a forward proxy.
 # Allowed schemes: socks5h:// (hostnames resolved at the proxy), socks5://,
@@ -53,3 +68,20 @@ messages = "anthropic"
 #
 # [provider.egress]
 # proxy = "socks5h://127.0.0.1:1080"
+
+# Prompt-cache hygiene (plan 06): opt-in edits at the provider edge that
+# protect the provider's own prompt cache. Off by default — without it the
+# request bytes are forwarded as they arrived (after the surgical edits the
+# proxy always makes: model aliasing and dialect translation, which never
+# touch prompt content). See docs/data-class-policy.md.
+#
+# strip_volatile: RFC 6901 JSON pointers removed from the encoded request
+# before egress — volatile per-request bytes (client correlation tokens)
+# that would bust the provider's prompt cache on every turn.
+# inject_markers: cache-control breakpoints on the stable prefix
+# (Anthropic Messages only, within the provider's 4-breakpoint budget;
+# the newest message is never marked; markers the client set are kept).
+#
+# [provider.prompt_cache]
+# strip_volatile = ["/metadata/user_id", "/user"]
+# inject_markers = true

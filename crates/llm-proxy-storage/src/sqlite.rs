@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -61,7 +62,9 @@ impl RetentionPolicy {
 
 /// Run one retention pass, deleting rows past `policy`'s bounds; returns the
 /// number of rows deleted. Age pruning covers failure-only rows (no
-/// `received_at`) via `COALESCE(received_at, completed_at)`.
+/// `received_at`) via `COALESCE(received_at, completed_at)`. Attempt rows are
+/// pruned with their requests: by the same age cutoff, and by request id when
+/// the row cap evicts requests.
 pub fn run_retention_pass(
     conn: &mut Connection,
     policy: &RetentionPolicy,
@@ -78,6 +81,11 @@ pub fn run_retention_pass(
             rusqlite::params![cutoff],
         )?;
         deleted += u64::try_from(n).unwrap_or(u64::MAX);
+        let n = conn.execute(
+            "DELETE FROM attempts WHERE created_at < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        deleted += u64::try_from(n).unwrap_or(u64::MAX);
     }
     if let Some(max_rows) = policy.max_rows {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))?;
@@ -86,6 +94,15 @@ pub fn run_retention_pass(
             .saturating_sub(max_rows);
         if excess > 0 {
             let limit = i64::try_from(excess).unwrap_or(i64::MAX);
+            let n = conn.execute(
+                "DELETE FROM attempts WHERE request_id IN (
+                     SELECT request_id FROM requests
+                     ORDER BY COALESCE(received_at, completed_at) ASC
+                     LIMIT ?1
+                 )",
+                rusqlite::params![limit],
+            )?;
+            deleted += u64::try_from(n).unwrap_or(u64::MAX);
             let n = conn.execute(
                 "DELETE FROM requests WHERE request_id IN (
                      SELECT request_id FROM requests
@@ -128,7 +145,10 @@ CREATE TABLE IF NOT EXISTS requests (
     error_kind            TEXT,
     http_status           INTEGER,
     latency_ms            INTEGER,
-    body_hash             TEXT
+    body_hash             TEXT,
+    session_id            TEXT,
+    credential_id         TEXT,
+    cache_hit             INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_requests_timestamp
     ON requests (received_at);
@@ -136,21 +156,70 @@ CREATE INDEX IF NOT EXISTS idx_requests_provider_timestamp
     ON requests (provider, received_at);
 CREATE INDEX IF NOT EXISTS idx_requests_caller_timestamp
     ON requests (caller, received_at);
+CREATE TABLE IF NOT EXISTS attempts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id    TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    attempt_seq   INTEGER NOT NULL,
+    route         TEXT,
+    provider      TEXT NOT NULL,
+    model         TEXT,
+    credential_id TEXT,
+    outcome       TEXT NOT NULL,
+    error_kind    TEXT,
+    http_status   INTEGER,
+    message       TEXT,
+    latency_ms    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_request
+    ON attempts (request_id);
+CREATE INDEX IF NOT EXISTS idx_attempts_created
+    ON attempts (created_at);
 ";
+
+/// Columns appended to `requests` after its first release, as `(name, type)`.
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing table's columns alone, so
+/// a ledger created by an earlier build gets them from [`migrate_schema`].
+const REQUESTS_COLUMNS_ADDED: &[(&str, &str)] = &[
+    ("session_id", "TEXT"),
+    ("credential_id", "TEXT"),
+    ("cache_hit", "INTEGER"),
+];
 
 fn open_connection(path: &Path) -> Result<Connection, StorageError> {
     let open_err = |source: rusqlite::Error| StorageError::Open {
         path: path.display().to_string(),
         source,
     };
-    let conn = Connection::open(path).map_err(open_err)?;
+    let mut conn = Connection::open(path).map_err(open_err)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .map_err(open_err)?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(open_err)?;
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(open_err)?;
     conn.execute_batch(SCHEMA_SQL).map_err(open_err)?;
+    migrate_schema(&mut conn).map_err(open_err)?;
     Ok(conn)
+}
+
+/// Brings a ledger created by an earlier build up to the current schema by
+/// adding the `requests` columns it lacks. Runs under an immediate
+/// transaction so two processes opening one file cannot both add a column.
+fn migrate_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let existing: HashSet<String> = {
+        let mut stmt = tx.prepare("SELECT name FROM pragma_table_info('requests')")?;
+        let names = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        names.collect::<Result<_, _>>()?
+    };
+    for (name, column_type) in REQUESTS_COLUMNS_ADDED {
+        if !existing.contains(*name) {
+            tx.execute_batch(&format!(
+                "ALTER TABLE requests ADD COLUMN {name} {column_type}"
+            ))?;
+        }
+    }
+    tx.commit()
 }
 
 fn unix_millis(ts: OffsetDateTime) -> i64 {
@@ -186,7 +255,37 @@ fn write_event(conn: &Connection, event: &ProxyEvent) -> Result<(), StorageError
         ProxyEvent::RequestReceived(e) => insert_request_received(conn, e),
         ProxyEvent::ResponseCompleted(e) => upsert_response_completed(conn, e),
         ProxyEvent::ResponseFailed(e) => upsert_response_failed(conn, e),
+        ProxyEvent::AttemptCompleted(e) => insert_attempt(conn, e),
     }
+}
+
+fn insert_attempt(conn: &Connection, e: &crate::AttemptCompleted) -> Result<(), StorageError> {
+    conn.execute(
+        "INSERT INTO attempts (
+                     request_id, created_at, attempt_seq, route, provider, model,
+                     credential_id, outcome, error_kind, http_status, message,
+                     latency_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            e.request_id,
+            unix_millis(e.timestamp),
+            i64::from(e.attempt),
+            e.route,
+            e.provider,
+            e.model,
+            e.credential_id,
+            match e.outcome {
+                crate::AttemptOutcome::Succeeded => "succeeded",
+                crate::AttemptOutcome::Failed => "failed",
+                crate::AttemptOutcome::Streaming => "streaming",
+            },
+            e.error_kind,
+            e.http_status.map(i64::from),
+            e.message,
+            i64::try_from(e.latency_ms).unwrap_or(i64::MAX),
+        ],
+    )?;
+    Ok(())
 }
 
 fn insert_request_received(
@@ -197,8 +296,8 @@ fn insert_request_received(
         "INSERT OR IGNORE INTO requests (
                      request_id, received_at, caller, provider, route_kind,
                      client_protocol, streaming, model_requested, model_upstream,
-                     body_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     body_hash, session_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             e.request_id,
             unix_millis(e.timestamp),
@@ -210,6 +309,7 @@ fn insert_request_received(
             e.model.requested,
             e.model.upstream,
             e.body_hash,
+            e.session_id,
         ],
     )?;
     Ok(())
@@ -225,9 +325,10 @@ fn upsert_response_completed(
                      model_upstream, input_tokens, output_tokens, reasoning_tokens,
                      cache_read_tokens, cache_creation_tokens, usage_provenance,
                      cost_input, cost_output, cost_cache_creation, cost_cache_read,
-                     cost_reasoning, cost_total, stop_reason, latency_ms
+                     cost_reasoning, cost_total, stop_reason, latency_ms,
+                     credential_id, cache_hit
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                           ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                           ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                  ON CONFLICT(request_id) DO UPDATE SET
                      completed_at = excluded.completed_at,
                      provider = excluded.provider,
@@ -246,7 +347,9 @@ fn upsert_response_completed(
                      cost_reasoning = excluded.cost_reasoning,
                      cost_total = excluded.cost_total,
                      stop_reason = excluded.stop_reason,
-                     latency_ms = excluded.latency_ms",
+                     latency_ms = excluded.latency_ms,
+                     credential_id = excluded.credential_id,
+                     cache_hit = excluded.cache_hit",
         rusqlite::params![
             e.request_id,
             unix_millis(e.timestamp),
@@ -267,6 +370,8 @@ fn upsert_response_completed(
             e.cost.as_ref().map(|c| c.total.to_string()),
             stop_reason_label(&e.stop_reason),
             i64::try_from(e.latency_ms).unwrap_or(i64::MAX),
+            e.credential_id,
+            i64::from(e.cache_hit),
         ],
     )?;
     Ok(())
@@ -376,14 +481,21 @@ fn signal_done(done: &DoneFlag) {
     done.1.notify_all();
 }
 
+/// Shared writer-side state handed to [`writer_task`].
+struct WriterState {
+    dropped: Arc<AtomicU64>,
+    done: DoneFlag,
+}
+
 async fn writer_task(
     path: PathBuf,
     conn: Connection,
     mut rx: mpsc::Receiver<ProxyEvent>,
     mut shutdown: watch::Receiver<bool>,
     retention: RetentionPolicy,
-    done: DoneFlag,
+    state: WriterState,
 ) {
+    let WriterState { dropped, done } = state;
     let pruning = retention.is_bounded();
     let mut prune = tokio::time::interval(retention.prune_every.max(Duration::from_secs(1)));
     prune.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -406,18 +518,20 @@ async fn writer_task(
                     break;
                 }
                 let Some(conn) = conn_slot.take() else { break };
-                match exec_on_conn(
-                    &path,
-                    conn,
-                    WriterOp::Write { events: std::mem::take(&mut buf) },
-                )
-                .await
-                {
+                let events = std::mem::take(&mut buf);
+                let batch_len = events.len();
+                match exec_on_conn(&path, conn, WriterOp::Write { events }).await {
                     Some((c, result)) => {
                         conn_slot = Some(c);
                         if let Err(error) = result {
+                            let lost = dropped.fetch_add(
+                                u64::try_from(batch_len).unwrap_or(u64::MAX),
+                                Ordering::Relaxed,
+                            ) + u64::try_from(batch_len).unwrap_or(u64::MAX);
                             tracing::error!(
                                 error = %error,
+                                events = batch_len,
+                                dropped_total = lost,
                                 "usage-ledger batch write failed; batch events lost"
                             );
                         }
@@ -460,10 +574,20 @@ async fn writer_task(
     }
     if !buf.is_empty() {
         if let Some(conn) = conn_slot.take() {
+            let batch_len = buf.len();
             match exec_on_conn(&path, conn, WriterOp::Write { events: buf }).await {
                 Some((_conn, Ok(_))) => {}
                 Some((_conn, Err(error))) => {
-                    tracing::error!(error = %error, "usage-ledger final drain failed");
+                    let lost = dropped.fetch_add(
+                        u64::try_from(batch_len).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    ) + u64::try_from(batch_len).unwrap_or(u64::MAX);
+                    tracing::error!(
+                        error = %error,
+                        events = batch_len,
+                        dropped_total = lost,
+                        "usage-ledger final drain failed; batch events lost"
+                    );
                 }
                 None => {}
             }
@@ -481,7 +605,10 @@ pub struct SqliteEventBus {
     tx: Sender<ProxyEvent>,
     shutdown_tx: Mutex<watch::Sender<bool>>,
     done: DoneFlag,
-    dropped: AtomicU64,
+    /// Events lost before reaching the ledger: dropped by a full channel in
+    /// `emit`, or by a failed batch in the writer task. Shared with the
+    /// writer so both loss paths feed [`SqliteEventBus::dropped_events`].
+    dropped: Arc<AtomicU64>,
     path: PathBuf,
 }
 
@@ -511,19 +638,23 @@ impl SqliteEventBus {
         let (tx, rx) = mpsc::channel(capacity.max(1));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let done: DoneFlag = Arc::new((Mutex::new(false), Condvar::new()));
+        let dropped = Arc::new(AtomicU64::new(0));
         tokio::spawn(writer_task(
             path.to_path_buf(),
             conn,
             rx,
             shutdown_rx,
             retention,
-            Arc::clone(&done),
+            WriterState {
+                dropped: Arc::clone(&dropped),
+                done: Arc::clone(&done),
+            },
         ));
         Ok(Self {
             tx,
             shutdown_tx: Mutex::new(shutdown_tx),
             done,
-            dropped: AtomicU64::new(0),
+            dropped,
             path: path.to_path_buf(),
         })
     }
@@ -537,7 +668,7 @@ impl SqliteEventBus {
             tx,
             shutdown_tx: Mutex::new(shutdown_tx),
             done: Arc::new((Mutex::new(false), Condvar::new())),
-            dropped: AtomicU64::new(0),
+            dropped: Arc::new(AtomicU64::new(0)),
             path: PathBuf::new(),
         }
     }
@@ -561,14 +692,14 @@ impl EventBus for SqliteEventBus {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(
+                tracing::warn!(
                     dropped,
                     "usage-ledger channel full; event dropped (never backpressure a response)"
                 );
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(dropped, "usage-ledger writer is gone; event dropped");
+                tracing::warn!(dropped, "usage-ledger writer is gone; event dropped");
             }
         }
     }
@@ -636,6 +767,7 @@ mod tests {
             },
             streaming: true,
             body_hash: "sha256-digest-only".to_owned(),
+            session_id: None,
         })
     }
 
@@ -670,6 +802,8 @@ mod tests {
             }),
             stop_reason: StopReason::Unknown("weird-finish".to_owned()),
             latency_ms: 4321,
+            credential_id: None,
+            cache_hit: false,
         })
     }
 
@@ -709,6 +843,293 @@ mod tests {
     fn text_column(conn: &Connection, sql: &str) -> Option<String> {
         conn.query_row(sql, [], |row| row.get::<_, Option<String>>(0))
             .expect("text query")
+    }
+
+    #[tokio::test]
+    async fn attempt_rows_persist_one_per_upstream_attempt_with_the_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        let bus = SqliteEventBus::open(&db, unbounded()).expect("open ledger");
+        let bus = Arc::new(bus);
+        for attempt in [
+            crate::AttemptCompleted {
+                request_id: "req-pool".to_owned(),
+                timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                    .expect("valid unix timestamp"),
+                attempt: 0,
+                route: "team".to_owned(),
+                provider: "limited".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+                credential_id: Some("key-0".to_owned()),
+                outcome: crate::AttemptOutcome::Failed,
+                error_kind: Some("Upstream".to_owned()),
+                http_status: Some(429),
+                message: Some("rate limited".to_owned()),
+                latency_ms: 12,
+            },
+            crate::AttemptCompleted {
+                request_id: "req-pool".to_owned(),
+                timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                    .expect("valid unix timestamp"),
+                attempt: 1,
+                route: "team".to_owned(),
+                provider: "healthy".to_owned(),
+                model: "claude-sonnet-4-6".to_owned(),
+                credential_id: None,
+                outcome: crate::AttemptOutcome::Succeeded,
+                error_kind: None,
+                http_status: None,
+                message: None,
+                latency_ms: 40,
+            },
+        ] {
+            bus.emit(&ProxyEvent::AttemptCompleted(attempt));
+        }
+        let closer = Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close");
+
+        let conn = reader(&db);
+        let rows: Vec<(i64, String, String, Option<String>, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT attempt_seq, provider, outcome, credential_id, error_kind
+                     FROM attempts WHERE request_id = ?1 ORDER BY attempt_seq",
+                )
+                .expect("prepare attempt query");
+            let mapped = stmt
+                .query_map(["req-pool"], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .expect("query attempts");
+            let mut rows = Vec::new();
+            for row in mapped {
+                rows.push(row.expect("attempt row"));
+            }
+            rows
+        };
+        assert_eq!(rows.len(), 2, "one row per upstream attempt");
+        assert_eq!(
+            rows[0],
+            (
+                0,
+                "limited".to_owned(),
+                "failed".to_owned(),
+                Some("key-0".to_owned()),
+                Some("Upstream".to_owned())
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (1, "healthy".to_owned(), "succeeded".to_owned(), None, None)
+        );
+    }
+
+    /// The `requests` table exactly as the build before plan 04 created it:
+    /// no `session_id`, no `credential_id`, and no `attempts` table at all.
+    const PRE_PLAN04_SCHEMA_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS requests (
+    request_id            TEXT PRIMARY KEY,
+    received_at           INTEGER,
+    completed_at          INTEGER,
+    caller                TEXT,
+    provider              TEXT,
+    route_kind            TEXT,
+    client_protocol       TEXT,
+    streaming             INTEGER,
+    model_requested       TEXT,
+    model_upstream        TEXT,
+    input_tokens          INTEGER,
+    output_tokens         INTEGER,
+    reasoning_tokens      INTEGER,
+    cache_read_tokens     INTEGER,
+    cache_creation_tokens INTEGER,
+    usage_provenance      TEXT,
+    cost_input            TEXT,
+    cost_output           TEXT,
+    cost_cache_creation   TEXT,
+    cost_cache_read       TEXT,
+    cost_reasoning        TEXT,
+    cost_total            TEXT,
+    stop_reason           TEXT,
+    error_kind            TEXT,
+    http_status           INTEGER,
+    latency_ms            INTEGER,
+    body_hash             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_requests_timestamp
+    ON requests (received_at);
+CREATE INDEX IF NOT EXISTS idx_requests_provider_timestamp
+    ON requests (provider, received_at);
+CREATE INDEX IF NOT EXISTS idx_requests_caller_timestamp
+    ON requests (caller, received_at);
+";
+
+    #[tokio::test]
+    async fn opening_a_pre_plan04_ledger_migrates_it_and_keeps_recording_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        {
+            let legacy = Connection::open(&db).expect("create legacy ledger");
+            legacy
+                .execute_batch(PRE_PLAN04_SCHEMA_SQL)
+                .expect("legacy schema");
+            legacy
+                .execute(
+                    "INSERT INTO requests (request_id, received_at, caller, body_hash)
+                     VALUES ('req-legacy', ?1, 'laptop', 'legacy-hash')",
+                    rusqlite::params![RECEIVED_MS],
+                )
+                .expect("legacy row");
+        }
+
+        let bus = Arc::new(SqliteEventBus::open(&db, unbounded()).expect("open legacy ledger"));
+        let received = match received_event("req-new", "laptop") {
+            ProxyEvent::RequestReceived(mut event) => {
+                event.session_id = Some("sess-9".to_owned());
+                ProxyEvent::RequestReceived(event)
+            }
+            other => other,
+        };
+        bus.emit(&received);
+        bus.emit(&ProxyEvent::AttemptCompleted(crate::AttemptCompleted {
+            request_id: "req-new".to_owned(),
+            timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                .expect("valid unix timestamp"),
+            attempt: 0,
+            route: "team".to_owned(),
+            provider: "prov-a".to_owned(),
+            model: "claude-3".to_owned(),
+            credential_id: Some("key-2".to_owned()),
+            outcome: crate::AttemptOutcome::Succeeded,
+            error_kind: None,
+            http_status: None,
+            message: None,
+            latency_ms: 40,
+        }));
+        let completed = match completed_event("req-new") {
+            ProxyEvent::ResponseCompleted(mut event) => {
+                event.credential_id = Some("key-2".to_owned());
+                ProxyEvent::ResponseCompleted(event)
+            }
+            other => other,
+        };
+        bus.emit(&completed);
+        let closer = Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close");
+
+        assert_eq!(
+            bus.dropped_events(),
+            0,
+            "no batch may be lost to the legacy schema"
+        );
+        let conn = reader(&db);
+        assert_eq!(
+            text_column(
+                &conn,
+                "SELECT body_hash FROM requests WHERE request_id = 'req-legacy'"
+            ),
+            Some("legacy-hash".to_owned()),
+            "rows written before the upgrade survive it"
+        );
+        assert_eq!(
+            text_column(
+                &conn,
+                "SELECT session_id FROM requests WHERE request_id = 'req-new'"
+            ),
+            Some("sess-9".to_owned())
+        );
+        assert_eq!(
+            text_column(
+                &conn,
+                "SELECT credential_id FROM requests WHERE request_id = 'req-new'"
+            ),
+            Some("key-2".to_owned())
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM attempts WHERE request_id = 'req-new'"
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_a_current_ledger_leaves_its_schema_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        for _ in 0..2 {
+            let bus = Arc::new(SqliteEventBus::open(&db, unbounded()).expect("open ledger"));
+            let closer = Arc::clone(&bus);
+            tokio::task::spawn_blocking(move || closer.close())
+                .await
+                .expect("close");
+        }
+        let conn = reader(&db);
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('requests')
+                 WHERE name IN ('session_id', 'credential_id')"
+            ),
+            2,
+            "each added column exists exactly once after a second open"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_prunes_attempt_rows_with_their_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        {
+            let bus = SqliteEventBus::open(&db, unbounded()).expect("open ledger");
+            let bus = Arc::new(bus);
+            bus.emit(&received_event("req-old", "laptop"));
+            bus.emit(&ProxyEvent::AttemptCompleted(crate::AttemptCompleted {
+                request_id: "req-old".to_owned(),
+                timestamp: OffsetDateTime::from_unix_timestamp(RECEIVED_MS / 1000)
+                    .expect("valid unix timestamp"),
+                attempt: 0,
+                route: "team".to_owned(),
+                provider: "limited".to_owned(),
+                model: "m".to_owned(),
+                credential_id: None,
+                outcome: crate::AttemptOutcome::Failed,
+                error_kind: None,
+                http_status: Some(500),
+                message: None,
+                latency_ms: 5,
+            }));
+            let closer = Arc::clone(&bus);
+            tokio::task::spawn_blocking(move || closer.close())
+                .await
+                .expect("close");
+        }
+        let mut conn = reader(&db);
+        // The row predates the cutoff, so an age pass removes it with its
+        // attempt rows.
+        let policy = RetentionPolicy {
+            max_age: Some(Duration::from_secs(1)),
+            max_rows: None,
+            prune_every: Duration::from_secs(3600),
+        };
+        let deleted = run_retention_pass(&mut conn, &policy).expect("retention pass");
+        assert!(deleted >= 2, "the request and its attempt row are pruned");
+        assert_eq!(
+            scalar(&conn, "SELECT COUNT(*) FROM attempts"),
+            0,
+            "no orphaned attempt rows survive their request"
+        );
     }
 
     #[tokio::test]
@@ -1161,6 +1582,43 @@ mod tests {
 
         let deleted = run_retention_pass(&mut conn, &unbounded()).expect("no-op pass");
         assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_batch_write_counts_its_lost_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("usage.db");
+        let bus = Arc::new(
+            SqliteEventBus::open_with_capacity(&db, unbounded(), 1024).expect("open ledger"),
+        );
+        // Wait for the schema to be committed, then drop the table so the
+        // writer's batch INSERT fails.
+        wait_until("schema exists", || {
+            let conn = reader(&db);
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='requests'",
+            ) > 0
+        })
+        .await;
+        {
+            let conn = reader(&db);
+            conn.execute("DROP TABLE requests", []).expect("drop table");
+        }
+
+        bus.emit(&received_event("lost-1", "laptop"));
+        bus.emit(&completed_event("lost-1"));
+        wait_until("batch failure is counted", || bus.dropped_events() >= 2).await;
+
+        let closer = Arc::clone(&bus);
+        tokio::task::spawn_blocking(move || closer.close())
+            .await
+            .expect("close");
+        assert!(
+            bus.dropped_events() >= 2,
+            "a failed batch must count every event it lost: {}",
+            bus.dropped_events()
+        );
     }
 
     #[tokio::test]

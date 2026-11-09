@@ -169,6 +169,11 @@ pub enum CoreContent {
         name: String,
         /// JSON arguments for the tool call.
         input: serde_json::Value,
+        /// Opaque tool-call signature a provider requires on replay (Gemini
+        /// `thoughtSignature`); redacted to `[REDACTED]` in `Debug` output.
+        /// Anthropic-style thinking signatures live on [`CoreContent::Thinking`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     /// The result of a tool invocation, fed back to the model.
     ToolResult {
@@ -178,6 +183,8 @@ pub enum CoreContent {
         content: Vec<CoreContent>,
         /// Whether this result represents an error.
         is_error: bool,
+        /// Optional cache-control directive carried on the `tool_result` block.
+        cache: Option<CacheControl>,
     },
     /// Extended thinking content.
     Thinking {
@@ -197,6 +204,14 @@ pub enum CoreContent {
     Refusal {
         /// Human-readable refusal text.
         text: String,
+    },
+    /// A client block the core does not model (an Anthropic `server_tool_use`
+    /// or `web_search_tool_result` replay, an MCP block, ...), carried as its
+    /// raw wire JSON. Only same-format passthrough can forward it; cross-format
+    /// it is rejected by name.
+    Opaque {
+        /// The raw wire block; `Debug` shows only its `type`.
+        block: serde_json::Value,
     },
 }
 
@@ -224,21 +239,29 @@ impl fmt::Debug for CoreContent {
                 .debug_struct("Video")
                 .field("source", &OpaqueJsonRef(source))
                 .finish(),
-            CoreContent::ToolUse { id, name, input } => f
+            CoreContent::ToolUse {
+                id,
+                name,
+                input,
+                signature,
+            } => f
                 .debug_struct("ToolUse")
                 .field("id", &id)
                 .field("name", &name)
                 .field("input", &OpaqueJsonRef(input))
+                .field("signature", &signature.as_ref().map(|_| "[REDACTED]"))
                 .finish(),
             CoreContent::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
+                cache,
             } => f
                 .debug_struct("ToolResult")
                 .field("tool_use_id", &tool_use_id)
                 .field("content", &content)
                 .field("is_error", &is_error)
+                .field("cache", &cache)
                 .finish(),
             CoreContent::Thinking { text, signature } => f
                 .debug_struct("Thinking")
@@ -252,6 +275,17 @@ impl fmt::Debug for CoreContent {
             CoreContent::Refusal { text } => {
                 f.debug_struct("Refusal").field("text", &text).finish()
             }
+            CoreContent::Opaque { block } => f
+                .debug_struct("Opaque")
+                .field(
+                    "type",
+                    &block
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|t| crate::util::truncate_str_safe(t, 64)),
+                )
+                .field("block", &OpaqueJsonRef(block))
+                .finish(),
         }
     }
 }
@@ -414,6 +448,10 @@ pub struct SamplingOptions {
     /// bare OpenAI string becomes a single-element vec.
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
+    /// Top-K sampling (Anthropic `top_k`, Gemini `topK`); OpenAI Chat has no
+    /// equivalent, so the cross-format policy rejects it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
     /// Reasoning effort level (e.g. `"low"`, `"medium"`, `"high"`).
     pub reasoning_effort: Option<String>,
     /// Extended thinking configuration (provider-specific JSON, e.g. Anthropic
@@ -533,6 +571,7 @@ impl fmt::Debug for SamplingOptions {
             .field("top_p", &self.top_p)
             .field("max_tokens", &self.max_tokens)
             .field("stop", &self.stop)
+            .field("top_k", &self.top_k)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("thinking", &self.thinking.as_ref().map(OpaqueJsonRef))
             .finish()
@@ -1028,12 +1067,14 @@ mod tests {
                 cache: None,
             }],
             is_error: false,
+            cache: None,
         };
         match result {
             CoreContent::ToolResult {
                 content,
                 is_error,
                 tool_use_id,
+                ..
             } => {
                 assert!(!is_error);
                 assert_eq!(tool_use_id, "call_123");
@@ -1318,6 +1359,7 @@ mod tests {
                     id: "call_1".into(),
                     name: "fn".into(),
                     input: serde_json::json!({"x": 1}),
+                    signature: None,
                 },
             ],
             stop_reason: StopReason::ToolUse,
@@ -1522,11 +1564,13 @@ mod tests {
                 id: String::new(),
                 name: String::new(),
                 input: serde_json::Value::Null,
+                signature: None,
             },
             CoreContent::ToolResult {
                 tool_use_id: String::new(),
                 content: vec![],
                 is_error: false,
+                cache: None,
             },
             CoreContent::Thinking {
                 text: String::new(),
@@ -1583,6 +1627,7 @@ mod tests {
             top_p: Some(0.0),
             max_tokens: Some(0),
             stop: None,
+            top_k: None,
             reasoning_effort: None,
             thinking: None,
         };
@@ -1679,6 +1724,7 @@ mod tests {
                 cache: None,
             }],
             is_error: true,
+            cache: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: CoreContent = serde_json::from_str(&json).unwrap();
@@ -1691,6 +1737,7 @@ mod tests {
             tool_use_id: "call_empty".into(),
             content: vec![],
             is_error: true,
+            cache: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: CoreContent = serde_json::from_str(&json).unwrap();
@@ -1706,11 +1753,13 @@ mod tests {
                 cache: None,
             }],
             is_error: false,
+            cache: None,
         };
         let outer = CoreContent::ToolResult {
             tool_use_id: "outer".into(),
             content: vec![inner],
             is_error: false,
+            cache: None,
         };
         let json = serde_json::to_string(&outer).unwrap();
         let back: CoreContent = serde_json::from_str(&json).unwrap();
@@ -1740,6 +1789,7 @@ mod tests {
                 id: "call_1".into(),
                 name: "fn".into(),
                 input: serde_json::json!({"x": 1}),
+                signature: None,
             },
             CoreContent::ToolResult {
                 tool_use_id: "call_1".into(),
@@ -1748,6 +1798,7 @@ mod tests {
                     cache: None,
                 }],
                 is_error: false,
+                cache: None,
             },
             CoreContent::Thinking {
                 text: "hmm".into(),
@@ -1758,6 +1809,12 @@ mod tests {
             },
             CoreContent::Refusal {
                 text: "I cannot".into(),
+            },
+            CoreContent::Opaque {
+                block: serde_json::json!({
+                    "type": "server_tool_use", "id": "srvtoolu_1",
+                    "name": "web_search", "input": {"query": "q"}
+                }),
             },
         ];
         for content in &contents {
@@ -2103,6 +2160,7 @@ mod tests {
                 tool_use_id: format!("level_{i}"),
                 content: vec![content],
                 is_error: false,
+                cache: None,
             };
         }
         let json = serde_json::to_string(&content).unwrap();
@@ -2208,6 +2266,26 @@ mod tests {
         let debug = format!("{content:?}");
         assert!(!debug.contains("secret-url"), "Debug should redact source");
         assert!(debug.contains("Object"), "Debug should show type");
+    }
+
+    #[test]
+    fn opaque_block_debug_names_the_type_and_redacts_the_payload() {
+        let content = CoreContent::Opaque {
+            block: serde_json::json!({
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": [{"type": "web_search_result", "encrypted_content": "secret-blob"}]
+            }),
+        };
+        let debug = format!("{content:?}");
+        assert!(
+            debug.contains("web_search_tool_result"),
+            "Debug should name the block type: {debug}"
+        );
+        assert!(
+            !debug.contains("secret-blob") && !debug.contains("srvtoolu_1"),
+            "Debug should redact the block payload: {debug}"
+        );
     }
 
     #[test]

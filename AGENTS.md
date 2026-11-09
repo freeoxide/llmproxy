@@ -1,8 +1,9 @@
 # AGENTS.md
 
 `llm-proxy` is a Rust workspace (edition 2024, MSRV 1.85, toolchain pinned to
-1.96.1 in `rust-toolchain.toml`): the binary `apps/llm-proxy` plus the
-`crates/llm-proxy-{core,protocol,provider,storage,api,server}` libraries.
+1.96.1 in `rust-toolchain.toml`): the binary package `apps/llm-proxy` plus the
+`crates/llm-proxy-{core,protocol,adapters,transport,engine,storage,api,server,sdk}`
+libraries.
 Common tasks have `just` recipes — `just fmt`, `just lint`, `just test`,
 `just build`, `just run` — which wrap the cargo commands below.
 

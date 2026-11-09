@@ -1,0 +1,126 @@
+{
+  "error": null,
+  "response": {
+    "content": [
+      {
+        "text": "fixture reply",
+        "type": "text"
+      }
+    ],
+    "id": "msg_fixture_01",
+    "model": "claude-sonnet-4-5-20250929",
+    "role": "assistant",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "cache_creation_input_tokens": 64,
+      "cache_read_input_tokens": 32,
+      "input_tokens": 100,
+      "output_tokens": 20
+    }
+  },
+  "stream_events": null,
+  "upstream_headers": {
+    "anthropic-beta": "context-1m-2025-08-07",
+    "authorization": "Bearer operator-anthropic-key",
+    "content-type": "application/json",
+    "x-claude-code-session-id": "sess-fixture-1"
+  },
+  "upstream_request": {
+    "max_tokens": 16384,
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "Summarize the failing tests in crates/llm-proxy-server.",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "I'll list the failing tests first.",
+            "type": "text"
+          },
+          {
+            "id": "toolu_01ABC",
+            "input": {
+              "command": "cargo test -p llm-proxy-server 2>&1 | grep FAILED"
+            },
+            "name": "bash",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "cache_control": {
+              "type": "ephemeral"
+            },
+            "content": "test tests::messages_unknown_fields ... FAILED",
+            "tool_use_id": "toolu_01ABC",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "metadata": {
+      "user_id": "user_abc123"
+    },
+    "model": "claude-sonnet-4-5-20250929",
+    "stop_sequences": [
+      "\n\nHuman:"
+    ],
+    "system": [
+      {
+        "cache_control": {
+          "type": "ephemeral"
+        },
+        "text": "You are a coding agent working inside a repository.",
+        "type": "text"
+      },
+      {
+        "cache_control": {
+          "ttl": "1h",
+          "type": "ephemeral"
+        },
+        "text": "Long-term instructions that change rarely.",
+        "type": "text"
+      }
+    ],
+    "temperature": 1,
+    "thinking": {
+      "budget_tokens": 10000,
+      "type": "enabled"
+    },
+    "tool_choice": {
+      "disable_parallel_tool_use": false,
+      "type": "auto"
+    },
+    "tools": [
+      {
+        "description": "Run a shell command in the repository.",
+        "input_schema": {
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        "name": "bash"
+      }
+    ],
+    "top_k": 0,
+    "top_p": 0.95
+  }
+}

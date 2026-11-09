@@ -1,0 +1,83 @@
+{
+  "model": "gpt-4o",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a terse assistant."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Weather in SF? Also see this photo."
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+            "detail": "low"
+          }
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_sdk_01",
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "arguments": "{\"city\":\"SF\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_sdk_01",
+      "content": "72F and foggy"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a city.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "temperature": 0.2,
+  "seed": 42,
+  "max_completion_tokens": 512,
+  "response_format": {
+    "type": "json_object"
+  },
+  "parallel_tool_calls": false,
+  "frequency_penalty": 0.1,
+  "presence_penalty": 0.2,
+  "logit_bias": {
+    "50256": -100
+  },
+  "service_tier": "flex",
+  "store": false,
+  "user": "user_capture_fixture",
+  "stop": [
+    "\n\nUser:"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "accept": "application/json",
+  "user-agent": "OpenAI/JS 7.51.0",
+  "x-stainless-retry-count": "0",
+  "x-stainless-lang": "js",
+  "x-stainless-package-version": "7.51.0",
+  "x-stainless-os": "Linux",
+  "x-stainless-arch": "x64",
+  "x-stainless-runtime": "node",
+  "x-stainless-runtime-version": "v20.19.2",
+  "authorization": "Bearer sk-capture-fixture-not-real",
+  "content-type": "application/json",
+  "accept-language": "*",
+  "sec-fetch-mode": "cors"
+}

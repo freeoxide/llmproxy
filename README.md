@@ -7,14 +7,54 @@ catalogs, and optional live model discovery.
 ## Layout
 
 ~~~
-apps/llm-proxy                 main binary
-crates/llm-proxy-core          config, types, traits
+apps/llm-proxy                 daemon and CLI (binary: llm-proxy)
+crates/llm-proxy-core          config, routing, registry, metrics
 crates/llm-proxy-protocol      OpenAI / Claude / Gemini wire types
-crates/llm-proxy-provider      upstream channel implementations
-crates/llm-proxy-storage       persistence
-crates/llm-proxy-api           admin and user HTTP API
-crates/llm-proxy-server        axum wiring
+crates/llm-proxy-adapters      provider codecs (no I/O)
+crates/llm-proxy-transport     HTTP egress, credentials, discovery
+crates/llm-proxy-engine        request lifecycle (no HTTP) + traits
+crates/llm-proxy-bridge        JSON surface the Python/Node bindings wrap
+crates/llm-proxy-storage       usage ledger
+crates/llm-proxy-api           read-only /usage API
+crates/llm-proxy-server        axum routes and error mapping
+crates/llm-proxy-sdk           facade crate (published as llm-proxy-sdk)
+
+# Optional crates (plan 09) — not in the default build; enable with the
+# daemon feature of the same name:
+crates/llm-proxy-store-redis       [replica] shared limits/budgets in Redis
+crates/llm-proxy-store-postgres    [replica] shared limits/budgets in Postgres
+crates/llm-proxy-admin             admin surface: keys, usage, config, UI, MCP tools
+crates/llm-proxy-semantic-cache    [server.semantic_cache]
+crates/llm-proxy-mcp               MCP gateway ([mcp], own tokens)
+# No daemon feature: embedders wire guards through
+# EngineBuilder::guard (llm-proxy-guardrails never becomes a daemon
+# dependency).
+crates/llm-proxy-guardrails        guards with modes and fail policies
+
+# Language bindings (plan 10) — standalone workspaces packaged for PyPI/npm:
+bindings/python                 llm-proxy wheel (pyo3 + maturin)
+bindings/node                   @freeoxide/llm-proxy (napi-rs)
+bindings/shared                 binding contract cases and snapshots
 ~~~
+
+A bare `cargo build` compiles none of them (they sit outside
+`default-members`); `cargo build --workspace` builds everything.
+
+The non-chat endpoint families (embeddings, rerank, audio, images, files
+and batches) are a daemon feature too: build with
+`--features endpoint-families` and map them in `[provider.routes]`
+(`embeddings`, `rerank`, `audio_transcriptions`, `audio_speech`,
+`images_generations`, `files`, `batches`). A provider that routes a
+family in a build without the feature refuses to start.
+
+Live integration suites for the replica stores, the MCP gateway and the
+endpoint families ship `#[ignore]`d so the default test run needs no
+servers; set `LLM_PROXY_TEST_REDIS`, `LLM_PROXY_TEST_POSTGRES`,
+`LLM_PROXY_TEST_MCP_UPSTREAM` (plus `LLM_PROXY_TEST_MCP_CLIENT` to also
+drive the gateway from the official MCP Inspector CLI) or the
+`LLM_PROXY_TEST_*_URL` variables listed in
+`crates/llm-proxy-server/tests/live_families.rs`, and run the matching
+crate's tests with `-- --ignored`.
 
 ## Build
 

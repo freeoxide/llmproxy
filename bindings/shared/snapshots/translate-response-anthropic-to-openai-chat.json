@@ -1,0 +1,26 @@
+{
+  "error": null,
+  "result": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "fixture reply",
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": "<created-timestamp>",
+    "id": "msg_fixture_01",
+    "model": "claude-sonnet-4-5-20250929",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 20,
+      "prompt_cache_hit_tokens": 32,
+      "prompt_cache_miss_tokens": 64,
+      "prompt_tokens": 100,
+      "total_tokens": 120
+    }
+  }
+}

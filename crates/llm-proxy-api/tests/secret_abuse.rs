@@ -43,6 +43,7 @@ mod tests {
             },
             streaming: false,
             body_hash: "prx6-seed-digest".to_owned(),
+            session_id: None,
         }));
         let closer = Arc::new(bus);
         tokio::task::spawn_blocking(move || closer.close())

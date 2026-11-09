@@ -1,0 +1,46 @@
+[package]
+name = "llm-proxy-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The llm-proxy facade: one dependency that re-exports the engine, adapters, transport and (optionally) the axum server, with a builder for in-process use."
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["server", "sqlite"]
+# The axum router binding (llm-proxy-server), for mounting in an existing app.
+server = ["dep:llm-proxy-server"]
+# The persistent SQLite usage ledger.
+sqlite = ["llm-proxy-storage/sqlite"]
+# The read-only admin /usage API mounted behind [auth.admin].
+admin = ["llm-proxy-server/admin"]
+# The semantic response cache (plan 09 step 5).
+semantic-cache = ["llm-proxy-server/semantic-cache"]
+# The non-chat endpoint families on the router (plan 09 step 7).
+endpoint-families = ["llm-proxy-server/endpoint-families"]
+# Everything the standalone daemon needs.
+full = ["server", "sqlite", "admin"]
+
+[dependencies]
+llm-proxy-core = { workspace = true }
+llm-proxy-protocol = { workspace = true }
+llm-proxy-adapters = { workspace = true }
+llm-proxy-transport = { workspace = true }
+llm-proxy-engine = { workspace = true }
+llm-proxy-storage = { workspace = true }
+llm-proxy-server = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+axum = { workspace = true, features = ["macros", "json"] }
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+secrecy = { workspace = true }
+llm-proxy-storage = { workspace = true, features = ["test-utils", "sqlite"] }

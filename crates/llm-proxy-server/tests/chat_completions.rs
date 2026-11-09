@@ -17,11 +17,12 @@ mod tests {
         routing::post,
     };
     use futures::FutureExt;
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, build_router};
+    use llm_proxy_transport::ProxyClient;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -139,11 +140,13 @@ mod tests {
             llm_proxy_core::ProviderRoutesConfig {
                 messages: Some(adapter_name.to_owned()),
                 chat_completions: Some(adapter_name.to_owned()),
+                ..Default::default()
             }
         } else {
             llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some(adapter_name.to_owned()),
                 messages: None,
+                ..Default::default()
             }
         };
 
@@ -152,6 +155,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -161,6 +166,8 @@ mod tests {
                         protocol: protocol.to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -170,6 +177,9 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -185,13 +195,22 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
 
         AppState::new(
@@ -369,13 +388,22 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         let registry = ProviderRegistry::from_providers(vec![]).expect("empty registry");
         AppState::new(
@@ -398,6 +426,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -405,8 +435,10 @@ mod tests {
                     "openai-chat".to_owned(),
                     ProviderAdapterConfig {
                         protocol: "openai_chat".to_owned(),
-                        endpoint: "http://0.0.0.0:1/unreachable".to_owned(),
+                        endpoint: "http://127.0.0.1:1/unreachable".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -414,11 +446,15 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("openai-chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let app_config = AppConfig {
@@ -432,13 +468,22 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         AppState::new(
             app_config,
@@ -555,7 +600,9 @@ mod tests {
             resp_body["id"].as_str().unwrap().starts_with("chatcmpl-"),
             "id must start with chatcmpl-"
         );
-        assert_eq!(resp_body["model"], "gpt-4o");
+        // Same-format passthrough: the upstream response body reaches the
+        // client verbatim, so it advertises the upstream model name.
+        assert_eq!(resp_body["model"], "gpt-4o-2024-08-06");
         assert_eq!(resp_body["choices"][0]["finish_reason"], "stop");
         assert!(resp_body["choices"][0]["message"]["content"].is_string());
         assert!(resp_body["usage"]["prompt_tokens"].is_number());
@@ -646,17 +693,28 @@ mod tests {
         let upstream_json: Value =
             serde_json::from_slice(upstream_body).expect("upstream body should be valid JSON");
 
+        // Same-format passthrough (plan 02): the upstream body is the client's
+        // raw body with only the proxy's surgical edits — the field names the
+        // client used survive untouched.
         assert_eq!(upstream_json["model"], "gpt-4o");
-        assert_eq!(upstream_json["max_completion_tokens"], 256);
+        assert_eq!(upstream_json["max_tokens"], 256);
+        assert!(
+            upstream_json.get("max_completion_tokens").is_none(),
+            "same-format passthrough must not rename client fields"
+        );
         assert_eq!(upstream_json["temperature"], 0.7);
         assert_eq!(upstream_json["top_p"], 0.9);
         assert!(upstream_json["tools"].is_array(), "tools must be preserved");
         assert_eq!(upstream_json["tools"][0]["function"]["name"], "get_weather");
-        assert_eq!(upstream_json["tool_choice"]["type"], "auto");
-        assert_eq!(upstream_json["reasoning_effort"], "high");
+        assert_eq!(upstream_json["tool_choice"], "auto");
         assert_eq!(upstream_json["user"], "test-user-123");
-        assert_eq!(upstream_json["thinking"]["type"], "enabled");
-        assert_eq!(upstream_json["thinking"]["budget_tokens"], 10000);
+        // BUG-20: an Anthropic-style `thinking` object never reaches a chat
+        // API; the explicit reasoning_effort wins.
+        assert!(
+            upstream_json.get("thinking").is_none(),
+            "thinking must be translated, not forwarded: {upstream_json}"
+        );
+        assert_eq!(upstream_json["reasoning_effort"], "high");
     }
 
     #[tokio::test]
@@ -1764,6 +1822,8 @@ mod tests {
                 protocol: "openai_chat_completions".to_owned(),
                 endpoint: "https://provider-a.example.com/v1/chat/completions".to_owned(),
                 headers: std::sync::Arc::new(HashMap::new()),
+                forward_inbound_headers: None,
+                lossy: false,
             },
         );
         let provider_a = ProviderConfig {
@@ -1771,16 +1831,22 @@ mod tests {
             api_key: secrecy::SecretString::from("key-a"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: adapters_a,
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         let mut adapters_b = HashMap::new();
@@ -1790,6 +1856,8 @@ mod tests {
                 protocol: "openai_chat_completions".to_owned(),
                 endpoint: "https://provider-b.example.com/v1/chat/completions".to_owned(),
                 headers: std::sync::Arc::new(HashMap::new()),
+                forward_inbound_headers: None,
+                lossy: false,
             },
         );
         let provider_b = ProviderConfig {
@@ -1797,16 +1865,22 @@ mod tests {
             api_key: secrecy::SecretString::from("key-b"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: adapters_b,
             routes: llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some("chat".to_owned()),
                 messages: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider_a, provider_b]).unwrap();
@@ -1822,13 +1896,22 @@ mod tests {
                     server_name: "test".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::from_millis(500),
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),

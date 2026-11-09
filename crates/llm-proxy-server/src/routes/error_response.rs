@@ -7,6 +7,42 @@ use serde::Serialize;
 pub(super) enum ClientProtocol {
     Anthropic,
     OpenAiChat,
+    /// OpenAI Responses (`/v1/responses`, the Codex dialect; plan 08).
+    OpenAiResponses,
+    /// Gemini native (`/v1beta/models/{model}:generateContent`; plan 08).
+    Gemini,
+    /// Ollama native (`/api/chat`, `/api/generate`; plan 08).
+    Ollama,
+}
+
+impl ClientProtocol {
+    /// The wire framing a streaming response for this dialect uses: SSE with
+    /// named events (Anthropic, Responses), SSE data-only lines (OpenAI Chat,
+    /// Gemini `alt=sse`), NDJSON lines (Ollama) or a JSON array of chunks
+    /// (Gemini `streamGenerateContent` without `alt=sse`).
+    pub(super) fn stream_wire(self) -> StreamWire {
+        match self {
+            Self::Anthropic | Self::OpenAiResponses => StreamWire::SseNamed,
+            Self::OpenAiChat => StreamWire::SseData,
+            // The Gemini route chooses between SSE and the JSON array from
+            // the `alt` query parameter; both flow through the same encoder.
+            Self::Gemini => StreamWire::SseData,
+            Self::Ollama => StreamWire::Ndjson,
+        }
+    }
+}
+
+/// How encoded stream chunks are framed onto the client connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamWire {
+    /// SSE with an `event:` line per chunk (Anthropic Messages, Responses).
+    SseNamed,
+    /// SSE data-only lines (OpenAI Chat, Gemini `alt=sse`).
+    SseData,
+    /// NDJSON: one JSON object per line (Ollama).
+    Ndjson,
+    /// A JSON array of chunks (Gemini without `alt=sse`).
+    JsonArray,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum AuthOwner {
@@ -32,17 +68,64 @@ pub(super) enum RouteError {
         status: StatusCode,
         body: String,
         auth_owner: AuthOwner,
+        /// The upstream-advised wait, in seconds, when the error response
+        /// carried one (rendered as `Retry-After`).
+        retry_after_secs: Option<u64>,
     },
     #[error("upstream timeout: {0}")]
     UpstreamTimeout(String),
+    /// The engine's retry/failover ladder ran out (plan 04 step 12): the
+    /// proxy already retried, so the response also carries
+    /// `x-should-retry: false` and a computed `Retry-After`.
+    #[error("retries exhausted")]
+    RetryExhausted {
+        /// The status of the final underlying error.
+        status: StatusCode,
+        /// The computed wait, in seconds (always present: the ladder derives
+        /// one from the cooldown when the upstream advertised nothing).
+        retry_after_secs: u64,
+    },
+    /// The route's affinity policy refused a failover (plan 04 step 10).
+    #[error("session affinity refused the failover")]
+    AffinityRefused,
     #[error("provider decode error: {0}")]
     ProviderDecode(String),
     #[error("internal error: {0}")]
     Internal(String),
-    #[error("rate limit exceeded")]
-    RateLimited,
-    #[error("duplicate request")]
-    Conflict,
+    /// A rate window (RPM, TPM, RPD) refused the request: 429, with the
+    /// window reset as `Retry-After` when known (plan 05 step 5).
+    #[error("rate limit exceeded: {message}")]
+    RateLimited {
+        /// Which window refused (proxy-authored, safe for the client).
+        message: String,
+        /// The window reset in seconds, when the admission step knows it.
+        retry_after_secs: Option<u64>,
+    },
+    /// The caller's spend budget refused the request: 402 (plan 05 step 4).
+    #[error("spend budget exhausted: {message}")]
+    BudgetExhausted {
+        /// Which budget refused (proxy-authored, safe for the client).
+        message: String,
+        /// The budget window reset in seconds, when known.
+        retry_after_secs: Option<u64>,
+    },
+    /// A concurrency cap is saturated (plan 05 step 7): 503 with a short
+    /// `Retry-After`, never 429.
+    #[error("at capacity: {message}")]
+    Overloaded {
+        /// Which cap saturated (proxy-authored, safe for the client).
+        message: String,
+        /// A short wait in seconds after which a slot may be free.
+        retry_after_secs: Option<u64>,
+    },
+    /// The caller's key may not reach this provider or model (plan 05 step
+    /// 3): 403.
+    #[error("{0}")]
+    Forbidden(String),
+    /// Another request from this caller holds the same `Idempotency-Key`
+    /// and is still in flight (plan 06 step 3): 409 while it runs.
+    #[error("a request with this Idempotency-Key is already in flight")]
+    IdempotencyInFlight,
     #[error("not found")]
     NotFound,
     #[error("request timeout")]
@@ -81,10 +164,35 @@ struct OpenAiErrorDetail {
     code: serde_json::Value,
 }
 pub(super) fn route_error_response(protocol: ClientProtocol, error: &RouteError) -> Response<Body> {
-    match protocol {
+    let mut response = match protocol {
         ClientProtocol::Anthropic => anthropic_error_response(error),
-        ClientProtocol::OpenAiChat => openai_error_response(error),
+        ClientProtocol::OpenAiChat | ClientProtocol::OpenAiResponses => {
+            openai_error_response(error)
+        }
+        ClientProtocol::Gemini => gemini_error_response(error),
+        ClientProtocol::Ollama => ollama_error_response(error),
+    };
+    // One policy table (plan 05 step 1, audit conflict 14): every error
+    // response carries the deliberate x-should-retry choice for its status,
+    // not just the ladder-exhaustion case. An exhausted ladder overrides its
+    // row: the proxy already did the retrying (plan 04 step 12).
+    let (status, _type, _message) = extract_error_fields(error);
+    let should_retry = match error {
+        RouteError::RetryExhausted { .. } => false,
+        // A status outside the table (none ship today — the coverage test
+        // pins this) defaults to "do not retry".
+        _ => llm_proxy_engine::policy_for(status.as_u16()).is_some_and(|row| row.should_retry),
+    };
+    response.headers_mut().insert(
+        "x-should-retry",
+        HeaderValue::from_static(if should_retry { "true" } else { "false" }),
+    );
+    if let Some(secs) = error.retry_after_secs() {
+        if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
     }
+    response
 }
 pub(crate) const INTERNAL_ERROR_CLIENT_MESSAGE: &str = "internal server error";
 pub(crate) const PROVIDER_DECODE_CLIENT_MESSAGE: &str = "provider response decode error";
@@ -129,19 +237,123 @@ fn openai_error_response(error: &RouteError) -> Response<Body> {
     );
     response
 }
-pub(super) fn openai_stream_error_json_with_type(
-    message: &str,
-    error_type: &str,
-) -> Option<String> {
-    let body = OpenAiErrorBody {
-        error: OpenAiErrorDetail {
-            message: truncate_error_body(message),
-            r#type: error_type.to_owned(),
-            code: serde_json::Value::Null,
-        },
-    };
-    serde_json::to_string(&body).ok()
+
+/// Gemini error bodies: `{"error": {"code", "message", "status"}}`.
+fn gemini_error_response(error: &RouteError) -> Response<Body> {
+    let (status, _type, message) = extract_error_fields(error);
+    let body = llm_proxy_protocol::client::gemini::error_payload(status.as_u16(), &message);
+    let mut response = (status, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
+
+/// Ollama error bodies: `{"error": "<message>"}`.
+fn ollama_error_response(error: &RouteError) -> Response<Body> {
+    let (status, _type, message) = extract_error_fields(error);
+    let body = llm_proxy_protocol::client::ollama::error_payload(&message);
+    let mut response = (status, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+impl RouteError {
+    /// The advised wait in seconds this error carries, when any: the value
+    /// rendered as `Retry-After` (from an upstream header, a rate-window
+    /// reset, or a ladder computation). `None` for errors with no advice.
+    fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Upstream {
+                retry_after_secs, ..
+            }
+            | Self::RateLimited {
+                retry_after_secs, ..
+            }
+            | Self::BudgetExhausted {
+                retry_after_secs, ..
+            }
+            | Self::Overloaded {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            Self::RetryExhausted {
+                retry_after_secs, ..
+            } => Some(*retry_after_secs),
+            _ => None,
+        }
+    }
+}
+
+impl From<llm_proxy_engine::EngineError> for RouteError {
+    fn from(error: llm_proxy_engine::EngineError) -> Self {
+        use llm_proxy_engine::EngineError as E;
+        let secs = |wait: Option<std::time::Duration>| wait.map(|w| w.as_secs().max(1));
+        match error {
+            E::InvalidProviderName(m) => Self::InvalidProviderName(m),
+            E::UnknownProvider(m) => Self::UnknownProvider(m),
+            E::UnsupportedRoute(m) => Self::UnsupportedRoute(m),
+            E::ModelNotAllowed(m) => Self::ModelNotAllowed(m),
+            E::Unauthorized => Self::Unauthorized,
+            E::InvalidRequest(m) => Self::InvalidRequest(m),
+            E::ProviderDecode(m) => Self::ProviderDecode(m),
+            E::Upstream {
+                status,
+                body,
+                auth_owner,
+                retry_after,
+            } => {
+                let owner = match auth_owner {
+                    llm_proxy_engine::AuthOwner::Client => AuthOwner::Client,
+                    llm_proxy_engine::AuthOwner::Operator => AuthOwner::Operator,
+                };
+                let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+                Self::Upstream {
+                    status: code,
+                    body,
+                    auth_owner: owner,
+                    retry_after_secs: secs(retry_after),
+                }
+            }
+            E::UpstreamTimeout(m) => Self::UpstreamTimeout(m),
+            E::RetryExhausted {
+                last, retry_after, ..
+            } => Self::RetryExhausted {
+                status: StatusCode::from_u16(last.status_code()).unwrap_or(StatusCode::BAD_GATEWAY),
+                retry_after_secs: retry_after.map(|wait| wait.as_secs().max(1)).unwrap_or(1),
+            },
+            E::AffinityRefused { .. } => Self::AffinityRefused,
+            E::RateLimited {
+                message,
+                retry_after,
+            } => Self::RateLimited {
+                message,
+                retry_after_secs: secs(retry_after),
+            },
+            E::BudgetExhausted {
+                message,
+                retry_after,
+            } => Self::BudgetExhausted {
+                message,
+                retry_after_secs: secs(retry_after),
+            },
+            E::Overloaded {
+                message,
+                retry_after,
+            } => Self::Overloaded {
+                message,
+                retry_after_secs: secs(retry_after),
+            },
+            E::Forbidden(m) => Self::Forbidden(m),
+            E::IdempotencyInFlight => Self::IdempotencyInFlight,
+            E::Internal(m) => Self::Internal(m),
+            other => Self::Internal(other.to_string()),
+        }
+    }
+}
+
 pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
     match error {
         RouteError::InvalidRequest(_) => "InvalidRequest",
@@ -151,10 +363,15 @@ pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
         RouteError::InvalidProviderName(_) => "InvalidProviderName",
         RouteError::Upstream { .. } => "Upstream",
         RouteError::UpstreamTimeout(_) => "UpstreamTimeout",
+        RouteError::RetryExhausted { .. } => "RetryExhausted",
+        RouteError::AffinityRefused => "AffinityRefused",
         RouteError::ProviderDecode(_) => "ProviderDecode",
         RouteError::Internal(_) => "Internal",
-        RouteError::RateLimited => "RateLimited",
-        RouteError::Conflict => "Conflict",
+        RouteError::RateLimited { .. } => "RateLimited",
+        RouteError::BudgetExhausted { .. } => "BudgetExhausted",
+        RouteError::Overloaded { .. } => "Overloaded",
+        RouteError::Forbidden(_) => "Forbidden",
+        RouteError::IdempotencyInFlight => "IdempotencyInFlight",
         RouteError::NotFound => "NotFound",
         RouteError::RequestTimeout => "RequestTimeout",
         RouteError::PayloadTooLarge => "PayloadTooLarge",
@@ -162,6 +379,10 @@ pub(crate) fn route_error_variant_name(error: &RouteError) -> &'static str {
         RouteError::Unauthorized => "Unauthorized",
     }
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "one row per RouteError variant: the status/type/message table reads as a unit"
+)]
 pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static str, String) {
     match error {
         RouteError::InvalidRequest(msg) => (
@@ -193,6 +414,7 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             status,
             body: _body,
             auth_owner,
+            retry_after_secs: _,
         } => {
             let mapped = map_upstream_status(*status, *auth_owner);
             let message = if mapped == *status {
@@ -207,6 +429,17 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             "api_error",
             "upstream request timed out".to_owned(),
         ),
+        RouteError::RetryExhausted { status, .. } => (
+            *status,
+            "api_error",
+            "upstream unavailable after retries; the proxy has already retried this request"
+                .to_owned(),
+        ),
+        RouteError::AffinityRefused => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "api_error",
+            "session is pinned to an upstream that is unavailable".to_owned(),
+        ),
         RouteError::ProviderDecode(_msg) => (
             StatusCode::BAD_GATEWAY,
             "api_error",
@@ -217,15 +450,32 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
             "api_error",
             INTERNAL_ERROR_CLIENT_MESSAGE.to_owned(),
         ),
-        RouteError::RateLimited => (
+        RouteError::RateLimited { message, .. } => (
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
-            "rate limit exceeded".to_owned(),
+            truncate_error_body(message),
         ),
-        RouteError::Conflict => (
+        RouteError::BudgetExhausted { message, .. } => (
+            StatusCode::PAYMENT_REQUIRED,
+            "billing_error",
+            truncate_error_body(message),
+        ),
+        RouteError::Overloaded { message, .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded_error",
+            truncate_error_body(message),
+        ),
+        RouteError::Forbidden(message) => (
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            truncate_error_body(message),
+        ),
+        RouteError::IdempotencyInFlight => (
             StatusCode::CONFLICT,
             "invalid_request_error",
-            "duplicate request, please retry".to_owned(),
+            "a request with this Idempotency-Key is already in flight; retry once \
+             it completes to replay its response"
+                .to_owned(),
         ),
         RouteError::NotFound => (
             StatusCode::NOT_FOUND,
@@ -255,26 +505,28 @@ pub(crate) fn extract_error_fields(error: &RouteError) -> (StatusCode, &'static 
     }
 }
 fn map_upstream_status(upstream: StatusCode, auth_owner: AuthOwner) -> StatusCode {
-    match upstream.as_u16() {
-        400 | 413 | 429 => upstream,
-        401 | 403 if auth_owner == AuthOwner::Client => upstream,
-        code => {
-            if matches!(code, 401 | 403 | 404) {
-                tracing::warn!(
-                    upstream_status = code,
-                    auth_owner = ?auth_owner,
-                    "upstream returned a status that may indicate a configuration \
-                     issue (auth, forbidden, or not found); mapping to 502 for client"
-                );
-            } else if code < 400 {
-                tracing::debug!(
-                    upstream_status = code,
-                    "unexpected 1xx/2xx/3xx upstream status in error path; mapping to 502"
-                );
-            }
-            StatusCode::BAD_GATEWAY
-        }
+    // One policy, defined in the engine (audit conflict 14): the server only
+    // translates it to `StatusCode` and keeps the diagnostics.
+    let code = upstream.as_u16();
+    let owner = match auth_owner {
+        AuthOwner::Client => llm_proxy_engine::AuthOwner::Client,
+        AuthOwner::Operator => llm_proxy_engine::AuthOwner::Operator,
+    };
+    let mapped = llm_proxy_engine::map_upstream_status(code, owner);
+    if matches!(code, 401 | 403 | 404) && mapped != code {
+        tracing::warn!(
+            upstream_status = code,
+            auth_owner = ?auth_owner,
+            "upstream returned a status that may indicate a configuration \
+             issue (auth, forbidden, or not found); mapping to 502 for client"
+        );
+    } else if code < 400 && mapped != code {
+        tracing::debug!(
+            upstream_status = code,
+            "unexpected 1xx/2xx/3xx upstream status in error path; mapping to 502"
+        );
     }
+    StatusCode::from_u16(mapped).unwrap_or(StatusCode::BAD_GATEWAY)
 }
 const MAX_ERROR_MESSAGE_LEN: usize = 512;
 const TRUNCATED_SUFFIX: &str = "...[truncated]";
@@ -309,6 +561,7 @@ mod tests {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: "upstream error".into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -320,6 +573,7 @@ mod tests {
             status: StatusCode::TOO_MANY_REQUESTS,
             body: "rate limited".into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -341,16 +595,12 @@ mod tests {
 
     #[test]
     fn anthropic_rate_limited_returns_429() {
-        let err = RouteError::RateLimited;
+        let err = RouteError::RateLimited {
+            message: "rate limit exceeded".to_owned(),
+            retry_after_secs: None,
+        };
         let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    #[test]
-    fn anthropic_conflict_returns_409() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::Anthropic, &err);
-        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -407,6 +657,7 @@ mod tests {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: "upstream error".into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -418,6 +669,7 @@ mod tests {
             status: StatusCode::TOO_MANY_REQUESTS,
             body: "rate limited".into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -439,16 +691,12 @@ mod tests {
 
     #[test]
     fn openai_rate_limited_returns_429() {
-        let err = RouteError::RateLimited;
+        let err = RouteError::RateLimited {
+            message: "rate limit exceeded".to_owned(),
+            retry_after_secs: None,
+        };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    #[test]
-    fn openai_conflict_returns_409() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
-        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -493,6 +741,7 @@ mod tests {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: "model 'gpt-foo' is overloaded: request echoed here".into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -515,6 +764,7 @@ mod tests {
             status: StatusCode::BAD_REQUEST,
             body: r#"{"error":{"message":"model 'gpt-foo' does not exist","type":"invalid_request_error"}}"#.into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -534,6 +784,7 @@ mod tests {
             status: StatusCode::UNAUTHORIZED,
             body: "invalid api key sk-leaked".into(),
             auth_owner: AuthOwner::Client,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -552,6 +803,7 @@ mod tests {
             status: StatusCode::UNAUTHORIZED,
             body: "invalid api key".into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -589,7 +841,10 @@ mod tests {
 
     #[tokio::test]
     async fn openai_rate_limited_body_has_correct_structure() {
-        let err = RouteError::RateLimited;
+        let err = RouteError::RateLimited {
+            message: "rate limit exceeded".to_owned(),
+            retry_after_secs: None,
+        };
         let response = route_error_response(ClientProtocol::OpenAiChat, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -597,24 +852,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
         assert_eq!(json["error"]["type"], "rate_limit_error");
         assert_eq!(json["error"]["message"], "rate limit exceeded");
-        assert!(json["error"]["code"].is_null());
-    }
-
-    #[tokio::test]
-    async fn openai_conflict_body_has_correct_structure() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::OpenAiChat, &err);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-        assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("duplicate")
-        );
         assert!(json["error"]["code"].is_null());
     }
 
@@ -717,8 +954,8 @@ mod tests {
         );
         assert_eq!(route_error_variant_name(&RouteError::NotFound), "NotFound");
         assert_eq!(
-            route_error_variant_name(&RouteError::RateLimited),
-            "RateLimited"
+            route_error_variant_name(&RouteError::Forbidden("no".into())),
+            "Forbidden"
         );
         assert_eq!(
             route_error_variant_name(&RouteError::RequestTimeout),
@@ -737,6 +974,7 @@ mod tests {
                 status: StatusCode::BAD_GATEWAY,
                 body: String::new(),
                 auth_owner: AuthOwner::Operator,
+                retry_after_secs: None,
             }),
             "Upstream"
         );
@@ -902,6 +1140,7 @@ mod tests {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: "model 'gpt-foo' is overloaded: request echoed here".into(),
             auth_owner: AuthOwner::Operator,
+            retry_after_secs: None,
         };
         let response = route_error_response(ClientProtocol::Anthropic, &err);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -933,7 +1172,10 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_rate_limited_body_has_correct_structure() {
-        let err = RouteError::RateLimited;
+        let err = RouteError::RateLimited {
+            message: "rate limit exceeded".to_owned(),
+            retry_after_secs: None,
+        };
         let response = route_error_response(ClientProtocol::Anthropic, &err);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -945,21 +1187,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_conflict_body_has_correct_structure() {
-        let err = RouteError::Conflict;
-        let response = route_error_response(ClientProtocol::Anthropic, &err);
-        let body = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .expect("body");
-        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
-        assert_eq!(json["type"], "error");
-        assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("duplicate")
-        );
+    async fn idempotency_in_flight_renders_409_in_both_dialects() {
+        for protocol in [ClientProtocol::Anthropic, ClientProtocol::OpenAiChat] {
+            let response = route_error_response(protocol, &RouteError::IdempotencyInFlight);
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            // The policy row's deliberate choice: a stock SDK that auto-retries
+            // 409 clears this by itself once the first request finishes.
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-should-retry")
+                    .map(|v| v.to_str().unwrap()),
+                Some("true")
+            );
+            // The client-visible message reads as one sentence — no run of
+            // spaces where a string continuation was folded.
+            let body = axum::body::to_bytes(response.into_parts().1, 4096)
+                .await
+                .expect("body");
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+            let message = json["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("retry once it completes to replay its response"),
+                "the 409 message must read cleanly: {message}"
+            );
+            assert!(
+                !message.contains("  "),
+                "the 409 message must not carry a run of spaces: {message}"
+            );
+        }
     }
 
     #[test]
@@ -968,21 +1224,166 @@ mod tests {
         assert_ne!(ClientProtocol::Anthropic, ClientProtocol::OpenAiChat);
     }
 
-    #[test]
-    fn stream_error_json_produces_valid_structure() {
-        let json_str = openai_stream_error_json_with_type("test error", "server_error");
-        assert!(json_str.is_some());
-        let json: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
-        assert_eq!(json["error"]["message"], "test error");
-        assert_eq!(json["error"]["type"], "server_error");
-        assert!(json["error"]["code"].is_null());
+    /// One representative per `RouteError` variant: the status table the
+    /// server renders is exactly the engine's policy table (plan 05 step 1).
+    fn every_route_error() -> Vec<RouteError> {
+        vec![
+            RouteError::InvalidRequest("x".into()),
+            RouteError::ModelNotAllowed("x".into()),
+            RouteError::UnknownProvider("x".into()),
+            RouteError::UnsupportedRoute("x".into()),
+            RouteError::InvalidProviderName("x".into()),
+            RouteError::Upstream {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                body: String::new(),
+                auth_owner: AuthOwner::Operator,
+                retry_after_secs: Some(7),
+            },
+            RouteError::Upstream {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                body: String::new(),
+                auth_owner: AuthOwner::Operator,
+                retry_after_secs: None,
+            },
+            RouteError::UpstreamTimeout("x".into()),
+            RouteError::RetryExhausted {
+                status: StatusCode::BAD_GATEWAY,
+                retry_after_secs: 4,
+            },
+            RouteError::AffinityRefused,
+            RouteError::ProviderDecode("x".into()),
+            RouteError::Internal("x".into()),
+            RouteError::RateLimited {
+                message: "rpm".into(),
+                retry_after_secs: Some(30),
+            },
+            RouteError::BudgetExhausted {
+                message: "daily".into(),
+                retry_after_secs: None,
+            },
+            RouteError::Overloaded {
+                message: "cap".into(),
+                retry_after_secs: Some(1),
+            },
+            RouteError::Forbidden("no".into()),
+            RouteError::IdempotencyInFlight,
+            RouteError::NotFound,
+            RouteError::RequestTimeout,
+            RouteError::PayloadTooLarge,
+            RouteError::MethodNotAllowed,
+            RouteError::Unauthorized,
+        ]
     }
 
     #[test]
-    fn stream_error_json_with_empty_message() {
-        let json_str = openai_stream_error_json_with_type("", "api_error");
-        assert!(json_str.is_some());
-        let json: serde_json::Value = serde_json::from_str(&json_str.unwrap()).unwrap();
-        assert_eq!(json["error"]["message"], "");
+    fn every_server_status_is_in_the_engine_policy_table() {
+        for error in every_route_error() {
+            let (status, _type, _message) = extract_error_fields(&error);
+            assert!(
+                llm_proxy_engine::policy_for(status.as_u16()).is_some(),
+                "{error:?} renders {status}, which has no policy row"
+            );
+        }
+    }
+
+    #[test]
+    fn every_error_response_carries_the_tables_retry_choice() {
+        for error in every_route_error() {
+            for protocol in [ClientProtocol::Anthropic, ClientProtocol::OpenAiChat] {
+                let response = route_error_response(protocol, &error);
+                let status = response.status().as_u16();
+                let expected = if matches!(error, RouteError::RetryExhausted { .. }) {
+                    "false"
+                } else if llm_proxy_engine::policy_for(status)
+                    .expect("row exists")
+                    .should_retry
+                {
+                    "true"
+                } else {
+                    "false"
+                };
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("x-should-retry")
+                        .and_then(|v| v.to_str().ok()),
+                    Some(expected),
+                    "{error:?} ({status}) must carry the table's x-should-retry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn advised_waits_render_as_retry_after_only_when_carried() {
+        let with_wait = RouteError::Overloaded {
+            message: "cap".into(),
+            retry_after_secs: Some(1),
+        };
+        let response = route_error_response(ClientProtocol::OpenAiChat, &with_wait);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+
+        let without = RouteError::BudgetExhausted {
+            message: "daily".into(),
+            retry_after_secs: None,
+        };
+        let response = route_error_response(ClientProtocol::Anthropic, &without);
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+        assert_eq!(
+            response
+                .headers()
+                .get("x-should-retry")
+                .and_then(|v| v.to_str().ok()),
+            Some("false"),
+            "a spend budget is not something an SDK retry ladder can wait out"
+        );
+    }
+
+    #[test]
+    fn engine_admission_refusals_keep_their_status_through_the_server() {
+        use llm_proxy_engine::EngineError;
+        let cases: Vec<(EngineError, StatusCode)> = vec![
+            (
+                EngineError::RateLimited {
+                    message: "rpm".into(),
+                    retry_after: Some(std::time::Duration::from_secs(12)),
+                },
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                EngineError::BudgetExhausted {
+                    message: "usd".into(),
+                    retry_after: None,
+                },
+                StatusCode::PAYMENT_REQUIRED,
+            ),
+            (
+                EngineError::Overloaded {
+                    message: "cap".into(),
+                    retry_after: Some(std::time::Duration::from_secs(1)),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (EngineError::Forbidden("no".into()), StatusCode::FORBIDDEN),
+        ];
+        for (engine_error, expected) in cases {
+            let engine_status = engine_error.status_code();
+            let route: RouteError = engine_error.into();
+            let (status, _type, _message) = extract_error_fields(&route);
+            assert_eq!(status, expected, "{route:?}");
+            assert_eq!(
+                status.as_u16(),
+                engine_status,
+                "engine and server must agree on the status for {route:?}"
+            );
+        }
     }
 }

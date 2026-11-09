@@ -1,0 +1,29 @@
+{
+  "_provenance": {
+    "note": "Fixture synthesized from the models.dev api.json schema, verified live against https://models.dev/api.json on 2026-11-06. Field names and shapes follow the live feed; numeric values are the real published prices for the named models, reduced to the subset this test needs. Top-level keys that are not provider objects (like this one) are ignored by the parser.",
+    "units": "cost fields are USD per million tokens"
+  },
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "models": {
+      "claude-sonnet-4-5": {
+        "id": "claude-sonnet-4-5",
+        "name": "Claude Sonnet 4.5",
+        "limit": { "context": 200000, "output": 64000 },
+        "cost": { "input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75 }
+      },
+      "unpriced-preview": {
+        "id": "unpriced-preview",
+        "name": "Not Yet Priced Preview",
+        "limit": { "context": 100000, "output": 32000 }
+      },
+      "no-cost-dimensions": {
+        "id": "no-cost-dimensions",
+        "name": "Free Tier",
+        "limit": { "context": 8000, "output": 4000 },
+        "cost": {}
+      }
+    }
+  }
+}

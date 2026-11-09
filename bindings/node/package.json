@@ -1,0 +1,29 @@
+{
+  "name": "@freeoxide/llm-proxy",
+  "version": "0.1.0",
+  "description": "Node bindings for the llm-proxy engine: translation, request execution, streaming and configuration from code.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "binding.js",
+    "binding.d.ts",
+    "*.node"
+  ],
+  "scripts": {
+    "build": "napi build --platform --release --js binding.js --dts binding.d.ts",
+    "build:debug": "napi build --platform --js binding.js --dts binding.d.ts",
+    "test": "node --test test/"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  },
+  "napi": {
+    "binaryName": "llm-proxy"
+  },
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">=10.0.0"
+  }
+}

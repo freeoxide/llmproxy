@@ -1,0 +1,27 @@
+[
+  {
+    "type": "message_start"
+  },
+  {
+    "type": "content_start"
+  },
+  {
+    "type": "thinking_delta"
+  },
+  {
+    "type": "content_start"
+  },
+  {
+    "type": "text_delta"
+  },
+  {
+    "type": "usage_delta",
+    "usage": {
+      "input_tokens": 30,
+      "output_tokens": 20
+    }
+  },
+  {
+    "type": "message_stop"
+  }
+]

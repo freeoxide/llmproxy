@@ -5,7 +5,6 @@
 #![deny(missing_docs)]
 
 mod auth;
-mod reader;
 mod routes;
 
 pub use routes::UsageApi;

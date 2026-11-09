@@ -1,0 +1,40 @@
+[package]
+name = "llm-proxy-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The optional MCP gateway for llm-proxy (plan 09 step 6, audit conflict 17): its own auth and session model, sharing the proxy's admission and accounting."
+repository.workspace = true
+readme.workspace = true
+keywords = ["llm", "proxy", "mcp", "gateway"]
+categories = ["web-programming::http-server"]
+
+[lints]
+workspace = true
+
+[dependencies]
+llm-proxy-adapters = { workspace = true }
+llm-proxy-core = { workspace = true }
+llm-proxy-engine = { workspace = true }
+llm-proxy-storage = { workspace = true, default-features = false }
+llm-proxy-protocol = { workspace = true }
+llm-proxy-transport = { workspace = true }
+secrecy = { workspace = true }
+
+axum = { workspace = true, features = ["macros", "json"] }
+serde_json = { workspace = true }
+sha2 = "0.10"
+time = { workspace = true }
+tower-http = { version = "0.6", features = ["trace", "catch-panic", "set-header"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tracing = { workspace = true }
+llm-proxy-storage = { workspace = true, features = ["test-utils"] }
+tower = { workspace = true, features = ["util"] }
+axum = { workspace = true, features = ["macros", "json"] }
+llm-proxy-protocol = { workspace = true }
+secrecy = { workspace = true }
+tokio = { workspace = true }

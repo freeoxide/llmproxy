@@ -5,26 +5,15 @@ change follows and the decisions already made.
 
 ## Plans
 
-Each plan is one stage of work, with its scope, steps and finish line.
+Each plan is one stage of work, with its scope, steps and finish line. None
+are open; finished plans are linked under Completed below.
 
 | # | Plan | Status | Depends on |
 |---|---|---|---|
-| 01 | [Bug fixes](plans/01-bug-fixes.md) | In progress | None |
-| 02 | [Request fidelity](plans/02-request-fidelity.md) | Not started | 01 |
-| 03 | [Engine and crate split](plans/03-engine.md) | Not started | 02 |
-| 04 | [Routing and failover](plans/04-routing-and-failover.md) | Not started | 03 |
-| 05 | [Admission and budgets](plans/05-admission-and-budgets.md) | Not started | 04 |
-| 06 | [Cache and dedup](plans/06-cache-and-dedup.md) | Not started | 05 |
-| 07 | [Hardening and operations](plans/07-hardening-and-operations.md) | Not started | None; steps 10 and 11 need 03 |
-| 08 | [Client dialects](plans/08-client-dialects.md) | Not started | 03 |
-| 09 | [Optional crates](plans/09-optional-crates.md) | Not started | 05; the semantic cache also needs 06 |
-| 10 | [Language bindings](plans/10-bindings.md) | Not started | 03, with a stable API |
-| 11 | [Research corrections](plans/11-research-corrections.md) | Not started | None |
 
 How to use them:
 
-- Take the lowest-numbered plan whose dependencies are done. Plans 07 and 11 can
-  run alongside the others.
+- Take the lowest-numbered plan whose dependencies are done.
 - Update the status here and at the top of the plan in the same change as the
   work.
 - When a plan is finished, move it to `completed/` and link it below.
@@ -52,6 +41,8 @@ Plan headers point to the [research audit](research/audit-2026-11-05/REPORT.md):
 ## Reference
 
 - [Protocol architecture](protocol.md): the normalized core and streaming rules.
+- [Data-class policy](data-class-policy.md): what every opt-in stores, where
+  and for how long; prompts and responses are stored nowhere by default.
 - [Lint guide](rust-anti-slop-lint-guide.md),
   [lint setup](SETUP-RUST-LINTS.agent.md) and
   [lint backlog](lint-backlog.md).
@@ -61,9 +52,22 @@ Plan headers point to the [research audit](research/audit-2026-11-05/REPORT.md):
 - [Research index](research/README.md): competitor surveys, provider notes and
   the feature backlog. Use it as a catalogue of options, not a ranking of demand.
 - [Research audit, 2026-11-05](research/audit-2026-11-05/REPORT.md): what was
-  checked and what turned out to be wrong. Where the two disagree, trust the
-  audit until [plan 11](plans/11-research-corrections.md) is done.
+  checked and what turned out to be wrong. Its false and misleading claims
+  were corrected in the research docs on 2026-11-08
+  ([plan 11](completed/11-research-corrections.md)); where a doc still
+  describes llm-proxy's own code, it describes the audited commit.
 
 ## Completed
 
+- [11. Research corrections](completed/11-research-corrections.md)
+- [10. Language bindings](completed/10-bindings.md)
+- [09. Optional crates](completed/09-optional-crates.md)
+- [08. Client dialects](completed/08-client-dialects.md)
+- [07. Hardening and operations](completed/07-hardening-and-operations.md)
+- [06. Cache and dedup](completed/06-cache-and-dedup.md)
+- [05. Admission and budgets](completed/05-admission-and-budgets.md)
+- [04. Routing and failover](completed/04-routing-and-failover.md)
+- [03. Engine and crate split](completed/03-engine.md)
+- [02. Request fidelity](completed/02-request-fidelity.md)
+- [01. Bug fixes](completed/01-bug-fixes.md)
 - [Provider-scoped remodel](completed/remodel-proxy.md)

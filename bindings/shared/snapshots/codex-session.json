@@ -1,0 +1,160 @@
+{
+  "error": null,
+  "response": null,
+  "stream_events": [
+    {
+      "MessageStart": {
+        "id": null,
+        "model": {
+          "requested": "gpt-5.1-codex",
+          "upstream": "gpt-5.1-codex-2030-09-17"
+        }
+      }
+    },
+    {
+      "ContentStart": {
+        "index": 0,
+        "kind": "Text"
+      }
+    },
+    {
+      "TextDelta": {
+        "index": 0,
+        "text": "fixed"
+      }
+    },
+    {
+      "UsageDelta": {
+        "usage": {
+          "cache_creation_input_tokens": null,
+          "cache_read_input_tokens": 0,
+          "input_tokens": 120,
+          "output_tokens": 9,
+          "provenance": "ProviderReported",
+          "reasoning_tokens": 48
+        }
+      }
+    },
+    {
+      "MessageStop": {
+        "stop_reason": "EndTurn",
+        "stop_sequence": null
+      }
+    }
+  ],
+  "upstream_headers": {
+    "authorization": "Bearer operator-responses-key",
+    "content-type": "application/json"
+  },
+  "upstream_request": {
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "input": [
+      {
+        "content": [
+          {
+            "text": "<environment_context>\nWorking directory: /home/user/repo\nIs a git repo: true\nPlatform: linux\n</environment_context>\n\nFind the failing test and fix it.",
+            "type": "input_text"
+          }
+        ],
+        "role": "user",
+        "type": "message"
+      },
+      {
+        "encrypted_content": "gAAAAABfixture_encrypted_reasoning_not_real",
+        "id": "rs_fixture_0001",
+        "summary": [
+          {
+            "text": "Run the test suite to see the failure first.",
+            "type": "summary_text"
+          }
+        ],
+        "type": "reasoning"
+      },
+      {
+        "arguments": "{\"command\":[\"cargo\",\"test\",\"-p\",\"demo\"],\"workdir\":\"/home/user/repo\",\"timeout_ms\":120000}",
+        "call_id": "call_fixture_0001",
+        "name": "shell",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call_fixture_0001",
+        "output": "test parse::tests::flags ... FAILED\nfailures:\n        parse::tests::flags\ntest result: FAILED. 41 passed; 1 failed",
+        "type": "function_call_output"
+      }
+    ],
+    "instructions": "You are a coding agent running in the Codex CLI. You have tools to read files, run shell commands, and apply patches. Prefer the smallest change that solves the task.",
+    "model": "gpt-5.1-codex-2030-09-17",
+    "parallel_tool_calls": false,
+    "prompt_cache_key": "fixture-session-7f3a",
+    "reasoning": {
+      "effort": "medium",
+      "summary": "auto"
+    },
+    "store": false,
+    "stream": true,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "description": "Runs a shell command inside the repo working directory.",
+        "name": "shell",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "timeout_ms": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "workdir": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        "strict": true,
+        "type": "function"
+      },
+      {
+        "description": "Apply a patch to the files in the working directory.",
+        "name": "apply_patch",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "patch": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "patch"
+          ],
+          "type": "object"
+        },
+        "strict": false,
+        "type": "function"
+      }
+    ]
+  }
+}

@@ -21,11 +21,12 @@ mod tests {
         routing::post,
     };
     use futures::FutureExt;
+    use llm_proxy_adapters::ProviderAdapterRegistry;
     use llm_proxy_core::{
         AppConfig, AuthStyle, ProviderAdapterConfig, ProviderConfig, ProviderRegistry, ServerConfig,
     };
-    use llm_proxy_provider::{ProviderAdapterRegistry, ProxyClient};
     use llm_proxy_server::{AppState, BuildInfo, build_router};
+    use llm_proxy_transport::ProxyClient;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
@@ -145,21 +146,44 @@ mod tests {
         mock_endpoint: &str,
         protocol: &str,
         adapter_name: &str,
+        model_name: &str,
+        pricing: HashMap<llm_proxy_core::ModelId, llm_proxy_core::ModelPricing>,
+    ) -> AppState {
+        state_with_provider_edited(
+            mock_endpoint,
+            protocol,
+            adapter_name,
+            model_name,
+            pricing,
+            |_| {},
+        )
+    }
+
+    /// [`state_with_provider`] with an edit applied to the app config before
+    /// the state is built (the plan 06 opt-ins, per test).
+    fn state_with_provider_edited(
+        mock_endpoint: &str,
+        protocol: &str,
+        adapter_name: &str,
         _model_name: &str,
         pricing: HashMap<llm_proxy_core::ModelId, llm_proxy_core::ModelPricing>,
+        edit: impl FnOnce(&mut AppConfig),
     ) -> AppState {
         let routes = match protocol {
             "anthropic_messages" => llm_proxy_core::ProviderRoutesConfig {
                 messages: Some(adapter_name.to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             "openai_chat_completions" => llm_proxy_core::ProviderRoutesConfig {
                 chat_completions: Some(adapter_name.to_owned()),
                 messages: Some(adapter_name.to_owned()),
+                ..Default::default()
             },
             _ => llm_proxy_core::ProviderRoutesConfig {
                 messages: Some(adapter_name.to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
         };
 
@@ -168,6 +192,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -177,6 +203,8 @@ mod tests {
                         protocol: protocol.to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -186,11 +214,14 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing,
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
 
-        let app_config = AppConfig {
+        let mut app_config = AppConfig {
             server: ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
                 request_timeout: Duration::from_secs(300),
@@ -201,14 +232,24 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
+        edit(&mut app_config);
 
         AppState::new(
             app_config,
@@ -556,6 +597,111 @@ mod tests {
         format!("http://{}/providers/mock-provider/v1/messages", addr)
     }
 
+    async fn spawn_mock_anthropic_terminal_then_reset_stream() -> String {
+        use futures::StreamExt;
+
+        // A complete upstream message whose terminal frame is followed by a
+        // transport error: the body stream yields Err after message_stop, as
+        // a reset or timed-out connection would.
+        let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            let events: Vec<Result<Event, std::io::Error>> = vec![
+                Ok(Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_cut","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#)),
+                Ok(Event::default()
+                    .event("content_block_start")
+                    .data(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#)),
+                Ok(Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#)),
+                Ok(Event::default()
+                    .event("content_block_stop")
+                    .data(r#"{"type":"content_block_stop","index":0}"#)),
+                Ok(Event::default()
+                    .event("message_delta")
+                    .data(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}"#)),
+                Ok(Event::default()
+                    .event("message_stop")
+                    .data(r#"{"type":"message_stop"}"#)),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "upstream connection reset after terminal",
+                )),
+            ];
+            // Yield before the terminal error so the server flushes the
+            // frames above first; without this the whole body sits in the
+            // write buffer and the abort loses it all.
+            let stream = futures::stream::iter(events).then(|item| async move {
+                if item.is_err() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                item
+            });
+            let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.into_response(),
+            )
+        }),
+    );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{addr}/v1/messages")
+    }
+
+    async fn spawn_mock_anthropic_reset_before_terminal_stream() -> String {
+        use futures::StreamExt;
+
+        // A stream that starts delivering content, then dies on a transport
+        // error before any terminal event: the post-commit failure path with
+        // no decoder terminal behind it.
+        let app = Router::new().route(
+        "/{*path}",
+        post(|| async move {
+            let events: Vec<Result<Event, std::io::Error>> = vec![
+                Ok(Event::default()
+                    .event("message_start")
+                    .data(r#"{"type":"message_start","message":{"id":"msg_cut2","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}"#)),
+                Ok(Event::default()
+                    .event("content_block_start")
+                    .data(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#)),
+                Ok(Event::default()
+                    .event("content_block_delta")
+                    .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#)),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "upstream connection reset before terminal",
+                )),
+            ];
+            // Yield before the error so the server flushes the frames above
+            // first; without this the whole body sits in the write buffer
+            // and the abort loses it all.
+            let stream = futures::stream::iter(events).then(|item| async move {
+                if item.is_err() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                item
+            });
+            let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                sse.into_response(),
+            )
+        }),
+    );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{addr}/v1/messages")
+    }
+
     async fn spawn_mock_with_request_tracker(response_body: Vec<u8>) -> (String, Arc<AtomicBool>) {
         let received = Arc::new(AtomicBool::new(false));
         let received_clone = Arc::clone(&received);
@@ -615,6 +761,160 @@ mod tests {
         )
     }
 
+    async fn spawn_mock_anthropic_documented_stream() -> String {
+        // The documented Anthropic stream shape: message_start carries the
+        // input-side usage, and the final message_delta carries only the
+        // cumulative output_tokens alongside the stop reason.
+        let app = Router::new().route(
+            "/{*path}",
+            post(|| async move {
+                let events = vec![
+                    Event::default()
+                        .event("message_start")
+                        .data(r#"{"type":"message_start","message":{"id":"msg_doc","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}}"#),
+                    Event::default()
+                        .event("content_block_start")
+                        .data(r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
+                    Event::default()
+                        .event("content_block_delta")
+                        .data(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#),
+                    Event::default()
+                        .event("content_block_stop")
+                        .data(r#"{"type":"content_block_stop","index":0}"#),
+                    Event::default()
+                        .event("message_delta")
+                        .data(r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":15}}"#),
+                    Event::default()
+                        .event("message_stop")
+                        .data(r#"{"type":"message_stop"}"#),
+                ];
+                let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    sse.into_response(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{}/providers/mock-provider/v1/messages", addr)
+    }
+
+    async fn spawn_mock_openai_chat_usage_after_finish_stream() -> String {
+        // Documented chunk order: the finish_reason chunk arrives before the
+        // usage-only chunk.
+        let app = Router::new().route(
+            "/{*path}",
+            post(|| async move {
+                let events = vec![
+                    Event::default()
+                        .data(r#"{"id":"chatcmpl-uf","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#),
+                    Event::default()
+                        .data(r#"{"id":"chatcmpl-uf","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hi!"},"finish_reason":null}]}"#),
+                    Event::default()
+                        .data(r#"{"id":"chatcmpl-uf","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+                    Event::default()
+                        .data(r#"{"id":"chatcmpl-uf","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}}"#),
+                    Event::default()
+                        .data("[DONE]"),
+                ];
+                let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    sse.into_response(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{}/providers/mock-provider/v1/messages", addr)
+    }
+
+    async fn spawn_mock_openai_chat_error_frame_stream(content_first: bool) -> String {
+        let app = Router::new().route(
+            "/{*path}",
+            post(move || async move {
+                let mut events = Vec::new();
+                if content_first {
+                    events.push(Event::default()
+                        .data(r#"{"id":"chatcmpl-err","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#));
+                    events.push(Event::default()
+                        .data(r#"{"id":"chatcmpl-err","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#));
+                }
+                events.push(Event::default()
+                    .data(r#"{"error":{"message":"upstream overloaded","type":"server_error","code":"overloaded"}}"#));
+                let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    sse.into_response(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{}/providers/mock-provider/v1/messages", addr)
+    }
+
+    async fn spawn_mock_openai_chat_truncated_stream() -> String {
+        // Sends content and then closes the connection mid-stream.
+        let app = Router::new().route(
+            "/{*path}",
+            post(|| async move {
+                let events = vec![
+                    Event::default()
+                        .data(r#"{"id":"chatcmpl-tr","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#),
+                    Event::default()
+                        .data(r#"{"id":"chatcmpl-tr","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}"#),
+                ];
+                let stream = futures::stream::iter(events.into_iter().map(Ok::<_, std::convert::Infallible>));
+                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    sse.into_response(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{}/providers/mock-provider/v1/messages", addr)
+    }
+
+    async fn spawn_mock_silent_stream() -> String {
+        // Accepts the request and never sends an event.
+        let app = Router::new().route(
+            "/{*path}",
+            post(|| async move {
+                let stream = futures::stream::pending::<Result<Event, std::convert::Infallible>>();
+                let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    sse.into_response(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        format!("http://{}/providers/mock-provider/v1/messages", addr)
+    }
+
     fn make_messages_body(model: &str, stream: bool) -> String {
         json!({
             "model": model,
@@ -625,6 +925,78 @@ mod tests {
         .to_string()
     }
 
+    fn openai_chat_request(body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    fn make_openai_chat_stream_body(model: &str, include_usage: bool) -> String {
+        json!({
+            "model": model,
+            "stream": true,
+            "stream_options": if include_usage {
+                json!({ "include_usage": true })
+            } else {
+                Value::Null
+            },
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 64
+        })
+        .to_string()
+    }
+
+    async fn spawn_mock_openai_chat_stream_with_body_capture()
+    -> (String, Arc<tokio::sync::Mutex<Option<Vec<u8>>>>) {
+        let captured: Arc<tokio::sync::Mutex<Option<Vec<u8>>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/{*path}",
+            post(move |body: axum::body::Bytes| {
+                let captured = Arc::clone(&captured_clone);
+                async move {
+                    let mut guard = captured.lock().await;
+                    *guard = Some(body.to_vec());
+                    drop(guard);
+                    let events = vec![
+                        Event::default()
+                            .data(r#"{"id":"chatcmpl-cap","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}"#),
+                        Event::default()
+                            .data(r#"{"id":"chatcmpl-cap","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#),
+                        Event::default()
+                            .data(r#"{"id":"chatcmpl-cap","object":"chat.completion.chunk","created":12345,"model":"gpt-4o","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3,"total_tokens":12}}"#),
+                        Event::default()
+                            .data("[DONE]"),
+                    ];
+                    let stream = futures::stream::iter(
+                        events.into_iter().map(Ok::<_, std::convert::Infallible>),
+                    );
+                    let sse = Sse::new(stream).keep_alive(KeepAlive::default());
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        sse.into_response(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_mock_serve(listener, app);
+        wait_for_ready(addr).await;
+        (
+            format!(
+                "http://{}/providers/mock-provider/v1/chat/completions",
+                addr
+            ),
+            captured,
+        )
+    }
+
     fn messages_request(body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -632,6 +1004,496 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn documented_anthropic_stream_reports_usage_and_max_tokens() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_documented_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", true);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        let completed = bus
+            .snapshot()
+            .iter()
+            .find_map(|e| match e {
+                ProxyEvent::ResponseCompleted(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("documented stream must complete with real usage");
+        assert_eq!(completed.usage.input_tokens, 25);
+        assert_eq!(completed.usage.output_tokens, 15);
+        assert_eq!(completed.usage.cache_read_input_tokens, Some(7));
+        assert_eq!(completed.usage.cache_creation_input_tokens, Some(3));
+        assert_eq!(
+            completed.stop_reason,
+            llm_proxy_protocol::core::StopReason::MaxTokens
+        );
+
+        assert!(
+            text.contains("\"input_tokens\":25"),
+            "client message_delta must carry the merged usage: {text}"
+        );
+        assert!(
+            text.contains("\"stop_reason\":\"max_tokens\""),
+            "client must see the provider's stop reason: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_client_sees_real_usage_after_finish_chunk() {
+        let mock_url = spawn_mock_openai_chat_usage_after_finish_stream().await;
+        let state = state_with_openai_chat_provider(&mock_url);
+        let app = build_router(state);
+
+        let body = json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 64
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        let usage_pos = text.find("\"prompt_tokens\":100");
+        assert!(
+            usage_pos.is_some(),
+            "client that asked for usage must see the real numbers: {text}"
+        );
+        let finish_pos = text.find("\"finish_reason\":\"stop\"");
+        assert!(
+            finish_pos.is_some(),
+            "client must see the finish chunk: {text}"
+        );
+        assert!(
+            finish_pos < usage_pos,
+            "finish chunk must precede the usage chunk: {text}"
+        );
+        assert!(text.trim_end().ends_with("data: [DONE]"));
+    }
+
+    #[tokio::test]
+    async fn openai_client_without_include_usage_gets_no_usage_chunk() {
+        let mock_url = spawn_mock_openai_chat_usage_after_finish_stream().await;
+        let state = state_with_openai_chat_provider(&mock_url);
+        let app = build_router(state);
+
+        let body = json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 64
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !text.contains("\"prompt_tokens\":100"),
+            "client that did not ask for usage must not receive a usage chunk: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_streams_always_request_usage_upstream() {
+        let (mock_url, captured) = spawn_mock_openai_chat_stream_with_body_capture().await;
+        let state = state_with_openai_chat_provider(&mock_url);
+        let app = build_router(state);
+
+        // A client that did NOT set stream_options still makes the proxy ask
+        // the upstream for usage.
+        let body = make_openai_chat_stream_body("gpt-4o", false);
+        let resp = app.oneshot(openai_chat_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        let guard = captured.lock().await;
+        let upstream = guard.as_ref().expect("upstream body captured");
+        let json: Value = serde_json::from_slice(upstream).unwrap();
+        assert_eq!(
+            json["stream_options"]["include_usage"], true,
+            "the proxy must always ask chat upstreams for stream usage: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leading_chat_error_frame_is_marked_failed_in_ledger() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_openai_chat_error_frame_stream(false).await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_openai_chat_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("gpt-4o", true);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        // Plan 04: an error frame before any output event never commits —
+        // the caller gets an HTTP error status instead of a 200 stream.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            !text.contains("upstream overloaded"),
+            "the upstream's own error schema must not reach the client: {text}"
+        );
+
+        let events = bus.snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
+            "a leading error frame must not be recorded as success: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseCompleted(_))),
+            "a leading error frame must not record a success row: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn midstream_chat_error_frame_is_marked_failed_and_keeps_framing() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_openai_chat_error_frame_stream(true).await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_openai_chat_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_openai_chat_stream_body("gpt-4o", false);
+        let resp = app.oneshot(openai_chat_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("partial"),
+            "content before the error must have been delivered: {text}"
+        );
+        assert!(
+            text.contains("upstream overloaded"),
+            "client must see the error payload: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "stream must still terminate with [DONE]: {text}"
+        );
+
+        let events = bus.snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
+            "a mid-stream error frame must be recorded as a failure: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseCompleted(_))),
+            "a mid-stream error frame must not record a success row: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_chat_stream_is_marked_failed_and_keeps_framing() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_openai_chat_truncated_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_openai_chat_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_openai_chat_stream_body("gpt-4o", false);
+        let resp = app.oneshot(openai_chat_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("upstream stream ended before the response completed"),
+            "the client must see an in-band error for the cut stream: {text}"
+        );
+        assert!(
+            text.contains("\"finish_reason\":\"stop\""),
+            "synthetic terminal must keep the framing valid: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "stream must still terminate with [DONE]: {text}"
+        );
+
+        let events = bus.snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
+            "a truncated stream must be recorded as a failure: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseCompleted(_))),
+            "a truncated stream must not record a success row: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_anthropic_stream_is_marked_failed_and_keeps_framing() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_disconnect_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", true);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("event: error"),
+            "the Anthropic client must see an in-band error event: {text}"
+        );
+        assert!(
+            text.contains("event: message_stop"),
+            "the synthetic terminal must keep framing valid: {text}"
+        );
+
+        let events = bus.snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
+            "a truncated stream must be recorded as a failure: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseCompleted(_))),
+            "a truncated stream must not record a success row: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end stream scenario plus its ledger assertions; the two config \
+                  fields plan 06 added pushed it over the mechanical line budget"
+    )]
+    async fn streaming_alias_rows_keep_model_upstream() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_stream().await;
+        let mut provider = ProviderConfig {
+            name: "mock-provider".to_owned(),
+            api_key: secrecy::SecretString::from("test-key"),
+            auth_style: AuthStyle::Bearer,
+            passthrough_auth: false,
+            api_keys: None,
+            retry: None,
+            egress: None,
+            adapters: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "messages".to_owned(),
+                    ProviderAdapterConfig {
+                        protocol: "anthropic_messages".to_owned(),
+                        endpoint: mock_url,
+                        headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
+                    },
+                );
+                m
+            },
+            routes: llm_proxy_core::ProviderRoutesConfig {
+                messages: Some("messages".to_owned()),
+                chat_completions: None,
+                ..Default::default()
+            },
+            model_aliases: HashMap::from([(
+                "claude-alias".to_owned(),
+                "claude-sonnet-4-6".to_owned(),
+            )]),
+            discovery: None,
+            catalog: None,
+            pricing: HashMap::new(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
+        };
+        provider.name = "mock-provider".to_owned();
+        let registry =
+            llm_proxy_core::ProviderRegistry::from_providers(vec![provider]).expect("registry");
+        let app_config = AppConfig {
+            server: ServerConfig {
+                bind: "127.0.0.1:3456".parse().unwrap(),
+                request_timeout: Duration::from_secs(300),
+                shutdown_timeout: Duration::from_secs(30),
+                log_level: "info".to_owned(),
+                hot_reload: false,
+                allowed_origins: None,
+                server_name: "test-proxy".to_owned(),
+                rate_limit_rpm: 100,
+                trust_forwarded_headers: false,
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
+                log_format: Default::default(),
+                admin_bind: None,
+                admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
+            },
+            auth: Default::default(),
+            storage: None,
+            replica: None,
+            mcp: None,
+        };
+        let bus = Arc::new(RecordingBus::new());
+        let state = AppState::new(
+            app_config,
+            registry,
+            ProviderAdapterRegistry::builtin(),
+            ProxyClient::new(),
+            BuildInfo {
+                name: "test",
+                version: "0.0.0",
+                target: "test",
+                git_sha: "test",
+            },
+        )
+        .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-alias", true);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+
+        let completed = bus
+            .snapshot()
+            .iter()
+            .find_map(|e| match e {
+                ProxyEvent::ResponseCompleted(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("streaming row emitted");
+        assert_eq!(completed.model.requested, "claude-alias");
+        assert_eq!(
+            completed.model.upstream.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "streaming rows must keep model_upstream under aliases"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_before_first_event_settles_the_row() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_silent_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+
+        let app = build_router(state);
+        let body = make_messages_body("claude-sonnet-4-6", true);
+        let request = messages_request(&body);
+        let disconnect = || async {
+            let fut = app.clone().oneshot(request);
+            tokio::pin!(fut);
+
+            // The upstream never sends an event; give up like a client that
+            // disconnects before the first SSE byte. Leaving this block
+            // drops the in-flight handler future.
+            let result = tokio::time::timeout(Duration::from_millis(300), &mut fut).await;
+            match result {
+                Ok(Ok(_)) => panic!("response must not complete while the upstream is silent"),
+                Ok(Err(_)) => panic!("oneshot failed"),
+                Err(_) => {}
+            }
+        };
+        disconnect().await;
+
+        // The stream task must settle the RequestReceived row on its own.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let events = bus.snapshot();
+            let settled = events.iter().any(|e| {
+                matches!(e, ProxyEvent::ResponseCompleted(_))
+                    || matches!(e, ProxyEvent::ResponseFailed(_))
+            });
+            if settled {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a disconnect before the first event must leave a settled row; events: {:?}",
+                events
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]
@@ -964,14 +1826,18 @@ mod tests {
         let events = bus.snapshot();
         assert_eq!(
             events.len(),
-            2,
-            "expected RequestReceived + ResponseCompleted"
+            3,
+            "expected RequestReceived + AttemptCompleted + ResponseCompleted"
         );
         assert!(
             matches!(events[0], ProxyEvent::RequestReceived(_)),
             "first event must be RequestReceived"
         );
-        match &events[1] {
+        assert!(
+            matches!(events[1], ProxyEvent::AttemptCompleted(_)),
+            "second event must be the upstream attempt row"
+        );
+        match &events[2] {
             ProxyEvent::ResponseCompleted(rc) => {
                 assert_eq!(rc.provider, "mock-provider");
                 assert_eq!(rc.upstream_message_id.as_deref(), Some("msg_mock123"));
@@ -1123,7 +1989,10 @@ mod tests {
             .expect("hash token")
             .to_string();
         let mut clients = HashMap::new();
-        clients.insert(key_id.to_owned(), secrecy::SecretString::from(phc));
+        clients.insert(
+            key_id.to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc)),
+        );
         llm_proxy_server::ClientAuth::from_config(&llm_proxy_core::AuthConfig {
             mode: llm_proxy_core::AuthMode::ClientKeys,
             clients,
@@ -1647,6 +2516,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_error_after_terminal_keeps_terminal_and_error_events() {
+        use std::sync::Arc;
+
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_terminal_then_reset_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", true);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            text.contains("partial"),
+            "content before the terminal must have been delivered: {text}"
+        );
+        let stop_pos = text.find("event: message_stop").unwrap_or_else(|| {
+            panic!("the buffered terminal pair must survive the transport error: {text}")
+        });
+        let err_pos = text
+            .find("event: error")
+            .unwrap_or_else(|| panic!("the transport error must reach the client in-band: {text}"));
+        assert!(
+            stop_pos < err_pos,
+            "the buffered terminal pair must precede the error event: {text}"
+        );
+
+        let events = bus.snapshot();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProxyEvent::ResponseFailed(_))),
+            "a transport error after the terminal must be recorded as a failure: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_post_commit_failure_emits_exactly_one_error_event() {
+        // A transport error after the stream committed already crosses to
+        // the client in-band; the missing-terminal backstop must not append
+        // a second (truncation) error event on top of it.
+        let mock_url = spawn_mock_anthropic_reset_before_terminal_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", true);
+        let resp = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            text.contains("partial"),
+            "content before the failure must have been delivered: {text}"
+        );
+        assert_eq!(
+            text.matches("event: error").count(),
+            1,
+            "exactly one terminal error event must cross, got: {text}"
+        );
+        assert!(
+            text.contains("event: message_stop"),
+            "the synthetic terminal must still close the stream: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn in_band_upstream_error_emits_anthropic_error_event() {
         let mock_url = spawn_mock_in_band_error_stream().await;
         let state = state_with_anthropic_provider(&mock_url);
@@ -1829,6 +2774,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one end-to-end scenario: the config, provider and request setup read as a unit"
+    )]
     #[tokio::test]
     async fn rate_limited_request_returns_429() {
         let mock_url = spawn_mock_anthropic_non_stream().await;
@@ -1837,6 +2786,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -1846,6 +2797,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_url,
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -1853,11 +2806,15 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 messages: Some("messages".to_owned()),
                 chat_completions: None,
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         let state = AppState::new(
@@ -1872,13 +2829,22 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 1,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::from_millis(500),
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -1934,97 +2900,168 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_request_returns_409() {
+    async fn identical_requests_are_never_answered_409_by_default() {
+        // The dedup window was retired (plan 06 step 1): identical requests
+        // are answered, never 409-rejected, when every opt-in is off. Each
+        // one reaches the upstream; per-caller single-flight only merges
+        // requests that are in flight at the same instant, and these two are
+        // sequential.
         let mock_url = spawn_mock_anthropic_non_stream().await;
-        let provider = ProviderConfig {
-            name: "mock-provider".to_owned(),
-            api_key: secrecy::SecretString::from("test-key"),
-            auth_style: AuthStyle::Bearer,
-            passthrough_auth: false,
-            egress: None,
-            adapters: {
-                let mut m = HashMap::new();
-                m.insert(
-                    "messages".to_owned(),
-                    ProviderAdapterConfig {
-                        protocol: "anthropic_messages".to_owned(),
-                        endpoint: mock_url,
-                        headers: std::sync::Arc::new(HashMap::new()),
-                    },
-                );
-                m
-            },
-            routes: llm_proxy_core::ProviderRoutesConfig {
-                messages: Some("messages".to_owned()),
-                chat_completions: None,
-            },
-            model_aliases: HashMap::new(),
-            discovery: None,
-            catalog: None,
-            pricing: Default::default(),
-        };
-        let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
-        let state = AppState::new(
-            AppConfig {
-                server: ServerConfig {
-                    bind: "127.0.0.1:3456".parse().unwrap(),
-                    request_timeout: Duration::from_secs(300),
-                    shutdown_timeout: Duration::from_secs(30),
-                    log_level: "info".to_owned(),
-                    hot_reload: false,
-                    allowed_origins: None,
-                    server_name: "test-proxy".to_owned(),
-                    rate_limit_rpm: 100,
-                    trust_forwarded_headers: false,
-                    dedup_window: Duration::from_secs(60),
-                    log_format: Default::default(),
-                    admin_bind: None,
-                    admin_on_main_listener: false,
-                },
-                auth: Default::default(),
-                storage: None,
-            },
-            registry,
-            ProviderAdapterRegistry::builtin(),
-            ProxyClient::new(),
-            BuildInfo {
-                name: "test",
-                version: "0.0.0",
-                target: "test",
-                git_sha: "test",
-            },
-        );
+        let state = state_with_anthropic_provider(&mock_url);
         let app = build_router(state);
 
         let body = make_messages_body("claude-sonnet-4-6", false);
 
         let resp1 = app.clone().oneshot(messages_request(&body)).await.unwrap();
-        assert_ne!(
+        assert_eq!(
             resp1.status(),
-            StatusCode::CONFLICT,
-            "first request should not be a duplicate"
+            StatusCode::OK,
+            "first request must be answered, not rejected"
         );
 
         let resp2 = app.oneshot(messages_request(&body)).await.unwrap();
         assert_eq!(
             resp2.status(),
-            StatusCode::CONFLICT,
-            "second identical request should be deduplicated"
+            StatusCode::OK,
+            "the retired dedup window must not 409 the second identical request"
         );
-        let resp_body: Value = serde_json::from_slice(
-            &axum::body::to_bytes(resp2.into_body(), 64 * 1024)
-                .await
-                .unwrap(),
+    }
+
+    #[tokio::test]
+    async fn response_cache_opt_in_serves_the_second_identical_request() {
+        use llm_proxy_storage::{ProxyEvent, RecordingBus};
+
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let bus = Arc::new(RecordingBus::new());
+        let state = state_with_provider_edited(
+            &mock_url,
+            "anthropic_messages",
+            "messages",
+            "claude-sonnet-4-6",
+            HashMap::new(),
+            |config| {
+                config.server.cache = llm_proxy_core::ResponseCacheConfig {
+                    enabled: true,
+                    ttl: Duration::from_secs(60),
+                    max_entries: 16,
+                };
+            },
         )
-        .unwrap();
-        assert_eq!(resp_body["type"], "error");
-        assert!(
-            resp_body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("duplicate"),
-            "error message should mention 'duplicate'"
+        .with_event_bus(Arc::<RecordingBus>::clone(&bus));
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", false);
+        let first = app.clone().oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+
+        // Where the retired dedup window answered 409, the cache answers
+        // the identical request with the stored response.
+        let second = app.oneshot(messages_request(&body)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        // The first response returns the upstream bytes verbatim
+        // (same-format passthrough); the hit re-encodes the stored core
+        // response, so the equality that matters is content equality.
+        let first_json: Value = serde_json::from_slice(&first_bytes).unwrap();
+        let second_json: Value = serde_json::from_slice(&second_bytes).unwrap();
+        assert_eq!(
+            first_json["content"], second_json["content"],
+            "a cache hit returns the stored response content"
         );
+        assert_eq!(first_json["id"], second_json["id"]);
+        assert_eq!(first_json["usage"], second_json["usage"]);
+
+        let rows: Vec<bool> = bus
+            .snapshot()
+            .into_iter()
+            .filter_map(|event| match event {
+                ProxyEvent::ResponseCompleted(row) => Some(row.cache_hit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().filter(|hit| **hit).count(), 1);
+    }
+
+    #[cfg(feature = "semantic-cache")]
+    #[tokio::test]
+    async fn enabling_both_cache_optins_refuses_to_build_an_engine() {
+        // The engine holds one cache: both opt-ins together would silently
+        // replace the exact-match cache with the semantic one. Programmatic
+        // configs are refused at the engine build, mirroring the load-time
+        // refusal in llm-proxy-core.
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_provider_edited(
+            &mock_url,
+            "anthropic_messages",
+            "messages",
+            "claude-sonnet-4-6",
+            HashMap::new(),
+            |config| {
+                config.server.cache = llm_proxy_core::ResponseCacheConfig {
+                    enabled: true,
+                    ttl: Duration::from_secs(60),
+                    max_entries: 16,
+                };
+                config.server.semantic_cache.enabled = true;
+            },
+        );
+        let error = state.engine().expect_err("both cache opt-ins must refuse");
+        assert!(
+            error.to_string().contains("mutually exclusive"),
+            "the refusal must name the conflict, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_opt_in_replays_for_a_matching_retry() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_provider_edited(
+            &mock_url,
+            "anthropic_messages",
+            "messages",
+            "claude-sonnet-4-6",
+            HashMap::new(),
+            |config| {
+                config.server.idempotency = llm_proxy_core::IdempotencyConfig {
+                    enabled: true,
+                    ttl: Duration::from_secs(3600),
+                    max_entries: 1024,
+                };
+            },
+        );
+        let app = build_router(state);
+
+        let body = make_messages_body("claude-sonnet-4-6", false);
+        let keyed = |body: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/providers/mock-provider/v1/messages")
+                .header("content-type", "application/json")
+                .header("Idempotency-Key", "retry-after-timeout-1")
+                .body(Body::from(body.to_owned()))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(keyed(&body)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_bytes = axum::body::to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+
+        // A client retry after a timeout replays the stored response instead
+        // of executing and billing again.
+        let second = app.oneshot(keyed(&body)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_bytes = axum::body::to_bytes(second.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(first_bytes, second_bytes);
     }
 
     #[tokio::test]
@@ -2247,6 +3284,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -2256,6 +3295,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: "https://127.0.0.1:0/v1/messages".to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -2263,11 +3304,15 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 messages: Some("messages".to_owned()),
                 chat_completions: Some("messages".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
         AppState::new(
@@ -2282,13 +3327,22 @@ mod tests {
                     server_name: "test-proxy".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: Duration::from_millis(500),
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
             ProviderAdapterRegistry::builtin(),
@@ -2475,6 +3529,8 @@ mod tests {
             api_key: secrecy::SecretString::from("test-key"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: {
                 let mut m = HashMap::new();
@@ -2484,6 +3540,8 @@ mod tests {
                         protocol: "anthropic_messages".to_owned(),
                         endpoint: mock_endpoint.to_owned(),
                         headers: std::sync::Arc::new(HashMap::new()),
+                        forward_inbound_headers: None,
+                        lossy: false,
                     },
                 );
                 m
@@ -2491,11 +3549,15 @@ mod tests {
             routes: llm_proxy_core::ProviderRoutesConfig {
                 messages: None,
                 chat_completions: Some("messages".to_owned()),
+                ..Default::default()
             },
             model_aliases: HashMap::new(),
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry = ProviderRegistry::from_providers(vec![provider]).expect("registry");
@@ -2510,13 +3572,22 @@ mod tests {
                 server_name: "test-proxy".to_owned(),
                 rate_limit_rpm: 100,
                 trust_forwarded_headers: false,
-                dedup_window: Duration::from_millis(500),
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: Default::default(),
             storage: None,
+            replica: None,
+            mcp: None,
         };
         AppState::new(
             app_config,
@@ -2575,7 +3646,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_openai_chat_leading_error_returns_200_in_band_sse_error() {
+    async fn stream_openai_chat_leading_error_returns_an_http_error_before_commit() {
         let mock_url = spawn_mock_anthropic_leading_error_stream().await;
         let state = state_with_openai_chat_client_anthropic_upstream(&mock_url);
         let app = build_router(state);
@@ -2586,10 +3657,13 @@ mod tests {
             .await
             .unwrap();
 
+        // Plan 04 (backlog 2): a 200 whose first frame is an error never
+        // commits — the failure happened before any output event, so the
+        // caller gets an HTTP error status instead of a 200 stream.
         assert_eq!(
             resp.status(),
-            StatusCode::OK,
-            "leading stream error must be delivered in-band at HTTP 200, not a 502"
+            StatusCode::BAD_GATEWAY,
+            "a leading error frame is a pre-commit failure"
         );
 
         let ct = resp
@@ -2599,8 +3673,8 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(
-            ct.contains("text/event-stream"),
-            "expected SSE content-type for in-band error, got: {ct}"
+            ct.contains("application/json"),
+            "expected a JSON error body, got: {ct}"
         );
 
         let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
@@ -2609,26 +3683,327 @@ mod tests {
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
         assert!(
-            text.contains("\"error\"") && text.contains("\"type\""),
-            "in-band SSE error must carry an OpenAI error object; got: {text}"
+            text.contains("\"error\""),
+            "the error body must carry an OpenAI error object; got: {text}"
         );
         assert!(
-            text.contains("server_error"),
-            "an upstream/overloaded error must render as server_error; got: {text}"
+            !text.contains("Upstream overloaded"),
+            "the upstream's own error schema must not reach the client: {text}"
         );
-        assert!(
-            text.contains("Upstream overloaded"),
-            "the sanitized error message must be surfaced in-band; got: {text}"
-        );
-
-        assert!(
-            text.contains("[DONE]"),
-            "the OpenAI [DONE] terminator must follow the in-band error; got: {text}"
-        );
-
         assert!(
             !text.contains("empty stream"),
             "must not surface the misleading empty-stream 502 body; got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn transport_error_after_terminal_keeps_finish_chunk_openai_client() {
+        let mock_url = spawn_mock_anthropic_terminal_then_reset_stream().await;
+        let state = state_with_openai_chat_client_anthropic_upstream(&mock_url);
+        let app = build_router(state);
+
+        let body = make_chat_completions_stream_body("claude-sonnet-4-6");
+        let resp = app
+            .oneshot(chat_completions_stream_request(&body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(
+            text.contains("partial"),
+            "content before the terminal must have been delivered: {text}"
+        );
+        let finish_pos = text.find("\"finish_reason\":\"stop\"").unwrap_or_else(|| {
+            panic!("the buffered finish chunk must survive the transport error: {text}")
+        });
+        let err_pos = text
+            .find("\"error\"")
+            .unwrap_or_else(|| panic!("the transport error must reach the client in-band: {text}"));
+        assert!(
+            finish_pos < err_pos,
+            "the buffered finish chunk must precede the error payload: {text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "stream must still terminate with [DONE]: {text}"
+        );
+    }
+
+    fn authorized_messages_request(token: &str, body: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/providers/mock-provider/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    }
+
+    /// Swapping the authenticator on the running state is what makes a
+    /// managed key issued or revoked through the admin API take effect:
+    /// the old token dies with the old authenticator (its digest cache
+    /// included), the new one starts working — no restart, no rebuild.
+    #[tokio::test]
+    async fn a_swapped_client_auth_takes_effect_on_the_running_router() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url)
+            .with_client_auth(Arc::new(client_auth_for("laptop", "first-token")));
+        let app = build_router(state.clone());
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        let first = app
+            .clone()
+            .oneshot(authorized_messages_request("first-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        state.swap_client_auth(Arc::new(client_auth_for("laptop", "second-token")));
+
+        let old = app
+            .clone()
+            .oneshot(authorized_messages_request("first-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            old.status(),
+            StatusCode::UNAUTHORIZED,
+            "the old token must stop authenticating after the swap"
+        );
+        let new = app
+            .oneshot(authorized_messages_request("second-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(new.status(), StatusCode::OK);
+    }
+
+    fn admission_for(
+        key_id: &str,
+        allow_models: Vec<String>,
+        rpd: Option<u64>,
+        backend: Arc<dyn llm_proxy_engine::AdmissionBackend>,
+        registry: &ProviderRegistry,
+    ) -> Arc<llm_proxy_engine::PolicyAdmission> {
+        let spec = if allow_models.is_empty() && rpd.is_none() {
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from("unused"))
+        } else {
+            llm_proxy_core::ClientKeySpec::Policy {
+                verifier: secrecy::SecretString::from("unused"),
+                allow_models,
+                allow_providers: Vec::new(),
+                limits: Some(llm_proxy_core::KeyWindowLimits {
+                    rpm: None,
+                    tpm: None,
+                    rpd,
+                }),
+                budget: None,
+            }
+        };
+        let mut clients = HashMap::new();
+        clients.insert(key_id.to_owned(), spec);
+        let auth = llm_proxy_core::AuthConfig {
+            mode: llm_proxy_core::AuthMode::ClientKeys,
+            clients,
+            admin: None,
+        };
+        Arc::new(llm_proxy_engine::PolicyAdmission::over_config_backend(
+            &auth, registry, backend,
+        ))
+    }
+
+    /// Swapping the admission rules on the running engine is what makes a
+    /// managed key's policy take effect the moment the daemon loads it:
+    /// the engine keeps serving on the same instance (no rebuild — the
+    /// caches and cooldowns stand) while the rules change under it.
+    #[tokio::test]
+    async fn swapped_admission_rules_take_effect_without_rebuilding_the_engine() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let registry = state.providers();
+        let pair = Arc::new(llm_proxy_server::SwappingAuthPair::new(
+            Arc::new(client_auth_for("laptop", "sekrit-token")),
+            admission_for(
+                "laptop",
+                Vec::new(),
+                None,
+                Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new()),
+                &registry,
+            ),
+        ));
+        let state = state.with_auth_pair(Arc::clone(&pair));
+        let app = build_router(state.clone());
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        let allowed = app
+            .clone()
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
+
+        let engine_before = state.engine().unwrap();
+        pair.replace_admission(admission_for(
+            "laptop",
+            vec!["other-*".to_owned()],
+            None,
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new()),
+            &registry,
+        ));
+        let engine_after = state.engine().unwrap();
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "a rules swap must not rebuild the engine"
+        );
+
+        let refused = app
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "the swapped-in allowlist must refuse the model the running engine serves"
+        );
+    }
+
+    /// The counters a key already charged survive a rules swap (issuing
+    /// another managed key must not hand anyone a fresh window): both the
+    /// old and the new rules run over the same backend.
+    #[tokio::test]
+    async fn an_admission_swap_keeps_the_counters_already_charged() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let registry = state.providers();
+        let backend: Arc<dyn llm_proxy_engine::AdmissionBackend> =
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
+        let pair = Arc::new(llm_proxy_server::SwappingAuthPair::new(
+            Arc::new(client_auth_for("laptop", "sekrit-token")),
+            admission_for(
+                "laptop",
+                Vec::new(),
+                Some(1),
+                Arc::clone(&backend),
+                &registry,
+            ),
+        ));
+        let state = state.with_auth_pair(Arc::clone(&pair));
+        let app = build_router(state);
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        let first = app
+            .clone()
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK, "rpd of 1 admits one");
+
+        pair.replace_admission(admission_for(
+            "laptop",
+            Vec::new(),
+            Some(1),
+            backend,
+            &registry,
+        ));
+
+        let second = app
+            .oneshot(authorized_messages_request("sekrit-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(
+            second.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the day's request count survived the swap; a reset backend would have answered 200"
+        );
+    }
+
+    /// The single-swap invariant, pinned through the running router: after
+    /// every whole-pair swap there is no observable state where the router
+    /// authenticates against the old key set while admission enforces the
+    /// new rules, nor the mirror. A key from the OLD pair must already 401
+    /// (the new authenticator forgot it) and never slip through the new
+    /// rules; a key from the NEW pair must hit the NEW rules (403 here),
+    /// never still be riding the old permissive ones (200). The two
+    /// adjacent swaps this design replaced could answer exactly those two
+    /// wrong codes in the window between them.
+    #[tokio::test]
+    async fn a_pair_swap_never_serves_the_old_authenticator_with_the_new_rules() {
+        let mock_url = spawn_mock_anthropic_non_stream().await;
+        let state = state_with_anthropic_provider(&mock_url);
+        let registry = state.providers();
+        let backend: Arc<dyn llm_proxy_engine::AdmissionBackend> =
+            Arc::new(llm_proxy_engine::MemoryAdmissionBackend::new());
+        let permissive =
+            || admission_for("laptop", Vec::new(), None, Arc::clone(&backend), &registry);
+        let restrictive = || {
+            admission_for(
+                "laptop",
+                vec!["other-*".to_owned()],
+                None,
+                Arc::clone(&backend),
+                &registry,
+            )
+        };
+        let pair = Arc::new(llm_proxy_server::SwappingAuthPair::new(
+            Arc::new(client_auth_for("laptop", "one-token")),
+            permissive(),
+        ));
+        let state = state.with_auth_pair(Arc::clone(&pair));
+        let app = build_router(state);
+        let body = make_messages_body("claude-sonnet-4-6", false);
+
+        // Sanity: generation one serves one-token under permissive rules.
+        let served = app
+            .clone()
+            .oneshot(authorized_messages_request("one-token", &body))
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+
+        for swap in 0..4 {
+            let (token, rules, expected_new_key) = if swap % 2 == 0 {
+                ("two-token", restrictive(), StatusCode::FORBIDDEN)
+            } else {
+                ("one-token", permissive(), StatusCode::OK)
+            };
+            pair.replace(Arc::new(client_auth_for("laptop", token)), rules);
+            let other_token = if swap % 2 == 0 {
+                "one-token"
+            } else {
+                "two-token"
+            };
+
+            // The previous generation's token is already unknown to the
+            // new authenticator — 401, never authenticated-under-old and
+            // judged-under-new.
+            let stale = app
+                .clone()
+                .oneshot(authorized_messages_request(other_token, &body))
+                .await
+                .unwrap();
+            assert_eq!(
+                stale.status(),
+                StatusCode::UNAUTHORIZED,
+                "the swapped-out token must die in the same instant the rules flip"
+            );
+
+            // The installed token meets the INSTALLED rules: restrictive
+            // refuses the model (403), permissive serves (200) — a 403
+            // under permissive or a 200 under restrictive would mean the
+            // halves were one swap apart.
+            let fresh = app
+                .clone()
+                .oneshot(authorized_messages_request(token, &body))
+                .await
+                .unwrap();
+            assert_eq!(
+                fresh.status(),
+                expected_new_key,
+                "the freshly installed token must be judged by the freshly installed rules"
+            );
+        }
     }
 }

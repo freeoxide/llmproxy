@@ -1,0 +1,67 @@
+{
+  "model": "claude-sonnet-4-5",
+  "max_tokens": 16384,
+  "system": [
+    {
+      "type": "text",
+      "text": "You are a coding agent working inside a repository.",
+      "cache_control": { "type": "ephemeral" }
+    },
+    {
+      "type": "text",
+      "text": "Long-term instructions that change rarely.",
+      "cache_control": { "type": "ephemeral", "ttl": "1h" }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "Summarize the failing tests in crates/llm-proxy-server." }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "text", "text": "I'll list the failing tests first." },
+        {
+          "type": "tool_use",
+          "id": "toolu_01ABC",
+          "name": "bash",
+          "input": { "command": "cargo test -p llm-proxy-server 2>&1 | grep FAILED" }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_01ABC",
+          "content": "test tests::messages_unknown_fields ... FAILED",
+          "cache_control": { "type": "ephemeral" }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "bash",
+      "description": "Run a shell command in the repository.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string" }
+        },
+        "required": ["command"]
+      }
+    }
+  ],
+  "tool_choice": { "type": "auto", "disable_parallel_tool_use": false },
+  "temperature": 1,
+  "top_p": 0.95,
+  "top_k": 0,
+  "stop_sequences": ["\n\nHuman:"],
+  "thinking": { "type": "enabled", "budget_tokens": 10000 },
+  "metadata": { "user_id": "user_abc123" }
+}

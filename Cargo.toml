@@ -1,13 +1,39 @@
 [workspace]
 resolver = "2"
+# The optional plan-09 crates are members (so --workspace builds and tests
+# them) but not default members: the default build compiles none of them.
+default-members = [
+    "apps/llm-proxy",
+    "crates/llm-proxy-core",
+    "crates/llm-proxy-protocol",
+    "crates/llm-proxy-adapters",
+    "crates/llm-proxy-transport",
+    "crates/llm-proxy-storage",
+    "crates/llm-proxy-engine",
+    "crates/llm-proxy-bridge",
+    "crates/llm-proxy-api",
+    "crates/llm-proxy-server",
+    "crates/llm-proxy-sdk",
+]
+
 members = [
     "apps/llm-proxy",
     "crates/llm-proxy-core",
     "crates/llm-proxy-protocol",
-    "crates/llm-proxy-provider",
+    "crates/llm-proxy-adapters",
+    "crates/llm-proxy-transport",
     "crates/llm-proxy-storage",
+    "crates/llm-proxy-engine",
+    "crates/llm-proxy-bridge",
     "crates/llm-proxy-api",
     "crates/llm-proxy-server",
+    "crates/llm-proxy-sdk",
+    "crates/llm-proxy-store-redis",
+    "crates/llm-proxy-store-postgres",
+    "crates/llm-proxy-admin",
+    "crates/llm-proxy-guardrails",
+    "crates/llm-proxy-semantic-cache",
+    "crates/llm-proxy-mcp",
 ]
 
 [workspace.package]
@@ -20,13 +46,28 @@ keywords = ["llm", "proxy", "openai", "anthropic", "ai"]
 categories = ["web-programming::http-server", "api-bindings"]
 
 [workspace.dependencies]
-# Internal
-llm-proxy-core = { path = "crates/llm-proxy-core" }
-llm-proxy-server = { path = "crates/llm-proxy-server" }
+# Internal. Version keys are required for `cargo publish` (path-only
+# dependencies cannot be packaged) and must match each crate's version.
+llm-proxy-core = { path = "crates/llm-proxy-core", version = "0.1.0" }
+llm-proxy-protocol = { path = "crates/llm-proxy-protocol", version = "0.1.0" }
+llm-proxy-adapters = { path = "crates/llm-proxy-adapters", version = "0.1.0" }
+llm-proxy-transport = { path = "crates/llm-proxy-transport", version = "0.1.0" }
+llm-proxy-storage = { path = "crates/llm-proxy-storage", version = "0.1.0", default-features = false }
+llm-proxy-engine = { path = "crates/llm-proxy-engine", version = "0.1.0" }
+# Not in [workspace.dependencies]: the bridge's consumers are the standalone
+# binding workspaces under bindings/, which reference it by path directly.
+llm-proxy-api = { path = "crates/llm-proxy-api", version = "0.1.0" }
+llm-proxy-server = { path = "crates/llm-proxy-server", version = "0.1.0" }
+llm-proxy-store-redis = { path = "crates/llm-proxy-store-redis", version = "0.1.0" }
+llm-proxy-store-postgres = { path = "crates/llm-proxy-store-postgres", version = "0.1.0" }
+llm-proxy-admin = { path = "crates/llm-proxy-admin", version = "0.1.0", default-features = false }
+llm-proxy-semantic-cache = { path = "crates/llm-proxy-semantic-cache", version = "0.1.0" }
+llm-proxy-mcp = { path = "crates/llm-proxy-mcp", version = "0.1.0" }
 
 # Async / runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
 
 # Web
 axum = { version = "0.8", features = ["macros", "json"] }
@@ -37,9 +78,10 @@ tower-http = { version = "0.6", features = ["trace", "timeout"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+toml_edit = "0.23"
 humantime-serde = "1"
 regex = "1"
-time = { version = "=0.3.44", features = ["formatting", "parsing", "serde", "serde-well-known"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

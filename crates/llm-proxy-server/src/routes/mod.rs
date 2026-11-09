@@ -24,27 +24,55 @@ use secrecy::ExposeSecret;
 mod chat;
 mod core_pipeline;
 mod error_response;
+#[cfg(feature = "endpoint-families")]
+mod families;
+mod gemini_generate;
 mod health;
 mod messages;
 mod models;
+mod ollama;
+mod responses;
 mod token_count;
 
-use chat::handle_chat_completions;
+use chat::{handle_bare_chat_completions, handle_chat_completions};
+#[cfg(feature = "endpoint-families")]
+use families::{
+    FAMILY_AUDIO_SPEECH, FAMILY_AUDIO_TRANSCRIPTIONS, FAMILY_BATCHES, FAMILY_EMBEDDINGS,
+    FAMILY_FILES, FAMILY_IMAGES_GENERATIONS, FAMILY_RERANK, FamilySpec, handle_family,
+    handle_family_resource,
+};
+use gemini_generate::handle_generate_content;
 use health::{health, ready, version};
-use messages::handle_messages;
+use llm_proxy_core::{family_max_body_bytes, family_request_timeout};
+use messages::{handle_bare_messages, handle_messages};
 use models::handle_models;
+use ollama::{handle_ollama_chat, handle_ollama_generate, handle_ollama_tags};
+use responses::handle_responses;
 use token_count::count_tokens;
-const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Endpoint families (audit conflict 16): admission, routing and accounting
+/// are generic; the body limit and timeout are per-family settings.
+pub(crate) const FAMILY_MESSAGES: &str = "messages";
+pub(crate) const FAMILY_COUNT_TOKENS: &str = "count_tokens";
+pub(crate) const FAMILY_CHAT_COMPLETIONS: &str = "chat_completions";
+pub(crate) const FAMILY_MODELS: &str = "models";
+pub(crate) const FAMILY_RESPONSES: &str = "responses";
+pub(crate) const FAMILY_GENERATE_CONTENT: &str = "generate_content";
+pub(crate) const FAMILY_OLLAMA: &str = "ollama";
+
+/// Wraps one family's fixed wiring for its handlers.
+#[cfg(feature = "endpoint-families")]
+fn family(spec: FamilySpec) -> axum::Extension<FamilySpec> {
+    axum::Extension(spec)
+}
+
 const NOT_FOUND_BODY_DRAIN_LIMIT: usize = 1024;
 
 /// Build the full HTTP router: `/health`, `/ready`, `/version`, provider API
 /// routes under `/providers/{provider}/v1/*`, and the 404/405 fallbacks. The
 /// admin `/usage` surface merges in only under the `admin_on_main_listener` opt-in.
 pub fn router(state: AppState) -> Router {
-    let timeout = state.request_timeout();
     let id_gen = Arc::clone(&state.request_id_gen);
-    let event_bus = Arc::clone(&state.event_bus);
-    let state_arc = state.clone();
     let trace = TraceLayer::new_for_http().make_span_with(make_request_span);
     let lightweight = Router::new()
         .route("/health", get(health))
@@ -53,31 +81,10 @@ pub fn router(state: AppState) -> Router {
         .layer(
             ServiceBuilder::new()
                 .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
-                .layer(trace.clone()),
+                .layer(trace),
         );
-    let api_middleware = ServiceBuilder::new()
-        .layer(from_fn_with_state(id_gen, inject_request_id))
-        .layer(from_fn_with_state(state_arc, require_client_auth))
-        .layer(from_fn_with_state(event_bus, normalize_error_responses))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(trace)
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            timeout,
-        ));
 
-    let api = Router::new()
-        .route("/providers/{provider}/v1/messages", post(handle_messages))
-        .route(
-            "/providers/{provider}/v1/messages/count_tokens",
-            post(count_tokens),
-        )
-        .route(
-            "/providers/{provider}/v1/chat/completions",
-            post(handle_chat_completions),
-        )
-        .route("/providers/{provider}/v1/models", get(handle_models))
-        .layer(api_middleware);
+    let api = provider_api_router(&state);
 
     let router = Router::new()
         .merge(lightweight)
@@ -107,6 +114,205 @@ pub fn router(state: AppState) -> Router {
         Some(usage) => router.merge(usage),
         None => router,
     }
+}
+
+/// The provider-scoped API surface: every client dialect's route, each under
+/// its endpoint family's admission chain, plus the opt-in bare `/v1/*` routes
+/// (plan 04 step 11).
+#[expect(
+    clippy::too_many_lines,
+    reason = "a route table with one block per endpoint family; the family loops below replaced a longer unrolled list"
+)]
+fn provider_api_router(state: &AppState) -> Router<AppState> {
+    let id_gen = Arc::clone(&state.request_id_gen);
+    let event_bus = Arc::clone(&state.event_bus);
+    let config = &state.app_config().server;
+    let trace = TraceLayer::new_for_http().make_span_with(make_request_span);
+
+    // Shared admission middleware; the body limit and timeout layer on top
+    // are per endpoint family (conflict 16), so each family composes its own.
+    // Order: request id, then the self-loop refusal (508, backlog 32), then
+    // the host/origin gate, then client auth. The host/origin gate is the
+    // DNS-rebinding defense (backlog 11) under anonymous auth; the loop
+    // refusal runs under every auth mode because a loop has no caller.
+    let admission = |family: &'static str| {
+        ServiceBuilder::new()
+            .layer(from_fn_with_state(Arc::clone(&id_gen), inject_request_id))
+            .layer(from_fn_with_state(
+                state.clone(),
+                crate::loop_guard::refuse_looped_requests,
+            ))
+            .layer(from_fn_with_state(
+                state.clone(),
+                crate::host_guard::enforce_host_origin,
+            ))
+            .layer(from_fn_with_state(state.clone(), require_client_auth))
+            .layer(from_fn_with_state(
+                Arc::clone(&event_bus),
+                normalize_error_responses,
+            ))
+            .layer(DefaultBodyLimit::max(family_max_body_bytes(config, family)))
+            .layer(trace.clone())
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                family_request_timeout(config, family),
+            ))
+    };
+
+    let messages = Router::new()
+        .route("/providers/{provider}/v1/messages", post(handle_messages))
+        .layer(admission(FAMILY_MESSAGES));
+    let count_tokens = Router::new()
+        .route(
+            "/providers/{provider}/v1/messages/count_tokens",
+            post(count_tokens),
+        )
+        .layer(admission(FAMILY_COUNT_TOKENS));
+    let chat = Router::new()
+        .route(
+            "/providers/{provider}/v1/chat/completions",
+            post(handle_chat_completions),
+        )
+        .layer(admission(FAMILY_CHAT_COMPLETIONS));
+    let models = Router::new()
+        .route("/providers/{provider}/v1/models", get(handle_models))
+        .layer(admission(FAMILY_MODELS));
+    let responses = Router::new()
+        .route("/providers/{provider}/v1/responses", post(handle_responses))
+        .layer(admission(FAMILY_RESPONSES));
+    let generate_content = Router::new()
+        .route(
+            "/providers/{provider}/v1beta/models/{model_method}",
+            post(handle_generate_content),
+        )
+        .layer(admission(FAMILY_GENERATE_CONTENT));
+    let ollama = Router::new()
+        .route("/providers/{provider}/api/chat", post(handle_ollama_chat))
+        .route(
+            "/providers/{provider}/api/generate",
+            post(handle_ollama_generate),
+        )
+        .layer(admission(FAMILY_OLLAMA));
+    let ollama_tags = Router::new()
+        .route("/providers/{provider}/api/tags", get(handle_ollama_tags))
+        .layer(admission(FAMILY_MODELS));
+
+    let mut api = messages
+        .merge(count_tokens)
+        .merge(chat)
+        .merge(models)
+        .merge(responses)
+        .merge(generate_content)
+        .merge(ollama)
+        .merge(ollama_tags);
+
+    // Non-chat families (plan 09 step 7), each behind its own admission
+    // chain: its body limit and timeout from
+    // [server.endpoint_families], the same loop/host/auth gates, and a
+    // family-specific handler. Each route serves the methods of the
+    // family's documented API; the handler forwards the client's method.
+    #[cfg(feature = "endpoint-families")]
+    {
+        use axum::routing::{MethodFilter, on};
+        use llm_proxy_core::ProviderRouteKind as Kind;
+        let create = MethodFilter::POST;
+        let list_or_create = MethodFilter::GET.or(MethodFilter::POST);
+        // (path, route kind, JSON request body, family name, methods)
+        for (path, kind, json, family_name, methods) in [
+            (
+                "/providers/{provider}/v1/embeddings",
+                Kind::Embeddings,
+                true,
+                FAMILY_EMBEDDINGS,
+                create,
+            ),
+            (
+                "/providers/{provider}/v1/rerank",
+                Kind::Rerank,
+                true,
+                FAMILY_RERANK,
+                create,
+            ),
+            (
+                "/providers/{provider}/v1/images/generations",
+                Kind::ImagesGenerations,
+                true,
+                FAMILY_IMAGES_GENERATIONS,
+                create,
+            ),
+            (
+                "/providers/{provider}/v1/audio/transcriptions",
+                Kind::AudioTranscriptions,
+                false,
+                FAMILY_AUDIO_TRANSCRIPTIONS,
+                create,
+            ),
+            // Speech takes JSON (so the alias applies) and answers audio.
+            (
+                "/providers/{provider}/v1/audio/speech",
+                Kind::AudioSpeech,
+                true,
+                FAMILY_AUDIO_SPEECH,
+                create,
+            ),
+            // Files: list and upload; retrieve, download and delete.
+            (
+                "/providers/{provider}/v1/files",
+                Kind::Files,
+                false,
+                FAMILY_FILES,
+                list_or_create,
+            ),
+            (
+                "/providers/{provider}/v1/files/{*resource}",
+                Kind::Files,
+                false,
+                FAMILY_FILES,
+                MethodFilter::GET.or(MethodFilter::DELETE),
+            ),
+            // Batches: list and create; retrieve and cancel.
+            (
+                "/providers/{provider}/v1/batches",
+                Kind::Batches,
+                true,
+                FAMILY_BATCHES,
+                list_or_create,
+            ),
+            (
+                "/providers/{provider}/v1/batches/{*resource}",
+                Kind::Batches,
+                true,
+                FAMILY_BATCHES,
+                list_or_create,
+            ),
+        ] {
+            let route = if path.ends_with("{*resource}") {
+                on(methods, handle_family_resource)
+            } else {
+                on(methods, handle_family)
+            };
+            api = api.merge(
+                Router::new()
+                    .route(path, route)
+                    .route_layer(family(FamilySpec { kind, json }))
+                    .layer(admission(family_name)),
+            );
+        }
+    }
+
+    // Bare `/v1/*` is off by default (plan 04 step 11): with it off, those
+    // paths fall through to the 404 fallback; enabled, the model name
+    // resolves to a provider or pool through the same engine.
+    if state.app_config().server.bare_v1.enabled {
+        let bare_messages = Router::new()
+            .route("/v1/messages", post(handle_bare_messages))
+            .layer(admission(FAMILY_MESSAGES));
+        let bare_chat = Router::new()
+            .route("/v1/chat/completions", post(handle_bare_chat_completions))
+            .layer(admission(FAMILY_CHAT_COMPLETIONS));
+        api = api.merge(bare_messages).merge(bare_chat);
+    }
+    api
 }
 fn cors_layer_for(origins: Option<&[String]>) -> Option<CorsLayer> {
     let origins = origins?;
@@ -152,7 +358,12 @@ async fn inject_request_id(
     next.run(req).await
 }
 async fn require_client_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if !state.client_auth.is_enforced() {
+    // The pair fetch is what makes runtime key changes visible here: the
+    // daemon swaps the authenticator (together with the admission rules,
+    // one lock) without a restart, so each request reads the half serving
+    // right now.
+    let client_auth = state.client_auth.current_client_auth();
+    if !client_auth.is_enforced() {
         let mut req = req;
         req.extensions_mut().insert(CallerId::anonymous());
         return next.run(req).await;
@@ -173,7 +384,7 @@ async fn require_client_auth(State(state): State<AppState>, req: Request, next: 
                 state.metrics.record_rate_limited();
                 None
             } else {
-                state.client_auth.authenticate(token.expose_secret()).await
+                client_auth.authenticate(token.expose_secret()).await
             }
         }
         None => None,
@@ -264,11 +475,33 @@ async fn normalize_error_responses(
     }
     rewritten
 }
+/// Path prefixes of the non-chat endpoint families (plan 09 step 7): all
+/// of them are OpenAI-dialect APIs.
+const OPENAI_FAMILY_PATHS: &[&str] = &[
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/audio/",
+    "/v1/images/",
+    "/v1/files",
+    "/v1/batches",
+];
+
 fn protocol_for_path(path: &str) -> error_response::ClientProtocol {
-    let is_openai_chat_path =
-        path.contains("/v1/chat/completions") || path.contains("/v1/chat/edits");
-    if is_openai_chat_path {
+    // The dialect of the path decides the error body shape for layer-level
+    // failures (auth, limits, 404/405) that never reach a route handler.
+    if path.contains("/v1/chat/completions")
+        || path.contains("/v1/chat/edits")
+        || OPENAI_FAMILY_PATHS
+            .iter()
+            .any(|prefix| path.contains(prefix))
+    {
         error_response::ClientProtocol::OpenAiChat
+    } else if path.contains("/v1/responses") {
+        error_response::ClientProtocol::OpenAiResponses
+    } else if path.contains("/v1beta/") {
+        error_response::ClientProtocol::Gemini
+    } else if path.contains("/api/") {
+        error_response::ClientProtocol::Ollama
     } else {
         error_response::ClientProtocol::Anthropic
     }
@@ -381,7 +614,10 @@ mod auth_gate_tests {
             .to_string();
 
         let mut clients = std::collections::HashMap::new();
-        clients.insert("laptop".to_owned(), secrecy::SecretString::from(phc));
+        clients.insert(
+            "laptop".to_owned(),
+            llm_proxy_core::ClientKeySpec::Verifier(secrecy::SecretString::from(phc)),
+        );
         let app_config = llm_proxy_core::AppConfig {
             server: llm_proxy_core::ServerConfig {
                 bind: "127.0.0.1:3456".parse().unwrap(),
@@ -393,10 +629,17 @@ mod auth_gate_tests {
                 server_name: "gate-test".to_owned(),
                 rate_limit_rpm,
                 trust_forwarded_headers: false,
-                dedup_window: std::time::Duration::ZERO,
+                cache: Default::default(),
+                idempotency: Default::default(),
+                metrics: Default::default(),
                 log_format: Default::default(),
                 admin_bind: None,
                 admin_on_main_listener: false,
+                endpoint_families: Default::default(),
+                upstream_timeouts: Default::default(),
+                bare_v1: Default::default(),
+                preflight: Default::default(),
+                semantic_cache: Default::default(),
             },
             auth: llm_proxy_core::AuthConfig {
                 mode: llm_proxy_core::AuthMode::ClientKeys,
@@ -404,13 +647,15 @@ mod auth_gate_tests {
                 admin: None,
             },
             storage: None,
+            replica: None,
+            mcp: None,
         };
 
         let state = crate::state::AppState::new(
             app_config,
             llm_proxy_core::ProviderRegistry::from_providers(vec![]).expect("empty registry"),
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",

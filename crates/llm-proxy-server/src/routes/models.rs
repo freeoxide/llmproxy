@@ -4,8 +4,8 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, Response, StatusCode, header};
 use axum::response::IntoResponse;
+use llm_proxy_adapters::ProviderError;
 use llm_proxy_protocol::core::ModelRef;
-use llm_proxy_provider::ProviderError;
 use serde::Serialize;
 use tracing::warn;
 
@@ -52,6 +52,10 @@ pub(crate) async fn handle_models(
         }
     }
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "one handler with per-stage ledger emission; splitting would scatter the failure rows"
+)]
 async fn handle_models_inner(
     state: &AppState,
     provider_name: &str,
@@ -88,36 +92,57 @@ async fn handle_models_inner(
             start,
         )
     })?;
-    let provider = state
-        .providers()
-        .get(provider_name)
-        .ok_or_else(|| RouteError::UnknownProvider(provider_name.to_owned()))
-        .inspect_err(|e| {
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                request_id,
-                Some(provider_name),
-                None::<&ModelRef>,
-                e,
-                start,
-            )
-        })?;
+    // A pool name lists the union of its members' catalogs; a provider name
+    // lists its own (plan 04 step 4: clients use the same URL shape either
+    // way). One captured registry snapshot answers both lookups, so a reload
+    // landing between them cannot split the view.
+    let live_providers = state.providers();
+    let member_names: Vec<String> = match live_providers.pool(provider_name) {
+        Some(pool) => pool.members.clone(),
+        None => {
+            if live_providers.get(provider_name).is_none() {
+                let err = RouteError::UnknownProvider(provider_name.to_owned());
+                core_pipeline::emit_response_failed(
+                    &event_bus,
+                    request_id,
+                    Some(provider_name),
+                    None::<&ModelRef>,
+                    &err,
+                    start,
+                );
+                return Err(err);
+            }
+            vec![provider_name.to_owned()]
+        }
+    };
 
-    let entries = state
-        .model_catalogs()
-        .catalog(provider, refresh_live)
-        .await
-        .map_err(map_catalog_error)
-        .inspect_err(|e| {
-            core_pipeline::emit_response_failed(
-                &event_bus,
-                request_id,
-                Some(provider_name),
-                None::<&ModelRef>,
-                e,
-                start,
-            )
-        })?;
+    let mut entries = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    for member_name in &member_names {
+        let Some(provider) = live_providers.get(member_name) else {
+            continue;
+        };
+        let member_entries = state
+            .model_catalogs()
+            .catalog(provider, refresh_live)
+            .await
+            .map_err(map_catalog_error)
+            .inspect_err(|e| {
+                core_pipeline::emit_response_failed(
+                    &event_bus,
+                    request_id,
+                    Some(provider_name),
+                    None::<&ModelRef>,
+                    e,
+                    start,
+                )
+            })?;
+        for entry in member_entries {
+            if seen_ids.insert(entry.id.clone()) {
+                entries.push(entry);
+            }
+        }
+    }
     let first_id = entries.first().map(|m| m.id.clone());
     let last_id = entries.last().map(|m| m.id.clone());
 
@@ -127,7 +152,7 @@ async fn handle_models_inner(
             id: entry.id,
             object: "model",
             created: 0,
-            owned_by: provider.name.clone(),
+            owned_by: provider_name.to_owned(),
             model_type: "model",
             display_name: entry.display_name,
             created_at: None,
@@ -137,6 +162,17 @@ async fn handle_models_inner(
                 .map(|k| match k {
                     llm_proxy_core::ProviderRouteKind::ChatCompletions => "chat_completions",
                     llm_proxy_core::ProviderRouteKind::Messages => "messages",
+                    llm_proxy_core::ProviderRouteKind::Responses => "responses",
+                    llm_proxy_core::ProviderRouteKind::GenerateContent => "generate_content",
+                    llm_proxy_core::ProviderRouteKind::Embeddings => "embeddings",
+                    llm_proxy_core::ProviderRouteKind::Rerank => "rerank",
+                    llm_proxy_core::ProviderRouteKind::AudioTranscriptions => {
+                        "audio_transcriptions"
+                    }
+                    llm_proxy_core::ProviderRouteKind::AudioSpeech => "audio_speech",
+                    llm_proxy_core::ProviderRouteKind::ImagesGenerations => "images_generations",
+                    llm_proxy_core::ProviderRouteKind::Files => "files",
+                    llm_proxy_core::ProviderRouteKind::Batches => "batches",
                 })
                 .collect(),
             context_length: entry.context_length,
@@ -160,9 +196,9 @@ async fn handle_models_inner(
     Ok(response)
 }
 
-fn map_catalog_error(error: ProviderError) -> RouteError {
+pub(super) fn map_catalog_error(error: ProviderError) -> RouteError {
     match error {
-        ProviderError::Api { status, body } => {
+        ProviderError::Api { status, body, .. } => {
             let status_code = StatusCode::from_u16(status).unwrap_or_else(|_| {
                 tracing::warn!(
                     status,
@@ -174,6 +210,7 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
                 status: status_code,
                 body,
                 auth_owner: AuthOwner::Operator,
+                retry_after_secs: None,
             }
         }
         ProviderError::Http { timeout: true, .. } => {
@@ -184,11 +221,12 @@ fn map_catalog_error(error: ProviderError) -> RouteError {
             timeout: false,
             ..
         } => {
-            let sanitized = super::core_pipeline::sanitize_upstream_error_body(&message);
+            let sanitized = llm_proxy_engine::sanitize_upstream_error_body(&message);
             RouteError::Upstream {
                 status: StatusCode::BAD_GATEWAY,
                 body: sanitized,
                 auth_owner: AuthOwner::Operator,
+                retry_after_secs: None,
             }
         }
         ProviderError::Serialize(_)
@@ -226,6 +264,8 @@ mod tests {
             api_key: secrecy::SecretString::from("sk-test"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -256,6 +296,9 @@ mod tests {
                 ],
             }),
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry =
@@ -272,17 +315,26 @@ mod tests {
                     server_name: "test".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: std::time::Duration::from_millis(500),
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",
@@ -297,6 +349,8 @@ mod tests {
             api_key: secrecy::SecretString::from("sk-test"),
             auth_style: AuthStyle::Bearer,
             passthrough_auth: false,
+            api_keys: None,
+            retry: None,
             egress: None,
             adapters: HashMap::new(),
             routes: ProviderRoutesConfig::default(),
@@ -304,6 +358,9 @@ mod tests {
             discovery: None,
             catalog: None,
             pricing: Default::default(),
+            concurrency: None,
+            pricing_sync: None,
+            prompt_cache: None,
         };
 
         let registry =
@@ -320,17 +377,26 @@ mod tests {
                     server_name: "test".to_owned(),
                     rate_limit_rpm: 100,
                     trust_forwarded_headers: false,
-                    dedup_window: std::time::Duration::from_millis(500),
+                    cache: Default::default(),
+                    idempotency: Default::default(),
+                    metrics: Default::default(),
                     log_format: Default::default(),
                     admin_bind: None,
                     admin_on_main_listener: false,
+                    endpoint_families: Default::default(),
+                    upstream_timeouts: Default::default(),
+                    bare_v1: Default::default(),
+                    preflight: Default::default(),
+                    semantic_cache: Default::default(),
                 },
                 auth: Default::default(),
                 storage: None,
+                replica: None,
+                mcp: None,
             },
             registry,
-            llm_proxy_provider::ProviderAdapterRegistry::builtin(),
-            llm_proxy_provider::ProxyClient::new(),
+            llm_proxy_adapters::ProviderAdapterRegistry::builtin(),
+            llm_proxy_transport::ProxyClient::new(),
             crate::state::BuildInfo {
                 name: "test",
                 version: "0.0.0",
