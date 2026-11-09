@@ -5,11 +5,12 @@ change follows and the decisions already made.
 
 ## Plans
 
-Each plan is one stage of work, with its scope, steps and finish line. None
-are open; finished plans are linked under Completed below.
+Each plan is one stage of work, with its scope, steps and finish line.
+Finished plans are linked under Completed below.
 
 | # | Plan | Status | Depends on |
 |---|---|---|---|
+| 12 | [Fix brief: finish every completed plan](fix-brief/README.md) | Open | 01–11, remodel |
 
 How to use them:
 
