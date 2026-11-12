@@ -179,7 +179,8 @@ Items 09-1 to 09-3 all touch `crates/llm-proxy-store-redis` and the in-repo RESP
 - **How:** add jobs to `ci.yml` (same toolchain/cache steps as `quality`, `runs-on: ubuntu-latest`, pinned action versions as the file already uses):
   1. Job `features-off`: `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --workspace --locked` (no `--all-features`; this exercises every feature-off refusal test in the app).
   2. Job `feature-matrix` with `strategy.fail-fast: false` and `matrix.feature: [store-redis, store-postgres, admin-ui, semantic-cache, mcp-gateway, endpoint-families]`: `cargo clippy -p llm-proxy --all-targets --features ${{ matrix.feature }} --locked -- -D warnings` then `cargo test -p llm-proxy --features ${{ matrix.feature }} --locked`. Fix any single-feature compile failure this reveals (report each as part of this item).
-  3. Step `default-build-isolation` in `features-off`: `cargo tree -p llm-proxy --locked -e normal --prefix none | grep -E '^llm-proxy-(store-redis|store-postgres|admin|guardrails|semantic-cache|mcp) ' && { echo "optional crate in default build"; exit 1; } || true` (use `! ... grep` form so a match fails the job).
+  3. Step `default-build-isolation` in `features-off`: `! cargo tree -p llm-proxy --locked -e normal --prefix none | grep -E '^llm-proxy-(store-redis|store-postgres|admin|guardrails|semantic-cache|mcp) '`. A match fails the step. (Do not write `grep … && exit 1 || true`: the `|| true` swallows the failure.)
+  4. 03-7 adds a `feature-closures` job to the same file. Land both in one commit with shared toolchain/cache steps.
 - **Test:** the CI jobs are the test. Locally verify with `cargo test -p llm-proxy` and `cargo test -p llm-proxy --features store-redis` once before pushing.
 - **Done when:** the three CI additions exist and a throwaway branch that deletes one `#[cfg(feature)]` gate fails the matrix.
 - **Risk / notes:** CI time increases (cache is shared); `unused-deps` job unaffected. Postgres feature tests that need a server are `#[ignore]` so the matrix stays offline.
@@ -222,9 +223,9 @@ Items 09-1 to 09-3 all touch `crates/llm-proxy-store-redis` and the in-repo RESP
 - **Risk / notes:** none.
 
 ## Rule violations to clean up
-- `crates/llm-proxy-store-redis/src/test_server.rs:170` — no indexing in non-test code (the module is compiled under the `test-server` feature, not `cfg(test)`) — `if byte[0] == b'\n' {` — read into `let mut byte = [0_u8; 1];` then `let [value] = byte;` and use `value` (or `byte.first().copied()`), and at ~176 `buffer.push(byte[0]);` becomes `buffer.push(value);`.
-- `apps/llm-proxy/src/replica.rs:41` and `:55` — borderline `let _ =` — `let _ = (url, registry, state, pair);` — replace with `drop((url, registry, state, pair));` if clippy accepts it, otherwise name the unused parameters conditionally with `#[cfg_attr(not(feature = "store-redis"), expect(unused_variables, reason = "the arm bails before using them"))]` on the match arm's bindings. The rule only targets `Result`/`Future`, so this is lowest priority.
-- Test-server additions in 09-1 to 09-3 must follow the same no-indexing rule (use `.get()` and slice patterns).
+
+All are in [rule-violations.md](rule-violations.md), each listed once with one instruction. This area: RV-17.
+New code written for this plan must follow the same rules: no `unwrap`/`expect`/`panic!`, no indexing or slicing, and no `let _ =` on a `Result` or `Future` in non-test code.
 
 ## Rejected findings
 - "`[replica]` and endpoint-families startup refusals both untested" (report G11/row 52) — only half true. `apps/llm-proxy/src/state.rs` `family_routes_need_the_endpoint_families_feature` (~1429-1479) asserts the endpoint-families refusal message, and `semantic_cache_without_the_feature_refuses_to_start` (~1482) covers the semantic-cache one. The real defect is that they only compile in feature-off builds and CI never builds that way (09-11). The `[replica]` refusal is genuinely untested (09-13).

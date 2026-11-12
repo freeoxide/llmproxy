@@ -205,18 +205,8 @@ indexing/slicing in non-test code, no `#[allow]`, tests assert behaviour). Tests
 - **Risk / notes:** needs R-4 for the `catalog = None` variants only.
 
 ### R-20 [FIX] [P2] Remove `expect()` and slicing from non-test code in the plan area (AGENTS.md)
-- **Where / Now / How:**
-  - `PR:470` `keys[..MAX_ADAPTERS_IN_ERROR].join(", ")` and `keys.len() - MAX_ADAPTERS_IN_ERROR`: replace with `keys.iter().take(MAX_ADAPTERS_IN_ERROR).copied().collect::<Vec<_>>().join(", ")` and `keys.len().saturating_sub(MAX_ADAPTERS_IN_ERROR)`. Also sort `keys` first so the error message is deterministic (HashMap order).
-  - `PC:2631 scheme_region`: `Some(idx) => &endpoint[..idx]` -> `endpoint.split_once("://").map_or("", |(scheme, _)| scheme)`.
-  - `PC:2225` `PROVIDER_NAME_SLUG` regex `.expect(...)`: drop the regex; write `fn is_valid_provider_name(name: &str) -> bool { (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')) }` (same as `EC is_safe_provider_slug`). Remove the `#[expect(clippy::expect_used)]`.
-  - `crates/llm-proxy-engine/src/lib.rs:90` `PROVIDER_NAME_REGEX`: same replacement inside `validate_provider_name`; `lib.rs:362` `.expect("an empty provider registry is always valid")` in `Engine::new`: DECIDE-lite default: make `Engine::new` return `Result<Self, EngineError>`? That is public API (also used by `llm-proxy-sdk`); recommended default: add `ProviderRegistry::empty() -> Self` (infallible, in `PR`) and use it, then remove the `expect`.
-  - `crates/llm-proxy-engine/src/error.rs:302` `URL_REDACT_REGEX` `.expect`: replace the regex with a small scanner: find `http://`/`https://`, redact through the next whitespace; no regex needed. Keep the existing redaction tests.
-  - `crates/llm-proxy-transport/src/discovery.rs:152` `last_error.expect("retry loop ran at least once")`: restructure `fetch_page` as `let mut attempt = 0; loop { match send_once { Ok => return Ok, Err(e) if transient && attempt < MAX_TRANSIENT_RETRIES => { warn; attempt += 1; sleep } Err(e) => return Err(e) } }`; delete the `#[expect]`.
-  - `discovery.rs:353 Default for DiscoveryClient` and `crates/llm-proxy-transport/src/client.rs:67 ProxyClient::new`: both `try_new().expect(..)`. DECIDE, recommended default: keep `ProxyClient::new()` (about 20 call sites incl. `llm-proxy-sdk`, `-bridge`, `-mcp`; public API) but remove `impl Default for DiscoveryClient`, replace its two non-test users (`EC:91 ModelCatalogService::new`, `apps/.../models.rs` `get_or_insert_with(DiscoveryClient::default)`) by making `ModelCatalogService::new` build the client lazily or returning `Result`; if that ripples too far, keep both with their current `#[expect(clippy::expect_used, reason = …)]` and say in the commit message that these are the only remaining `expect` sites.
-- **Wanted:** AGENTS.md: "No `unwrap()`, `expect()`, `panic!` … in non-test code" and "No indexing or string slicing … in non-test code".
-- **Test:** existing tests keep passing; add `adapter_error_lists_at_most_n_adapters_sorted` in `PR` tests (provider with `MAX_ADAPTERS_IN_ERROR + 3` adapters and a route pointing at a missing one: assert the `MissingAdapter.available` string has exactly `MAX_ADAPTERS_IN_ERROR` names in sorted order and ends with "(+3 more)"); `scheme_region` cases via the existing egress-proxy validation tests; provider-name table in R-17; `redact_urls` test with two URLs in one message.
-- **Done when:** `rg -n '\.expect\(' <the listed files>` shows only lines after `#[cfg(test)]` (plus the sanctioned ProxyClient/DiscoveryClient sites if kept); `rg -n '\[\.\.' <listed files>` shows none in non-test code.
-- **Risk / notes:** all `#[expect(clippy::expect_used)]` attributes that become unfulfilled must be removed or clippy (`-D warnings`) fails with an unfulfilled-expectation error.
+- **Where / How / Test:** moved to [rule-violations.md](rule-violations.md) so each violation has one instruction: RV-6 (`ProxyClient::new`), RV-7 (`Default for DiscoveryClient`), RV-8 (`fetch_page` retry loop), RV-9 (provider-name validator, with R-21), RV-10 (`ProviderRegistry::empty`), RV-11 (URL redaction), RV-13 (`provider_registry.rs:470` slicing), RV-14 (`scheme_region`). The earlier default here, "keep `ProxyClient::new()`, about 20 call sites", was wrong: only 5 callers are outside tests, and RV-6 deletes it.
+- **Done when:** those eight RV items are done. Report R-20 as `done (via RV-…)`.
 
 ### R-21 [DECIDE] [P2] Provider-name length limit differs between config (64) and URL path validation (128)
 - **Where:** `PC:2225` regex `{1,64}`; `crates/llm-proxy-engine/src/lib.rs` `MAX_PROVIDER_NAME_LEN` (128); `EC:487 MAX_PROVIDER_SLUG_LEN = 128`.
@@ -229,15 +219,8 @@ indexing/slicing in non-test code, no `#[allow]`, tests assert behaviour). Tests
 
 ## Rule violations to clean up
 
-- `crates/llm-proxy-core/src/provider_registry.rs:470` — string/slice indexing — `keys[..MAX_ADAPTERS_IN_ERROR].join(", ")` — `keys.iter().take(MAX_ADAPTERS_IN_ERROR).copied().collect::<Vec<_>>().join(", ")` (R-20)
-- `crates/llm-proxy-core/src/provider_config.rs:2631` — string slicing — `Some(idx) => &endpoint[..idx],` — `endpoint.split_once("://").map_or("", |(scheme, _)| scheme)` (R-20)
-- `crates/llm-proxy-core/src/provider_config.rs:2225` — `expect` (the `#[expect(clippy::expect_used)]` silences the lint, not the written rule) — `regex::Regex::new(...).expect("valid provider name slug regex")` — byte-class check, no regex (R-20)
-- `crates/llm-proxy-engine/src/lib.rs:90` — `expect` — `regex::Regex::new(r"^[a-z0-9_-]+$").expect(...)` — same byte-class check (R-20)
-- `crates/llm-proxy-engine/src/lib.rs:362` — `expect` — `.expect("an empty provider registry is always valid")` — add infallible `ProviderRegistry::empty()` (R-20)
-- `crates/llm-proxy-engine/src/error.rs:302` — `expect` — `regex::Regex::new(r"https?://\S+").expect(...)` — hand scanner (R-20)
-- `crates/llm-proxy-transport/src/discovery.rs:152` — `expect` — `Err(last_error.expect("retry loop ran at least once"))` — restructure the retry loop (R-20)
-- `crates/llm-proxy-transport/src/discovery.rs:353` and `crates/llm-proxy-transport/src/client.rs:67` — `expect` — `Self::try_new().expect(...)` in `Default for DiscoveryClient` / `ProxyClient::new` — see R-20 DECIDE (default: remove `Default for DiscoveryClient`, keep `ProxyClient::new` documented)
-- (Not violations: `let _ = param;` in `crates/llm-proxy-engine/src/traits.rs:234-472` discards unused parameters, not a `Result`/`Future`; `core_pipeline.rs:398` `#[expect(clippy::large_enum_variant, reason = …)]` is compliant.)
+All are in [rule-violations.md](rule-violations.md), each listed once with one instruction. This area: RV-6, RV-7, RV-8, RV-9, RV-10, RV-11, RV-13, RV-14 (see R-20).
+New code written for this plan must follow the same rules: no `unwrap`/`expect`/`panic!`, no indexing or slicing, and no `let _ =` on a `Result` or `Future` in non-test code.
 
 ## Rejected findings
 

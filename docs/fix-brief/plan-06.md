@@ -166,10 +166,9 @@ Line numbers were re-checked against the current tree; use symbol names if they 
 - **Risk / notes:** use the existing temp-dir helper in the storage tests.
 
 ## Rule violations to clean up
-- `crates/llm-proxy-engine/src/lib.rs:37` and `:63-65` — "one path" — `pub mod cache;` + `pub use cache::{..}` — see 06-13 / 05-13.
-- `.expect(..)` under `#[expect(clippy::expect_used, reason = "...")]` at `lib.rs` `PROVIDER_NAME_REGEX`, `provider_config.rs:~2225`, `adapters/src/anthropic.rs:31,40,60` — the attribute form is the AGENTS.md-sanctioned escape; low priority. If swept, replace compile-time regex statics with hand-written checks (provider name: bytes all in `[a-z0-9_-]` and non-empty) and delete the regex. Not needed for this plan's behaviour.
-- `crates/llm-proxy-engine/src/cache.rs:189,226,449,462` `let _ = self.share.tx.send_replace(..)` — `send_replace` returns the previous value, not a `Result`/`Future`, so the rule does not apply; no change.
-- No `unwrap`/`panic`/indexing/`#[allow]` found in the non-test code of `cache.rs`, `mutation.rs`, `state.rs` (server), `middleware.rs`. `mutation.rs` `items.remove(index)` is guarded by `index < items.len()`.
+
+All are in [rule-violations.md](rule-violations.md), each listed once with one instruction. This area: none of its own; the `cache` double path is 06-13 / 05-13.
+New code written for this plan must follow the same rules: no `unwrap`/`expect`/`panic!`, no indexing or slicing, and no `let _ =` on a `Result` or `Future` in non-test code.
 
 ## Rejected findings
 - "Data-class policy says `ttl` from storage; should be from completion" — the clock starts at `MemoryCache::store` (`Instant::now()` stamped when the completed response is stored), i.e. at completion. Only the wording is ambiguous (06-11, doc-only).

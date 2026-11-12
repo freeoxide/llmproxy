@@ -114,7 +114,8 @@ CI has no docs/link checker (`.github/workflows` has only `ci.yml` and `release.
 
 ## Rule violations to clean up
 
-- None in non-test code. (`crates/llm-proxy-server/src/middleware.rs:652,667` and `core_pipeline.rs:1001-1021` `expect/unwrap` sit after `#[cfg(test)]`.) The docs items above must not add self-report tables or "why we chose" prose (AGENTS.md).
+All are in [rule-violations.md](rule-violations.md), each listed once with one instruction. This area: none (docs only).
+New code written for this plan must follow the same rules: no `unwrap`/`expect`/`panic!`, no indexing or slicing, and no `let _ =` on a `Result` or `Future` in non-test code.
 
 ## Rejected findings
 

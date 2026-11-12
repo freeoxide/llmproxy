@@ -245,12 +245,9 @@ and were re-checked against master @ `fe6e66f`. "Adapters" = `crates/llm-proxy-a
 - **Risk / notes:** Do this last so it matches whichever options were taken for the DECIDE items.
 
 ## Rule violations to clean up
-- `crates/llm-proxy-adapters/src/anthropic.rs:31` (also: plan 01) — no `expect()` — `.expect("json! macro with {{...}} always produces a JSON object")` in `json_object` — see plan 01 for replacement (build `serde_json::Map` directly).
-- `crates/llm-proxy-adapters/src/anthropic.rs:40` (also: plan 01) — no `expect()` — `regex::Regex::new(r"[^A-Za-z0-9_]").expect("valid regex")` — replace with a `chars().map(...)` sanitizer.
-- `crates/llm-proxy-adapters/src/anthropic.rs:60` (also: plan 01) — no `expect()` — `write!(result, ...).expect(...)` — use `result.push_str(&format!(...))`.
-- `crates/llm-proxy-core/src/provider_config.rs:2225` (also: plan 01) — no `expect()` — slug regex `.expect(...)` — hand-written byte check.
-- `crates/llm-proxy-transport/src/client.rs:67` (also: plan 01) — no `expect()` — `ProxyClient::new` — migrate callers to `try_new()` or gate `new()` behind `cfg(test)`.
-- `crates/llm-proxy-adapters/src/openai_chat.rs:497` — no indexing — `include_usage["include_usage"].clone()` — replace with `serde_json::Value::Bool(true)` (and build the `stream_options` object from it). `Value` indexing does not panic, so low severity, but it is the literal pattern the rule bans.
+
+All are in [rule-violations.md](rule-violations.md), each listed once with one instruction. This area: RV-2, RV-3, RV-4, RV-5, RV-6, RV-9.
+New code written for this plan must follow the same rules: no `unwrap`/`expect`/`panic!`, no indexing or slicing, and no `let _ =` on a `Result` or `Future` in non-test code.
 
 ## Rejected findings
 - "G13: client request ids are not sanitized before logging" — not a defect: inbound `x-request-id` is never read or adopted (`routes/mod.rs` `inject_request_id` generates the id; `x-request-id` is in `NEVER_FORWARDED_HEADERS`; `contract_replay.rs:346` asserts the response id is not the client's). Only the plan wording is loose (02-21 item 8).

@@ -2,8 +2,8 @@
 
 All eleven numbered plans and the provider-routing remodel under `docs/completed/` are
 marked "Completed", but a static audit on 2026-11-09 (master @ `fe6e66f`) found work that
-is partial, missing, untested or described wrongly. This folder lists every item: 188 in
-total (18 P0, 97 P1, 73 P2). Your job is to close all of them.
+is partial, missing, untested or described wrongly. This folder lists every item: 205 in
+total (18 P0, 97 P1, 90 P2). Your job is to close all of them.
 
 ## Files
 
@@ -21,14 +21,17 @@ total (18 P0, 97 P1, 73 P2). Your job is to close all of them.
 | [plan-10.md](plan-10.md) | 10 Bindings |
 | [plan-11.md](plan-11.md) | 11 Research corrections |
 | [plan-remodel.md](plan-remodel.md) | Provider-routing remodel (items `R-n`) |
+| [rule-violations.md](rule-violations.md) | `AGENTS.md` violations across all areas (items `RV-n`) |
 
 Read this page fully, then open a plan file only when you work on its items. Each plan
-file stands alone: "Done — leave alone", work items, rule violations, rejected findings.
+file stands alone: "Done — leave alone", work items, rejected findings. Rule violations
+are listed once, in `rule-violations.md`; each plan names the RV items in its area.
 
 ## Rules (read before touching code)
 
 1. Read `AGENTS.md`, `docs/goal.md` and `docs/README.md` first. Every rule in `AGENTS.md`
-   applies: no `unwrap`/`expect`/`panic!`/indexing/slicing in non-test code, no `#[allow]`,
+   applies: no `unwrap`/`expect`/`panic!`/indexing/slicing in non-test code (an
+   `#[expect(clippy::expect_used)]` attribute does not make an `expect()` acceptable), no `#[allow]`,
    no `let _ =` on a `Result`/`Future`, `thiserror` in libraries, tests assert observable
    behaviour, one public path per item, no design narratives in user-facing docs.
 2. Run the quality gates after every work item, not only at the end:
@@ -44,7 +47,10 @@ file stands alone: "Done — leave alone", work items, rule violations, rejected
    directories when you touch them.
 3. Red-green for every FIX and TEST item: write the test first, watch it fail for the
    stated reason, then fix. If a test passes before the fix, the test is wrong;
-   strengthen it until it fails on the old code.
+   strengthen it until it fails on the old code. Exception: a TEST item for behaviour that
+   is already correct (its "Now" says so, e.g. 01-2) cannot fail first. Prove it can fail
+   with the mutation its "Done when" names, then revert the mutation. Do not commit the
+   mutation.
 4. Do not start servers, daemons or live upstreams by hand. Use the in-process fakes the
    test suites already use (loopback fake upstreams, the in-repo RESP server, `oneshot`
    on the router). `#[ignore]`d live tests stay ignored.
@@ -66,14 +72,30 @@ file stands alone: "Done — leave alone", work items, rule violations, rejected
 ## Order of work
 
 1. All **P0** items across plans (correctness, security, money/data loss, false "Done
-   when"). Suggested sequence: 02 (silent field drops), 09 (Redis budget race, guardrail
-   fail policy), 07 (reload half-apply), 03 (allowlist order), 05 (status table,
-   charging), 10 (binding errors and cancellation), 01, 04, 06, 08, remodel.
+   when"). Suggested sequence: 02 (silent field drops), 09 (Redis budget race and lease
+   reaping), 07 (reload half-apply), 03 (allowlist order), 05 (status table, bare tokens,
+   charging), 10 (binding errors and cancellation), 01, 04, remodel. Plans 06, 08 and 11
+   have no P0 items.
 2. All **P1** items (missing features claimed done, missing behavioural tests on key
    paths).
 3. All **P2** items (docs, naming, small tests, rule-violation cleanup).
 4. Final: run every gate above, then write the report: each item ID with `done` /
    `rejected (why)` / `decided (what)`, plus the names of tests added.
+
+## Coupled items
+
+Do these together, or in the order given:
+
+- 05-13 closes 04-15 and 06-13 (root re-exports are the one engine path). Do them in one
+  change to `engine/src/lib.rs`.
+- 04-7 and RV-6 both change how `ProxyClient` is built in the engine, SDK and bridge.
+- 07-22, RV-7 and RV-8 all edit `transport/src/discovery.rs`. Do them one after another.
+- R-21 and RV-9 share one provider-name constant and validator.
+- RV-12 is part of 04-4.
+- 09-1, then 09-2 (09-2 reuses 09-1's `DEL` claim).
+- 10-1, then 10-4 (docs follow the behaviour). 10-6 before 10-7 (shared `error_json`).
+- 10-10 and 10-11, then 10-12, then 10-13 (the release workflow calls the others).
+- 03-7 and 09-11 add jobs to the same `ci.yml`. Land them in one commit.
 
 ## Item format
 
@@ -278,4 +300,20 @@ Types: `FIX` (change behaviour), `TEST` (add or strengthen a behavioural test),
 - 10-9 [TEST] [P2] One shared runtime, and bridges can be dropped from async context
 - 10-14 [DOC] [P2] Bring READMEs and the plan in line with CI as built
 - 10-15 [TEST] [P2] Same-format passthrough through `execute` is only covered by a snapshot
-
+- RV-1 [FIX] [P2] Slice pattern instead of `content[0]` in the Anthropic client decoder
+- RV-2 [FIX] [P2] `json_object` builds a `serde_json::Map` directly
+- RV-3 [FIX] [P2] Replace the tool-use-id sanitiser regex
+- RV-4 [FIX] [P2] Drop the `write!(..).expect(..)` in the id escaper
+- RV-5 [FIX] [P2] No `Value` indexing for `include_usage`
+- RV-6 [FIX] [P2] Delete `ProxyClient::new()` and `impl Default for ProxyClient`
+- RV-7 [FIX] [P2] Delete `impl Default for DiscoveryClient`
+- RV-8 [FIX] [P2] Restructure the discovery retry loop
+- RV-9 [FIX] [P2] One provider-name validator, no regex
+- RV-10 [FIX] [P2] Infallible empty registry for `EngineBuilder::new`
+- RV-11 [FIX] [P2] URL redaction without a regex
+- RV-12 [FIX] [P2] Duration parsing without a regex
+- RV-13 [FIX] [P2] No slicing in the missing-adapter error
+- RV-14 [FIX] [P2] No string slicing in `scheme_region`
+- RV-15 [FIX] [P2] No indexing in `percentile`
+- RV-16 [FIX] [P2] `self_loop` reachable through one path
+- RV-17 [FIX] [P2] No indexing in the RESP test server

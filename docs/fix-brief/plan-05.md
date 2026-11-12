@@ -164,7 +164,7 @@ Line numbers were re-checked against the current tree; use the symbol names if t
 - **How (DECIDE resolved: root re-exports are the one path, because ~130 call sites already use them):** for each module in the list make it private (`mod x;`) and make its `pub use` list complete (add any `pub` item the module has that is not in the list, e.g. `LeaseId`-adjacent items, `UnsettledLeaseGuard` already there). Then fix callers that use a module path: `rg "llm_proxy_engine::(traits|error|error_policy|admission|admission_backend|cache|catalog|classification|headers|health|types)::"` (known: `llm_proxy_engine::traits`, `llm_proxy_engine::error`, `llm_proxy_engine::lifecycle` — `lifecycle` stays a pub module with no re-export, leave it). In-crate `crate::error_policy::` paths are unaffected. `#![deny(missing_docs)]` still applies to the re-exported items.
 - **Test:** build only (`cargo clippy --workspace --all-targets --all-features -- -D warnings`); no new test.
 - **Done when:** `rg "^pub mod (admission|admission_backend|cache|catalog|classification|error|error_policy|headers|health|traits|types);" crates/llm-proxy-engine/src/lib.rs` returns nothing, and the workspace builds.
-- **Risk / notes:** also affects plan 06 (`cache`, tagged: also plan 06 for 06-13). If an out-of-workspace consumer needs a non-listed item, add it to the `pub use` rather than reopening the module. Run `cargo shear` not needed (no deps change).
+- **Risk / notes:** this item also closes 04-15 (`classification`, `error_policy`, `health`; rewrite the module-path references in `docs/completed/04-routing-and-failover.md:59,106` and `05-admission-and-budgets.md:48`) and 06-13 (`cache`). It also covers `traits`, which plan 07 had rejected. Do all of them in one change to `lib.rs`. If an out-of-workspace consumer needs a non-listed item, add it to the `pub use` rather than reopening the module. Run `cargo shear` not needed (no deps change).
 
 ### 05-14 [DOC] [P2] Align plan 05 prose with the code
 - **Where:** `docs/completed/05-admission-and-budgets.md` Done section.
@@ -176,9 +176,9 @@ Line numbers were re-checked against the current tree; use the symbol names if t
 - **Risk / notes:** do last; do not add design narrative (AGENTS.md).
 
 ## Rule violations to clean up
-- `crates/llm-proxy-engine/src/error.rs:299-302` — "No `expect()` in non-test code" — `#[expect(clippy::expect_used, ..)] static URL_REDACT_REGEX ... Regex::new(r"https?://\S+").expect("valid URL redaction regex")` — The attribute form is the allowed escape in AGENTS.md, so this is low priority. If cleaned: replace `redact_urls` with a small non-regex scanner (find `http://`/`https://`, replace through the next whitespace with `[url-redacted]`) and delete the regex static; keep the existing `sanitize_*` tests as the behaviour check. (The same attribute pattern exists at `lib.rs` `PROVIDER_NAME_REGEX`, `provider_config.rs:~2225`, `adapters/src/anthropic.rs:31,40,60` — other plans; leave unless doing the sweep.)
-- `crates/llm-proxy-engine/src/lib.rs` `pub mod X` + `pub use X::..` pairs — see 05-13.
-- No `unwrap`/`panic`/indexing/`#[allow]`/`let _ =`-on-Result found in the non-test code of the plan-05 files.
+
+All are in [rule-violations.md](rule-violations.md), each listed once with one instruction. This area: RV-11; the engine's double public paths are 05-13.
+New code written for this plan must follow the same rules: no `unwrap`/`expect`/`panic!`, no indexing or slicing, and no `let _ =` on a `Result` or `Future` in non-test code.
 
 ## Rejected findings
 - "Server `every_route_error()` omits `RateLimited`/`BudgetExhausted`/`Overloaded`/`Forbidden`" — wrong: `routes/error_response.rs` `every_route_error()` lists all 21 `RouteError` variants including those four. Only the ENGINE `representative_errors()` omits them (fixed in 05-2).

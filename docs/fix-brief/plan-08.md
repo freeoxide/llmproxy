@@ -157,8 +157,9 @@ Test file shorthand: `CD` = `crates/llm-proxy-server/tests/client_dialects.rs`.
 - **Risk / notes:** do this last so the count is right.
 
 ## Rule violations to clean up
-- `crates/llm-proxy-protocol/src/client/responses.rs:985` — silenced unused binding (`let _ = index;`) — see 08-13 (`{ kind, .. }` pattern, empty arm).
-- No `unwrap`/`expect`/`panic!`/`#[allow]`/indexing/slicing found in non-test code of the plan area (report scan); nothing else to clean.
+
+All are in [rule-violations.md](rule-violations.md), each listed once with one instruction. This area: none of its own; `let _ = index;` is 08-13.
+New code written for this plan must follow the same rules: no `unwrap`/`expect`/`panic!`, no indexing or slicing, and no `let _ =` on a `Result` or `Future` in non-test code.
 
 ## Rejected findings
 - "`response.in_progress` is never emitted" (report note on row 3) — the plan lists only `response.created` ... terminal events and the captured Codex session replays against the route (`contract_replay.rs:1489`); Codex does not require `in_progress`. Not a gap; revisit only if a client needs it.
